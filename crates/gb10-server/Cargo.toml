@@ -1,0 +1,12 @@
+[package]
+name = "gb10-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAI- and Anthropic-compatible local endpoint"
+
+[dependencies]
+gb10-core.workspace = true
+gb10-model.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

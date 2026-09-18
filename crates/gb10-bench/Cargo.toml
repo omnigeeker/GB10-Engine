@@ -1,0 +1,14 @@
+[package]
+name = "gb10-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmark and verification harness"
+
+[dependencies]
+gb10-core.workspace = true
+gb10-cuda.workspace = true
+gb10-model.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

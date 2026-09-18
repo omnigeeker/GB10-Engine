@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Model weights are downloaded, never committed (21 GB + 52 GB)
+/models
+*.safetensors
+*.safetensors.index.json
+*.gguf
+
+# Downloaded third-party binaries / archives
+/tools/ollama/root
+/tools/ollama/*.tar.zst
+/tools/ollama/*.tgz
+
+# Compiled hardware probes
+/bench/hw/bw
+/bench/hw/bw2
+*.o
+*.ptx
+*.cubin
+
+# Loop scratch
+/loop/logs
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

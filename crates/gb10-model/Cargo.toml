@@ -1,0 +1,12 @@
+[package]
+name = "gb10-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.5 (Gated DeltaNet + full attention + MTP) model graph"
+
+[dependencies]
+gb10-core.workspace = true
+gb10-cuda.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

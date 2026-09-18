@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gb10-core",
+    "crates/gb10-cuda",
+    "crates/gb10-model",
+    "crates/gb10-server",
+    "crates/gb10-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gb10-core = { path = "crates/gb10-core" }
+gb10-cuda = { path = "crates/gb10-cuda" }
+gb10-model = { path = "crates/gb10-model" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+half = { version = "2", features = ["std"] }
+byteorder = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+minijinja = { version = "2", features = ["loader"] }
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Benchmarks keep symbols so a failing config is reportable.
+[profile.bench]
+inherits = "release"
+debug = 1

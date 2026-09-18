@@ -1,0 +1,25 @@
+[package]
+name = "gb10-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model config, safetensors reader and tokenizer for GB10-Engine"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+half.workspace = true
+minijinja.workspace = true
+regex.workspace = true
+tracing.workspace = true
+# HF tokenizers, pure-Rust regex backend (no libonig C dependency).
+tokenizers = { version = "0.23", default-features = false, features = [
+    "fancy-regex",
+    "esaxx_fast",
+] }
+
+[dev-dependencies]
