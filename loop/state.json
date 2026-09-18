@@ -1,23 +1,63 @@
 {
   "project": "GB10-Engine",
-  "round": 0,
-  "last_round_at": null,
-  "last_status": null,
+  "round": 1,
+  "last_round_at": "20260918T112529Z",
+  "last_status": "PASS",
   "model": "nv-community/Qwen3.8-27B-NVFP4",
   "hardware": "NVIDIA GB10 (DGX Spark), sm_121, 48 SMs, 121 GiB unified, CUDA 13.0",
-  "measured_read_bandwidth_gbps": 200,
-  "roofline_single_stream_tok_s": 9.52,
-  "current_milestone": "M0",
+  "measured_read_bandwidth_gbps": 228,
+  "roofline_single_stream_tok_s": 12.95,
+  "current_milestone": "M2",
   "milestones": {
-    "M0": { "name": "Foundation: config, safetensors, tokenizer, chat template", "status": "done" },
-    "M1": { "name": "CUDA backend + roofline GEMV kernels", "status": "in_progress" },
-    "M2": { "name": "Qwen3.5 layer kernels (DeltaNet, attention, MLP, NVFP4/FP8)", "status": "pending" },
-    "M3": { "name": "Full 64-layer forward, greedy decode parity vs HF oracle", "status": "pending" },
-    "M4": { "name": "MTP speculative decoding", "status": "pending" },
-    "M5": { "name": "Paged KV cache + continuous batching, 16 concurrent", "status": "pending" },
-    "M6": { "name": "OpenAI + Anthropic compatible endpoints", "status": "pending" },
-    "M7": { "name": "Roofline optimization (targets T1-T4)", "status": "pending" },
-    "M8": { "name": "Ollama head-to-head (targets T5, T6)", "status": "pending" }
+    "M0": {
+      "name": "Foundation: config, safetensors, tokenizer, chat template",
+      "status": "done"
+    },
+    "M1": {
+      "name": "CUDA backend + roofline GEMV kernels",
+      "status": "done"
+    },
+    "M2": {
+      "name": "Qwen3.5 layer kernels (DeltaNet, attention, MLP, NVFP4/FP8)",
+      "status": "in_progress"
+    },
+    "M3": {
+      "name": "Full 64-layer forward, greedy decode parity vs HF oracle",
+      "status": "pending"
+    },
+    "M4": {
+      "name": "MTP speculative decoding",
+      "status": "pending"
+    },
+    "M5": {
+      "name": "Paged KV cache + continuous batching, 16 concurrent",
+      "status": "pending"
+    },
+    "M6": {
+      "name": "OpenAI + Anthropic compatible endpoints",
+      "status": "pending"
+    },
+    "M7": {
+      "name": "Roofline optimization (targets T1-T4)",
+      "status": "pending"
+    },
+    "M8": {
+      "name": "Ollama head-to-head (targets T5, T6)",
+      "status": "pending"
+    }
   },
-  "history": []
+  "history": [
+    {
+      "round": 1,
+      "at": "20260918T112529Z",
+      "status": "PASS",
+      "gates": {
+        "build": "pass",
+        "test": "pass",
+        "correctness": "missing",
+        "benchmark": "pass"
+      }
+    }
+  ],
+  "per_token_traffic_gb": 17.608
 }

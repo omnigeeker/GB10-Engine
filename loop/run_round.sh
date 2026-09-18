@@ -82,7 +82,7 @@ fi
 # ------------------------------------------------------------ 4. benchmark ---
 if [ "$QUICK" = 0 ] && [ "$GATE_BUILD" = pass ] && [ -x "$ROOT/target/release/gb10-bench" ]; then
   say "gb10-bench"
-  if "$ROOT/target/release/gb10-bench" --out "$RESULTS/$STAMP.json" >>"$LOG" 2>&1; then
+  if "$ROOT/target/release/gb10-bench" stream --out "$RESULTS/$STAMP.json" >>"$LOG" 2>&1; then
     GATE_BENCH=pass; say "bench OK -> $RESULTS/$STAMP.json"
   else
     GATE_BENCH=fail; say "bench FAILED (see $LOG)"

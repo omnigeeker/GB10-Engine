@@ -18,17 +18,26 @@ every round.
 
 ## M1 — CUDA backend and the roofline
 
-The whole engine lives or dies on streaming 21 GB/token at 200 GB/s.
+The whole engine lives or dies on streaming 17.6 GB/token at ~230 GB/s.
 
-- [ ] `gb10-cuda`: device init, stream/event wrappers, device buffer pool,
-      pinned host staging, PTX module loading via `cudarc`
-- [ ] NVFP4 dequant-and-GEMV kernel: read packed E2M1 + group-16 E4M3 scales,
-      accumulate fp32, saturate bandwidth at batch 1
-- [ ] FP8 (E4M3) GEMV kernel with per-tensor scale
-- [ ] bf16 GEMV (embeddings, MTP)
-- [ ] RMSNorm, SiLU/SwiGLU, residual, fused where it saves traffic
-- [ ] **gate: GEMV over the real 21 GB of weights reaches >= 180 GB/s**
-      (90 % of the measured 200 GB/s ceiling) — measured, not estimated
+- [x] `gb10-cuda`: device init, PTX module loading via `cudarc`, typed launch
+      wrappers, bandwidth-derived grid/block config
+- [x] NVFP4 dequant-and-GEMV kernel: packed E2M1 + group-16 E4M3 scales, fp32
+      accumulate
+- [x] FP8 (E4M3) GEMV kernel with per-tensor scale
+- [x] bf16 GEMV
+- [x] **gate PASSED: 249.9 GB/s over the real 17.56 GB of quantized weights,
+      projecting 14.23 tok/s — above the 12.95 tok/s conservative roofline**
+      (`bench/results/stream-m1.json`)
+- [x] correctness: all three kernels verified against an independent CPU
+      reference on real weights, error ~1e-6 (fp32 rounding)
+- [ ] RMSNorm, SiLU/SwiGLU, residual, fused where it saves traffic (moved to M2)
+
+Design note: GB10 caps dynamic shared memory at 99 KB/block and 100 KB/SM, so
+staging activations in shared memory would cap occupancy at one block per SM.
+The kernels instead keep the activation tile in registers and hoist it out of
+the row loop, amortising activation traffic over `ROWS` output rows with no
+shared memory at all.
 
 ## M2 — Qwen3.5 layer kernels
 

@@ -1,4 +1,4 @@
-# GB10 Physics: why the original throughput targets are unreachable
+# GB10 Physics: what the hardware can actually do
 
 This document is the **evidence base** for the performance contract in
 `docs/TARGETS.md`. Everything here was measured on the target machine, not
@@ -9,109 +9,121 @@ LPDDR5X, driver 580.142, CUDA 13.0.
 
 ---
 
-## 1. Measured memory bandwidth
+## 1. Read bandwidth
 
-`bench/hw/bw.cu` (8 GiB buffer, 5 launch configs, `__ldcs` streaming loads):
+Datasheet: 8533 MT/s x 256 bit = **273 GB/s**.
 
-| Pattern | Achieved |
-|---|---|
-| Pure read (8 GiB) | **195 – 199 GB/s** |
-| Pure write (8 GiB) | 161 – 170 GB/s |
-| Triad read+write | 120 – 124 GB/s |
-| `cudaMemcpy` D2D | 189 – 193 GB/s |
+Measured with three independent probes. Earlier revisions of this document
+reported 200 GB/s; that figure was **wrong** and the correction matters, so the
+mistake is recorded here.
 
-Theoretical: 8533 MT/s x 256 bit = 273 GB/s. Measured streaming read is
-**~200 GB/s = 73 % of peak**, which is normal for LPDDR5X.
-
-A 24 GiB buffer measured *slower* (44–158 GB/s) due to page/TLB pressure from
-the 100 GiB page cache; 8 GiB is the representative figure for steady-state
-decode.
-
-> **Working number: 200 GB/s of usable weight-read bandwidth.**
-
-## 2. Measured per-token weight traffic
-
-Decode is memory-bound: for a dense model *every* weight must be read from
-HBM/LPDDR once per generated token. Parsing the safetensors headers of
-`nv-community/Qwen3.8-27B-NVFP4` (2194 tensors) gives the exact bytes:
-
-| Module | GB | tensors |
+| Probe | Method | Result |
 |---|---|---|
-| `mlp` (NVFP4, U8-packed) | 9.626 | 768 |
-| `linear_attn` Gated DeltaNet (FP8) | 5.588 | 720 |
-| `embed_tokens` (BF16) | 2.543 | 1 |
-| `full_attn` (FP8) | 1.678 | 224 |
-| `vision_tower` (not used for text) | 0.921 | 333 |
-| `mtp` (BF16, 1 layer) | 0.849 | 15 |
-| `lm_head` (NVFP4) | 0.715 | 4 |
-| norms/misc | 0.001 | 129 |
-| **total checkpoint** | **21.921** | 2194 |
+| `bench/hw/bw.cu` | 8 GiB, 1536 blocks, `__ldcs` | 199 GB/s |
+| `bench/hw/bw3.cu` | 8 GiB, 3072 blocks, 4 load policies | 207 – 233 GB/s |
+| `bench/hw/bw4.cu` | **16 GiB incompressible random**, 6 configs | **228 GB/s** |
+| real workload | NVFP4/FP8/bf16 GEMV over the actual 17.6 GB checkpoint | **250 GB/s** |
 
-**Text-only traffic per token: 21.0 GB.**
+**Two methodology errors produced the original 200 GB/s figure:**
+
+1. *Under-parallelised.* The first probe launched 1536 blocks; the kernel needs
+   ~3072 to saturate. Going to 3072 blocks alone moved 8 GiB reads from 199 to
+   233 GB/s.
+2. *Compressible fill.* The probe filled its buffer with `cudaMemset`, a
+   repeating byte pattern that Blackwell's memory compression can compress.
+   `bw4.cu` fills with pseudo-random data from a GPU kernel instead.
+
+The real-weight GEMV measuring *above* the synthetic probe (250 vs 228 GB/s) is
+consistent: 401 separate matrices have better page/row-buffer locality than one
+16 GiB buffer walked with a 12.6 MB stride.
+
+> **Working number: 228 GB/s conservative, 250 GB/s demonstrated on the real
+> weight set.**
+
+## 2. Per-token weight traffic
+
+Decode is memory-bound: for a dense model every weight is read once per token.
+Parsing the safetensors headers of `nv-community/Qwen3.8-27B-NVFP4` (2194
+tensors) gives exact bytes:
+
+| Group | GB | Note |
+|---|---|---|
+| `mlp` NVFP4 (U8-packed) | 9.626 | read every token |
+| `linear_attn` Gated DeltaNet (FP8) | 5.588 | read every token |
+| `full_attn` (FP8) | 1.678 | read every token |
+| `lm_head` (NVFP4) | 0.715 | read every token |
+| norms / conv1d / a,b projections | ~0.001 | read every token |
+| **dense text total** | **17.608** | **this is the per-token traffic** |
+| `embed_tokens` (bf16) | 2.543 | **gather**, ~10 KB per token — *not* 2.5 GB |
+| `mtp` (bf16, 1 layer) | 0.849 | read only when speculative drafting |
+| `vision_tower` | 0.921 | unused for text |
+| checkpoint total | 21.921 | |
+
+**Per-token dense traffic: 17.608 GB.** An earlier revision of this document
+used 21.0 GB, which wrongly counted the embedding table as fully read; the
+embedding is a row gather, so at batch 1 it costs one 5120-element row.
 
 ## 3. Roofline
 
 ```
-time_per_token = weight_bytes / bandwidth = 21.0 GB / 200 GB/s = 105 ms
-=> single-stream ceiling = 9.5 tok/s
+time_per_token = 17.608 GB / bandwidth
 ```
 
-| Variant | GB/token | ms/token | tok/s ceiling |
-|---|---|---|---|
-| full checkpoint | 21.92 | 109.6 | 9.12 |
-| text-only | 21.00 | 105.0 | **9.52** |
-| text w/o vision+mtp | 20.15 | 100.8 | 9.93 |
+| Bandwidth | ms/token | single-stream ceiling |
+|---|---|---|
+| 228 GB/s (conservative probe) | 77.2 | **12.95 tok/s** |
+| 250 GB/s (measured GEMV) | 70.4 | **14.20 tok/s** |
 
-Compute is **not** the constraint: 100 tok/s needs only
+Compute is **not** the constraint: 100 tok/s needs
 `2 x 27.8e9 x 100 = 5.6 TFLOPS`, while GB10 offers roughly 250 dense FP8
-TFLOPS. There is ~45x of spare compute and ~10x too little bandwidth.
+TFLOPS. There is ~45x spare compute and ~7.7x too little bandwidth.
 
-## 4. Consequence for the requested targets
+## 4. Consequence for the originally requested targets
 
 | Requested | Required | Measured hardware | Verdict |
 |---|---|---|---|
-| 100 tok/s, 1 stream | 2.10 TB/s | 0.20 TB/s | **impossible, 10.5x short** |
-| 50 tok/s/stream @ 16 | 2.10 TB/s | 0.20 TB/s | **impossible** (per-stream) |
-| 150 tok/s aggregate @ 16 | 0.20 TB/s (weights shared) | 0.20 TB/s | **at the roofline** |
+| 100 tok/s, 1 stream | 1.76 TB/s | 0.23 TB/s | **impossible, 7.7x short** |
+| 50 tok/s/stream @ 16 | 1.76 TB/s | 0.23 TB/s | **impossible** (per-stream) |
+| ~200 tok/s aggregate @ 16 | 0.23 TB/s (weights shared) | 0.23 TB/s | **at the roofline** |
 
 Batching does not raise per-stream speed; it amortises the weight read across
-sequences. At batch 16 the step still costs ~105 ms, so all 16 streams advance
-one token per 105 ms => **9.5 tok/s each, ~150 tok/s aggregate**.
+sequences. At batch 16 the step still costs ~70 ms, so all 16 streams advance
+one token per step => **~13-14 tok/s each, ~210-225 tok/s aggregate**.
 
-The only lever that reduces bytes-per-token below 21 GB is **speculative
+The only lever that reduces bytes-per-token below 17.6 GB is **speculative
 decoding with the MTP head** (`mtp_num_hidden_layers: 1` is present in this
 checkpoint): one weight read produces several accepted tokens.
 
-With MTP acceptance `a` tokens/step:
-
 | accepted/step | effective tok/s, 1 stream | aggregate @ batch 16 |
 |---|---|---|
-| 1.0 (no MTP) | 9.5 | ~150 |
-| 2.0 | 19.0 | ~300 |
-| 2.5 | 23.8 | ~380 |
+| 1.0 (no MTP) | ~13-14 | ~210-225 |
+| 2.0 | ~26-28 | ~420-450 |
+| 2.5 | ~32-35 | ~525-560 |
 
-Acceptance is bounded by the single MTP layer; 2–2.5 is the realistic design
+Acceptance is bounded by the single MTP layer; 2-2.5 is the realistic design
 point.
 
 ## 5. What this means for "beat Ollama"
 
-Ollama on GB10 runs the same checkpoint and is subject to the same roofline.
-It is therefore winnable on:
+Ollama on GB10 runs the same checkpoint against the same wall, so it is
+winnable on:
 
-- **TTFT** — prefill is compute-bound, so FP8/NVFP4 GEMM efficiency, chunked
-  prefill and prefix caching matter. This is where a hand-written engine can
-  win big.
+- **TTFT** — prefill is compute-bound, not bandwidth-bound. FP8/NVFP4 GEMM
+  efficiency, chunked prefill and prefix caching all matter here.
 - **Aggregate throughput at batch 16** — continuous batching + paged KV cache
-  vs Ollama's scheduler.
-- **Single-stream tok/s** — only marginally; both are pinned to ~9.5 tok/s.
+  versus Ollama's scheduler.
+- **Single-stream tok/s** — only marginally; both are pinned near the roofline.
 
-It is **not** winnable on single-stream tok/s by a large margin, because both
-implementations are against the same wall.
+It is **not** winnable on single-stream tok/s by a large margin.
 
 ## 6. Reproduce
 
 ```bash
 nvcc -arch=sm_121 -O3 -o bench/hw/bw  bench/hw/bw.cu  && ./bench/hw/bw
-nvcc -arch=sm_121 -O3 -o bench/hw/bw2 bench/hw/bw2.cu && ./bench/hw/bw2
-python3 scripts/weight_traffic.py            # tensor-by-tensor traffic table
+nvcc -arch=sm_121 -O3 -o bench/hw/bw3 bench/hw/bw3.cu && ./bench/hw/bw3
+nvcc -arch=sm_121 -O3 -o bench/hw/bw4 bench/hw/bw4.cu && ./bench/hw/bw4
+python3 scripts/weight_traffic.py
+
+# the real thing: streams the actual checkpoint through the GEMV kernels
+./target/release/gb10-bench stream --out bench/results/stream-m1.json
 ```

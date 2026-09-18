@@ -72,8 +72,8 @@ def classify(name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir", nargs="?", default="models/Qwen3.8-27B-NVFP4")
-    ap.add_argument("--bandwidth-gbps", type=float, default=200.0,
-                    help="measured usable read bandwidth (default 200 GB/s)")
+    ap.add_argument("--bandwidth-gbps", type=float, default=228.0,
+                    help="measured usable read bandwidth (default 228 GB/s)")
     args = ap.parse_args()
 
     headers = read_headers(args.model_dir)
@@ -102,15 +102,23 @@ def main():
     for k, v in dtypes.most_common():
         print(f"  {k:10s} {v / 1e9:8.3f} GB")
 
+    # Per-token traffic is NOT the whole text model: `embed_tokens` is a row
+    # gather (one 5120-element row per token, ~10 KB), not a full read, and the
+    # MTP head is only touched when speculative drafting.
+    per_token = text - groups["embed_tokens"] - groups["mtp"]
+
     bw = args.bandwidth_gbps * 1e9
+    print(f"\nper-token dense traffic: {per_token / 1e9:.3f} GB "
+          f"(embedding is a gather, MTP excluded)")
     print(f"\n--- roofline at {args.bandwidth_gbps:.0f} GB/s usable read ---")
-    for label, g in (("full checkpoint", total), ("text-only", text)):
+    for label, g in (("full checkpoint", total), ("text incl. embed", text),
+                     ("per-token dense", per_token)):
         t = g / bw
         print(f"{label:18s} {g / 1e9:6.2f} GB -> {t * 1000:6.1f} ms/token "
               f"-> {1 / t:5.2f} tok/s single-stream")
 
     for target in (50.0, 100.0):
-        need = text / (1.0 / target)
+        need = per_token / (1.0 / target)
         print(f"\nto reach {target:.0f} tok/s you need {need / 1e12:.2f} TB/s "
               f"({need / bw:.1f}x the measured bandwidth)")
 
