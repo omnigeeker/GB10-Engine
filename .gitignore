@@ -13,9 +13,11 @@
 /tools/ollama/*.tar.zst
 /tools/ollama/*.tgz
 
-# Compiled hardware probes
+# Compiled hardware probes (sources are tracked; binaries are not)
 /bench/hw/bw
 /bench/hw/bw2
+/bench/hw/bw3
+/bench/hw/bw4
 *.o
 *.ptx
 *.cubin

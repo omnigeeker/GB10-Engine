@@ -61,7 +61,8 @@ Both numbers are reported; neither is presented as the other.
 
 1. **Reach the bandwidth roofline.** At batch 1 every kernel must be a
    streaming GEMV that saturates ~230 GB/s. *Done for the three weight formats:
-   the M1 benchmark projects 14.2 tok/s, above the 12.95 tok/s conservative
+   the M1 benchmark measures 234.9 – 249.9 GB/s over the real 17.56 GB weight
+   set, projecting 13.4 – 14.2 tok/s against a 12.95 tok/s conservative
    roofline.*
 2. **MTP speculative decoding.** Reduce bytes-per-token by accepting multiple
    tokens per weight read. This is the only lever that beats the roofline.

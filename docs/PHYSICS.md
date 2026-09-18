@@ -22,7 +22,7 @@ mistake is recorded here.
 | `bench/hw/bw.cu` | 8 GiB, 1536 blocks, `__ldcs` | 199 GB/s |
 | `bench/hw/bw3.cu` | 8 GiB, 3072 blocks, 4 load policies | 207 – 233 GB/s |
 | `bench/hw/bw4.cu` | **16 GiB incompressible random**, 6 configs | **228 GB/s** |
-| real workload | NVFP4/FP8/bf16 GEMV over the actual 17.6 GB checkpoint | **250 GB/s** |
+| real workload | NVFP4/FP8/bf16 GEMV over the actual 17.6 GB checkpoint | **235 – 250 GB/s** |
 
 **Two methodology errors produced the original 200 GB/s figure:**
 
@@ -37,8 +37,12 @@ The real-weight GEMV measuring *above* the synthetic probe (250 vs 228 GB/s) is
 consistent: 401 separate matrices have better page/row-buffer locality than one
 16 GiB buffer walked with a 12.6 MB stride.
 
-> **Working number: 228 GB/s conservative, 250 GB/s demonstrated on the real
-> weight set.**
+The real-workload figure varies by ~6 % between runs (measured 234.9 and
+249.9 GB/s on two consecutive invocations). The best run is **not** quoted as
+the headline: both are reported.
+
+> **Working number: 228 GB/s conservative floor, 235 – 250 GB/s demonstrated
+> on the real weight set.**
 
 ## 2. Per-token weight traffic
 
@@ -72,7 +76,8 @@ time_per_token = 17.608 GB / bandwidth
 | Bandwidth | ms/token | single-stream ceiling |
 |---|---|---|
 | 228 GB/s (conservative probe) | 77.2 | **12.95 tok/s** |
-| 250 GB/s (measured GEMV) | 70.4 | **14.20 tok/s** |
+| 235 GB/s (measured GEMV, low) | 74.9 | **13.35 tok/s** |
+| 250 GB/s (measured GEMV, high) | 70.4 | **14.20 tok/s** |
 
 Compute is **not** the constraint: 100 tok/s needs
 `2 x 27.8e9 x 100 = 5.6 TFLOPS`, while GB10 offers roughly 250 dense FP8
