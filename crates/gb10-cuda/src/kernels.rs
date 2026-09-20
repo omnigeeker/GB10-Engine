@@ -9,7 +9,16 @@ pub const KERNEL_NAMES: &[&str] = &[
     "nvfp4_gemv_kernel",
     "fp8_gemv_kernel",
     "bf16_gemv_kernel",
+    "nvfp4_gemv_batch_kernel",
+    "fp8_gemv_batch_kernel",
+    "bf16_gemv_batch_kernel",
 ];
+
+/// Largest batch the multi-sequence GEMV kernels accept. Must match
+/// `GB10_BATCH_MAX` in `kernels/gemv.cu`. Larger batches fall back to the
+/// per-sequence kernels, which are correct but re-read the weights per
+/// sequence; only tiny projections are ever called that way.
+pub const GEMV_BATCH_MAX: usize = 16;
 
 /// Threads per block for the GEMV kernels (8 warps).
 pub const GEMV_BLOCK: u32 = 256;
@@ -22,8 +31,11 @@ pub const GEMV_ROWS_PER_WARP: u32 = 1;
 /// Loaded kernel functions.
 pub struct Kernels {
     nvfp4_gemv: CudaFunction,
+    nvfp4_gemv_batch: CudaFunction,
     fp8_gemv: CudaFunction,
     bf16_gemv: CudaFunction,
+    fp8_gemv_batch: CudaFunction,
+    bf16_gemv_batch: CudaFunction,
 }
 
 impl Kernels {
@@ -36,8 +48,11 @@ impl Kernels {
         };
         Ok(Self {
             nvfp4_gemv: take(map, "nvfp4_gemv_kernel")?,
+            nvfp4_gemv_batch: take(map, "nvfp4_gemv_batch_kernel")?,
             fp8_gemv: take(map, "fp8_gemv_kernel")?,
             bf16_gemv: take(map, "bf16_gemv_kernel")?,
+            fp8_gemv_batch: take(map, "fp8_gemv_batch_kernel")?,
+            bf16_gemv_batch: take(map, "bf16_gemv_batch_kernel")?,
         })
     }
 
@@ -64,9 +79,20 @@ impl Kernels {
         batch: usize,
     ) -> Result<()> {
         check_gemv_shapes("nvfp4_gemv", x, w, y, n, k, batch, 1)?;
+        let (n_i32, k_i32) = (n as i32, k as i32);
+        if batch > 1 && batch <= GEMV_BATCH_MAX {
+            let b_i32 = batch as i32;
+            let grid = (((n as u32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1);
+            unsafe {
+                dev.stream()
+                    .launch_builder(&self.nvfp4_gemv_batch)
+                    .arg(x).arg(w).arg(wscale).arg(scale2).arg(y)
+                    .arg(&n_i32).arg(&k_i32).arg(&b_i32)
+                    .launch(LaunchConfig { grid_dim: grid, block_dim: (GEMV_BLOCK, 1, 1), shared_mem_bytes: 0 })?;
+            }
+            return Ok(());
+        }
         let (grid, block, smem) = gemv_launch_config(n, k, batch);
-        let n_i32 = n as i32;
-        let k_i32 = k as i32;
         let f = &self.nvfp4_gemv;
         unsafe {
             dev.stream()
@@ -101,9 +127,20 @@ impl Kernels {
         batch: usize,
     ) -> Result<()> {
         check_gemv_shapes("fp8_gemv", x, w, y, n, k, batch, 1)?;
+        let (n_i32, k_i32) = (n as i32, k as i32);
+        if batch > 1 && batch <= GEMV_BATCH_MAX {
+            let b_i32 = batch as i32;
+            let grid = (((n as u32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1);
+            unsafe {
+                dev.stream()
+                    .launch_builder(&self.fp8_gemv_batch)
+                    .arg(x).arg(w).arg(wscale).arg(y)
+                    .arg(&n_i32).arg(&k_i32).arg(&b_i32)
+                    .launch(LaunchConfig { grid_dim: grid, block_dim: (GEMV_BLOCK, 1, 1), shared_mem_bytes: 0 })?;
+            }
+            return Ok(());
+        }
         let (grid, block, smem) = gemv_launch_config(n, k, batch);
-        let n_i32 = n as i32;
-        let k_i32 = k as i32;
         let f = &self.fp8_gemv;
         unsafe {
             dev.stream()
@@ -135,9 +172,20 @@ impl Kernels {
         k: usize,
         batch: usize,
     ) -> Result<()> {
+        let (n_i32, k_i32) = (n as i32, k as i32);
+        if batch > 1 && batch <= GEMV_BATCH_MAX {
+            let b_i32 = batch as i32;
+            let grid = (((n as u32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1);
+            unsafe {
+                dev.stream()
+                    .launch_builder(&self.bf16_gemv_batch)
+                    .arg(x).arg(w).arg(y)
+                    .arg(&n_i32).arg(&k_i32).arg(&b_i32)
+                    .launch(LaunchConfig { grid_dim: grid, block_dim: (GEMV_BLOCK, 1, 1), shared_mem_bytes: 0 })?;
+            }
+            return Ok(());
+        }
         let (grid, block, smem) = gemv_launch_config(n, k, batch);
-        let n_i32 = n as i32;
-        let k_i32 = k as i32;
         let f = &self.bf16_gemv;
         unsafe {
             dev.stream()

@@ -317,6 +317,196 @@ __device__ __forceinline__ void bf16_gemv_tmpl(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-sequence variants.
+//
+// The kernels above launch with `gridDim.y = batch`, so every block streams the
+// *whole* weight matrix for its own sequence and a batch of B costs B times the
+// weight traffic. Weight traffic must be independent of batch size, so these
+// variants loop over the batch inside the block: the weight tile is loaded once
+// and applied to all B x-vectors.
+// ---------------------------------------------------------------------------
+#define GB10_BATCH_MAX 16
+
+template <int BMAX>
+__device__ __forceinline__ void nvfp4_gemv_batch_tmpl(
+    const float* __restrict__ x, const uint8_t* __restrict__ w,
+    const uint8_t* __restrict__ wscale, const float* __restrict__ scale2,
+    float* __restrict__ y, int N, int K, int B) {
+    const int lane = threadIdx.x & (kWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int rowbytes = K >> 1;
+    const int scalerow = K >> 4;
+    const int full_tiles = K / kTile;
+    const int row_stride = gridDim.x * nwarps;
+
+    for (int row = blockIdx.x * nwarps + warp; row < N; row += row_stride) {
+        float acc[BMAX];
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
+
+        const uint8_t* __restrict__ wr = w + (size_t)row * rowbytes;
+        const uint8_t* __restrict__ sr = wscale + (size_t)row * scalerow;
+
+        for (int i = 0; i < full_tiles; ++i) {
+            const int e0 = i * kTile + lane * kVec;
+            const uint2 packed = *reinterpret_cast<const uint2*>(wr + (e0 >> 1));
+            const float s = e4m3_to_float(sr[i * kWarp + lane]);
+
+            float lo[8], hi[8];
+            e2m1x8_to_float(packed.x, lo);
+            e2m1x8_to_float(packed.y, hi);
+
+            for (int b = 0; b < B; ++b) {
+                const XVec xv = load_x(x + (size_t)b * K, e0);
+                float t = lo[0] * xv.a0.x + lo[1] * xv.a0.y + lo[2] * xv.a0.z +
+                          lo[3] * xv.a0.w;
+                t = fmaf(lo[4], xv.a1.x, t);
+                t = fmaf(lo[5], xv.a1.y, t);
+                t = fmaf(lo[6], xv.a1.z, t);
+                t = fmaf(lo[7], xv.a1.w, t);
+                t = fmaf(hi[0], xv.a2.x, t);
+                t = fmaf(hi[1], xv.a2.y, t);
+                t = fmaf(hi[2], xv.a2.z, t);
+                t = fmaf(hi[3], xv.a2.w, t);
+                t = fmaf(hi[4], xv.a3.x, t);
+                t = fmaf(hi[5], xv.a3.y, t);
+                t = fmaf(hi[6], xv.a3.z, t);
+                t = fmaf(hi[7], xv.a3.w, t);
+                acc[b] = fmaf(t, s, acc[b]);
+            }
+        }
+
+        for (int e = full_tiles * kTile + lane; e < K; e += kWarp) {
+            const uint8_t byte = wr[e >> 1];
+            const uint8_t nib = (e & 1) ? (byte >> 4) : (byte & 0xF);
+            const float wv = e2m1_to_float(nib) * e4m3_to_float(sr[e >> 4]);
+            for (int b = 0; b < B; ++b)
+                acc[b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[b]);
+        }
+
+        const float s2 = __ldg(scale2);
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            if (b < B) {
+                const float a = warp_reduce_sum(acc[b]);
+                if (lane == 0) y[(size_t)b * N + row] = a * s2;
+            }
+        }
+    }
+}
+
+template <int BMAX>
+__device__ __forceinline__ void fp8_gemv_batch_tmpl(
+    const float* __restrict__ x, const uint8_t* __restrict__ w,
+    const float* __restrict__ wscale, float* __restrict__ y, int N, int K, int B) {
+    const int lane = threadIdx.x & (kWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int full_tiles = K / kTile;
+    const int row_stride = gridDim.x * nwarps;
+
+    for (int row = blockIdx.x * nwarps + warp; row < N; row += row_stride) {
+        float acc[BMAX];
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
+
+        const uint8_t* __restrict__ wr = w + (size_t)row * K;
+        for (int i = 0; i < full_tiles; ++i) {
+            const int e0 = i * kTile + lane * kVec;
+            const uint4 packed = *reinterpret_cast<const uint4*>(wr + e0);
+            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
+            float wv[kVec];
+#pragma unroll
+            for (int j = 0; j < kVec; ++j) wv[j] = e4m3_to_float(pb[j]);
+            for (int b = 0; b < B; ++b) {
+                const XVec xv = load_x(x + (size_t)b * K, e0);
+                acc[b] += dot16(wv, xv);
+            }
+        }
+
+        for (int e = full_tiles * kTile + lane; e < K; e += kWarp) {
+            const float wv = e4m3_to_float(wr[e]);
+            for (int b = 0; b < B; ++b)
+                acc[b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[b]);
+        }
+
+        const float s = __ldg(wscale);
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            if (b < B) {
+                const float a = warp_reduce_sum(acc[b]);
+                if (lane == 0) y[(size_t)b * N + row] = a * s;
+            }
+        }
+    }
+}
+
+template <int BMAX>
+__device__ __forceinline__ void bf16_gemv_batch_tmpl(
+    const float* __restrict__ x, const uint16_t* __restrict__ w,
+    float* __restrict__ y, int N, int K, int B) {
+    const int lane = threadIdx.x & (kWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int full_tiles = K / kTile;
+    const int row_stride = gridDim.x * nwarps;
+
+    for (int row = blockIdx.x * nwarps + warp; row < N; row += row_stride) {
+        float acc[BMAX];
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
+
+        const uint16_t* __restrict__ wr = w + (size_t)row * K;
+        for (int i = 0; i < full_tiles; ++i) {
+            const int e0 = i * kTile + lane * kVec;
+            float wv[kVec];
+#pragma unroll
+            for (int j = 0; j < kVec; ++j) wv[j] = bf16_to_float(__ldg(wr + e0 + j));
+            for (int b = 0; b < B; ++b) {
+                const XVec xv = load_x(x + (size_t)b * K, e0);
+                acc[b] += dot16(wv, xv);
+            }
+        }
+
+        for (int e = full_tiles * kTile + lane; e < K; e += kWarp) {
+            const float wv = bf16_to_float(__ldg(wr + e));
+            for (int b = 0; b < B; ++b)
+                acc[b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[b]);
+        }
+
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            if (b < B) {
+                const float a = warp_reduce_sum(acc[b]);
+                if (lane == 0) y[(size_t)b * N + row] = a;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+nvfp4_gemv_batch_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                        const uint8_t* __restrict__ wscale,
+                        const float* __restrict__ scale2, float* __restrict__ y,
+                        int N, int K, int B) {
+    nvfp4_gemv_batch_tmpl<GB10_BATCH_MAX>(x, w, wscale, scale2, y, N, K, B);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+fp8_gemv_batch_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
+                      const float* __restrict__ wscale, float* __restrict__ y,
+                      int N, int K, int B) {
+    fp8_gemv_batch_tmpl<GB10_BATCH_MAX>(x, w, wscale, y, N, K, B);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+bf16_gemv_batch_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                       float* __restrict__ y, int N, int K, int B) {
+    bf16_gemv_batch_tmpl<GB10_BATCH_MAX>(x, w, y, N, K, B);
+}
+
+// ---------------------------------------------------------------------------
 // Exported entry points (row tiling chosen on the host)
 // ---------------------------------------------------------------------------
 extern "C" __global__ void __launch_bounds__(256)
