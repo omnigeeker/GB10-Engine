@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         "hw" => hw(),
         "gemv-parity" => gemv_parity(&model),
         "stream" => stream(&model, opt("--out")),
+        "store-stream" => store_stream(&model),
         "launch-overhead" => launch_overhead(),
         _ => {
             eprintln!(
@@ -310,6 +311,146 @@ fn text_weight_names(cfg: &ModelConfig, st: &ShardedSafeTensors) -> Vec<(String,
     out
 }
 
+/// The same measurement as `stream`, but every matrix is loaded through
+/// `gb10_model::Store` -- the exact path the engine uses -- instead of the
+/// benchmark's own uploader.
+///
+/// This exists to settle one question: the NVFP4 GEMV runs exactly 2x slower
+/// inside the model than inside `stream` while the FP8 GEMV is identical in
+/// both. If the cause is the weight buffers or how they are loaded, this
+/// command will show the slow number with nothing else running; if it shows
+/// the fast number, the buffers are innocent and the cause is contextual.
+fn store_stream(model: &str) -> Result<()> {
+    let dev = Device::new(0)?;
+    let dir = std::path::Path::new(model);
+    let store = gb10_model::Store::open(dir, "model.language_model.")?;
+
+    // The tiny bf16 in_proj_a/b run at ~11 GB/s (gridX=2). Excluding them
+    // tests whether 96 starved kernels cost more than their 47 MB of traffic
+    // suggests, by draining the memory pipeline around them.
+    let skip_small = std::env::args().any(|a| a == "--skip-small");
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..64 {
+        let p = format!("layers.{i}");
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            names.push(format!("{p}.mlp.{proj}"));
+        }
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            names.push(format!("{p}.self_attn.{proj}"));
+        }
+        let mut lin = vec!["in_proj_qkv", "in_proj_z", "out_proj"];
+        if !skip_small {
+            lin.push("in_proj_a");
+            lin.push("in_proj_b");
+        }
+        for proj in lin {
+            names.push(format!("{p}.linear_attn.{proj}"));
+        }
+    }
+    names.push("lm_head".to_string());
+
+    let t0 = Instant::now();
+    let mut weights = Vec::new();
+    let mut total_bytes = 0usize;
+    for name in &names {
+        let wname = if name == "lm_head" {
+            name.clone()
+        } else {
+            name.clone()
+        };
+        if !store.has(&format!("{wname}.weight")) {
+            continue;
+        }
+        // lm_head lives outside the `model.language_model.` prefix.
+        let lin = if name == "lm_head" {
+            gb10_model::Store::open(dir, "")?.linear(&dev, "lm_head")?
+        } else {
+            store.linear(&dev, name)?
+        };
+        total_bytes += lin.traffic_bytes();
+        weights.push(lin);
+    }
+    dev.synchronize()?;
+    println!(
+        "loaded {} matrices via Store, {:.3} GB in {:.1}s",
+        weights.len(),
+        total_bytes as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+
+    let mut max_k = 0usize;
+    let mut max_n = 0usize;
+    for w in &weights {
+        max_k = max_k.max(w.k);
+        max_n = max_n.max(w.n);
+    }
+    let x: Vec<f32> = (0..max_k).map(|i| ((i % 17) as f32) * 0.031 - 0.25).collect();
+    let x_dev = dev.stream().clone_htod(&x)?;
+    let mut y: CudaSlice<f32> = dev.stream().alloc_zeros(max_n)?;
+
+    for _ in 0..2 {
+        for w in &weights {
+            w.forward(&dev, &x_dev, &mut y, 1)?;
+        }
+        dev.synchronize()?;
+    }
+    let iters = 10;
+    let t = Instant::now();
+    for _ in 0..iters {
+        for w in &weights {
+            w.forward(&dev, &x_dev, &mut y, 1)?;
+        }
+    }
+    dev.synchronize()?;
+    let elapsed = t.elapsed().as_secs_f64() / iters as f64;
+
+    // Per-shape attribution: which matrices actually cost the time, and what
+    // bandwidth does each achieve? One synchronise per matrix, so this is a
+    // diagnostic pass rather than a fast path.
+    {
+        let mut groups: std::collections::BTreeMap<(String, usize, usize), (usize, f64, usize)> =
+            std::collections::BTreeMap::new();
+        for w in &weights {
+            let kind = match &w.data {
+                gb10_model::LinearData::NvFp4 { .. } => "nvfp4",
+                gb10_model::LinearData::Fp8 { .. } => "fp8",
+                gb10_model::LinearData::Bf16 { .. } => "bf16",
+            }
+            .to_string();
+            dev.synchronize()?;
+            let t = Instant::now();
+            for _ in 0..3 {
+                w.forward(&dev, &x_dev, &mut y, 1)?;
+            }
+            dev.synchronize()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3 / 3.0;
+            let e = groups.entry((kind, w.n, w.k)).or_insert((0, 0.0, 0));
+            e.0 += 1;
+            e.1 += ms;
+            e.2 = w.traffic_bytes();
+        }
+        let mut rows: Vec<_> = groups.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        println!();
+        println!(
+            "{:6} {:>7} {:>7} {:>5} {:>10} {:>10} {:>8}",
+            "kind", "n", "k", "calls", "ms/step", "MB", "GB/s"
+        );
+        for ((kind, n, k), (calls, ms, bytes)) in rows.iter().take(14) {
+            let gb = (*calls as f64) * (*bytes as f64) / 1e9;
+            println!(
+                "{kind:6} {n:7} {k:7} {calls:5} {ms:10.3} {:10.1} {:8.1}",
+                gb * 1e3,
+                gb / (ms / 1e3)
+            );
+        }
+    }
+    println!("per-token weight traffic : {:.3} GB", total_bytes as f64 / 1e9);
+    println!("time per token           : {:.2} ms", elapsed * 1e3);
+    println!("achieved bandwidth       : {:.1} GB/s", total_bytes as f64 / elapsed / 1e9);
+    Ok(())
+}
+
 fn stream(model: &str, out: Option<String>) -> Result<()> {
     let dev = Device::new(0)?;
     let st = ShardedSafeTensors::open(model).context("open checkpoint")?;
@@ -339,6 +480,25 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
                 let w = dev.stream().clone_htod(raw)?;
                 let s = dev.stream().clone_htod(sraw)?;
                 let s2 = dev.stream().clone_htod(&[scale2])?;
+                // `weight` is stored PACKED as [N, K/2], so `info.shape[1]` is
+                // half the true K. Passing it straight through made the kernel
+                // read only half of every row while this function still
+                // credited the full byte count -- which inflated the reported
+                // bandwidth by exactly 2x for NVFP4 (and only NVFP4, since FP8
+                // and bf16 are stored unpacked). Derive K from the group-scale
+                // shape, exactly as `Store::linear` does.
+                let group = st.info(&sname).with_context(|| sname.clone())?.shape[1];
+                let k = group * 16;
+                // Guard against the exact bug this replaced: a packed [N, K/2]
+                // tensor silently halved K, which halved the bytes actually
+                // read while still crediting the full count, inflating the
+                // reported bandwidth by 2x.
+                anyhow::ensure!(
+                    raw.len() == n * k / 2 && sraw.len() == n * group,
+                    "{name}: packed weight {} bytes / scale {} bytes inconsistent with n={n} k={k}",
+                    raw.len(),
+                    sraw.len()
+                );
                 (
                     Kind::NvFp4 { w, s, s2, n, k },
                     raw.len() + sraw.len() + 4,

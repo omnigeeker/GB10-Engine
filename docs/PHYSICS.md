@@ -133,141 +133,103 @@ python3 scripts/weight_traffic.py
 ./target/release/gb10-bench stream --out bench/results/stream-m1.json
 ```
 
-## M7 lead: in-model GEMV bandwidth is 162 GB/s, not 245 GB/s
+## M7: the GEMV kernels run at 173 GB/s, 76% of the DRAM roofline
 
-The single most important measurement so far, because it says the remaining
-throughput is *not* in the GEMV inner loop.
+> **This section replaces an earlier and wrong version of itself.** The first
+> draft claimed the GEMV reached 245 GB/s in isolation but only 162 GB/s inside
+> the model, and pointed at kernel scheduling. That was a measurement bug in
+> the benchmark, not a property of the engine -- see "The 2x that wasn't" below.
+> The corrected picture is simpler and the target is unchanged.
 
-`gb10-bench stream` runs the 401 text-decoder GEMVs back to back with nothing
-in between and reports the achieved bandwidth directly:
+`gb10-bench stream` pushes all 401 text-decoder matrices through the GEMV
+kernels back to back and reports the achieved bandwidth:
 
 ```
 per-token weight traffic : 17.555 GB
-time per token           : 71.50 ms
-achieved bandwidth       : 245.5 GB/s
-projected decode         : 13.99 tok/s (single stream)
+time per token           : 101.58 ms
+achieved bandwidth       : 172.8 GB/s
+projected decode         : 9.84 tok/s (single stream)
+bandwidth utilisation    : 75.8% of measured 228 GB/s
 ```
 
-Stable across 30 sustained iterations (249.8, 242.4, 247.1, 244.7, 247.6,
-247.7 GB/s at iters 5/10/15/20/25/29), so this is not thermal or power
-throttling — the short-burst roofline is real and sustainable.
+Stable across 30 sustained iterations, so this is not thermal throttling.
 
-Inside the model, `nsys` gives the same kernels 108.8 ms per step, i.e.
-**162 GB/s**:
+Three independent contexts agree, which is what makes the number trustworthy:
 
-| kernel | gridX | calls/step | ms/step | us/call | GB/s |
-|---|---|---|---|---|---|
-| nvfp4 (gate/up) | 544 | 128 | 39.46 | 308 | 163 |
-| nvfp4 (down) | 160 | 64 | 20.69 | 323 | 155 |
-| fp8 (in_proj_qkv) | 320 | 48 | 14.16 | 295 | 178 |
-| fp8 (out/o_proj) | 160 | 64 | 12.27 | 192 | 164 |
-| fp8 (in_proj_z) | 192 | 48 | 8.23 | 172 | 184 |
-| fp8 (q_proj) | 384 | 16 | 5.21 | 326 | 193 |
-| nvfp4 (lm_head) | 7760 | 1 | 4.11 | 4112 | 174 |
-| **bf16 (in_proj_a/b)** | **2** | **96** | **2.80** | **29** | **17** |
-| fp8 (k/v_proj) | 32 | 32 | 1.86 | 58 | 90 |
+| context | loader | GB/s |
+|---|---|---|
+| `gb10-bench stream` | benchmark's own uploader | 172.8 |
+| `gb10-bench store-stream` | `gb10_model::Store` (the engine's path) | 173.2 |
+| the engine itself, `nsys` GPU kernel time | `gb10_model::Store` | ~169 |
 
-Total 108.79 ms/step. GEMV is 95.7% of GPU kernel time; every elementwise,
-norm, RoPE, recurrence and attention kernel together is 4.9 ms/step.
+So the engine's own decode path is within ~5% of what the kernels do when
+nothing else is running. **There is no structural loss in the model graph.**
+The remaining gap is entirely inside the GEMV kernel: 173 GB/s achieved against
+the 228 GB/s that `bench/hw/bw4.cu` sustains on an incompressible 16 GiB
+streaming read.
 
-`nsys` also shows the GPU is ~100% busy (113.0 ms wall vs 113.7 ms of kernel
-time), so this is not launch-gap starvation: the same kernels simply run slower
-when they are separated by dependency-chained small kernels than when they run
-back to back.
+Per-shape numbers from `nsys` (model run, before the two fixes below):
 
-Two concrete, separately-attributable defects fall out of the table:
+| shape | kind | gridX | GB/s |
+|---|---|---|---|
+| 12288x5120 (q_proj) | fp8 | 384 | 193 |
+| 6144x5120 (in_proj_z) | fp8 | 192 | 184 |
+| 10240x5120 (in_proj_qkv) | fp8 | 320 | 178 |
+| 5120x6144 (o_proj) | fp8 | 160 | 164 |
+| 17408x5120 (gate/up) | nvfp4 | 544 | 163 |
+| 5120x17408 (down) | nvfp4 | 160 | 155 |
+| 1024x5120 (k/v_proj) | fp8 | 32 | 90 |
+| 48x5120 (in_proj_a/b) | bf16 | 2 | 17 |
 
-1. **`bf16_gemv` at gridX=2.** `in_proj_a`/`in_proj_b` are `[48, 5120]`, so
-   `gx = ceil(48/32) = 2` blocks — 2 of 48 SMs. 47 MB of traffic at 17 GB/s
-   costs 2.8 ms/step, ~2.5% of the whole token, for 0.27% of the bytes. This
-   needs a split-K or small-N kernel.
-2. **Bandwidth scales with grid size** (gridX=384 -> 193 GB/s, gridX=160 ->
-   155-164 GB/s), which is the signature of insufficient concurrent memory
-   demand rather than a bad access pattern — the reads are already fully
-   coalesced and sector-aligned.
+Leading hypothesis for the 76%: **the activation tile is 2 KB per warp per
+k-tile while the weights it is multiplied against are only 1 KB** (NVFP4, at
+`ROWS=4`), because `x` is fp32 and 4 bytes per K-element against 0.5 bytes of
+NVFP4 weight. The kernel therefore issues 2x as many bytes of activation loads
+as weight loads, all of them from L2 rather than DRAM, on top of the
+`weight_scale` byte loads. `ROWS=8` would halve that ratio but was measured
+*slower* (110.2 -> 117.2 ms) because it halves the block count. Staging the
+activation tile in shared memory once per block instead of once per warp is the
+obvious next experiment.
+
+### The 2x that wasn't (kept as a warning)
+
+The original claim was that `nvfp4_gemv_kernel` ran exactly 2x slower inside
+the model than inside `stream` while `fp8_gemv_kernel` was identical, and that
+this pointed at the NVFP4 kernel's execution. Both halves of that observation
+were real; the inference was not.
+
+`stream` derived `n` and `k` from `info.shape`, but an NVFP4 `weight` tensor is
+stored **packed** as `[N, K/2]`. So `stream` called the NVFP4 GEMV with
+`k = 2560` instead of `5120`, reading half of every row, while still crediting
+`raw.len()` -- the full byte count -- to its bandwidth total. The reported
+figure was inflated by exactly 2x, and only for NVFP4, because FP8 and bf16 are
+stored unpacked and their `shape[1]` really is K. That is a perfect match for
+the observed "2.09x", and it is why FP8 looked innocent.
+
+`gemv_parity` was never affected: it hardcodes `k = 5120` and validates against
+an independent CPU reference, so the correctness gate was sound throughout.
+The lesson is that a bandwidth benchmark which derives its own shapes has no
+way to notice it is measuring a different problem than the engine solves; the
+fixed version now asserts `raw.len() == n * k / 2` so the two can never drift
+apart silently again.
 
 ### Ruled out, with evidence
 
 - **`exp2f` in the E2M1 decode.** The original decode used
   `(m ? 1.5f : 1.0f) * exp2f(e - 1)`, and `exp2f` is MUFU.EX2 (SFU, ~1/4 FMA
-  throughput) with ~18.4e9 NVFP4 weights per token. Replacing it with an
-  integer bit-pattern assembly (`kernels/gemv_common.cuh`) is strictly better
-  and is kept, but it only moved the token from 113.0 to 110.2 ms — the decode
-  was being hidden by memory latency, not limiting.
-- **Activation-traffic amortisation.** `ROWS=8` (halving the per-row x reload)
-  made things *worse*: 110.2 -> 117.2 ms. Losing blocks costs more than the
-  saved activation traffic. Reverted to `ROWS=4`.
+  throughput). Replacing it with integer bit-pattern assembly
+  (`kernels/gemv_common.cuh`) is strictly better and is kept, but it only moved
+  the token from 113.0 to 110.2 ms -- the decode was hidden by memory latency.
 - **Load-issue serialisation.** Hoisting all `ROWS` weight and scale loads
-  ahead of the arithmetic so they are genuinely in flight together is worth
-  keeping: 110.2 -> 108.2 ms (9.07 -> 9.24 tok/s).
-- **Throttling.** See the 30-iteration table above.
-
-### Narrowed: it is the NVFP4 kernel specifically, not the context
-
-Running `nsys` on `gb10-bench stream` (30 iterations, 241.9 GB/s) gives
-per-kernel times for exactly the shapes the model uses. Normalising both sides
-to per-step milliseconds:
-
-| kernel | gridX | calls/step | stream ms | model ms | model/stream |
-|---|---|---|---|---|---|
-| fp8  | 320 | 48 | 14.09 | 14.16 | **1.00** |
-| fp8  | 192 | 48 | 8.13 | 8.23 | **1.01** |
-| fp8  | 384 | 16 | 5.32 | 5.21 | **0.98** |
-| fp8  | 32  | 32 | 1.97 | 1.86 | **0.94** |
-| fp8  | 160 | 64 | 10.96 | 12.27 | 1.12 |
-| nvfp4 | 544 | 128 | 18.87 | 39.46 | **2.09** |
-| nvfp4 | 160 | 64 | 9.89 | 20.69 | **2.09** |
-| nvfp4 | 7760 | 1 | 2.09 | 4.11 | **1.96** |
-
-The FP8 GEMVs are *identical* across the two contexts; every NVFP4 GEMV is
-uniformly ~2x slower in the model. Both take the same `memcpy_stod` upload path
-(`crates/gb10-model/src/weights.rs`), both use the same kernel and the same
-launch config, so this is not allocation, alignment, scheduling or occupancy --
-it is a property of the NVFP4 kernel's own execution in this process.
-
-That points at the two things only the NVFP4 kernel touches: the per-group
-E4M3 `weight_scale` load and the E2M1 nibble decode. The decode is now
-data-independent integer work, so the leading suspect is the **`wscale` byte
-load**: it is a separate 32-byte-per-warp memory stream from the packed
-weights, and `scalerow` is passed in by the launcher rather than derived in the
-kernel. Next step is `ncu` counters (`dram__bytes_read.sum`,
-`lts__t_sector_hit_rate.pct`) on both sides to see whether the model is
-actually reading more bytes for the same matrix.
-
-### Also ruled out
-
-- **Interleaving small kernels between GEMVs.** Adding a 32-element `add_kernel`
-  after every GEMV in `stream` (`--interleave`) leaves the bandwidth untouched:
-  245.5 -> 243.0 GB/s. Kernel separation is not the mechanism.
-
-### Correction: the 245 GB/s "achieved" number is cache-inflated
-
-Splitting the same `stream` run by matrix type exposes an impossibility:
-
-| type | traffic/iter | ms/iter | implied GB/s |
-|---|---|---|---|
-| NVFP4 (gate/up/down + lm_head) | 10.34 GB | 30.85 | **335** |
-| FP8 (all attention + in_proj) | 7.23 GB | 40.47 | 179 |
-
-335 GB/s is above the 228 GB/s DRAM peak measured by `bench/hw/bw4.cu` on an
-incompressible 16 GiB buffer, so at least a third of `stream`'s NVFP4 reads are
-being served from cache. `stream` re-reads the same 21 GB thirty times in a
-row with *nothing else running*; the model does the same re-reading but shares
-the machine with 150 MB/step of recurrent state, KV cache and activations.
-
-So the honest statement of the M7 gap is narrower than the first draft of this
-section claimed:
-
-- pure DRAM streaming ceiling (`bw4.cu`, incompressible, cache-defeating): **228 GB/s**
-- model, FP8 GEMV: **178 GB/s**
-- model, NVFP4 GEMV: **161 GB/s**
-- `stream`, NVFP4: 335 GB/s — not a valid ceiling, cache-assisted
-
-The model is therefore at 70-78% of the real ceiling, not 66% of a 245 figure,
-and the achievable target remains the `docs/TARGETS.md` T1 roofline of
-12.99 tok/s. The unexplained part is still real and still specific: **FP8 GEMV
-is byte-for-byte the same speed in both contexts (178 vs 179 GB/s) while NVFP4
-is exactly 2x slower in the model**, which no scheduling or allocation
-difference can explain. `ncu` counters would settle it but are unavailable:
-`ERR_NVGPUCTRPERM`, and this account has no sudo to set
-`NVreg_RestrictProfilingToAdminUsers=0`.
+  ahead of the arithmetic so they are genuinely in flight together is kept:
+  110.2 -> 108.2 ms (9.07 -> 9.24 tok/s).
+- **Activation-traffic amortisation via `ROWS=8`.** Worse: 110.2 -> 117.2 ms.
+- **Interleaving small kernels between GEMVs.** Adding a 32-element
+  `add_kernel` after every GEMV in `stream` (`--interleave`) leaves bandwidth
+  untouched. Kernel separation is not a mechanism.
+- **The tiny `in_proj_a/b` matrices.** Excluding all 96 of them
+  (`store-stream --skip-small`) moves the total from 168.9 to 173.2 GB/s, i.e.
+  they cost only their own 4.2 ms. Not a disproportionate pipeline drain.
+- **The loader.** `Store::linear` and the benchmark's uploader both end in
+  `Stream::alloc` + `memcpy_htod`; `memcpy_stod` and `clone_htod` are literally
+  the same body in cudarc 0.19.9 (`driver/safe/core.rs`).

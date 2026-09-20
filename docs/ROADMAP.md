@@ -99,20 +99,30 @@ The only lever that beats the bandwidth roofline.
 
 ## M7 — Roofline optimization (in progress)
 
-**Lead:** the GEMV kernels achieve 245.5 GB/s back-to-back but only 162 GB/s
-inside the model, and the GPU is ~100% busy in both cases — so the loss is in
-how kernels are separated, not in any one kernel. Full data and the list of
-already-ruled-out hypotheses in `docs/PHYSICS.md`. Closing this gap alone is
-worth ~1.5x, i.e. ~13.5 tok/s and target T1.
+**Where we are:** the GEMV kernels achieve **173 GB/s**, which is 76% of the
+228 GB/s `bench/hw/bw4.cu` sustains on an incompressible streaming read. Three
+independent contexts agree on 173 (`stream`, `store-stream`, and the engine's
+own `nsys` kernel time), so the model graph itself costs only ~5% and the whole
+remaining gap is inside the GEMV kernel. See `docs/PHYSICS.md`.
 
-Immediate defects:
-- [ ] `bf16_gemv` for `in_proj_a`/`in_proj_b` runs at gridX=2 (2 SMs of 48)
-      for 2.8 ms/step, 2.5% of the token for 0.27% of the bytes
-- [ ] bandwidth tracks grid size (193 GB/s at gridX=384 vs 155 at gridX=160)
-- [ ] fuse the small per-layer kernels to shorten the dependency chain between
-      GEMVs
+**Leading hypothesis:** the fp32 activation tile is 2 KB per warp per k-tile
+against only 1 KB of NVFP4 weights (`ROWS=4`), so the kernel issues twice as
+many bytes of L2 activation loads as DRAM weight loads, plus the
+`weight_scale` byte loads. `ROWS=8` halves that ratio but was measured slower
+because it halves the block count.
+
+- [ ] stage the activation k-tile in shared memory once per block instead of
+      once per warp (8x less activation traffic), with a transposed layout so
+      the per-lane reads are bank-conflict-free
+- [ ] make `ROWS` adaptive to `N`, so large-`N` matrices amortise the
+      activation tile without starving small-`N` ones of blocks
+- [ ] fix `in_proj_a/b` (bf16, `gridX=2`, 17 GB/s) and `k/v_proj`
+      (fp8, `gridX=32`, 90 GB/s) with a split-K or small-N kernel
+- [ ] widen the `weight_scale` load: it is one byte per lane per row-tile, a
+      32-byte transaction against a 256-byte weight transaction
 
 Original plan:
+
 
 
 - [ ] profile per-kernel bandwidth utilization, close the gap to 200 GB/s
