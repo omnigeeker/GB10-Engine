@@ -226,11 +226,26 @@ keeping the 64-layer gate exact:
 3. **Same treatment for FP8**, reading a `uint2` per segment and hoisting the
    per-tensor scale out of the loop entirely. 627 -> 588 ms.
 
-**Where the remaining 8x is.** The GEMM still runs well below both rooflines.
-Remaining measured candidates: only ~1.4 waves of 272 blocks
-(`grid.x = 17408/64`), so the tail wastes most of the last wave; and 320
-`__syncthreads` per block serialising staging against compute, whose standard
-fix is double-buffering the shared tiles.
+**Where the remaining 8x is -- and a third failed hypothesis (round 18).**
+
+The wave-count theory looked strong: `grid.x = 17408/64 = 272` blocks against
+48 SMs x 4 resident = 192 is only ~1.4 waves, so the tail wastes most of the
+last wave. Halving TILE_N to 32 doubles the block count to 544 (2.3 waves) and
+also cuts the accumulator to 8 registers -- and it measured **worse**: 588 ->
+666 ms. Reverted.
+
+That is now the third structural change in a row to lose (NR=4, TILE_T=64,
+TILE_N=32). The pattern is consistent: *every* change that reduces per-thread
+work or occupancy makes this kernel slower, and the two that helped (float4
+shared reads, de-duplicated staging loads) both cut redundant memory traffic
+without touching the tile shape. The kernel is latency-bound on its staging
+loads, and the tile shape is not what is limiting it.
+
+The remaining untried lever is double-buffering the shared tiles so staging of
+chunk c+1 overlaps compute of chunk c, which is the one change that attacks
+the latency directly rather than the shape. It costs 34.8 KB of shared (2
+blocks/SM), which by the pattern above may well hurt -- so it needs measuring,
+not assuming.
 
 **The design that should work** is a 2D register tile with *both* operands
 staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and
