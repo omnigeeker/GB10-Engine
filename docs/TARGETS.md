@@ -57,6 +57,59 @@ Both numbers are reported; neither is presented as the other.
 - Vision/multimodal inference. The vision tower is loaded but not exercised;
   text-only is the contract.
 
+## Measured: 16-way batched decode
+
+Correctness: `gb10-verify batch-parity --n-seq 16 --n 16` reports **16/16
+sequences token-exact** against decoding them one at a time, over prompts of
+deliberately *different* lengths. Equal-length prompts are not a valid gate:
+every sequence then sits at the same position, so a per-sequence addressing bug
+reads equivalent data and passes.
+
+Throughput, same kernel set, measured this round:
+
+| n_seq | ms/step | aggregate tok/s | per-sequence tok/s |
+|---|---|---|---|
+| 1 | 115.1 | 8.69 | 8.69 |
+| 2 | 124.9 | 16.01 | 8.00 |
+| 4 | 163.2 | 24.51 | 6.13 |
+| 8 | 207.1 | 38.63 | 4.83 |
+| 16 | 380.3 | **42.08** | 2.63 |
+
+T3 asks for >=195 tok/s aggregate; T1 asks for >=12.5 tok/s single-stream
+(roofline ceiling 12.95).
+
+Three steps got here, each measured:
+
+1. The GEMV originally launched with `gridDim.y = batch`, so every block
+   streamed the whole weight matrix for its own sequence: 16 sequences cost 16x
+   the weight traffic (17.6 GB x 16 = 281 GB ~ 1233 ms at 228 GB/s, against
+   1453 ms measured). 11.01 tok/s.
+2. Multi-sequence kernels loop over the batch inside the block and load each
+   weight tile once. 25.52 tok/s.
+3. Profiling showed the batch GEMV was still 545 of ~645 ms/step, ~11x off the
+   weight roofline, because with one row per warp each warp pulled all B
+   x-vectors through L2 for its own row -- x traffic was ~8x the weight traffic.
+   Staging x in `__shared__` once per block made it *worse* (837 ms): two
+   `__syncthreads()` per k-tile cost more than the L2 traffic they saved.
+   Templating on `ROWS` so one x load feeds ROWS rows worked. On NVFP4:
+
+   | ROWS | ms/step | tok/s |
+   |---|---|---|
+   | 1 | 624.0 | 25.64 |
+   | 2 | 474.7 | 33.70 |
+   | 4 | **447.9** | **35.72** |
+   | 6 | 470.2 | 34.03 |
+   | 8 | 476.5 | 33.58 |
+
+   ROWS=4 is the optimum; beyond it `acc[ROWS][BMAX]` spills. Applying the same
+   to FP8 gave 380.3 ms and **42.08 tok/s**.
+
+Still ~5x above the ~77 ms/step weight floor (17.6 GB / 228 GB/s). Next
+suspect: the Gated DeltaNet recurrence. `gated_delta_rule_step_multi` declares
+`__shared__ float S[128][129]` = 66048 B, so only **one block fits per SM**
+(102400 B available); at n_seq=16 the grid is (48, 16) = 768 blocks over 48
+SMs, i.e. 16 sequential waves.
+
 ## Optimisation order (roofline-driven)
 
 1. **Reach the bandwidth roofline.** At batch 1 every kernel must be a
