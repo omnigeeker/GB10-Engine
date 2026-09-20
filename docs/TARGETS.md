@@ -145,8 +145,34 @@ registers) still measured 582 ms, worse than 448 ms, because the two
 So the remaining fix is to give each block many more rows of work per staged
 x-tile -- roughly 64-128 rows -- with the per-row partial sums held in
 `__shared__` rather than registers, since 64 rows x 16 sequences cannot fit in
-registers at all. Shared budget: `xs[16][512]` = 32 KB plus `part[128][16]` =
-8 KB = 40 KB, inside the 48 KB static limit.
+registers at all. Shared budget: `xs[16][512]` = 32 KB plus `part[64][16]` =
+4 KB = 36 KB, inside the 48 KB static limit.
+
+### Attempted and NOT yet working (round 37)
+
+That design was implemented as `GB10_BATCH_RB = 64`: each block takes 64 rows,
+stages x per k-tile with float4 loads, keeps `part[64][16]` in shared, and
+reduces with `warp_reduce_sum` before a lane-0 shared add. It compiles to **109
+registers, 0 spill, 36864 B shared**, which is the profile the analysis calls
+for.
+
+It is **wrong and slower**: `batch-parity` reports 0/16 with the first mismatch
+at token 1, and the step is 628 ms against 377 ms. The launcher grid was
+initially left at `cdiv(N, warps)` instead of `cdiv(N, RB)` (1904 of 2176
+blocks idle); fixing that changed nothing, so the fault is inside the kernel.
+
+Verified while debugging, and therefore *not* the cause: the staging index math
+(`reinterpret_cast<float4*>(xs)[idx]` with `idx = b*(kTile/4) + j` maps to float
+`b*kTile + 4j`, matching the source at `x + b*K + i*kTile`); `kTile/kVec/kWarp`
+= 512/16/32; `warp_reduce_sum` is a down-shuffle so lane 0 holds the sum and the
+`if (lane == 0)` guard is right; `rl = rr*nwarps + warp` covers 0..RB-1 exactly
+once; the `__syncthreads()` placement (after zeroing, after staging, after the
+row loop, after write-out) has no race; and the shared budget is exact.
+
+Reverted to the ROWS=4 kernels, which remain the verified state at **42.44
+tok/s, 16/16 exact, 377.0 ms/step**. The next step is to isolate the new kernel
+against `nvfp4_gemv` for the same input at a fixed batch, rather than reasoning
+about it further.
 
 ## Optimisation order (roofline-driven)
 
