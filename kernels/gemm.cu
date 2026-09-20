@@ -115,14 +115,35 @@ __device__ __forceinline__ void stage_wtile_bf16(float (*wt)[GB10_WSTRIDE],
 }
 
 // Stage the [TILE_T, KC] activation chunk as `xt[k][t]`.
+//
+// Read as float4: the naive element-at-a-time version issues 8 scalar global
+// loads per thread per chunk, which at ~500 cycles of latency each is what the
+// double buffering was struggling to hide. Two float4 loads per thread do the
+// same work, and x is contiguous in k so the vector is naturally aligned
+// (K, KC and the segment stride are all multiples of 4).
 template <int KC>
 __device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
                                             const float* __restrict__ x, int K, int T, int t0,
                                             int c) {
-    for (int idx = threadIdx.x; idx < GB10_TT * KC; idx += GB10_GEMM_BLOCK) {
-        const int tl = idx / KC, kl = idx % KC;
-        const int t = t0 + tl;
-        xt[kl][tl] = (t < T) ? __ldg(x + (size_t)t * K + c * KC + kl) : 0.0f;
+    static_assert(GB10_TT == 64 && GB10_KC == 32, "staging map assumes 64x32");
+    const int tl = threadIdx.x >> 2;
+    const int seg = threadIdx.x & 3;
+    const int t = t0 + tl;
+    const int kbase = c * KC + seg * 8;
+    if (t < T) {
+        const float4 a = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase);
+        const float4 b = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase + 4);
+        xt[seg * 8 + 0][tl] = a.x;
+        xt[seg * 8 + 1][tl] = a.y;
+        xt[seg * 8 + 2][tl] = a.z;
+        xt[seg * 8 + 3][tl] = a.w;
+        xt[seg * 8 + 4][tl] = b.x;
+        xt[seg * 8 + 5][tl] = b.y;
+        xt[seg * 8 + 6][tl] = b.z;
+        xt[seg * 8 + 7][tl] = b.w;
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) xt[seg * 8 + j][tl] = 0.0f;
     }
 }
 

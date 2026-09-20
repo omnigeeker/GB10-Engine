@@ -253,6 +253,30 @@ not. Worth remembering: the pattern was real but I over-extended it.
 
 Cumulative on TTFT: 6273 -> 492 ms, 12.7x.
 
+**Further 492 -> 457 ms (round 20)**, two more staging-side fixes, both exact:
+
+1. **float4 x staging.** The activation tile was still read as 8 scalar global
+   loads per thread per chunk, each ~500 cycles of latency -- exactly what the
+   double buffering was straining to hide. x is contiguous in k and K, KC and
+   the segment stride are all multiples of 4, so two float4 loads do the same
+   work. 492 -> 460 ms.
+2. **Swapped the thread mapping** so `ty` indexes rows and `tx` tokens. The
+   transposed assignment made every thread write four 4-byte values strided by
+   N (16 scattered stores per thread); the swap makes the 16 threads sharing a
+   `tx` write 64 contiguous floats of one row. It also turns the shared reads
+   into broadcasts: a warp now touches 16 distinct weight vectors but only 2
+   distinct activation vectors. 460 -> 457 ms -- smaller than expected, so the
+   store path was not actually binding.
+
+**A calibration correction.** I had been computing the FMA roofline from
+48 SMs x 128 FP32 lanes x 1.7 GHz = 21 TFLOPS, which put prefill's floor at
+144 ms -- i.e. *above* llama.cpp's measured 74 ms for the same prompt. That is
+impossible, so the estimate was wrong. Inverting llama.cpp's 798.91 tok/s
+against the same 2.56e10 MACs/token gives **2.05e13 MAC/s = 41 TFLOPS**, so
+GB10 sustains roughly 2x the FP32 rate I assumed. The real prefill floor is
+~73 ms, and at 457 ms we are ~6x off it -- there is more room than the old
+(incorrect) roofline suggested.
+
 **The design that should work** is a 2D register tile with *both* operands
 staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and
 `xtile[64][KC]` in shared, each thread owning a 4x4 sub-tile. That reads 4 W
