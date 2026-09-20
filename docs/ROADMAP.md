@@ -268,6 +268,21 @@ Cumulative on TTFT: 6273 -> 492 ms, 12.7x.
    distinct activation vectors. 460 -> 457 ms -- smaller than expected, so the
    store path was not actually binding.
 
+**449.7 ms (round 21): bf16 weight tile.** The NVFP4 weight tile is now stored
+as bf16 in shared. This is **lossless**: the E2M1 x E4M3 product has at most 4
+significant bits against bf16's 8, so it is exactly representable, and the
+per-tensor `wscale2` is folded into the accumulator once at store time instead
+of into every staged weight. Halving that tile drops shared from 34.8 KB to
+26.1 KB and lifts occupancy from 2 to 3 blocks/SM. 457 -> 449.7 ms, gate still
+16/16 exact.
+
+The gain was small, which is now the third occupancy-related change to
+disappoint. The evidence across rounds 16-21 has settled into a clear split:
+**changes that remove redundant memory traffic pay (float4 shared reads,
+de-duplicated scale loads, float4 x staging, double buffering); changes that
+only rearrange the tile shape or occupancy do not.** Whatever is left is on the
+memory side, not the execution side.
+
 **A calibration correction.** I had been computing the FMA roofline from
 48 SMs x 128 FP32 lanes x 1.7 GHz = 21 TFLOPS, which put prefill's floor at
 144 ms -- i.e. *above* llama.cpp's measured 74 ms for the same prompt. That is

@@ -32,6 +32,7 @@
 // every thread in the block shares the same tile.
 
 #include "gemv_common.cuh"
+#include <cuda_bf16.h>
 
 using namespace gb10;
 
@@ -51,12 +52,13 @@ using namespace gb10;
 
 // Stage the [TILE_N, KC] weight chunk, decoded to fp32, as `wt[k][n]`.
 template <int KC>
-__device__ __forceinline__ void stage_wtile(float (*wt)[GB10_WSTRIDE],
+__device__ __forceinline__ void stage_wtile(uint16_t (*wt)[GB10_WSTRIDE],
                                             const uint8_t* __restrict__ w,
                                             const uint8_t* __restrict__ sc,
                                             const float* __restrict__ s2, int K, int nbase,
                                             int N, int c) {
     static_assert(GB10_TN == 64 && GB10_KC == 32, "staging map assumes 64x32");
+    (void)s2;  // folded into the accumulator at store time
     // One thread per (row, 8-wide k segment). The naive element-at-a-time loop
     // issues one scale load per element, i.e. 16 redundant loads per group
     // byte -- that is 713 MB of staging traffic for a 44.6 MB matrix. Loading
@@ -69,12 +71,11 @@ __device__ __forceinline__ void stage_wtile(float (*wt)[GB10_WSTRIDE],
         const int kbase = c * KC + seg * 8;
         const uint32_t packed =
             *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
-        const float s =
-            e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4))) * __ldg(s2);
+        const float s = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const uint8_t nib = (uint8_t)((packed >> (4 * j)) & 0xF);
-            wt[seg * 8 + j][nl] = e2m1_to_float(nib) * s;
+            wt[seg * 8 + j][nl] = __bfloat16_as_ushort(__float2bfloat16_rn(e2m1_to_float(nib) * s));
         }
     }
 }
@@ -176,6 +177,39 @@ __device__ __forceinline__ void gemm2d_outer(const float (*wt)[GB10_WSTRIDE],
     }
 }
 
+// Same 4x4 outer product, reading the bf16 weight tile.
+__device__ __forceinline__ void gemm2d_outer_bf16(const uint16_t (*wt)[GB10_WSTRIDE],
+                                                  const float (*xt)[GB10_XSTRIDE],
+                                                  float (&acc)[GB10_TM][GB10_TNREG], int ty,
+                                                  int tx) {
+    static_assert(GB10_TM == 4 && GB10_TNREG == 4, "bf16 path assumes 4x4 tiles");
+#pragma unroll
+    for (int k = 0; k < GB10_KC; ++k) {
+        const uint2 wq = *reinterpret_cast<const uint2*>(&wt[k][ty * GB10_TM]);
+        const float w0 = bf16_to_float((uint16_t)(wq.x & 0xFFFF));
+        const float w1 = bf16_to_float((uint16_t)(wq.x >> 16));
+        const float w2 = bf16_to_float((uint16_t)(wq.y & 0xFFFF));
+        const float w3 = bf16_to_float((uint16_t)(wq.y >> 16));
+        const float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        acc[0][0] = fmaf(w0, xv.x, acc[0][0]);
+        acc[0][1] = fmaf(w0, xv.y, acc[0][1]);
+        acc[0][2] = fmaf(w0, xv.z, acc[0][2]);
+        acc[0][3] = fmaf(w0, xv.w, acc[0][3]);
+        acc[1][0] = fmaf(w1, xv.x, acc[1][0]);
+        acc[1][1] = fmaf(w1, xv.y, acc[1][1]);
+        acc[1][2] = fmaf(w1, xv.z, acc[1][2]);
+        acc[1][3] = fmaf(w1, xv.w, acc[1][3]);
+        acc[2][0] = fmaf(w2, xv.x, acc[2][0]);
+        acc[2][1] = fmaf(w2, xv.y, acc[2][1]);
+        acc[2][2] = fmaf(w2, xv.z, acc[2][2]);
+        acc[2][3] = fmaf(w2, xv.w, acc[2][3]);
+        acc[3][0] = fmaf(w3, xv.x, acc[3][0]);
+        acc[3][1] = fmaf(w3, xv.y, acc[3][1]);
+        acc[3][2] = fmaf(w3, xv.z, acc[3][2]);
+        acc[3][3] = fmaf(w3, xv.w, acc[3][3]);
+    }
+}
+
 __device__ __forceinline__ void gemm2d_store(float (&acc)[GB10_TM][GB10_TNREG],
                                              float* __restrict__ y, int nbase, int t0, int N,
                                              int T, int ty, int tx) {
@@ -190,6 +224,18 @@ __device__ __forceinline__ void gemm2d_store(float (&acc)[GB10_TM][GB10_TNREG],
             }
         }
     }
+}
+
+// `gemm2d_store` with the per-tensor weight scale applied once, rather than
+// folding it into every staged weight.
+__device__ __forceinline__ void gemm2d_store_scaled(float (&acc)[GB10_TM][GB10_TNREG],
+                                                    float* __restrict__ y, int nbase, int t0,
+                                                    int N, int T, int ty, int tx, float s2) {
+#pragma unroll
+    for (int i = 0; i < GB10_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < GB10_TNREG; ++j) acc[i][j] *= s2;
+    gemm2d_store(acc, y, nbase, t0, N, T, ty, tx);
 }
 
 __device__ __forceinline__ void gemm2d_begin(float (&acc)[GB10_TM][GB10_TNREG]) {
@@ -212,7 +258,11 @@ __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
                                                 float* __restrict__ y, int N, int K, int T) {
     // Double buffered: staging chunk c+1 while computing chunk c hides the
     // staging load latency, which is what this kernel is actually bound by.
-    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    // bf16 weight tile: the E2M1 x E4M3 product has at most 4 significant
+    // bits, so bf16 (8) stores it exactly and the per-tensor `wscale2` can be
+    // folded into the accumulator once at the end instead. Halving this tile
+    // is what lifts occupancy from 2 to 3 blocks/SM.
+    __shared__ uint16_t wt[2][GB10_KC][GB10_WSTRIDE];
     __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
@@ -233,11 +283,11 @@ __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
             stage_wtile<GB10_KC>(wt[nxt], w, sc, s2, K, nbase, N, c + 1);
             stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
         }
-        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
+        gemm2d_outer_bf16(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 
-    gemm2d_store(acc, y, nbase, t0, N, T, ty, tx);
+    gemm2d_store_scaled(acc, y, nbase, t0, N, T, ty, tx, __ldg(s2));
 }
 
 __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
