@@ -362,15 +362,39 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
     );
 
     let mut out = Vec::with_capacity(n_new);
+    let mut acc = gb10_model::model::PhaseTimes::default();
     let t2 = std::time::Instant::now();
     for _ in 0..n_new {
         if tok.is_eos(next) {
             break;
         }
         out.push(next);
-        next = model.step(&dev, next, &mut state, &mut sc)?;
+        if args.profile {
+            let (n, pt) = model.step_timed(&dev, next, &mut state, &mut sc)?;
+            next = n;
+            acc.embed += pt.embed;
+            acc.delta_layers += pt.delta_layers;
+            acc.attn_layers += pt.attn_layers;
+            acc.final_norm += pt.final_norm;
+            acc.lm_head += pt.lm_head;
+            acc.argmax += pt.argmax;
+        } else {
+            next = model.step(&dev, next, &mut state, &mut sc)?;
+        }
     }
     let dt = t2.elapsed();
+    if args.profile && !out.is_empty() {
+        let n = out.len() as f64;
+        println!("--- per-phase breakdown (mean ms/token) ---");
+        println!("  embed        {:7.3}", acc.embed / n);
+        println!("  delta layers {:7.3}   (48 layers)", acc.delta_layers / n);
+        println!("  attn layers  {:7.3}   (16 layers)", acc.attn_layers / n);
+        println!("  final norm   {:7.3}", acc.final_norm / n);
+        println!("  lm_head      {:7.3}", acc.lm_head / n);
+        println!("  argmax       {:7.3}", acc.argmax / n);
+        println!("  sum          {:7.3}", acc.total() / n);
+        println!("  wall         {:7.3}", dt.as_secs_f64() * 1e3 / n);
+    }
     println!(
         "decoded {} tokens in {:.3}s -> {:.2} tok/s",
         out.len(),
@@ -432,6 +456,7 @@ struct Args {
     raw: bool,
     prompt: String,
     n_new: usize,
+    profile: bool,
     /// Minimum token agreement with the bf16 oracle before the gate passes.
     /// The oracle is bf16-rounded, so bit-exactness is not expected; see
     /// docs/TARGETS.md T7.
@@ -459,6 +484,7 @@ fn parse_args() -> Result<(String, Args)> {
         prompt: String::new(),
         n_new: 32,
         min_agree: 0.85,
+        profile: false,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -509,6 +535,10 @@ fn parse_args() -> Result<(String, Args)> {
             "--n" => {
                 a.n_new = val()?.parse()?;
                 i += 2;
+            }
+            "--profile" => {
+                a.profile = true;
+                i += 1;
             }
             "--min-agree" => {
                 a.min_agree = val()?.parse()?;
@@ -569,6 +599,7 @@ fn main() -> Result<()> {
             prompt: args.prompt.clone(),
             n_new: args.n_new,
             min_agree: args.min_agree,
+            profile: args.profile,
         };
         all_ok &= layer_parity(&a)?;
     }

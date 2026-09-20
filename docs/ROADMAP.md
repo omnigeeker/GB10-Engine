@@ -97,7 +97,23 @@ The only lever that beats the bandwidth roofline.
 - [ ] **gate (T8, T9): 16 simultaneous requests served correctly over both
       protocol shapes**
 
-## M7 — Roofline optimization
+## M7 — Roofline optimization (in progress)
+
+**Lead:** the GEMV kernels achieve 245.5 GB/s back-to-back but only 162 GB/s
+inside the model, and the GPU is ~100% busy in both cases — so the loss is in
+how kernels are separated, not in any one kernel. Full data and the list of
+already-ruled-out hypotheses in `docs/PHYSICS.md`. Closing this gap alone is
+worth ~1.5x, i.e. ~13.5 tok/s and target T1.
+
+Immediate defects:
+- [ ] `bf16_gemv` for `in_proj_a`/`in_proj_b` runs at gridX=2 (2 SMs of 48)
+      for 2.8 ms/step, 2.5% of the token for 0.27% of the bytes
+- [ ] bandwidth tracks grid size (193 GB/s at gridX=384 vs 155 at gridX=160)
+- [ ] fuse the small per-layer kernels to shorten the dependency chain between
+      GEMVs
+
+Original plan:
+
 
 - [ ] profile per-kernel bandwidth utilization, close the gap to 200 GB/s
 - [ ] kernel fusion to remove intermediate traffic

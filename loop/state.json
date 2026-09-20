@@ -1,13 +1,13 @@
 {
   "project": "GB10-Engine",
-  "round": 5,
-  "last_round_at": "20260920T043154Z",
+  "round": 6,
+  "last_round_at": "20260920T045042Z",
   "last_status": "PASS",
   "model": "nv-community/Qwen3.8-27B-NVFP4",
   "hardware": "NVIDIA GB10 (DGX Spark), sm_121, 48 SMs, 121 GiB unified, CUDA 13.0",
   "measured_read_bandwidth_gbps": 228,
   "roofline_single_stream_tok_s": 12.95,
-  "current_milestone": "M4",
+  "current_milestone": "M7",
   "milestones": {
     "M0": {
       "name": "Foundation: config, safetensors, tokenizer, chat template",
@@ -27,7 +27,7 @@
     },
     "M4": {
       "name": "MTP speculative decoding",
-      "status": "in_progress"
+      "status": "pending"
     },
     "M5": {
       "name": "Paged KV cache + continuous batching, 16 concurrent",
@@ -39,7 +39,7 @@
     },
     "M7": {
       "name": "Roofline optimization (targets T1-T4)",
-      "status": "pending"
+      "status": "in_progress"
     },
     "M8": {
       "name": "Ollama head-to-head (targets T5, T6)",
@@ -102,10 +102,24 @@
         "generate": "pass",
         "benchmark": "pass"
       }
+    },
+    {
+      "round": 6,
+      "at": "20260920T045042Z",
+      "status": "PASS",
+      "gates": {
+        "build": "pass",
+        "test": "pass",
+        "correctness": "pass",
+        "generate": "pass",
+        "benchmark": "pass"
+      }
     }
   ],
   "per_token_traffic_gb": 17.608,
-  "measured_decode_tok_s": 8.52,
+  "measured_decode_tok_s": 9.24,
   "measured_ttft_ms_prompt59": 6892,
-  "oracle_agreement": "16/16 exact"
+  "oracle_agreement": "16/16 exact",
+  "gemv_isolated_gbps": 245.5,
+  "gemv_in_model_gbps": 162
 }

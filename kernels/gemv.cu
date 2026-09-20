@@ -109,15 +109,28 @@ __device__ __forceinline__ void nvfp4_gemv_tmpl(
             const XVec xv = load_x(xb, e0);
             const int so = i * kWarp + lane;
 
+            // Issue every row's weight and scale load BEFORE any of the
+            // arithmetic. Fusing the loads into the compute loop leaves the
+            // compiler free to keep only one load in flight per warp, which
+            // starves DRAM; separating them gives ROWS independent loads.
+            uint2 pk[ROWS];
+            float sc[ROWS];
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 const int row = rbase + r;
                 if (row < N) {
                     const uint8_t* __restrict__ wr = w + (size_t)row * rowbytes;
-                    const uint2 packed =
-                        *reinterpret_cast<const uint2*>(wr + (e0 >> 1));
-                    const float sc =
-                        e4m3_to_float(wscale[(size_t)row * scalerow + so]);
+                    pk[r] = *reinterpret_cast<const uint2*>(wr + (e0 >> 1));
+                    sc[r] = e4m3_to_float(wscale[(size_t)row * scalerow + so]);
+                }
+            }
+
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    const uint2 packed = pk[r];
+                    const float s = sc[r];
 
                     float lo[8], hi[8];
                     e2m1x8_to_float(packed.x, lo);
@@ -138,7 +151,7 @@ __device__ __forceinline__ void nvfp4_gemv_tmpl(
                     t = fmaf(hi[6], xv.a3.z, t);
                     t = fmaf(hi[7], xv.a3.w, t);
 
-                    acc[r] = fmaf(t, sc, acc[r]);
+                    acc[r] = fmaf(t, s, acc[r]);
                 }
             }
         }

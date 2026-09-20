@@ -132,3 +132,72 @@ python3 scripts/weight_traffic.py
 # the real thing: streams the actual checkpoint through the GEMV kernels
 ./target/release/gb10-bench stream --out bench/results/stream-m1.json
 ```
+
+## M7 lead: in-model GEMV bandwidth is 162 GB/s, not 245 GB/s
+
+The single most important measurement so far, because it says the remaining
+throughput is *not* in the GEMV inner loop.
+
+`gb10-bench stream` runs the 401 text-decoder GEMVs back to back with nothing
+in between and reports the achieved bandwidth directly:
+
+```
+per-token weight traffic : 17.555 GB
+time per token           : 71.50 ms
+achieved bandwidth       : 245.5 GB/s
+projected decode         : 13.99 tok/s (single stream)
+```
+
+Stable across 30 sustained iterations (249.8, 242.4, 247.1, 244.7, 247.6,
+247.7 GB/s at iters 5/10/15/20/25/29), so this is not thermal or power
+throttling — the short-burst roofline is real and sustainable.
+
+Inside the model, `nsys` gives the same kernels 108.8 ms per step, i.e.
+**162 GB/s**:
+
+| kernel | gridX | calls/step | ms/step | us/call | GB/s |
+|---|---|---|---|---|---|
+| nvfp4 (gate/up) | 544 | 128 | 39.46 | 308 | 163 |
+| nvfp4 (down) | 160 | 64 | 20.69 | 323 | 155 |
+| fp8 (in_proj_qkv) | 320 | 48 | 14.16 | 295 | 178 |
+| fp8 (out/o_proj) | 160 | 64 | 12.27 | 192 | 164 |
+| fp8 (in_proj_z) | 192 | 48 | 8.23 | 172 | 184 |
+| fp8 (q_proj) | 384 | 16 | 5.21 | 326 | 193 |
+| nvfp4 (lm_head) | 7760 | 1 | 4.11 | 4112 | 174 |
+| **bf16 (in_proj_a/b)** | **2** | **96** | **2.80** | **29** | **17** |
+| fp8 (k/v_proj) | 32 | 32 | 1.86 | 58 | 90 |
+
+Total 108.79 ms/step. GEMV is 95.7% of GPU kernel time; every elementwise,
+norm, RoPE, recurrence and attention kernel together is 4.9 ms/step.
+
+`nsys` also shows the GPU is ~100% busy (113.0 ms wall vs 113.7 ms of kernel
+time), so this is not launch-gap starvation: the same kernels simply run slower
+when they are separated by dependency-chained small kernels than when they run
+back to back.
+
+Two concrete, separately-attributable defects fall out of the table:
+
+1. **`bf16_gemv` at gridX=2.** `in_proj_a`/`in_proj_b` are `[48, 5120]`, so
+   `gx = ceil(48/32) = 2` blocks — 2 of 48 SMs. 47 MB of traffic at 17 GB/s
+   costs 2.8 ms/step, ~2.5% of the whole token, for 0.27% of the bytes. This
+   needs a split-K or small-N kernel.
+2. **Bandwidth scales with grid size** (gridX=384 -> 193 GB/s, gridX=160 ->
+   155-164 GB/s), which is the signature of insufficient concurrent memory
+   demand rather than a bad access pattern — the reads are already fully
+   coalesced and sector-aligned.
+
+### Ruled out, with evidence
+
+- **`exp2f` in the E2M1 decode.** The original decode used
+  `(m ? 1.5f : 1.0f) * exp2f(e - 1)`, and `exp2f` is MUFU.EX2 (SFU, ~1/4 FMA
+  throughput) with ~18.4e9 NVFP4 weights per token. Replacing it with an
+  integer bit-pattern assembly (`kernels/gemv_common.cuh`) is strictly better
+  and is kept, but it only moved the token from 113.0 to 110.2 ms — the decode
+  was being hidden by memory latency, not limiting.
+- **Activation-traffic amortisation.** `ROWS=8` (halving the per-row x reload)
+  made things *worse*: 110.2 -> 117.2 ms. Losing blocks costs more than the
+  saved activation traffic. Reverted to `ROWS=4`.
+- **Load-issue serialisation.** Hoisting all `ROWS` weight and scale loads
+  ahead of the arithmetic so they are genuinely in flight together is worth
+  keeping: 110.2 -> 108.2 ms (9.07 -> 9.24 tok/s).
+- **Throttling.** See the 30-iteration table above.

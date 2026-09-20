@@ -178,3 +178,93 @@ impl Model {
         Ok(next)
     }
 }
+
+/// Per-phase wall time for one decode step, in milliseconds.
+///
+/// Every phase is synchronised before it is timed, so this measures the GPU
+/// rather than the queue. It is a diagnostic for finding where the gap to the
+/// bandwidth roofline lives, not a fast path.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct PhaseTimes {
+    pub embed: f64,
+    pub delta_layers: f64,
+    pub attn_layers: f64,
+    pub final_norm: f64,
+    pub lm_head: f64,
+    pub argmax: f64,
+}
+
+impl PhaseTimes {
+    pub fn total(&self) -> f64 {
+        self.embed
+            + self.delta_layers
+            + self.attn_layers
+            + self.final_norm
+            + self.lm_head
+            + self.argmax
+    }
+}
+
+impl Model {
+    /// `step`, with each phase timed. Only for `--profile`.
+    pub fn step_timed(
+        &self,
+        dev: &Device,
+        token: u32,
+        state: &mut ModelState,
+        sc: &mut Scratch,
+    ) -> Result<(u32, PhaseTimes)> {
+        let text = self.text();
+        let hidden = text.hidden_size;
+        let eps = text.rms_norm_eps as f32;
+        let mut pt = PhaseTimes::default();
+        let mut t = std::time::Instant::now();
+
+        dev.ops()
+            .embed_gather(dev, &self.embed, token, &mut state.a, hidden)?;
+        dev.synchronize()?;
+        pt.embed = t.elapsed().as_secs_f64() * 1e3;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            t = std::time::Instant::now();
+            layer.forward(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc)?;
+            dev.synchronize()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if layer.is_delta() {
+                pt.delta_layers += ms;
+            } else {
+                pt.attn_layers += ms;
+            }
+            std::mem::swap(&mut state.a, &mut state.b);
+        }
+
+        t = std::time::Instant::now();
+        dev.ops().rmsnorm_zero_centered(
+            dev,
+            &state.a,
+            &self.norm,
+            &mut state.normed,
+            1,
+            hidden,
+            eps,
+        )?;
+        dev.synchronize()?;
+        pt.final_norm = t.elapsed().as_secs_f64() * 1e3;
+
+        t = std::time::Instant::now();
+        self.lm_head
+            .forward(dev, &state.normed, &mut state.logits, 1)?;
+        dev.synchronize()?;
+        pt.lm_head = t.elapsed().as_secs_f64() * 1e3;
+
+        t = std::time::Instant::now();
+        dev.ops()
+            .argmax(dev, &state.logits, &mut state.idx, self.vocab_size())?;
+        dev.synchronize()?;
+        pt.argmax = t.elapsed().as_secs_f64() * 1e3;
+
+        state.n_tokens += 1;
+        let v = dev.stream().memcpy_dtov(&state.idx)?;
+        Ok((v[0] as u32, pt))
+    }
+}

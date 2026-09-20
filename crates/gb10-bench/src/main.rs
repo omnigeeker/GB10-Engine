@@ -41,8 +41,12 @@ fn main() -> Result<()> {
         "hw" => hw(),
         "gemv-parity" => gemv_parity(&model),
         "stream" => stream(&model, opt("--out")),
+        "launch-overhead" => launch_overhead(),
         _ => {
-            eprintln!("usage: gb10-bench <hw|gemv-parity|stream> [--model DIR] [--out FILE]");
+            eprintln!(
+                "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
+                 [--model DIR] [--out FILE]"
+            );
             std::process::exit(2);
         }
     }
@@ -64,6 +68,51 @@ fn hw() -> Result<()> {
 // ---------------------------------------------------------------------------
 // gemv-parity
 // ---------------------------------------------------------------------------
+
+/// Cost of an empty kernel launch, and of the whole host-side launch path.
+///
+/// Decode issues ~1200 kernel launches per token (497 GEMVs plus ~700
+/// elementwise/norm/RoPE/recurrence kernels across 64 layers). If the
+/// host-side launch path costs tens of microseconds, that alone accounts for a
+/// large fraction of the gap between the measured decode rate and the
+/// bandwidth roofline, and the fix is to batch or fuse rather than to tune the
+/// GEMV inner loop.
+fn launch_overhead() -> Result<()> {
+    let dev = Device::new(0)?;
+    let n = 1 << 20;
+    let mut c = dev.stream().alloc_zeros::<f32>(n)?;
+    let a = dev.stream().alloc_zeros::<f32>(n)?;
+    let b = dev.stream().alloc_zeros::<f32>(n)?;
+
+    let reps = 2000;
+    // Warm up so first-touch allocation and module load are not counted.
+    for _ in 0..50 {
+        dev.ops().add(&dev, &a, &b, &mut c, n)?;
+    }
+    dev.synchronize()?;
+
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        dev.ops().add(&dev, &a, &b, &mut c, n)?;
+    }
+    let queued = t.elapsed();
+    dev.synchronize()?;
+    let total = t.elapsed();
+
+    let per = total.as_secs_f64() / reps as f64;
+    println!("add_kernel on {n} elements, {reps} reps");
+    println!(
+        "  host-side queue time : {:.1} us/launch",
+        queued.as_secs_f64() / reps as f64 * 1e6
+    );
+    println!("  end-to-end            : {:.1} us/launch", per * 1e6);
+    println!(
+        "\nprojected at 1200 launches/token: {:.1} ms/token  ({:.1} tok/s ceiling)",
+        per * 1200.0 * 1e3,
+        1.0 / (per * 1200.0)
+    );
+    Ok(())
+}
 
 fn gemv_parity(model: &str) -> Result<()> {
     let dev = Device::new(0)?;
@@ -364,13 +413,27 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
     }
     tracing::debug!("largest matrix: {}", weights.iter().map(|w| w.describe()).max().unwrap());
 
-    let iters = 10;
-    let t1 = Instant::now();
+    // Report every iteration separately: if the achieved bandwidth decays over
+    // a sustained run, the short-burst roofline is optimistic and the real
+    // ceiling is lower.
+    let iters = 30;
+    let mut per_iter = Vec::with_capacity(iters);
     for _ in 0..iters {
+        let t = Instant::now();
         run_once(&weights, &mut y)?;
+        dev.synchronize()?;
+        per_iter.push(t.elapsed().as_secs_f64());
     }
-    dev.synchronize()?;
-    let elapsed = t1.elapsed().as_secs_f64() / iters as f64;
+    for (i, s) in per_iter.iter().enumerate() {
+        if i % 5 == 0 || i == iters - 1 {
+            println!(
+                "  iter {i:2}: {:.2} ms  {:.1} GB/s",
+                s * 1e3,
+                total_bytes as f64 / s / 1e9
+            );
+        }
+    }
+    let elapsed: f64 = per_iter.iter().sum::<f64>() / iters as f64;
 
     let gbps = total_bytes as f64 / elapsed / 1e9;
     println!();
