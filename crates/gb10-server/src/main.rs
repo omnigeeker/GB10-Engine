@@ -191,7 +191,7 @@ impl Engine {
         let model = Model::load_from(&dev, cfg, &args.model)?;
         let tok = QwenTokenizer::from_model_dir(&args.model)?;
         let tmpl = ChatTemplate::from_model_dir(&args.model)?;
-        let state = ModelState::new(&dev, &model, MAX_SEQ)?;
+        let state = ModelState::new(&dev, &model, MAX_SEQ, 1)?;
         let sc = Scratch::new(&dev, &text, MAX_SEQ)?;
         Ok(Self { dev, model, tok, tmpl, state, sc, name: args.model_name.clone() })
     }
