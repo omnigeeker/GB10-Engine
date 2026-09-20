@@ -393,6 +393,23 @@ both proven behaviour-neutral, what remains is purely wiring: build the state
 with `n_seq = 16`, add `Model::step_batch`, and have the server schedule
 sequences onto it.
 
+**Step 3a landed (round 27): the four multi-sequence kernels exist.**
+`conv1d_step_silu_multi`, `gated_delta_rule_step_multi`,
+`kv_cache_append_multi` and `attn_decode_multi` are written and registered.
+Each takes `gridDim.y = sequence index`, reads that sequence's position from a
+device array, and addresses state at `seq * base_stride` inside the shared
+allocation -- so one launch serves the whole batch instead of one launch per
+sequence. They are additive: the single-sequence kernels are untouched and
+nothing calls the new ones yet.
+
+I chose `_multi` kernels over giving the existing kernels source/destination
+offsets. Offsets would have meant slicing `CudaSlice` at every call site (the
+ops take `&CudaSlice`, not a view), threading two more integers through four
+kernels, and still paying one launch per sequence. Putting the sequence on
+`gridDim.y` costs the same lines and removes both problems.
+
+Gate: 64-layer oracle still 16/16 exact.
+
 Rough shape of the work: add a sequence stride to those four kernels, grow the
 four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add
 `Model::step_batch`, then have the server hold N states and schedule. The

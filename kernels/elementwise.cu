@@ -658,3 +658,144 @@ extern "C" __global__ void copy_last_row_kernel(const float* __restrict__ src,
     if (i >= n) return;
     dst[i] = src[(size_t)(t - 1) * n + i];
 }
+
+// ---------------------------------------------------------------------------
+// Multi-sequence decode variants
+//
+// These are the `_multi` counterparts of the four decode kernels above. Each
+// takes `gridDim.y = sequence index` and reads that sequence's position from a
+// device array, so one launch serves the whole batch instead of one launch per
+// sequence. The per-sequence state lives at `seq * base_stride` inside the
+// shared state allocation (see `LayerState`, which is laid out sequence-major).
+//
+// They are deliberately additive: the single-sequence kernels are untouched,
+// and nothing calls these yet.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void conv1d_step_silu_multi_kernel(
+    const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ hist,
+    float* __restrict__ y, int channels, int base_stride) {
+    const int s = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const size_t xb = (size_t)s * channels;
+    const size_t hb = (size_t)s * base_stride;
+    const float* __restrict__ wc = w + (size_t)c * 4;
+    float* __restrict__ h = hist + hb + (size_t)c * 3;
+    const float xc = x[xb + c];
+    const float acc = fmaf(wc[0], h[0], fmaf(wc[1], h[1], fmaf(wc[2], h[2], wc[3] * xc)));
+    y[xb + c] = silu_f(acc);
+    h[0] = h[1];
+    h[1] = h[2];
+    h[2] = xc;
+}
+
+// One token of the Gated DeltaNet recurrence for every sequence in the batch.
+// `qkv` is `[n_seq, row_stride]`; the q/k/v offsets inside a row are the same
+// for all sequences, so only the row base moves.
+extern "C" __global__ void gated_delta_rule_step_multi_kernel(
+    const float* __restrict__ qkv, int q_off, int k_off, int v_off, int row_stride,
+    const float* __restrict__ decay, const float* __restrict__ beta,
+    float* __restrict__ state, float* __restrict__ out, int n_v_heads, int n_k_heads,
+    int group, int base_stride) {
+    constexpr int D = 128;
+    const int hv = blockIdx.x;
+    const int s = blockIdx.y;
+    const int j = threadIdx.x;
+    const int kh = hv / group;
+
+    __shared__ float S[D][D + 1];
+    __shared__ float sk[D];
+
+    const float* __restrict__ row = qkv + (size_t)s * row_stride;
+    const float* __restrict__ qh = row + q_off + (size_t)kh * D;
+    const float* __restrict__ khp = row + k_off + (size_t)kh * D;
+    const float* __restrict__ vh = row + v_off + (size_t)hv * D;
+    float* __restrict__ sh =
+        state + (size_t)s * base_stride + (size_t)hv * D * D;
+    const float dec = decay[(size_t)s * n_v_heads + hv];
+    const float bet = beta[(size_t)s * n_v_heads + hv];
+
+    for (int i = threadIdx.x; i < D * D; i += blockDim.x) S[i / D][i % D] = sh[i];
+    __syncthreads();
+    sk[j] = khp[j];
+    __syncthreads();
+
+    for (int i = 0; i < D; ++i) {
+        const float s_ij = S[i][j] * dec;
+        S[i][j] = s_ij;
+    }
+    __syncthreads();
+
+    float delta = 0.0f;
+    for (int i = 0; i < D; ++i) delta = fmaf(S[i][j], sk[i], delta);
+    delta = (vh[j] - delta) * bet;
+    for (int i = 0; i < D; ++i) S[i][j] = fmaf(sk[i], delta, S[i][j]);
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int i = 0; i < D; ++i) acc = fmaf(S[i][j], qh[i], acc);
+    out[(size_t)s * n_v_heads * D + (size_t)hv * D + j] = acc;
+
+    for (int i = threadIdx.x; i < D * D; i += blockDim.x) sh[i] = S[i / D][i % D];
+}
+
+// Append each sequence's k/v row at its own position.
+extern "C" __global__ void kv_cache_append_multi_kernel(
+    const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ k_cache,
+    float* __restrict__ v_cache, const int* __restrict__ positions, int n_kv_heads,
+    int head_dim, int base_stride) {
+    const int s = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = n_kv_heads * head_dim;
+    if (i >= n) return;
+    const size_t src = (size_t)s * n;
+    const size_t dst = (size_t)s * base_stride + (size_t)positions[s] * n;
+    k_cache[dst + i] = k[src + i];
+    v_cache[dst + i] = v[src + i];
+}
+
+// Decode attention for every sequence. `max_keys` sizes the shared score
+// buffer; each sequence loops only to its own `positions[s]`.
+extern "C" __global__ void attn_decode_multi_kernel(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out,
+    const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
+    float scale, int base_stride) {
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int d = threadIdx.x;
+    const int group = n_q_heads / n_kv_heads;
+    const int kh = h / group;
+    const int n_keys = positions[s];
+
+    extern __shared__ float scores[];
+
+    const size_t qb = (size_t)s * n_q_heads * head_dim;
+    const size_t cb = (size_t)s * base_stride;
+    const bool active = d < head_dim;
+    const float qv = active ? q[qb + h * head_dim + d] : 0.0f;
+
+    for (int i = 0; i < n_keys; ++i) {
+        const float kk =
+            active ? k_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d] : 0.0f;
+        const float dot = block_reduce_sum(qv * kk) * scale;
+        if (d == 0) scores[i] = dot;
+        __syncthreads();
+    }
+
+    float mx = -INFINITY;
+    for (int i = 0; i < n_keys; ++i) mx = fmaxf(mx, scores[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < n_keys; ++i) sum += __expf(scores[i] - mx);
+    const float inv = 1.0f / sum;
+
+    if (active) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_keys; ++i) {
+            const float p = __expf(scores[i] - mx) * inv;
+            acc = fmaf(p, v_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d], acc);
+        }
+        out[qb + h * head_dim + d] = acc;
+    }
+}
