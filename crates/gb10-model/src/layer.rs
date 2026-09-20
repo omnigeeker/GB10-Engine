@@ -878,6 +878,7 @@ impl FullAttnLayer {
             pos,
             nkv,
             hd,
+            0,
         )?;
         state.n_keys[seq] = pos + 1;
 
@@ -893,6 +894,7 @@ impl FullAttnLayer {
             nkv,
             hd,
             scale,
+            0,
         )?;
 
         // The output gate is sigmoid, NOT the swish in config.json.

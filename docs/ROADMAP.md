@@ -481,7 +481,26 @@ so the batch rows fit), `block_reduce_sum` (static `__shared__`, so it cannot
 alias `attn_decode_multi`'s dynamic `scores`), and the GEMV batch path (both
 `x` and `y` are indexed by `blockIdx.y`).
 
-**Still failing: 1/4.** Sequence 0 (shortest prompt, 5 tokens) is exact over 16
+**Bisect (round 32): the bug requires differing `n_keys`.**
+
+The failure point is not fixed -- it moves with the data -- so this is a small
+error that the model tolerates for a while before a token flips, not a wrong
+address. Running the gate with the *same* prompt lengths but different content
+passes **4/4 over 16 tokens**; running it with different lengths fails. Two
+sequences that happen to share a length both match, so there is no cross-talk
+between slots -- each sequence's result depends only on its own prompt.
+
+That narrows the bug to the only two kernels that read a per-sequence position:
+`attn_decode_multi` and `kv_cache_append_multi`. Everything else -- the
+recurrence, the conv step, the projections, RoPE, the norms, `Scratch` sizing,
+the GEMV batch path -- is exercised identically by the equal-length run and is
+therefore exonerated.
+
+Also established this round: `n_seq = 1` is bit-exact against `Model::step`
+over 32 generated tokens, so `forward_batch`/`_multi` at batch 1 is not merely
+"close" but identical; the divergence appears only once the batch is real.
+
+**Still failing.** Sequence 0 (shortest prompt, 5 tokens) is exact over 16
 tokens; sequences 1, 2 and 3 diverge at tokens 2, 3 and 3. The pattern -- a
 shorter prompt surviving longer -- points at state that is still indexed
 wrongly for `s >= 1`. The prime suspect is that `gated_delta_rule_step_multi`

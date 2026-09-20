@@ -892,6 +892,7 @@ impl Ops {
         n_kv_heads: usize,
         head_dim: usize,
         scale: f32,
+        base: usize,
     ) -> Result<()> {
         need(n_keys > 0, "attn_decode: no keys")?;
         need(
@@ -901,7 +902,7 @@ impl Ops {
         )?;
         let (nk, nq, nkv, hd) =
             (n_keys as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
-        let base = 0i32;  // per-sequence offset; 0 until batching lands
+        let base = base as i32;
         unsafe {
             dev.stream()
                 .launch_builder(&self.attn_decode)
@@ -935,6 +936,7 @@ impl Ops {
         pos: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        base: usize,
     ) -> Result<()> {
         let n = n_kv_heads * head_dim;
         need(k.len() >= n && v.len() >= n, "kv append src")?;
@@ -943,7 +945,7 @@ impl Ops {
             "kv append cache",
         )?;
         let (p, nkv, hd) = (pos as i32, n_kv_heads as i32, head_dim as i32);
-        let base = 0i32;  // per-sequence offset; 0 until batching lands
+        let base = base as i32;
         unsafe {
             dev.stream()
                 .launch_builder(&self.kv_cache_append)
