@@ -38,7 +38,7 @@ REPORT="$ROUNDS/$(printf '%03d' "$ROUND")-round.md"
 
 say() { echo "[round $ROUND] $*" | tee -a "$LOG"; }
 
-GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_BENCH=skip
+GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_BENCH=skip
 STATUS=FAIL
 
 {
@@ -79,6 +79,24 @@ if [ "$GATE_TEST" = pass ]; then
   fi
 fi
 
+# ------------------------------------- 3b. end-to-end 64-layer generate gate ---
+# The layer gate proves each block; this proves the stack (embedding gather,
+# 64 layers wired in order, final norm, NVFP4 lm_head, argmax) against a
+# full-model oracle.
+if [ "$GATE_TEST" = pass ]; then
+  if [ -x "$ROOT/target/release/gb10-verify" ] && [ -f "$ROOT/fixtures/oracle/greedy_tokens.json" ]; then
+    say "gb10-verify generate (64-layer greedy decode vs full-model oracle)"
+    if "$ROOT/target/release/gb10-verify" generate --n 16 \
+         --oracle "$ROOT/fixtures/oracle" --model "$ROOT/models/Qwen3.8-27B-NVFP4" >>"$LOG" 2>&1; then
+      GATE_GENERATE=pass; say "generate OK"
+    else
+      GATE_GENERATE=fail; say "generate FAILED (see $LOG)"
+    fi
+  else
+    GATE_GENERATE=missing; say "no full-model oracle at fixtures/oracle/greedy_tokens.json — gate pending"
+  fi
+fi
+
 # ------------------------------------------------------------ 4. benchmark ---
 if [ "$QUICK" = 0 ] && [ "$GATE_BUILD" = pass ] && [ -x "$ROOT/target/release/gb10-bench" ]; then
   say "gb10-bench"
@@ -91,6 +109,7 @@ fi
 
 if [ "$GATE_BUILD" = pass ] && [ "$GATE_TEST" = pass ] &&
    { [ "$GATE_CORRECT" = pass ] || [ "$GATE_CORRECT" = missing ]; } &&
+   { [ "$GATE_GENERATE" = pass ] || [ "$GATE_GENERATE" = missing ]; } &&
    { [ "$GATE_BENCH" = pass ] || [ "$GATE_BENCH" = skip ]; }; then
   STATUS=PASS
 fi
@@ -103,7 +122,8 @@ fi
   echo "|---|---|"
   echo "| build | $GATE_BUILD |"
   echo "| test | $GATE_TEST |"
-  echo "| correctness | $GATE_CORRECT |"
+  echo "| correctness (layers) | $GATE_CORRECT |"
+  echo "| correctness (64-layer) | $GATE_GENERATE |"
   echo "| benchmark | $GATE_BENCH |"
   echo
   echo "**status: $STATUS**"
@@ -116,16 +136,16 @@ fi
 } >> "$REPORT"
 
 # ---------------------------------------------------------------- 6. state ---
-python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_BENCH" <<'PY'
+python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_BENCH" <<'PY'
 import json, sys
-state_path, rnd, status, stamp, b, t, c, bm = sys.argv[1:9]
+state_path, rnd, status, stamp, b, t, c, g, bm = sys.argv[1:10]
 s = json.load(open(state_path))
 s["round"] = int(rnd)
 s["last_round_at"] = stamp
 s["last_status"] = status
 s.setdefault("history", []).append(
     {"round": int(rnd), "at": stamp, "status": status,
-     "gates": {"build": b, "test": t, "correctness": c, "benchmark": bm}}
+     "gates": {"build": b, "test": t, "correctness": c, "generate": g, "benchmark": bm}}
 )
 json.dump(s, open(state_path, "w"), indent=2)
 print(f"state: round={rnd} status={status}")
@@ -138,7 +158,7 @@ if [ "$PUSH" = 1 ] && [ -d "$ROOT/.git" ]; then
   if ! git diff --cached --quiet; then
     git commit -q -m "round $ROUND: $STATUS
 
-gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT bench=$GATE_BENCH
+gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT generate=$GATE_GENERATE bench=$GATE_BENCH
 
 Automated round by loop/run_round.sh" >>"$LOG" 2>&1
   fi

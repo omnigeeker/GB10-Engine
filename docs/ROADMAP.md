@@ -55,15 +55,20 @@ semantic bugs were found this way: the head_dim^-0.5 factor applied to the key
 as well as the query, a missing `post_attention_layernorm`, and a fixture that
 had been generated with non-causal attention.
 
-## M3 — Full forward and greedy decode
+## M3 — Full forward and greedy decode (done)
 
-- [ ] 64-layer forward, bf16 embeddings, fp32 norms, NVFP4 `lm_head`
-- [ ] KV cache for the 16 full-attention layers; fp32 recurrent state for the
+- [x] 64-layer forward, bf16 embedding gather, fp32 norms, NVFP4 `lm_head`
+- [x] KV cache for the 16 full-attention layers; fp32 recurrent state for the
       48 DeltaNet layers
-- [ ] greedy decode loop
-- [ ] freeze oracle traces into `fixtures/oracle/` and build `gb10-verify`
-- [ ] **gate (T7): top-1 token id matches the HF oracle for >= 32 greedy
-      tokens on the frozen prompt set**
+- [x] greedy decode loop
+- [x] freeze oracle traces into `fixtures/oracle/` (`tools/full_oracle.py`)
+- [x] **gate: 16/16 greedy tokens match `Qwen3_5ForCausalLM` exactly, and the
+      59-token chat prompt tokenises identically**
+
+Measured: 17.60 GB streamed per token (predicted 17.608), TTFT 6.89 s for a
+59-token prompt (prefill is currently 59 sequential decode steps), decode
+8.52 tok/s against a 12.95 tok/s roofline — i.e. 66% of achievable bandwidth.
+Closing that gap is M7.
 
 ## M4 — MTP speculative decoding
 

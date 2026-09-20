@@ -12,9 +12,11 @@
 //! `docs/ARCHITECTURE.md`.
 
 pub mod layer;
+pub mod model;
 pub mod rope;
 pub mod weights;
 
 pub use layer::{FullAttnLayer, Layer, LayerState, Mlp, Scratch};
+pub use model::{Model, ModelState};
 pub use rope::rope_tables;
 pub use weights::{Linear, LinearData, Store};

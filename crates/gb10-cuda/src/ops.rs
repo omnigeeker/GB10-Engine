@@ -28,6 +28,8 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "attn_prefill_kernel",
     "attn_decode_kernel",
     "kv_cache_append_kernel",
+    "embed_gather_kernel",
+    "argmax_kernel",
 ];
 
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
@@ -49,6 +51,8 @@ pub struct Ops {
     attn_prefill: CudaFunction,
     attn_decode: CudaFunction,
     kv_cache_append: CudaFunction,
+    embed_gather: CudaFunction,
+    argmax: CudaFunction,
 }
 
 fn take(map: &mut HashMap<String, CudaFunction>, n: &str) -> Result<CudaFunction> {
@@ -86,6 +90,8 @@ impl Ops {
             attn_prefill: take(map, "attn_prefill_kernel")?,
             attn_decode: take(map, "attn_decode_kernel")?,
             kv_cache_append: take(map, "kv_cache_append_kernel")?,
+            embed_gather: take(map, "embed_gather_kernel")?,
+            argmax: take(map, "argmax_kernel")?,
         })
     }
 
@@ -247,6 +253,63 @@ impl Ops {
                 .arg(&n_i)
                 .launch(LaunchConfig {
                     grid_dim: (cdiv(n, 256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Copy one bf16 embedding row into an fp32 activation vector.
+    pub fn embed_gather(
+        &self,
+        dev: &Device,
+        table: &CudaSlice<u16>,
+        token: u32,
+        out: &mut CudaSlice<f32>,
+        hidden: usize,
+    ) -> Result<()> {
+        need(
+            table.len() >= (token as usize + 1) * hidden,
+            "embed_gather table",
+        )?;
+        need(out.len() >= hidden, "embed_gather out")?;
+        let (t, h) = (token as i32, hidden as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.embed_gather)
+                .arg(table)
+                .arg(&t)
+                .arg(out)
+                .arg(&h)
+                .launch(LaunchConfig {
+                    grid_dim: (cdiv(hidden, 256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Index of the maximum element, ties resolving to the lowest index.
+    pub fn argmax(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        out_idx: &mut CudaSlice<i32>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n, "argmax x")?;
+        need(out_idx.len() >= 1, "argmax out")?;
+        let n_i = n as i32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.argmax)
+                .arg(x)
+                .arg(&n_i)
+                .arg(out_idx)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;

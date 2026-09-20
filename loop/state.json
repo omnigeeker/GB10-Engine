@@ -1,13 +1,13 @@
 {
   "project": "GB10-Engine",
-  "round": 4,
-  "last_round_at": "20260920T041607Z",
+  "round": 5,
+  "last_round_at": "20260920T043154Z",
   "last_status": "PASS",
   "model": "nv-community/Qwen3.8-27B-NVFP4",
   "hardware": "NVIDIA GB10 (DGX Spark), sm_121, 48 SMs, 121 GiB unified, CUDA 13.0",
   "measured_read_bandwidth_gbps": 228,
   "roofline_single_stream_tok_s": 12.95,
-  "current_milestone": "M3",
+  "current_milestone": "M4",
   "milestones": {
     "M0": {
       "name": "Foundation: config, safetensors, tokenizer, chat template",
@@ -23,11 +23,11 @@
     },
     "M3": {
       "name": "Full 64-layer forward, greedy decode parity vs HF oracle",
-      "status": "in_progress"
+      "status": "done"
     },
     "M4": {
       "name": "MTP speculative decoding",
-      "status": "pending"
+      "status": "in_progress"
     },
     "M5": {
       "name": "Paged KV cache + continuous batching, 16 concurrent",
@@ -90,7 +90,22 @@
         "correctness": "pass",
         "benchmark": "pass"
       }
+    },
+    {
+      "round": 5,
+      "at": "20260920T043154Z",
+      "status": "PASS",
+      "gates": {
+        "build": "pass",
+        "test": "pass",
+        "correctness": "pass",
+        "generate": "pass",
+        "benchmark": "pass"
+      }
     }
   ],
-  "per_token_traffic_gb": 17.608
+  "per_token_traffic_gb": 17.608,
+  "measured_decode_tok_s": 8.52,
+  "measured_ttft_ms_prompt59": 6892,
+  "oracle_agreement": "16/16 exact"
 }

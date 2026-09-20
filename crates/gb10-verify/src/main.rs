@@ -12,9 +12,11 @@
 //! correctness gate keys on.
 
 use anyhow::{bail, Context, Result};
+use gb10_core::chat::{text_message, ChatTemplate};
 use gb10_core::config::ModelConfig;
+use gb10_core::tokenizer::QwenTokenizer;
 use gb10_cuda::Device;
-use gb10_model::{LayerState, Scratch, Store};
+use gb10_model::{LayerState, Model, ModelState, Scratch, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -282,6 +284,142 @@ fn layer_parity(args: &Args) -> Result<bool> {
     Ok(ok)
 }
 
+
+/// End-to-end greedy decode with the real 64-layer model.
+///
+/// This is the M3 gate: it exercises the whole stack (embedding gather, all 48
+/// DeltaNet + 16 attention layers, final norm, NVFP4 lm_head, argmax) rather
+/// than a single layer.
+///
+/// If `fixtures/oracle/greedy_tokens.json` exists it is used as the reference:
+/// the prompt token ids must match exactly and the greedy continuation must
+/// agree token for token.
+fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+    let tmpl = ChatTemplate::from_model_dir(&args.model)?;
+
+    // The oracle fixes the prompt and the number of steps, so both runs are
+    // compared on identical input.
+    let oracle_path = args.fixtures.join("greedy_tokens.json");
+    let oracle: Option<serde_json::Value> = if oracle_path.exists() {
+        Some(serde_json::from_str(&std::fs::read_to_string(&oracle_path)?)?)
+    } else {
+        None
+    };
+    let (prompt, n_new) = match &oracle {
+        Some(o) => (
+            o["prompt"].as_str().unwrap_or(prompt).to_string(),
+            o["n_new"].as_u64().unwrap_or(n_new as u64) as usize,
+        ),
+        None => (prompt.to_string(), n_new),
+    };
+
+    let ids = if args.raw {
+        tok.encode(&prompt, false)?
+    } else {
+        let rendered = tmpl.render(
+            &[text_message("user", &prompt)],
+            &gb10_core::chat::ChatTemplateOptions::default(),
+        )?;
+        tok.encode(&rendered, false)?
+    };
+    println!("prompt: {} tokens", ids.len());
+
+    if let Some(o) = &oracle {
+        let want: Vec<u32> = o["prompt_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+            .unwrap_or_default();
+        if !want.is_empty() && want != ids {
+            bail!(
+                "prompt tokenisation differs from the oracle\n  engine: {ids:?}\n  oracle: {want:?}"
+            );
+        }
+        println!("prompt ids match the oracle ({} tokens)", ids.len());
+    }
+
+    let t0 = std::time::Instant::now();
+    let model = Model::load_from(&dev, cfg.clone(), &args.model)?;
+    println!(
+        "model loaded in {:.1}s  ({:.2} GB streamed per token)",
+        t0.elapsed().as_secs_f64(),
+        model.traffic_bytes() as f64 / 1e9
+    );
+
+    let mut state = ModelState::new(&dev, &model, args.max_seq)?;
+    let mut sc = Scratch::new(&dev, &text)?;
+
+    let t1 = std::time::Instant::now();
+    let mut next = model.prefill(&dev, &ids, &mut state, &mut sc)?;
+    println!(
+        "TTFT {:.1} ms ({} prompt tokens)",
+        t1.elapsed().as_secs_f64() * 1e3,
+        ids.len()
+    );
+
+    let mut out = Vec::with_capacity(n_new);
+    let t2 = std::time::Instant::now();
+    for _ in 0..n_new {
+        if tok.is_eos(next) {
+            break;
+        }
+        out.push(next);
+        next = model.step(&dev, next, &mut state, &mut sc)?;
+    }
+    let dt = t2.elapsed();
+    println!(
+        "decoded {} tokens in {:.3}s -> {:.2} tok/s",
+        out.len(),
+        dt.as_secs_f64(),
+        out.len() as f64 / dt.as_secs_f64()
+    );
+    println!("ids:  {:?}", &out[..out.len().min(24)]);
+    println!("text: {:?}", tok.decode(&out, false)?);
+
+    let Some(o) = &oracle else {
+        println!("no {} — nothing to compare against", oracle_path.display());
+        return Ok(true);
+    };
+    let want: Vec<u32> = o["tokens"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+        .unwrap_or_default();
+    let n = out.len().min(want.len());
+    let agree = (0..n).filter(|&i| out[i] == want[i]).count();
+    let first_bad = (0..n).find(|&i| out[i] != want[i]);
+    let rate = if n == 0 { 0.0 } else { agree as f64 / n as f64 };
+    println!(
+        "oracle agreement: {agree}/{n} ({:.1}%)  reference={}",
+        rate * 100.0,
+        o["reference"].as_str().unwrap_or("?")
+    );
+    match first_bad {
+        None if out.len() == want.len() => {
+            println!("  exact match");
+            Ok(true)
+        }
+        None => {
+            println!(
+                "  matched on the first {n}, engine produced {} vs oracle {}",
+                out.len(),
+                want.len()
+            );
+            Ok(out.len() >= want.len())
+        }
+        Some(i) => {
+            println!(
+                "  first divergence at index {i}: engine {} vs oracle {}",
+                out[i], want[i]
+            );
+            Ok(rate >= args.min_agree)
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Args {
     model: PathBuf,
@@ -291,6 +429,13 @@ struct Args {
     tol_norm: f32,
     tol_rel: f32,
     quiet: bool,
+    raw: bool,
+    prompt: String,
+    n_new: usize,
+    /// Minimum token agreement with the bf16 oracle before the gate passes.
+    /// The oracle is bf16-rounded, so bit-exactness is not expected; see
+    /// docs/TARGETS.md T7.
+    min_agree: f64,
 }
 
 fn parse_args() -> Result<(String, Args)> {
@@ -310,6 +455,10 @@ fn parse_args() -> Result<(String, Args)> {
         tol_norm: 2e-3,
         tol_rel: 5e-2,
         quiet: false,
+        raw: false,
+        prompt: String::new(),
+        n_new: 32,
+        min_agree: 0.85,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -349,6 +498,22 @@ fn parse_args() -> Result<(String, Args)> {
                 a.quiet = true;
                 i += 1;
             }
+            "--raw" => {
+                a.raw = true;
+                i += 1;
+            }
+            "--prompt" => {
+                a.prompt = val()?;
+                i += 2;
+            }
+            "--n" => {
+                a.n_new = val()?.parse()?;
+                i += 2;
+            }
+            "--min-agree" => {
+                a.min_agree = val()?.parse()?;
+                i += 2;
+            }
             other => bail!("unknown flag {other}"),
         }
     }
@@ -367,6 +532,19 @@ fn main() -> Result<()> {
     let layers: Vec<usize> = match cmd.as_str() {
         // Layer 0 is a Gated DeltaNet block, layer 3 a full-attention block.
         // Both are part of the gate.
+        "generate" => {
+            let prompt = if args.prompt.is_empty() {
+                "What is the capital of France?".to_string()
+            } else {
+                args.prompt.clone()
+            };
+            let ok = generate(&args, &prompt, args.n_new)?;
+            if !ok {
+                bail!("generate gate FAILED");
+            }
+            println!("\ngenerate: OK");
+            return Ok(());
+        }
         "layer-parity" | "all" => {
             if args.layer == usize::MAX {
                 vec![0, 3]
@@ -387,6 +565,10 @@ fn main() -> Result<()> {
             tol_norm: args.tol_norm,
             tol_rel: args.tol_rel,
             quiet: args.quiet,
+            raw: args.raw,
+            prompt: args.prompt.clone(),
+            n_new: args.n_new,
+            min_agree: args.min_agree,
         };
         all_ok &= layer_parity(&a)?;
     }

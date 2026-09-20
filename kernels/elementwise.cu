@@ -401,3 +401,52 @@ extern "C" __global__ void kv_cache_append_kernel(const float* __restrict__ k,
     k_cache[(size_t)pos * n + i] = k[i];
     v_cache[(size_t)pos * n + i] = v[i];
 }
+
+// ---------------------------------------------------------------------------
+// Embedding gather
+// ---------------------------------------------------------------------------
+// One embedding row, bf16 table -> fp32 activation. This is a row gather, not
+// a full table read: ~10 KB per token out of a 2.5 GB table, which is why
+// `embed_tokens` is excluded from the per-token traffic budget in
+// docs/PHYSICS.md.
+extern "C" __global__ void embed_gather_kernel(const uint16_t* __restrict__ table,
+                                               int token, float* __restrict__ out,
+                                               int hidden) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    out[i] = bf16_to_float(table[(size_t)token * hidden + i]);
+}
+
+// ---------------------------------------------------------------------------
+// Greedy argmax
+// ---------------------------------------------------------------------------
+// Single block, so no atomics and no second pass. Ties resolve to the lowest
+// index, matching `torch.argmax`.
+extern "C" __global__ void argmax_kernel(const float* __restrict__ x, int n,
+                                         int* __restrict__ out_idx) {
+    __shared__ float best_val[256];
+    __shared__ int best_idx[256];
+    const int tid = threadIdx.x;
+
+    float bv = -INFINITY;
+    int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = x[i];
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    best_val[tid] = bv;
+    best_idx[tid] = bi;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s && best_val[tid + s] > best_val[tid]) {
+            best_val[tid] = best_val[tid + s];
+            best_idx[tid] = best_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_idx[0] = best_idx[0];
+}
