@@ -56,6 +56,18 @@ __device__ __forceinline__ XVec load_x(const float* __restrict__ xb, int e0) {
     return v;
 }
 
+// Same as `load_x`, but for a `__shared__` source: `__ldg` is only valid on
+// global pointers and faults with CUDA_ERROR_INVALID_ADDRESS_SPACE otherwise.
+__device__ __forceinline__ XVec load_x_shared(const float* xs, int e0) {
+    const float4* p = reinterpret_cast<const float4*>(xs + e0);
+    XVec v;
+    v.a0 = p[0];
+    v.a1 = p[1];
+    v.a2 = p[2];
+    v.a3 = p[3];
+    return v;
+}
+
 __device__ __forceinline__ float dot16(const float* w, const XVec& v) {
     float t = w[0] * v.a0.x + w[1] * v.a0.y + w[2] * v.a0.z + w[3] * v.a0.w;
     t = fmaf(w[4], v.a1.x, t);
@@ -327,7 +339,7 @@ __device__ __forceinline__ void bf16_gemv_tmpl(
 // ---------------------------------------------------------------------------
 #define GB10_BATCH_MAX 16
 
-template <int BMAX>
+template <int ROWS, int BMAX>
 __device__ __forceinline__ void nvfp4_gemv_batch_tmpl(
     const float* __restrict__ x, const uint8_t* __restrict__ w,
     const uint8_t* __restrict__ wscale, const float* __restrict__ scale2,
@@ -338,65 +350,102 @@ __device__ __forceinline__ void nvfp4_gemv_batch_tmpl(
     const int rowbytes = K >> 1;
     const int scalerow = K >> 4;
     const int full_tiles = K / kTile;
-    const int row_stride = gridDim.x * nwarps;
+    const int row_stride = gridDim.x * nwarps * ROWS;
 
-    for (int row = blockIdx.x * nwarps + warp; row < N; row += row_stride) {
-        float acc[BMAX];
+    // Each warp keeps ROWS rows in flight so that one x load feeds ROWS rows.
+    // With ROWS = 1 the x-vectors are re-read once per row, which at batch 16
+    // is ~8x the weight traffic and makes the kernel L2-bound.
+    for (int rbase = (blockIdx.x * nwarps + warp) * ROWS; rbase < N;
+         rbase += row_stride) {
+        float acc[ROWS][BMAX];
 #pragma unroll
-        for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
-
-        const uint8_t* __restrict__ wr = w + (size_t)row * rowbytes;
-        const uint8_t* __restrict__ sr = wscale + (size_t)row * scalerow;
+        for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+            for (int b = 0; b < BMAX; ++b) acc[r][b] = 0.0f;
 
         for (int i = 0; i < full_tiles; ++i) {
             const int e0 = i * kTile + lane * kVec;
-            const uint2 packed = *reinterpret_cast<const uint2*>(wr + (e0 >> 1));
-            const float s = e4m3_to_float(sr[i * kWarp + lane]);
+            const int so = i * kWarp + lane;
 
-            float lo[8], hi[8];
-            e2m1x8_to_float(packed.x, lo);
-            e2m1x8_to_float(packed.y, hi);
+            uint2 pk[ROWS];
+            float sc[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    pk[r] = *reinterpret_cast<const uint2*>(
+                        w + (size_t)row * rowbytes + (e0 >> 1));
+                    sc[r] = e4m3_to_float(wscale[(size_t)row * scalerow + so]);
+                }
+            }
+
+            float lo[ROWS][8], hi[ROWS][8];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                if (rbase + r < N) {
+                    e2m1x8_to_float(pk[r].x, lo[r]);
+                    e2m1x8_to_float(pk[r].y, hi[r]);
+                }
+            }
 
             for (int b = 0; b < B; ++b) {
                 const XVec xv = load_x(x + (size_t)b * K, e0);
-                float t = lo[0] * xv.a0.x + lo[1] * xv.a0.y + lo[2] * xv.a0.z +
-                          lo[3] * xv.a0.w;
-                t = fmaf(lo[4], xv.a1.x, t);
-                t = fmaf(lo[5], xv.a1.y, t);
-                t = fmaf(lo[6], xv.a1.z, t);
-                t = fmaf(lo[7], xv.a1.w, t);
-                t = fmaf(hi[0], xv.a2.x, t);
-                t = fmaf(hi[1], xv.a2.y, t);
-                t = fmaf(hi[2], xv.a2.z, t);
-                t = fmaf(hi[3], xv.a2.w, t);
-                t = fmaf(hi[4], xv.a3.x, t);
-                t = fmaf(hi[5], xv.a3.y, t);
-                t = fmaf(hi[6], xv.a3.z, t);
-                t = fmaf(hi[7], xv.a3.w, t);
-                acc[b] = fmaf(t, s, acc[b]);
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    if (rbase + r < N) {
+                        float t = lo[r][0] * xv.a0.x + lo[r][1] * xv.a0.y +
+                                  lo[r][2] * xv.a0.z + lo[r][3] * xv.a0.w;
+                        t = fmaf(lo[r][4], xv.a1.x, t);
+                        t = fmaf(lo[r][5], xv.a1.y, t);
+                        t = fmaf(lo[r][6], xv.a1.z, t);
+                        t = fmaf(lo[r][7], xv.a1.w, t);
+                        t = fmaf(hi[r][0], xv.a2.x, t);
+                        t = fmaf(hi[r][1], xv.a2.y, t);
+                        t = fmaf(hi[r][2], xv.a2.z, t);
+                        t = fmaf(hi[r][3], xv.a2.w, t);
+                        t = fmaf(hi[r][4], xv.a3.x, t);
+                        t = fmaf(hi[r][5], xv.a3.y, t);
+                        t = fmaf(hi[r][6], xv.a3.z, t);
+                        t = fmaf(hi[r][7], xv.a3.w, t);
+                        acc[r][b] = fmaf(t, sc[r], acc[r][b]);
+                    }
+                }
             }
         }
 
         for (int e = full_tiles * kTile + lane; e < K; e += kWarp) {
-            const uint8_t byte = wr[e >> 1];
-            const uint8_t nib = (e & 1) ? (byte >> 4) : (byte & 0xF);
-            const float wv = e2m1_to_float(nib) * e4m3_to_float(sr[e >> 4]);
-            for (int b = 0; b < B; ++b)
-                acc[b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[b]);
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    const uint8_t byte = w[(size_t)row * rowbytes + (e >> 1)];
+                    const uint8_t nib = (e & 1) ? (byte >> 4) : (byte & 0xF);
+                    const float wv =
+                        e2m1_to_float(nib) * e4m3_to_float(wscale[(size_t)row * scalerow + (e >> 4)]);
+                    for (int b = 0; b < B; ++b)
+                        acc[r][b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[r][b]);
+                }
+            }
         }
 
         const float s2 = __ldg(scale2);
 #pragma unroll
-        for (int b = 0; b < BMAX; ++b) {
-            if (b < B) {
-                const float a = warp_reduce_sum(acc[b]);
-                if (lane == 0) y[(size_t)b * N + row] = a * s2;
+        for (int r = 0; r < ROWS; ++r) {
+            const int row = rbase + r;
+            if (row < N) {
+#pragma unroll
+                for (int b = 0; b < BMAX; ++b) {
+                    if (b < B) {
+                        const float a = warp_reduce_sum(acc[r][b]);
+                        if (lane == 0) y[(size_t)b * N + row] = a * s2;
+                    }
+                }
             }
         }
     }
 }
 
-template <int BMAX>
+template <int ROWS, int BMAX>
 __device__ __forceinline__ void fp8_gemv_batch_tmpl(
     const float* __restrict__ x, const uint8_t* __restrict__ w,
     const float* __restrict__ wscale, float* __restrict__ y, int N, int K, int B) {
@@ -404,39 +453,65 @@ __device__ __forceinline__ void fp8_gemv_batch_tmpl(
     const int warp = threadIdx.x >> 5;
     const int nwarps = blockDim.x >> 5;
     const int full_tiles = K / kTile;
-    const int row_stride = gridDim.x * nwarps;
+    const int row_stride = gridDim.x * nwarps * ROWS;
 
-    for (int row = blockIdx.x * nwarps + warp; row < N; row += row_stride) {
-        float acc[BMAX];
+    for (int rbase = (blockIdx.x * nwarps + warp) * ROWS; rbase < N;
+         rbase += row_stride) {
+        float acc[ROWS][BMAX];
 #pragma unroll
-        for (int b = 0; b < BMAX; ++b) acc[b] = 0.0f;
+        for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+            for (int b = 0; b < BMAX; ++b) acc[r][b] = 0.0f;
 
-        const uint8_t* __restrict__ wr = w + (size_t)row * K;
         for (int i = 0; i < full_tiles; ++i) {
             const int e0 = i * kTile + lane * kVec;
-            const uint4 packed = *reinterpret_cast<const uint4*>(wr + e0);
-            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
-            float wv[kVec];
+
+            float wv[ROWS][kVec];
 #pragma unroll
-            for (int j = 0; j < kVec; ++j) wv[j] = e4m3_to_float(pb[j]);
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    const uint4 packed =
+                        *reinterpret_cast<const uint4*>(w + (size_t)row * K + e0);
+                    const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
+#pragma unroll
+                    for (int j = 0; j < kVec; ++j) wv[r][j] = e4m3_to_float(pb[j]);
+                }
+            }
+
             for (int b = 0; b < B; ++b) {
                 const XVec xv = load_x(x + (size_t)b * K, e0);
-                acc[b] += dot16(wv, xv);
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    if (rbase + r < N) acc[r][b] += dot16(wv[r], xv);
+                }
             }
         }
 
         for (int e = full_tiles * kTile + lane; e < K; e += kWarp) {
-            const float wv = e4m3_to_float(wr[e]);
-            for (int b = 0; b < B; ++b)
-                acc[b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[b]);
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    const float wv = e4m3_to_float(w[(size_t)row * K + e]);
+                    for (int b = 0; b < B; ++b)
+                        acc[r][b] = fmaf(wv, __ldg(x + (size_t)b * K + e), acc[r][b]);
+                }
+            }
         }
 
         const float s = __ldg(wscale);
 #pragma unroll
-        for (int b = 0; b < BMAX; ++b) {
-            if (b < B) {
-                const float a = warp_reduce_sum(acc[b]);
-                if (lane == 0) y[(size_t)b * N + row] = a * s;
+        for (int r = 0; r < ROWS; ++r) {
+            const int row = rbase + r;
+            if (row < N) {
+#pragma unroll
+                for (int b = 0; b < BMAX; ++b) {
+                    if (b < B) {
+                        const float a = warp_reduce_sum(acc[r][b]);
+                        if (lane == 0) y[(size_t)b * N + row] = a * s;
+                    }
+                }
             }
         }
     }
@@ -490,14 +565,14 @@ nvfp4_gemv_batch_kernel(const float* __restrict__ x, const uint8_t* __restrict__
                         const uint8_t* __restrict__ wscale,
                         const float* __restrict__ scale2, float* __restrict__ y,
                         int N, int K, int B) {
-    nvfp4_gemv_batch_tmpl<GB10_BATCH_MAX>(x, w, wscale, scale2, y, N, K, B);
+    nvfp4_gemv_batch_tmpl<4, GB10_BATCH_MAX>(x, w, wscale, scale2, y, N, K, B);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
 fp8_gemv_batch_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                       const float* __restrict__ wscale, float* __restrict__ y,
                       int N, int K, int B) {
-    fp8_gemv_batch_tmpl<GB10_BATCH_MAX>(x, w, wscale, y, N, K, B);
+    fp8_gemv_batch_tmpl<4, GB10_BATCH_MAX>(x, w, wscale, y, N, K, B);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
