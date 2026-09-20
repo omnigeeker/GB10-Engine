@@ -455,6 +455,11 @@ pub struct Scratch {
 }
 
 impl Scratch {
+    /// One token's worth of scratch, for the per-token parity gate and decode.
+    pub fn new_single(dev: &Device, cfg: &TextConfig) -> Result<Self> {
+        Self::new(dev, cfg, 1)
+    }
+
     pub fn new(dev: &Device, cfg: &TextConfig, max_seq: usize) -> Result<Self> {
         // Every buffer below is per-token, so prefill needs `max_seq` copies
         // of each. At 512 tokens that is ~300 MB, which is cheap next to the

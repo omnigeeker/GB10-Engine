@@ -151,7 +151,7 @@ fn layer_parity(args: &Args) -> Result<bool> {
 
     let layer = store.layer(&dev, &text, args.layer)?;
     let mut state = LayerState::new(&dev, &text, &layer, args.max_seq)?;
-    let mut sc = Scratch::new(&dev, &text, 512)?;
+    let mut sc = Scratch::new_single(&dev, &text)?;
 
     let mut xbuf = dev.stream().alloc_zeros::<f32>(hidden)?;
     let mut obuf = dev.stream().alloc_zeros::<f32>(hidden)?;
