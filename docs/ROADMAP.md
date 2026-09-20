@@ -466,6 +466,21 @@ writing its recurrent state and conv history into slot 0, destroying sequence
 0's state. Both kernels now take a base. That took the gate from 0/4 to 1/4 and
 pushed first divergence from token 1 to token 3.
 
+**Bisect (round 31): the recurrence kernel is exonerated.** The original
+`gated_delta_rule_step` already indexes its state as `b * n_v_heads * D * D`,
+which is exactly `rec_stride`, so calling it with `batch = n_seq` addresses the
+state identically to `gated_delta_rule_step_multi`. Swapping one for the other
+produced a **byte-identical failure** (same 1/4, same wrong tokens). Two
+independent implementations agreeing on the same wrong answer means the
+divergence is *upstream* of the recurrence -- in the conv step, the
+projections, or state written during prefill -- and the recurrence is merely
+propagating it. `_multi` is restored (it is equivalent and needs one launch).
+
+Also ruled out this round: `Scratch` sizing (every buffer really is `n * max_seq`,
+so the batch rows fit), `block_reduce_sum` (static `__shared__`, so it cannot
+alias `attn_decode_multi`'s dynamic `scores`), and the GEMV batch path (both
+`x` and `y` are indexed by `blockIdx.y`).
+
 **Still failing: 1/4.** Sequence 0 (shortest prompt, 5 tokens) is exact over 16
 tokens; sequences 1, 2 and 3 diverge at tokens 2, 3 and 3. The pattern -- a
 shorter prompt surviving longer -- points at state that is still indexed
