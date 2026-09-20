@@ -30,6 +30,12 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "kv_cache_append_kernel",
     "embed_gather_kernel",
     "argmax_kernel",
+    "l2norm_scale_batched_kernel",
+    "delta_gate_batched_kernel",
+    "conv1d_prefill_silu_kernel",
+    "rope_neox_batched_kernel",
+    "kv_cache_append_batched_kernel",
+    "gated_delta_rule_chunk_kernel",
 ];
 
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
@@ -53,6 +59,12 @@ pub struct Ops {
     kv_cache_append: CudaFunction,
     embed_gather: CudaFunction,
     argmax: CudaFunction,
+    l2norm_scale_batched: CudaFunction,
+    delta_gate_batched: CudaFunction,
+    conv1d_prefill_silu: CudaFunction,
+    rope_neox_batched: CudaFunction,
+    kv_cache_append_batched: CudaFunction,
+    gated_delta_rule_chunk: CudaFunction,
 }
 
 fn take(map: &mut HashMap<String, CudaFunction>, n: &str) -> Result<CudaFunction> {
@@ -92,6 +104,12 @@ impl Ops {
             kv_cache_append: take(map, "kv_cache_append_kernel")?,
             embed_gather: take(map, "embed_gather_kernel")?,
             argmax: take(map, "argmax_kernel")?,
+            l2norm_scale_batched: take(map, "l2norm_scale_batched_kernel")?,
+            delta_gate_batched: take(map, "delta_gate_batched_kernel")?,
+            conv1d_prefill_silu: take(map, "conv1d_prefill_silu_kernel")?,
+            rope_neox_batched: take(map, "rope_neox_batched_kernel")?,
+            kv_cache_append_batched: take(map, "kv_cache_append_batched_kernel")?,
+            gated_delta_rule_chunk: take(map, "gated_delta_rule_chunk_kernel")?,
         })
     }
 
@@ -748,6 +766,100 @@ impl Ops {
         }
         Ok(())
     }
+    /// Batched `l2norm_scale` over `batch` rows of `row_stride` floats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn l2norm_scale_batched(
+        &self, dev: &Device, x: &mut CudaSlice<f32>, row_stride: usize, offset: usize,
+        vectors: usize, n: usize, batch: usize, scale: f32, eps: f32,
+    ) -> Result<()> {
+        let (rs, off, nn) = (row_stride as i32, offset as i32, n as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.l2norm_scale_batched)
+                .arg(x).arg(&rs).arg(&off).arg(&nn).arg(&scale).arg(&eps)
+                .launch(LaunchConfig { grid_dim: (vectors as u32, batch as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Batched `delta_gate` over `batch` rows of `n` heads.
+    pub fn delta_gate_batched(
+        &self, dev: &Device, a: &CudaSlice<f32>, b: &CudaSlice<f32>, a_log: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>, decay: &mut CudaSlice<f32>, beta: &mut CudaSlice<f32>,
+        n: usize, batch: usize,
+    ) -> Result<()> {
+        let nn = n as i32;
+        unsafe {
+            dev.stream().launch_builder(&self.delta_gate_batched)
+                .arg(a).arg(b).arg(a_log).arg(dt_bias).arg(decay).arg(beta).arg(&nn)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,256), batch as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Causal depthwise conv + SiLU over `t` rows, threading `hist` through.
+    pub fn conv1d_prefill_silu(
+        &self, dev: &Device, x: &CudaSlice<f32>, w: &CudaSlice<f32>, hist: &mut CudaSlice<f32>,
+        y: &mut CudaSlice<f32>, channels: usize, t: usize,
+    ) -> Result<()> {
+        let (c, tt) = (channels as i32, t as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.conv1d_prefill_silu)
+                .arg(x).arg(w).arg(hist).arg(y).arg(&c).arg(&tt)
+                .launch(LaunchConfig { grid_dim: (cdiv(channels,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// RoPE over `t` rows with per-position `cos`/`sin` tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_batched(
+        &self, dev: &Device, q: &mut CudaSlice<f32>, k: &mut CudaSlice<f32>,
+        cos: &CudaSlice<f32>, sin: &CudaSlice<f32>, n_q_heads: usize, n_k_heads: usize,
+        head_dim: usize, half: usize, t: usize,
+    ) -> Result<()> {
+        let (nq, nk, hd, hf) = (n_q_heads as i32, n_k_heads as i32, head_dim as i32, half as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.rope_neox_batched)
+                .arg(q).arg(k).arg(cos).arg(sin).arg(&nq).arg(&nk).arg(&hd).arg(&hf)
+                .launch(LaunchConfig { grid_dim: (cdiv((n_q_heads+n_k_heads)*half,256), t as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Append `t` rows of k/v into the cache starting at `start_pos`.
+    pub fn kv_cache_append_batched(
+        &self, dev: &Device, k: &CudaSlice<f32>, v: &CudaSlice<f32>, k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>, start_pos: usize, n_kv_heads: usize, head_dim: usize, t: usize,
+    ) -> Result<()> {
+        let (sp, nkv, hd) = (start_pos as i32, n_kv_heads as i32, head_dim as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.kv_cache_append_batched)
+                .arg(k).arg(v).arg(k_cache).arg(v_cache).arg(&sp).arg(&nkv).arg(&hd)
+                .launch(LaunchConfig { grid_dim: (cdiv(n_kv_heads*head_dim,256), t as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// The Gated DeltaNet recurrence over `t` rows, state resident in shared
+    /// memory for the whole loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_rule_chunk(
+        &self, dev: &Device, qkv: &CudaSlice<f32>, q_off: usize, k_off: usize, v_off: usize,
+        row_stride: usize, decay: &CudaSlice<f32>, beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>, out: &mut CudaSlice<f32>, t: usize, n_v_heads: usize,
+        n_k_heads: usize, group: usize,
+    ) -> Result<()> {
+        let (qo, ko, vo, rs, tt, nv, nk, g) =
+            (q_off as i32, k_off as i32, v_off as i32, row_stride as i32, t as i32, n_v_heads as i32, n_k_heads as i32, group as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.gated_delta_rule_chunk)
+                .arg(qkv).arg(&qo).arg(&ko).arg(&vo).arg(&rs).arg(decay).arg(beta)
+                .arg(state).arg(out).arg(&tt).arg(&nv).arg(&nk).arg(&g)
+                .launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
 }
 
 fn need(ok: bool, what: &str) -> Result<()> {

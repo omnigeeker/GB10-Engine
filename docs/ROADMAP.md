@@ -106,13 +106,27 @@ tok/s of prompt processing. See `bench/results/llamacpp-baseline.json`.
 
 This is the largest single win available and it is independent of decode.
 
-- [ ] batch the 16 full-attention layers over the whole prompt (they are
-      already parallel in T; only the causal mask and RoPE positions differ)
-- [ ] chunked prefill for the 48 Gated-DeltaNet layers (the recurrence is
-      sequential in T, but the chunked form processes a block of tokens per
-      step while keeping the same recurrent state)
-- [ ] tiled flash-attention prefill kernel to replace the O(T^2)-per-thread
-      `attn_prefill_kernel`
+**Done:** the six batched kernels and their `Ops` launchers are in place and
+compile -- `l2norm_scale_batched`, `delta_gate_batched`,
+`conv1d_prefill_silu` (threads the 3-token conv history in and out so a prompt
+can be chunked), `rope_neox_batched`, `kv_cache_append_batched`, and
+`gated_delta_rule_chunk` (the whole T-loop in one launch with the 3.1 MB
+recurrent state held in shared memory, rather than one launch plus a state
+round trip per token).
+
+`rmsnorm_zero_centered`, `rmsnorm_gated` and `add` already took a row count, and
+`Linear::forward` already takes `batch`, so the projections and MLP need no new
+kernels.
+
+**Remaining wiring:**
+- [ ] size `Scratch` and `ModelState::{a,b,normed}` by `max_seq` instead of 1
+      token (~300 MB at 512, which is fine)
+- [ ] `deinterleave_heads` needs a batched variant (it has no row stride today)
+- [ ] `DeltaNetLayer::forward_prefill` / `FullAttnLayer::forward_prefill`
+- [ ] `Model::prefill`: embed all T tokens, run all 64 layers batched, then
+      norm + lm_head + argmax on the last row only
+- [ ] replace the O(T^2)-per-thread `attn_prefill_kernel` with a tiled
+      flash-attention kernel
 
 ## M7 — Roofline optimization (in progress)
 

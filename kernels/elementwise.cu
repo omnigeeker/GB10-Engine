@@ -450,3 +450,172 @@ extern "C" __global__ void argmax_kernel(const float* __restrict__ x, int n,
     }
     if (tid == 0) out_idx[0] = best_idx[0];
 }
+
+// ---------------------------------------------------------------------------
+// Batched-prefill variants.
+//
+// The decode path runs one token at a time, so every kernel above is written
+// for a single row. Prompt processing needs the same maths over T rows at
+// once, otherwise prefill costs exactly what decode costs per token -- which
+// is what made TTFT ~85x worse than llama.cpp. Only the recurrence and the
+// causal attention are genuinely sequential in T; everything else is
+// embarrassingly parallel across rows.
+// ---------------------------------------------------------------------------
+
+// x is [T, row_stride]; normalise `vectors` independent n-element vectors per
+// row starting at `offset`.
+extern "C" __global__ void l2norm_scale_batched_kernel(float* __restrict__ x, int row_stride,
+                                                       int offset, int n, float scale,
+                                                       float eps) {
+    float* __restrict__ xr = x + (size_t)blockIdx.y * row_stride + offset +
+                             (size_t)blockIdx.x * n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        ss = fmaf(v, v, ss);
+    }
+    const float mul = scale * rsqrtf(block_reduce_sum(ss) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) xr[i] *= mul;
+}
+
+// a/b/decay/beta are [T, n].
+extern "C" __global__ void delta_gate_batched_kernel(const float* __restrict__ a,
+                                                     const float* __restrict__ b,
+                                                     const float* __restrict__ a_log,
+                                                     const float* __restrict__ dt_bias,
+                                                     float* __restrict__ decay,
+                                                     float* __restrict__ beta, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t off = (size_t)blockIdx.y * n + i;
+    const float x = a[off] + dt_bias[i];
+    const float sp = (x > 20.0f) ? x : log1pf(__expf(x));
+    decay[off] = __expf(-__expf(a_log[i]) * sp);
+    beta[off] = 1.0f / (1.0f + __expf(-b[off]));
+}
+
+// Causal depthwise conv over T rows. `hist` carries the `k-1` tokens before
+// the chunk in, and the last `k-1` tokens back out, so a prompt can be
+// processed in pieces without losing continuity.
+extern "C" __global__ void conv1d_prefill_silu_kernel(const float* __restrict__ x,
+                                                      const float* __restrict__ w,
+                                                      float* __restrict__ hist,
+                                                      float* __restrict__ y, int channels,
+                                                      int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float* __restrict__ wc = w + (size_t)c * 4;
+    float* __restrict__ h = hist + (size_t)c * 3;
+    float h0 = h[0], h1 = h[1], h2 = h[2];
+    for (int t = 0; t < T; ++t) {
+        const float xc = x[(size_t)t * channels + c];
+        const float acc = fmaf(wc[0], h0, fmaf(wc[1], h1, fmaf(wc[2], h2, wc[3] * xc)));
+        y[(size_t)t * channels + c] = silu_f(acc);
+        h0 = h1;
+        h1 = h2;
+        h2 = xc;
+    }
+    h[0] = h0;
+    h[1] = h1;
+    h[2] = h2;
+}
+
+// RoPE over T rows. cos/sin are [T, half].
+extern "C" __global__ void rope_neox_batched_kernel(float* __restrict__ q,
+                                                    float* __restrict__ k,
+                                                    const float* __restrict__ cs,
+                                                    const float* __restrict__ sn, int n_q_heads,
+                                                    int n_k_heads, int head_dim, int half) {
+    const int t = blockIdx.y;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = (n_q_heads + n_k_heads) * half;
+    if (idx >= total) return;
+
+    float* __restrict__ base;
+    int i;
+    if (idx < n_q_heads * half) {
+        base = q + (size_t)t * n_q_heads * head_dim + (size_t)(idx / half) * head_dim;
+        i = idx % half;
+    } else {
+        const int r = idx - n_q_heads * half;
+        base = k + (size_t)t * n_k_heads * head_dim + (size_t)(r / half) * head_dim;
+        i = r % half;
+    }
+    const size_t so = (size_t)t * half + i;
+    const float c = cs[so], s = sn[so];
+    const float a = base[i], b = base[i + half];
+    base[i] = fmaf(-b, s, a * c);
+    base[i + half] = fmaf(a, s, b * c);
+}
+
+// k/v are [T, n_kv_heads * head_dim]; appended starting at `start_pos`.
+extern "C" __global__ void kv_cache_append_batched_kernel(const float* __restrict__ k,
+                                                          const float* __restrict__ v,
+                                                          float* __restrict__ k_cache,
+                                                          float* __restrict__ v_cache,
+                                                          int start_pos, int n_kv_heads,
+                                                          int head_dim) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = n_kv_heads * head_dim;
+    if (i >= n) return;
+    const int t = blockIdx.y;
+    k_cache[(size_t)(start_pos + t) * n + i] = k[(size_t)t * n + i];
+    v_cache[(size_t)(start_pos + t) * n + i] = v[(size_t)t * n + i];
+}
+
+// The Gated DeltaNet recurrence is the one part of prefill that cannot be
+// parallelised across T, so it is run as a T-iteration loop inside a single
+// launch with the recurrent state held in shared memory. Launching one kernel
+// per token instead would cost ~30us of launch plus a 3.1 MB state round trip
+// per layer per token.
+extern "C" __global__ void gated_delta_rule_chunk_kernel(
+    const float* __restrict__ qkv, int q_off, int k_off, int v_off, int row_stride,
+    const float* __restrict__ decay, const float* __restrict__ beta,
+    float* __restrict__ state, float* __restrict__ out, int T, int n_v_heads, int n_k_heads,
+    int group) {
+    constexpr int D = 128;
+    const int hv = blockIdx.x;
+    const int b = blockIdx.y;
+    const int j = threadIdx.x;
+    const int kh = hv / group;
+
+    __shared__ float S[D][D + 1];
+    __shared__ float sk[D];
+
+    float* __restrict__ sh = state + ((size_t)b * n_v_heads + hv) * D * D;
+    for (int i = threadIdx.x; i < D * D; i += blockDim.x) S[i / D][i % D] = sh[i];
+    __syncthreads();
+
+    for (int t = 0; t < T; ++t) {
+        const float* __restrict__ row = qkv + (size_t)(b * T + t) * row_stride;
+        const float* __restrict__ qh = row + q_off + (size_t)kh * D;
+        const float* __restrict__ khp = row + k_off + (size_t)kh * D;
+        const float* __restrict__ vh = row + v_off + (size_t)hv * D;
+
+        for (int i = threadIdx.x; i < D; i += blockDim.x) sk[i] = khp[i];
+        __syncthreads();
+
+        const float dec = decay[(size_t)(b * T + t) * n_v_heads + hv];
+        const float bet = beta[(size_t)(b * T + t) * n_v_heads + hv];
+        const float vj = vh[j];
+
+        float kv = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float s = S[i][j] * dec;
+            S[i][j] = s;
+            kv = fmaf(s, sk[i], kv);
+        }
+        const float delta = (vj - kv) * bet;
+
+        float o = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float s = fmaf(sk[i], delta, S[i][j]);
+            S[i][j] = s;
+            o = fmaf(s, qh[i], o);
+        }
+        out[(size_t)(b * T + t) * n_v_heads * D + (size_t)hv * D + j] = o;
+        __syncthreads();
+    }
+
+    for (int i = threadIdx.x; i < D * D; i += blockDim.x) sh[i] = S[i / D][i % D];
+}
