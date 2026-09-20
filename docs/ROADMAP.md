@@ -333,6 +333,46 @@ it because its fixture prompt generates 16 tokens without reaching EOS.
 Generation is still serialised (one request at a time, greedy). Continuous
 batching is the next milestone.
 
+### M5 continuous batching: the refactor it actually needs (surveyed round 24)
+
+The layer code already threads a `batch` argument (`Mlp::forward(.., batch)`,
+`Layer::forward(.., batch)`, `Linear::forward(dev, x, y, batch)`,
+`gemv_launch_config(n, k, batch)`), which makes batching look closer than it
+is. It is not: **that `batch` is a *token* batch within one sequence, not a
+*sequence* batch.** `Model::prefill` uses it to push a whole prompt through the
+stack in one pass. Nothing indexes by sequence.
+
+What is single-sequence today, and where:
+
+| state | current shape | needed |
+|---|---|---|
+| `LayerState::k_cache` / `v_cache` | one cache | `[n_seq][max_seq][kv_dim]` |
+| `LayerState::n_keys` | one `usize` | per-sequence position |
+| `LayerState::conv_hist` | `conv_dim * 3` | `[n_seq][conv_dim * 3]` |
+| `LayerState::rec` | `48*128*128` | `[n_seq][48*128*128]` |
+| `ModelState::logits` / `idx` | one row | `[n_seq]` rows |
+| `Model::step` | one token | `step_batch(&[u32]) -> Vec<u32>` |
+
+The blockers are the kernels, not the Rust: `kv_cache_append(_batched)`,
+`conv1d_prefill_silu`, `gated_delta_rule_step/chunk` and `attn_prefill` all
+take a position and a cache base with no sequence stride, so each needs a
+`seq`/`stride` parameter and the address arithmetic redone. `rope_tables_range`
+already produces a per-position table, so RoPE itself is fine.
+
+Rough shape of the work: add a sequence stride to those four kernels, grow the
+four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add
+`Model::step_batch`, then have the server hold N states and schedule. The
+recurrent state is the memory driver: 48 x 128 x 128 x 4 B = 3.1 MB per layer
+per sequence, so 150 MB per sequence and **2.4 GB at n_seq=16** -- acceptable
+against 121 GiB unified, but it rules out a naive "one full state per request"
+pool much beyond 16.
+
+Note this is *true* batching (one GEMV pass over all 16 sequences), which is
+what the T3 target of >=195 tok/s aggregate at 16 needs. Serving 16 requests
+from 16 independent states on 16 threads would satisfy the *functional*
+concurrency requirement but only reach ~9.7 tok/s aggregate, because each
+sequence would still stream all 17.6 GB/token of weights separately.
+
 **Strategic note.** TTFT has gone 6273 -> 450 ms and the remaining gap is a
 pure GEMM-tuning problem with a known ceiling. Meanwhile three things the
 objective explicitly asks for are still untouched: **MTP speculative decoding,
