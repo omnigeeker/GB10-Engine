@@ -13,6 +13,7 @@
 
 pub mod layer;
 pub mod model;
+pub mod mtp;
 pub mod rope;
 pub mod weights;
 

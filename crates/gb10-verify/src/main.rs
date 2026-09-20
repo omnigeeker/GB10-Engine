@@ -16,6 +16,7 @@ use gb10_core::chat::{text_message, ChatTemplate};
 use gb10_core::config::ModelConfig;
 use gb10_core::tokenizer::QwenTokenizer;
 use gb10_cuda::Device;
+use gb10_model::mtp::Mtp;
 use gb10_model::{LayerState, Model, ModelState, Scratch, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -648,6 +649,42 @@ fn parse_args() -> Result<(String, Args)> {
     Ok((cmd, a))
 }
 
+/// Loads the MTP head and reports what it costs, without running it yet.
+///
+/// The head is unquantized BF16 while the decoder it drafts for is FP4, so the
+/// first thing worth knowing is what fraction of a decoder step the head costs.
+/// That ratio, not the acceptance rate, is what bounds the payoff of
+/// speculative decoding on this machine.
+fn mtp_probe(args: &Args) -> Result<()> {
+    let cfg = load_config(&args.model)?;
+    let dev = Device::new(0)?;
+    // The MTP tensors sit at the top level of the checkpoint, outside the
+    // `model.language_model.` prefix the decoder uses.
+    let store = Store::open(&args.model, "")?;
+    let model = Model::load_from(&dev, cfg.clone(), &args.model)?;
+    let mtp = Mtp::load(&store, &dev, &cfg.text_config)?;
+
+    let decoder = model.traffic_bytes();
+    let head = mtp.traffic_bytes();
+    println!("== MTP head ==\n");
+    println!("  mtp.fc              [{} x {}]", mtp.fc.n, mtp.fc.k);
+    println!("  self_attn.q_proj    [{} x {}]", mtp.layer.q_proj.n, mtp.layer.q_proj.k);
+    println!("  self_attn.k_proj    [{} x {}]", mtp.layer.k_proj.n, mtp.layer.k_proj.k);
+    println!("  self_attn.v_proj    [{} x {}]", mtp.layer.v_proj.n, mtp.layer.v_proj.k);
+    println!("  self_attn.o_proj    [{} x {}]", mtp.layer.o_proj.n, mtp.layer.o_proj.k);
+    println!("  mlp.gate_proj       [{} x {}]", mtp.layer.mlp.gate.n, mtp.layer.mlp.gate.k);
+    println!("  mlp.down_proj       [{} x {}]", mtp.layer.mlp.down.n, mtp.layer.mlp.down.k);
+    println!();
+    println!("  decoder traffic     {decoder:>10} B/token");
+    println!(
+        "  mtp head traffic    {head:>10} B/token   ({:.1}% of a decoder step)",
+        100.0 * head as f64 / decoder as f64
+    );
+    println!();
+    println!("mtp-probe: OK (weights loaded)");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -673,6 +710,10 @@ fn main() -> Result<()> {
             println!("\ngenerate: OK");
             return Ok(());
         }
+        "mtp-probe" => {
+            mtp_probe(&args)?;
+            return Ok(());
+        }
         "batch-parity" => {
             let ok = batch_parity(&args, args.n_seq, args.n_new)?;
             if !ok {
@@ -689,7 +730,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe)"
         ),
     };
 

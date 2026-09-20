@@ -57,6 +57,41 @@ Both numbers are reported; neither is presented as the other.
 - Vision/multimodal inference. The vision tower is loaded but not exercised;
   text-only is the contract.
 
+## MTP is the strongest remaining lever (measured round 40)
+
+`gb10-verify mtp-probe` loads the head and prices it. The head is unquantized
+BF16 while the decoder it drafts for is FP4, which is the thing that could have
+made it too expensive to be worth running:
+
+| | B/token | vs decoder |
+|---|---|---|
+| decoder step | 17,602,479,684 | 100% |
+| MTP head | 849,451,008 | **4.8%** |
+
+So one MTP step costs `17.60 + 0.85 = 18.45 GB` and, when the draft is
+accepted, emits **two** tokens instead of one:
+
+| acceptance | GB per token | speedup |
+|---|---|---|
+| 1.00 | 9.23 | 1.91x |
+| 0.80 | 10.25 | 1.72x |
+| 0.70 | 10.85 | 1.62x |
+| 0.50 | 12.30 | 1.43x |
+
+Even at 50% acceptance the head pays for itself with room to spare, because it
+is 21x cheaper than the step it is drafting for. This is a far better lever than
+further tuning of the batch GEMV, which is already at the register wall
+(ROWS=4 is optimal, 128 registers + 256-byte spill; every alternative measured
+slower). At the current 42.44 tok/s at n_seq=16, a 1.6x gain lands at ~68 tok/s
+-- past the "50+ at concurrency 16" target.
+
+The head's structure is confirmed: `mtp.fc` is `[5120, 10240]` (the
+concatenation of the two normalised inputs back down to hidden),
+`mtp.layers.0` is a single full-attention layer with the same geometry as the
+decoder's full-attention blocks, `mtp.norm` feeds the shared `lm_head`, and
+`mtp_use_dedicated_embeddings: false` means it shares `embed_tokens`/`lm_head`.
+All 15 tensors load through the existing `Store::linear` BF16 path.
+
 ## Measured: 16-way batched decode
 
 Correctness: `gb10-verify batch-parity --n-seq 16 --n 16` reports **16/16

@@ -24,7 +24,7 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    fn load(store: &Store, dev: &Device, p: &str) -> Result<Self> {
+    pub(crate) fn load(store: &Store, dev: &Device, p: &str) -> Result<Self> {
         Ok(Self {
             gate: store.linear(dev, &format!("{p}mlp.gate_proj"))?,
             up: store.linear(dev, &format!("{p}mlp.up_proj"))?,
