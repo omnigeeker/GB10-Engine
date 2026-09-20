@@ -156,6 +156,43 @@ A regression to watch: the first wiring pass used a bulk `sed` that also
 rewrote the *decode* call sites to `forward_prefill(..., 1)`, dropping decode
 from 9.73 to 6.13 tok/s. Reverted; decode is back to 8.59 in this gate.
 
+**Profiled, and two hypotheses died (round 15).** `nsys` on the prefill path
+gives the breakdown unambiguously:
+
+| kernel | launches | ms |
+|---|---|---|
+| `nvfp4_gemm` | 192 | 1536.9 |
+| `fp8_gemm` | 208 | 1051.8 |
+| `bf16_gemm` | 96 | 16.5 |
+| `gated_delta_rule_chunk` | 48 | **17.6** |
+| `rmsnorm_zero_centered` | 2737 | 30.2 |
+
+So prefill is 98% GEMM, and the chunked recurrence costs 17.6 ms -- the part I
+expected to be hard is essentially free. But the GEMM moves 17.6 GB in 2605 ms
+= **6.8 GB/s**, 26x below the GEMV's 178 GB/s.
+
+*Hypothesis 1: shared-memory-bound.* Plausible (each FMA pair costs 2 shared
+loads), but register-blocking to NR=4 made it **worse** (2054 -> 2650 ms):
+80 registers drops occupancy to 50%, and the kernel is latency-bound, not
+shared-throughput-bound. Reverted to NR=1.
+
+*Hypothesis 2: weights re-read once per T-tile.* With `grid.y = ceil(59/8) = 8`
+every grid.y block sweeps the full N and K range, so W is read 8x. Setting
+TILE_T=64 should read it once -- but it needs `xv0[64], xv1[64]` = 128
+registers on top of a 64-wide accumulator, so it **spilled** and got slower
+again (2838 ms). The experiment was invalid, so this hypothesis is still open.
+
+**What is actually known:** `NR=1, TILE_T=8` is the best configuration found
+(2054 ms). Both obvious levers are blocked by register pressure, which means
+the tiling itself has to change rather than its parameters.
+
+**The design that should work** is a 2D register tile with *both* operands
+staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and
+`xtile[64][KC]` in shared, each thread owning a 4x4 sub-tile. That reads 4 W
+and 4 x values from shared per 16 FMAs (ratio 1:2 instead of 1:1), keeps the
+accumulator at 16 registers, and reads each weight exactly once because the
+block's T extent covers the whole prompt.
+
 **Why TTFT is still 2054 ms and not ~100 ms.** 17.6 GB read once at 178 GB/s
 is 99 ms, so we are 20x off the bandwidth bound -- i.e. compute-bound, as the
 roofline predicted. But 1.5e12 MACs / 2054 ms = **0.73 TFLOPS**, against ~20
