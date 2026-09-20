@@ -1,0 +1,29 @@
+{
+  "kind": "llamacpp-baseline",
+  "note": "M8 head-to-head. llama.cpp run on the SAME NVFP4 weights: convert_hf_to_gguf.py preserved the checkpoint's nvfp4 tensors, so the GGUF is 26.28 GiB of nvfp4 and this is a like-for-like comparison, not a different quantization.",
+  "llamacpp": {
+    "build": "4260903",
+    "commit": "fix(mamba): make time-step projection input contiguous (#28832)",
+    "cuda_arch": "sm_121",
+    "model": "qwen35 27B NVFP4",
+    "size_gib": 26.28,
+    "params_b": 27.32,
+    "ngl": 99,
+    "pp512_tok_s": 798.91,
+    "pp512_stdev": 15.84,
+    "tg128_tok_s": 7.63,
+    "tg128_stdev": 0.09,
+    "ttft_ms_at_512": 640.9
+  },
+  "gb10_engine": {
+    "decode_tok_s": 9.73,
+    "ttft_ms_at_59": 6273.2,
+    "prefill_ms_per_token": 106.3,
+    "ttft_ms_at_512_projected": 54430.0,
+    "per_token_weight_bytes": 17.6e9
+  },
+  "verdict": {
+    "decode": "WIN: 9.73 vs 7.63 tok/s (+27.5%)",
+    "ttft": "LOSE: 6273 ms for 59 prompt tokens vs ~74 ms. Prefill is still one token at a time, so prompt processing costs the same as decode."
+  }
+}

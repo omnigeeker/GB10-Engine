@@ -97,6 +97,23 @@ The only lever that beats the bandwidth roofline.
 - [ ] **gate (T8, T9): 16 simultaneous requests served correctly over both
       protocol shapes**
 
+## M5b — Batched prefill (NEW, highest priority)
+
+Measured against llama.cpp on identical NVFP4 weights, decode already wins
+(9.73 vs 7.63 tok/s) but TTFT loses by ~85x: 6273 ms for a 59-token prompt,
+because `Model::prefill` calls `step` once per token. llama.cpp does 798.91
+tok/s of prompt processing. See `bench/results/llamacpp-baseline.json`.
+
+This is the largest single win available and it is independent of decode.
+
+- [ ] batch the 16 full-attention layers over the whole prompt (they are
+      already parallel in T; only the causal mask and RoPE positions differ)
+- [ ] chunked prefill for the 48 Gated-DeltaNet layers (the recurrence is
+      sequential in T, but the chunked form processes a block of tokens per
+      step while keeping the same recurrent state)
+- [ ] tiled flash-attention prefill kernel to replace the O(T^2)-per-thread
+      `attn_prefill_kernel`
+
 ## M7 — Roofline optimization (in progress)
 
 **Where we are:** the GEMV kernels achieve **173 GB/s**, which is 76% of the
