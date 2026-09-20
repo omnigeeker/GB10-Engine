@@ -893,6 +893,7 @@ impl Ops {
         head_dim: usize,
         scale: f32,
         base: usize,
+        q_off: usize,
     ) -> Result<()> {
         need(n_keys > 0, "attn_decode: no keys")?;
         need(
@@ -902,7 +903,7 @@ impl Ops {
         )?;
         let (nk, nq, nkv, hd) =
             (n_keys as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
-        let base = base as i32;
+        let (base, qo) = (base as i32, q_off as i32);
         unsafe {
             dev.stream()
                 .launch_builder(&self.attn_decode)
@@ -916,6 +917,7 @@ impl Ops {
                 .arg(&hd)
                 .arg(&scale)
                 .arg(&base)
+                .arg(&qo)
                 .launch(LaunchConfig {
                     grid_dim: (n_q_heads as u32, 1, 1),
                     block_dim: (block_for(head_dim, 256), 1, 1),
@@ -937,6 +939,7 @@ impl Ops {
         n_kv_heads: usize,
         head_dim: usize,
         base: usize,
+        src_off: usize,
     ) -> Result<()> {
         let n = n_kv_heads * head_dim;
         need(k.len() >= n && v.len() >= n, "kv append src")?;
@@ -945,7 +948,7 @@ impl Ops {
             "kv append cache",
         )?;
         let (p, nkv, hd) = (pos as i32, n_kv_heads as i32, head_dim as i32);
-        let base = base as i32;
+        let (base, so) = (base as i32, src_off as i32);
         unsafe {
             dev.stream()
                 .launch_builder(&self.kv_cache_append)
@@ -957,6 +960,7 @@ impl Ops {
                 .arg(&nkv)
                 .arg(&hd)
                 .arg(&base)
+                .arg(&so)
                 .launch(LaunchConfig {
                     grid_dim: (cdiv(n, 128), 1, 1),
                     block_dim: (128, 1, 1),

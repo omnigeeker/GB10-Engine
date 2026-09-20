@@ -443,73 +443,41 @@ assembly. In order:
    compare token by token. Identical prompts would NOT catch a base-offset bug,
    because every sequence's state would then be identical.
 
-**Step 3b is implemented and its gate is failing -- on a real bug (round 29).**
+**Step 3b is correct (round 33).** `batch-parity --n-seq 16 --n 16` reports
+16/16 sequences token-exact against decoding them one at a time, and the
+64-layer oracle and layer-parity gates are unchanged. 16-way batched decode
+works.
 
-`forward_batch` for both layer types, `ModelState` with `n_seq`, `step_batch`,
-`prefill_seq` and a new `gb10-verify batch-parity` gate all landed. The
-existing gates are green (TTFT 453.5 ms, 64-layer oracle 16/16, layer parity
-OK). The new gate is **not** green, and that is the point of having written it.
+The bug, found by the gate and localised over rounds 29-33, was in the
+**prefill** path, not the decode path. `attn_prefill_kernel` indexes k/v from
+row 0 -- it hardcodes the causal window as `0..=t` and has no sequence base --
+but the call site handed it `state.k_cache`, the *shared multi-sequence* cache.
+So every sequence's prefill attention read **slot 0's** k/v.
 
-`batch-parity` runs N sequences both batched and one-at-a-time and compares
-token by token. Its prompts are deliberately of *different lengths*: with
-identical prompts every sequence holds identical state at identical positions,
-so a wrong per-sequence stride would read equivalent data, produce correct
-output, and pass. The gate immediately proved that reasoning right by failing
-on the first run, 0/4 sequences.
+That is why the symptom was so misleading. Sequence 0 was always correct,
+because slot 0 is the right slot for it. And the equal-length probe passed
+because those prompts shared a long prefix, so slot 0's rows were identical to
+the sequence's own rows except for the final token -- a small enough error for
+the model to absorb. The fix is to pass this sequence's own `sc.kb_ln`/`sc.vb`,
+which is what the kernel actually computes over.
 
-**Bug found and fixed.** `prefill_seq` calls `gated_delta_rule_chunk` and
-`conv1d_prefill_silu`, and neither took a sequence base -- I had deliberately
-reverted the chunk kernel's base in round 26 on the grounds that it is a
-prefill kernel. That reasoning was wrong: prefill is *also* per-sequence once
-you prefill N prompts into N slots. Every sequence's prefill was therefore
-writing its recurrent state and conv history into slot 0, destroying sequence
-0's state. Both kernels now take a base. That took the gate from 0/4 to 1/4 and
-pushed first divergence from token 1 to token 3.
+Three bisects were needed to find it, and the first two were informative
+precisely because they *failed to change anything*: replacing
+`gated_delta_rule_step_multi` and `attn_decode_multi` (and then
+`kv_cache_append_multi`) with the original single-sequence kernels each
+produced a byte-identical failure. When three independent reimplementations
+agree on the same wrong answer, the error is upstream of all of them.
 
-**Bisect (round 31): the recurrence kernel is exonerated.** The original
-`gated_delta_rule_step` already indexes its state as `b * n_v_heads * D * D`,
-which is exactly `rec_stride`, so calling it with `batch = n_seq` addresses the
-state identically to `gated_delta_rule_step_multi`. Swapping one for the other
-produced a **byte-identical failure** (same 1/4, same wrong tokens). Two
-independent implementations agreeing on the same wrong answer means the
-divergence is *upstream* of the recurrence -- in the conv step, the
-projections, or state written during prefill -- and the recurrence is merely
-propagating it. `_multi` is restored (it is equivalent and needs one launch).
+**Measured 16-way throughput: 11.01 tok/s aggregate (0.69 tok/s per sequence),
+1453 ms/step.** That is a diagnosis, not a mystery: the GEMV kernels are
+launched with `gridDim.y = batch` and each block reads the *whole* weight
+matrix for its own sequence, so a batch of 16 streams the weights 16 times.
+17.6 GB x 16 = 281 GB, and 281 GB / 228 GB/s = 1233 ms -- within 18% of the
+measured 1453 ms. Batching is currently pure overhead; the fix is a GEMV that
+loads a weight tile once and applies it to all 16 x-vectors, which is the
+next piece of M5 work.
 
-Also ruled out this round: `Scratch` sizing (every buffer really is `n * max_seq`,
-so the batch rows fit), `block_reduce_sum` (static `__shared__`, so it cannot
-alias `attn_decode_multi`'s dynamic `scores`), and the GEMV batch path (both
-`x` and `y` are indexed by `blockIdx.y`).
-
-**Bisect (round 32): the bug requires differing `n_keys`.**
-
-The failure point is not fixed -- it moves with the data -- so this is a small
-error that the model tolerates for a while before a token flips, not a wrong
-address. Running the gate with the *same* prompt lengths but different content
-passes **4/4 over 16 tokens**; running it with different lengths fails. Two
-sequences that happen to share a length both match, so there is no cross-talk
-between slots -- each sequence's result depends only on its own prompt.
-
-That narrows the bug to the only two kernels that read a per-sequence position:
-`attn_decode_multi` and `kv_cache_append_multi`. Everything else -- the
-recurrence, the conv step, the projections, RoPE, the norms, `Scratch` sizing,
-the GEMV batch path -- is exercised identically by the equal-length run and is
-therefore exonerated.
-
-Also established this round: `n_seq = 1` is bit-exact against `Model::step`
-over 32 generated tokens, so `forward_batch`/`_multi` at batch 1 is not merely
-"close" but identical; the divergence appears only once the batch is real.
-
-**Still failing.** Sequence 0 (shortest prompt, 5 tokens) is exact over 16
-tokens; sequences 1, 2 and 3 diverge at tokens 2, 3 and 3. The pattern -- a
-shorter prompt surviving longer -- points at state that is still indexed
-wrongly for `s >= 1`. The prime suspect is that `gated_delta_rule_step_multi`
-and `gated_delta_rule_chunk` both declare `__shared__ float S[128][129]` =
-66048 B, which exceeds the device's 49152 B `sharedPerBlock`; it is known to
-compile under NVRTC anyway (see PHYSICS.md), but it has never been exercised
-with `gridDim.y > 1`.
-
-Everything up to and including step 3a is verified behaviour-neutral. Step 3b
+Everything up to and including step 3a is verified behaviour-neutral.
 is real new behaviour and is **not** yet correct; do not treat the batching as
 working until `batch-parity` reports 4/4.
 

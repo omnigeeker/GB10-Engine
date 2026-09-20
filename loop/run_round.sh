@@ -76,6 +76,7 @@ if [ "$GATE_TEST" = pass ]; then
     fi
   else
     GATE_CORRECT=missing; say "gb10-verify not built yet — gate pending"
+  GATE_BATCH=missing
   fi
 fi
 
@@ -94,6 +95,27 @@ if [ "$GATE_TEST" = pass ]; then
     fi
   else
     GATE_GENERATE=missing; say "no full-model oracle at fixtures/oracle/greedy_tokens.json — gate pending"
+  fi
+fi
+
+# ------------------------------------------------- 3c. batched-decode gate ---
+# The generate gate above is single-sequence. This one proves that N sequences
+# decoded together in one pass give token-exact results, which is what the
+# concurrency target depends on. It uses prompts of *different* lengths: with
+# equal lengths every sequence sits at the same position, so a per-sequence
+# addressing bug would read equivalent data and pass.
+if [ "$GATE_TEST" = pass ]; then
+  if [ -x "$ROOT/target/release/gb10-verify" ]; then
+    say "gb10-verify batch-parity (16 sequences, token-exact vs one-at-a-time)"
+    if "$ROOT/target/release/gb10-verify" batch-parity --n-seq 16 --n 16 \
+         --model "$ROOT/models/Qwen3.8-27B-NVFP4" >>"$LOG" 2>&1; then
+      GATE_BATCH=pass; say "batch-parity OK"
+      grep -h "batched decode:" "$LOG" | tail -1
+    else
+      GATE_BATCH=fail; say "batch-parity FAILED (see $LOG)"
+    fi
+  else
+    GATE_BATCH=missing; say "gb10-verify not built yet — batch gate pending"
   fi
 fi
 

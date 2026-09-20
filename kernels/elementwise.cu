@@ -356,7 +356,7 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
                                               const float* __restrict__ v_cache,
                                               float* __restrict__ out, int n_keys,
                                               int n_q_heads, int n_kv_heads, int head_dim,
-                                              float scale, int base) {
+                                              float scale, int base, int q_off) {
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     const int group = n_q_heads / n_kv_heads;
@@ -365,7 +365,7 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
     extern __shared__ float scores[];  // n_keys entries
 
     const bool active = d < head_dim;
-    const float qv = active ? q[h * head_dim + d] : 0.0f;
+    const float qv = active ? q[q_off + h * head_dim + d] : 0.0f;
 
     for (int s = 0; s < n_keys; ++s) {
         const float kk =
@@ -387,7 +387,7 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
             const float p = __expf(scores[s] - mx) * inv;
             acc = fmaf(p, v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
         }
-        out[h * head_dim + d] = acc;
+        out[q_off + h * head_dim + d] = acc;
     }
 }
 
@@ -396,12 +396,12 @@ extern "C" __global__ void kv_cache_append_kernel(const float* __restrict__ k,
                                                   const float* __restrict__ v,
                                                   float* __restrict__ k_cache,
                                                   float* __restrict__ v_cache, int pos,
-                                                  int n_kv_heads, int head_dim, int base) {
+                                                  int n_kv_heads, int head_dim, int base, int src_off) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = n_kv_heads * head_dim;
     if (i >= n) return;
-    k_cache[base + (size_t)pos * n + i] = k[i];
-    v_cache[base + (size_t)pos * n + i] = v[i];
+    k_cache[base + (size_t)pos * n + i] = k[src_off + i];
+    v_cache[base + (size_t)pos * n + i] = v[src_off + i];
 }
 
 // ---------------------------------------------------------------------------

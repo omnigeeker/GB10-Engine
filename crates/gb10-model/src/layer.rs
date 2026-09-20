@@ -456,11 +456,14 @@ impl FullAttnLayer {
         state.n_keys[seq] = pos + t;
 
         let scale = 1.0 / (hd as f32).sqrt();
+        // The kernel hardcodes the causal window as 0..=t and indexes k/v from
+        // row 0, so it must be handed *this sequence's* projected k/v, not the
+        // shared cache: the cache would make every sequence attend to slot 0.
         ops.attn_prefill(
             dev,
             &sc.q,
-            &state.k_cache,
-            &state.v_cache,
+            &sc.kb_ln,
+            &sc.vb,
             &mut sc.attn,
             state.n_keys[seq],
             nh,
@@ -879,6 +882,7 @@ impl FullAttnLayer {
             nkv,
             hd,
             0,
+            0,
         )?;
         state.n_keys[seq] = pos + 1;
 
@@ -894,6 +898,7 @@ impl FullAttnLayer {
             nkv,
             hd,
             scale,
+            0,
             0,
         )?;
 

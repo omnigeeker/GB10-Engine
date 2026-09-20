@@ -163,6 +163,7 @@ fn batch_parity(args: &Args, n_seq: usize, n_new: usize) -> Result<bool> {
         next.push(model.prefill_seq(&dev, p, &mut st, &mut sc, s)?);
     }
     let mut got: Vec<Vec<u32>> = vec![Vec::with_capacity(n_new); n_seq];
+    let t0 = std::time::Instant::now();
     for i in 0..n_new {
         for s in 0..n_seq {
             got[s].push(next[s]);
@@ -171,6 +172,18 @@ fn batch_parity(args: &Args, n_seq: usize, n_new: usize) -> Result<bool> {
             break;
         }
         next = model.step_batch(&dev, &next, &mut st, &mut sc)?;
+    }
+    dev.stream().synchronize()?;
+    let dt = t0.elapsed().as_secs_f64();
+    let steps = (n_new.saturating_sub(1)) as f64;
+    if steps > 0.0 {
+        println!(
+            "batched decode: {:.2} tok/s aggregate ({} seq x {:.1} tok/s each), {:.1} ms/step",
+            steps * n_seq as f64 / dt,
+            n_seq,
+            steps / dt,
+            dt / steps * 1000.0
+        );
     }
 
     let mut all_ok = true;
