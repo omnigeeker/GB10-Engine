@@ -201,3 +201,73 @@ Two concrete, separately-attributable defects fall out of the table:
   ahead of the arithmetic so they are genuinely in flight together is worth
   keeping: 110.2 -> 108.2 ms (9.07 -> 9.24 tok/s).
 - **Throttling.** See the 30-iteration table above.
+
+### Narrowed: it is the NVFP4 kernel specifically, not the context
+
+Running `nsys` on `gb10-bench stream` (30 iterations, 241.9 GB/s) gives
+per-kernel times for exactly the shapes the model uses. Normalising both sides
+to per-step milliseconds:
+
+| kernel | gridX | calls/step | stream ms | model ms | model/stream |
+|---|---|---|---|---|---|
+| fp8  | 320 | 48 | 14.09 | 14.16 | **1.00** |
+| fp8  | 192 | 48 | 8.13 | 8.23 | **1.01** |
+| fp8  | 384 | 16 | 5.32 | 5.21 | **0.98** |
+| fp8  | 32  | 32 | 1.97 | 1.86 | **0.94** |
+| fp8  | 160 | 64 | 10.96 | 12.27 | 1.12 |
+| nvfp4 | 544 | 128 | 18.87 | 39.46 | **2.09** |
+| nvfp4 | 160 | 64 | 9.89 | 20.69 | **2.09** |
+| nvfp4 | 7760 | 1 | 2.09 | 4.11 | **1.96** |
+
+The FP8 GEMVs are *identical* across the two contexts; every NVFP4 GEMV is
+uniformly ~2x slower in the model. Both take the same `memcpy_stod` upload path
+(`crates/gb10-model/src/weights.rs`), both use the same kernel and the same
+launch config, so this is not allocation, alignment, scheduling or occupancy --
+it is a property of the NVFP4 kernel's own execution in this process.
+
+That points at the two things only the NVFP4 kernel touches: the per-group
+E4M3 `weight_scale` load and the E2M1 nibble decode. The decode is now
+data-independent integer work, so the leading suspect is the **`wscale` byte
+load**: it is a separate 32-byte-per-warp memory stream from the packed
+weights, and `scalerow` is passed in by the launcher rather than derived in the
+kernel. Next step is `ncu` counters (`dram__bytes_read.sum`,
+`lts__t_sector_hit_rate.pct`) on both sides to see whether the model is
+actually reading more bytes for the same matrix.
+
+### Also ruled out
+
+- **Interleaving small kernels between GEMVs.** Adding a 32-element `add_kernel`
+  after every GEMV in `stream` (`--interleave`) leaves the bandwidth untouched:
+  245.5 -> 243.0 GB/s. Kernel separation is not the mechanism.
+
+### Correction: the 245 GB/s "achieved" number is cache-inflated
+
+Splitting the same `stream` run by matrix type exposes an impossibility:
+
+| type | traffic/iter | ms/iter | implied GB/s |
+|---|---|---|---|
+| NVFP4 (gate/up/down + lm_head) | 10.34 GB | 30.85 | **335** |
+| FP8 (all attention + in_proj) | 7.23 GB | 40.47 | 179 |
+
+335 GB/s is above the 228 GB/s DRAM peak measured by `bench/hw/bw4.cu` on an
+incompressible 16 GiB buffer, so at least a third of `stream`'s NVFP4 reads are
+being served from cache. `stream` re-reads the same 21 GB thirty times in a
+row with *nothing else running*; the model does the same re-reading but shares
+the machine with 150 MB/step of recurrent state, KV cache and activations.
+
+So the honest statement of the M7 gap is narrower than the first draft of this
+section claimed:
+
+- pure DRAM streaming ceiling (`bw4.cu`, incompressible, cache-defeating): **228 GB/s**
+- model, FP8 GEMV: **178 GB/s**
+- model, NVFP4 GEMV: **161 GB/s**
+- `stream`, NVFP4: 335 GB/s — not a valid ceiling, cache-assisted
+
+The model is therefore at 70-78% of the real ceiling, not 66% of a 245 figure,
+and the achievable target remains the `docs/TARGETS.md` T1 roofline of
+12.99 tok/s. The unexplained part is still real and still specific: **FP8 GEMV
+is byte-for-byte the same speed in both contexts (178 vs 179 GB/s) while NVFP4
+is exactly 2x slower in the model**, which no scheduling or allocation
+difference can explain. `ncu` counters would settle it but are unavailable:
+`ERR_NVGPUCTRPERM`, and this account has no sudo to set
+`NVreg_RestrictProfilingToAdminUsers=0`.

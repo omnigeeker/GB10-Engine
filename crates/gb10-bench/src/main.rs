@@ -386,7 +386,14 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
     let x_dev = dev.stream().clone_htod(&x)?;
     let mut y: CudaSlice<f32> = dev.stream().alloc_zeros(max_n)?;
 
-    let run_once = |weights: &[DevWeight], y: &mut CudaSlice<f32>| -> Result<()> {
+    // `--interleave` inserts a tiny dependency-breaking kernel after every
+    // GEMV, mimicking the model's structure, to test whether separation --
+    // rather than any property of the GEMV kernels -- is what costs bandwidth.
+    let interleave = std::env::args().any(|a| a == "--interleave");
+    let small_a: CudaSlice<f32> = dev.stream().alloc_zeros(32)?;
+    let mut small_c: CudaSlice<f32> = dev.stream().alloc_zeros(32)?;
+
+    let mut run_once = |weights: &[DevWeight], y: &mut CudaSlice<f32>| -> Result<()> {
         for w in weights {
             match &w.kind {
                 Kind::NvFp4 { w, s, s2, n, k } => {
@@ -398,6 +405,9 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
                 Kind::Bf16 { w, n, k } => {
                     dev.kernels().bf16_gemv(&dev, &x_dev, w, y, *n, *k, 1)?
                 }
+            }
+            if interleave {
+                dev.ops().add(&dev, &small_a, &small_a, &mut small_c, 32)?;
             }
         }
         Ok(())
@@ -416,6 +426,7 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
     // Report every iteration separately: if the achieved bandwidth decays over
     // a sustained run, the short-burst roofline is optimistic and the real
     // ceiling is lower.
+    println!("interleave: {interleave}");
     let iters = 30;
     let mut per_iter = Vec::with_capacity(iters);
     for _ in 0..iters {
