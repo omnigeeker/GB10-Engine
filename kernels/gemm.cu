@@ -189,8 +189,10 @@ __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
                                                 const float* __restrict__ s2,
                                                 const float* __restrict__ x,
                                                 float* __restrict__ y, int N, int K, int T) {
-    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
-    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
+    // Double buffered: staging chunk c+1 while computing chunk c hides the
+    // staging load latency, which is what this kernel is actually bound by.
+    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
     const int t0 = blockIdx.y * GB10_TT;
@@ -200,11 +202,17 @@ __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
     float acc[GB10_TM][GB10_TNREG];
     gemm2d_begin(acc);
 
-    for (int c = 0; c < K / GB10_KC; ++c) {
-        stage_wtile<GB10_KC>(wt, w, sc, s2, K, nbase, N, c);
-        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
-        __syncthreads();
-        gemm2d_outer(wt, xt, acc, ty, tx);
+    const int nchunk = K / GB10_KC;
+    stage_wtile<GB10_KC>(wt[1], w, sc, s2, K, nbase, N, 0);
+    stage_xtile<GB10_KC>(xt[1], x, K, T, t0, 0);
+    __syncthreads();
+    for (int c = 0; c < nchunk; ++c) {
+        const int cur = (c ^ 1) & 1, nxt = c & 1;
+        if (c + 1 < nchunk) {
+            stage_wtile<GB10_KC>(wt[nxt], w, sc, s2, K, nbase, N, c + 1);
+            stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
+        }
+        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 
@@ -215,8 +223,10 @@ __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
                                               const float* __restrict__ s1,
                                               const float* __restrict__ x,
                                               float* __restrict__ y, int N, int K, int T) {
-    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
-    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
+    // Double buffered: staging chunk c+1 while computing chunk c hides the
+    // staging load latency, which is what this kernel is actually bound by.
+    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
     const int t0 = blockIdx.y * GB10_TT;
@@ -226,11 +236,17 @@ __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
     float acc[GB10_TM][GB10_TNREG];
     gemm2d_begin(acc);
 
-    for (int c = 0; c < K / GB10_KC; ++c) {
-        stage_wtile_fp8<GB10_KC>(wt, w, s1, K, nbase, N, c);
-        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
-        __syncthreads();
-        gemm2d_outer(wt, xt, acc, ty, tx);
+    const int nchunk = K / GB10_KC;
+    stage_wtile_fp8<GB10_KC>(wt[1], w, s1, K, nbase, N, 0);
+    stage_xtile<GB10_KC>(xt[1], x, K, T, t0, 0);
+    __syncthreads();
+    for (int c = 0; c < nchunk; ++c) {
+        const int cur = (c ^ 1) & 1, nxt = c & 1;
+        if (c + 1 < nchunk) {
+            stage_wtile_fp8<GB10_KC>(wt[nxt], w, s1, K, nbase, N, c + 1);
+            stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
+        }
+        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 
@@ -240,8 +256,10 @@ __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
 __device__ __forceinline__ void bf16_gemm_body(const uint16_t* __restrict__ w,
                                                const float* __restrict__ x,
                                                float* __restrict__ y, int N, int K, int T) {
-    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
-    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
+    // Double buffered: staging chunk c+1 while computing chunk c hides the
+    // staging load latency, which is what this kernel is actually bound by.
+    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
     const int t0 = blockIdx.y * GB10_TT;
@@ -251,11 +269,17 @@ __device__ __forceinline__ void bf16_gemm_body(const uint16_t* __restrict__ w,
     float acc[GB10_TM][GB10_TNREG];
     gemm2d_begin(acc);
 
-    for (int c = 0; c < K / GB10_KC; ++c) {
-        stage_wtile_bf16<GB10_KC>(wt, w, K, nbase, N, c);
-        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
-        __syncthreads();
-        gemm2d_outer(wt, xt, acc, ty, tx);
+    const int nchunk = K / GB10_KC;
+    stage_wtile_bf16<GB10_KC>(wt[1], w, K, nbase, N, 0);
+    stage_xtile<GB10_KC>(xt[1], x, K, T, t0, 0);
+    __syncthreads();
+    for (int c = 0; c < nchunk; ++c) {
+        const int cur = (c ^ 1) & 1, nxt = c & 1;
+        if (c + 1 < nchunk) {
+            stage_wtile_bf16<GB10_KC>(wt[nxt], w, K, nbase, N, c + 1);
+            stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
+        }
+        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 

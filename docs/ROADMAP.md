@@ -241,11 +241,17 @@ shared reads, de-duplicated staging loads) both cut redundant memory traffic
 without touching the tile shape. The kernel is latency-bound on its staging
 loads, and the tile shape is not what is limiting it.
 
-The remaining untried lever is double-buffering the shared tiles so staging of
-chunk c+1 overlaps compute of chunk c, which is the one change that attacks
-the latency directly rather than the shape. It costs 34.8 KB of shared (2
-blocks/SM), which by the pattern above may well hurt -- so it needs measuring,
-not assuming.
+**Double buffering works (round 19): 582 -> 492 ms.** Two shared tile sets,
+staging chunk c+1 while computing chunk c, so the staging loads' latency is
+hidden behind FMAs instead of sitting on the critical path. Still 16/16 exact.
+
+I predicted this would probably *hurt*, because it costs 34.8 KB of shared and
+drops occupancy to 2 blocks/SM -- following the pattern of the three previous
+failures. **That prediction was wrong, and the measurement is what settled
+it.** The latency reading of the evidence was right; the occupancy reading was
+not. Worth remembering: the pattern was real but I over-extended it.
+
+Cumulative on TTFT: 6273 -> 492 ms, 12.7x.
 
 **The design that should work** is a 2D register tile with *both* operands
 staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and
