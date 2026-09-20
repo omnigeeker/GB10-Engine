@@ -148,26 +148,46 @@ x-tile -- roughly 64-128 rows -- with the per-row partial sums held in
 registers at all. Shared budget: `xs[16][512]` = 32 KB plus `part[64][16]` =
 4 KB = 36 KB, inside the 48 KB static limit.
 
-### Attempted and NOT yet working (round 37)
+### The round-37 failure, explained (round 39)
 
-That design was implemented as `GB10_BATCH_RB = 64`: each block takes 64 rows,
-stages x per k-tile with float4 loads, keeps `part[64][16]` in shared, and
-reduces with `warp_reduce_sum` before a lane-0 shared add. It compiles to **109
-registers, 0 spill, 36864 B shared**, which is the profile the analysis calls
-for.
+The shared-partial kernel was **wrong, and the cause was a real semantic trap in
+the NVFP4 GEMV**:
 
-It is **wrong and slower**: `batch-parity` reports 0/16 with the first mismatch
-at token 1, and the step is 628 ms against 377 ms. The launcher grid was
-initially left at `cdiv(N, warps)` instead of `cdiv(N, RB)` (1904 of 2176
-blocks idle); fixing that changed nothing, so the fault is inside the kernel.
+```cuda
+const int so = i * kWarp + lane;                        // note: depends on lane
+sc[r] = e4m3_to_float(wscale[row * scalerow + so]);
+acc[r] = fmaf(t, sc[r], acc[r]);                        // scale BEFORE reduce
+...
+const float a = warp_reduce_sum(acc[r]);                // reduce afterwards
+```
 
-Verified while debugging, and therefore *not* the cause: the staging index math
-(`reinterpret_cast<float4*>(xs)[idx]` with `idx = b*(kTile/4) + j` maps to float
-`b*kTile + 4j`, matching the source at `x + b*K + i*kTile`); `kTile/kVec/kWarp`
-= 512/16/32; `warp_reduce_sum` is a down-shuffle so lane 0 holds the sum and the
-`if (lane == 0)` guard is right; `rl = rr*nwarps + warp` covers 0..RB-1 exactly
-once; the `__syncthreads()` placement (after zeroing, after staging, after the
-row loop, after write-out) has no race; and the shared budget is exact.
+`wscale[row][i*kWarp + lane]` is the block-16 scale covering exactly the 16
+elements that *lane* owns, so **every lane has a different scale** and it must
+be applied before the warp reduction. The shared-partial version wrote
+`warp_reduce_sum(t) * sc`, which scales the summed dot by lane 0's scale alone
+-- hence 0/16 sequences exact, first mismatch at token 1.
+
+With that corrected to `warp_reduce_sum(t * sc)` the kernel passes both the
+isolation harness and the full 16-sequence gate, so the diagnosis is confirmed.
+
+### ...but the design is slower anyway, so it is not shipped
+
+| RB | ms/step | aggregate tok/s | correct |
+|---|---|---|---|
+| 16 | 662.3 | 24.16 | yes |
+| 32 | 637.5 | 25.10 | yes |
+| 64 | 620.1 | 25.80 | yes |
+
+Against 377 ms for the ROWS=4 kernel. The reason is structural, not tuning:
+holding partial sums in shared forces a `warp_reduce_sum` per
+(row, sequence, k-tile) -- 64 x 16 x 10 = 10240 per block -- whereas the
+ROWS=4 kernel accumulates over the whole of K in registers and reduces **once**
+per (row, sequence), 64 per warp. That is ~160x more reductions, and it costs
+more than the shared-staging saves.
+
+So the register pressure at ROWS=4 (128 registers, 256-byte spill) is the
+cheaper problem to have, and the shipped kernel stays as it was:
+**40.84-42.44 tok/s, 16/16 exact, ~377-392 ms/step** (run-to-run spread).
 
 Reverted to the ROWS=4 kernels, which remain the verified state at **42.44
 tok/s, 16/16 exact, 377.0 ms/step**.
