@@ -410,6 +410,42 @@ kernels, and still paying one launch per sequence. Putting the sequence on
 
 Gate: 64-layer oracle still 16/16 exact.
 
+**Step 3b: the remaining wiring (handoff).**
+
+Everything the batched decode needs now exists and is verified; what is left is
+assembly. In order:
+
+1. `LayerState` -- replace `seq_stride()` with three accessors, because the
+   buffers have *different* per-sequence strides and using one value would
+   address `conv_hist` wrongly: `conv_stride() = conv_hist.len()/n_seq`,
+   `rec_stride() = rec.len()/n_seq`, `kv_stride() = k_cache.len()/n_seq`.
+2. `DeltaNetLayer::forward_batch` and `FullAttnLayer::forward_batch`, each
+   mirroring its `forward_prefill` but with `t` replaced by `n_seq` and the
+   state-touching ops swapped for the `_multi` kernels. Specifically:
+   `conv1d_step_silu_multi`, `gated_delta_rule_step_multi`,
+   `kv_cache_append_multi`, `attn_decode_multi`. The `_batched` variants
+   already used by prefill (`l2norm_scale_batched`, `delta_gate_batched`,
+   `rope_neox_batched`, `deinterleave_heads_batched`) work unchanged with
+   `batch = n_seq`. `rope_neox_batched` indexes its cos/sin table by
+   `gridDim.y`, so the table must be built by concatenating
+   `rope_tables(cfg, n_keys[s])` per sequence -- one row each -- not by
+   `rope_tables_range`, since the sequences are at unrelated positions.
+3. `ModelState` -- build with `n_seq`, add `positions: CudaSlice<i32>` holding
+   each sequence's `n_keys` (refreshed before the layer loop), and size
+   `logits` as `[n_seq, vocab]` and `idx` as `[n_seq]`.
+4. `Model::step_batch(&[u32]) -> Vec<u32>` -- `embed_gather_batched` over the
+   token batch, the layer loop with `forward_batch`, final norm over
+   `n_seq` rows, `lm_head.forward(.., n_seq)`, `argmax_multi`.
+5. **A new correctness gate is mandatory here.** The existing oracle is
+   single-sequence and cannot see a wrong `base_stride`. The gate must run N
+   sequences with *different prompt lengths* (so the sequences sit at different
+   positions and any cross-talk shows up) both batched and one-at-a-time, and
+   compare token by token. Identical prompts would NOT catch a base-offset bug,
+   because every sequence's state would then be identical.
+
+`argmax_multi` and its launcher landed this round; the tree builds and the
+64-layer oracle is still 16/16 exact.
+
 Rough shape of the work: add a sequence stride to those four kernels, grow the
 four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add
 `Model::step_batch`, then have the server hold N states and schedule. The

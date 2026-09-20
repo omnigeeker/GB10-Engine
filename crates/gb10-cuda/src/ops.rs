@@ -39,6 +39,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "gated_delta_rule_step_multi_kernel",
     "kv_cache_append_multi_kernel",
     "attn_decode_multi_kernel",
+    "argmax_multi_kernel",
     "gated_delta_rule_chunk_kernel",
     "deinterleave_heads_batched_kernel",
     "embed_gather_batched_kernel",
@@ -75,6 +76,7 @@ pub struct Ops {
     kv_cache_append: CudaFunction,
     embed_gather: CudaFunction,
     argmax: CudaFunction,
+    argmax_multi: CudaFunction,
     l2norm_scale_batched: CudaFunction,
     delta_gate_batched: CudaFunction,
     conv1d_prefill_silu: CudaFunction,
@@ -126,6 +128,7 @@ impl Ops {
             kv_cache_append: take(map, "kv_cache_append_kernel")?,
             embed_gather: take(map, "embed_gather_kernel")?,
             argmax: take(map, "argmax_kernel")?,
+            argmax_multi: take(map, "argmax_multi_kernel")?,
             l2norm_scale_batched: take(map, "l2norm_scale_batched_kernel")?,
             delta_gate_batched: take(map, "delta_gate_batched_kernel")?,
             conv1d_prefill_silu: take(map, "conv1d_prefill_silu_kernel")?,
@@ -338,6 +341,33 @@ impl Ops {
     }
 
     /// Index of the maximum element, ties resolving to the lowest index.
+    /// Per-row argmax over a `[n_seq, n]` buffer.
+    pub fn argmax_multi(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        out_idx: &mut CudaSlice<i32>,
+        n: usize,
+        n_seq: usize,
+    ) -> Result<()> {
+        need(x.len() >= n * n_seq, "argmax_multi x")?;
+        need(out_idx.len() >= n_seq, "argmax_multi out")?;
+        let n_i = n as i32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.argmax_multi)
+                .arg(x)
+                .arg(&n_i)
+                .arg(out_idx)
+                .launch(LaunchConfig {
+                    grid_dim: (1, n_seq as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn argmax(
         &self,
         dev: &Device,

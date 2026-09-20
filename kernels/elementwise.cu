@@ -799,3 +799,34 @@ extern "C" __global__ void attn_decode_multi_kernel(
         out[qb + h * head_dim + d] = acc;
     }
 }
+
+// Per-sequence argmax: `gridDim.y` selects the row of a `[n_seq, n]` logits
+// buffer, so the batched decode needs one launch rather than one per sequence.
+extern "C" __global__ void argmax_multi_kernel(const float* __restrict__ x, int n,
+                                               int* __restrict__ out_idx) {
+    __shared__ float best_val[256];
+    __shared__ int best_idx[256];
+    const int tid = threadIdx.x;
+    const float* __restrict__ row = x + (size_t)blockIdx.y * n;
+
+    float bv = -INFINITY;
+    int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = row[i];
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    best_val[tid] = bv;
+    best_idx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s && best_val[tid + s] > best_val[tid]) {
+            best_val[tid] = best_val[tid + s];
+            best_idx[tid] = best_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_idx[blockIdx.y] = best_idx[0];
+}
