@@ -231,6 +231,74 @@ fn gemv_parity(model: &str) -> Result<()> {
     }
 
     println!();
+
+    // ---- batched path: does row b of the batch equal the single-row result? --
+    // The batched kernels index x by sequence, so a wrong per-sequence stride
+    // produces a wrong answer that the single-row cases above cannot see.
+    {
+        let name = "model.language_model.layers.0.mlp.gate_proj";
+        let wname = format!("{name}.weight");
+        let info = st.info(&wname).with_context(|| wname.clone())?.clone();
+        let full_n = info.shape[0];
+        let n = full_n.min(256);
+        let row_bytes = info.nbytes / full_n;
+        let raw = st.tensor_bytes(&wname)?;
+        let slice = &raw[..row_bytes * n];
+
+        let sname = format!("{name}.weight_scale");
+        let sinfo = st.info(&sname).with_context(|| sname.clone())?.clone();
+        let sraw = st.tensor_bytes(&sname)?;
+        let srow = sinfo.nbytes / full_n;
+        let sslice = &sraw[..srow * n];
+        let scale2 = f32::from_le_bytes(st.tensor_bytes(&format!("{name}.weight_scale_2"))?[..4].try_into().unwrap());
+
+        let w = dev.stream().clone_htod(slice)?;
+        let sc = dev.stream().clone_htod(sslice)?;
+        let s2 = dev.stream().clone_htod(&[scale2])?;
+
+        let b = 16usize;
+        let want = reference::nvfp4_gemv_ref(&x, slice, sslice, scale2, n, k);
+
+        for (label, batch) in [("batch=1 ", 1usize), ("batch=16", b)] {
+            // Row 0 is the same vector in every slot; slots 1.. differ so a
+            // wrong stride cannot read equivalent data and pass.
+            let mut xb = Vec::with_capacity(batch * k);
+            for j in 0..batch {
+                for i in 0..k {
+                    let v = ((i as f32 * 0.61803398875).fract() * 2.0 - 1.0) * 0.75;
+                    xb.push(if j == 0 { v } else { v * (1.0 + j as f32 * 0.01) });
+                }
+            }
+            let xb_dev = dev.stream().clone_htod(&xb)?;
+            let mut y: CudaSlice<f32> = dev.stream().alloc_zeros(n * batch)?;
+            dev.kernels().nvfp4_gemv(&dev, &xb_dev, &w, &sc, &s2, &mut y, n, k, batch)?;
+            dev.synchronize()?;
+            let got = dev.stream().clone_dtoh(&y)?;
+
+            let mut worst = 0.0f64;
+            let mut worst_row = 0usize;
+            for j in 0..batch {
+                for i in 0..n {
+                    let want_v = if j == 0 { want[i] } else { want[i] * (1.0 + j as f32 * 0.01) };
+                    let d = (got[j * n + i] as f64 - want_v as f64).abs();
+                    if d > worst {
+                        worst = d;
+                        worst_row = j;
+                    }
+                }
+            }
+            let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs() as f64));
+            let norm = if scale > 0.0 { worst / scale } else { worst };
+            let ok = norm < 1e-4;
+            all_ok &= ok;
+            println!(
+                "batched {label}  n={n} k={k} b={batch}  max|y|={scale:.4e}  err/scale={norm:.3e} (worst seq {worst_row})  {}",
+                if ok { "OK" } else { "FAIL" }
+            );
+        }
+    }
+
+    println!();
     anyhow::ensure!(all_ok, "gemv parity FAILED");
     println!("gemv parity: OK");
     Ok(())

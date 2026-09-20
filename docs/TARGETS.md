@@ -170,9 +170,26 @@ once; the `__syncthreads()` placement (after zeroing, after staging, after the
 row loop, after write-out) has no race; and the shared budget is exact.
 
 Reverted to the ROWS=4 kernels, which remain the verified state at **42.44
-tok/s, 16/16 exact, 377.0 ms/step**. The next step is to isolate the new kernel
-against `nvfp4_gemv` for the same input at a fixed batch, rather than reasoning
-about it further.
+tok/s, 16/16 exact, 377.0 ms/step**.
+
+### The isolation harness now exists (round 38)
+
+`gb10-bench gemv-parity` gained a batched case: it builds a 16-row activation
+matrix whose slots differ from each other (so a wrong per-sequence stride cannot
+read equivalent data and pass) and checks **every row** of the batched result
+against the independent CPU reference.
+
+```
+batched batch=1   n=256 k=5120 b=1   err/scale=1.286e-6  OK
+batched batch=16  n=256 k=5120 b=16  err/scale=1.572e-6  OK
+```
+
+So the shipped ROWS=4 batch kernel is numerically sound at batch 16, and the
+1e-4 tolerance is a real gate rather than a rubber stamp.
+
+This is the tool the failed round-37 design needed: re-applying it and running
+this command names the offending sequence and row directly, instead of
+reasoning about the kernel. That is the next step.
 
 ## Optimisation order (roofline-driven)
 
