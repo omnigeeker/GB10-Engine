@@ -42,10 +42,12 @@ using namespace gb10;
 #define GB10_TNREG 4  // tokens owned by one thread
 #define GB10_GEMM_BLOCK 256
 
-// Padded strides: one extra float so consecutive `k` slices do not start on the
-// same shared bank.
-#define GB10_WSTRIDE (GB10_TN + 1)
-#define GB10_XSTRIDE (GB10_TT + 1)
+// Padded strides. The pad must keep each row 16-byte aligned (a multiple of 4
+// floats) so the inner loop can read a whole 4-wide sub-tile with one LDS.128
+// instead of four LDS.32; the extra float beyond that keeps consecutive `k`
+// slices off the same shared bank.
+#define GB10_WSTRIDE (GB10_TN + 4)
+#define GB10_XSTRIDE (GB10_TT + 4)
 
 // Stage the [TILE_N, KC] weight chunk, decoded to fp32, as `wt[k][n]`.
 template <int KC>
@@ -54,21 +56,26 @@ __device__ __forceinline__ void stage_wtile(float (*wt)[GB10_WSTRIDE],
                                             const uint8_t* __restrict__ sc,
                                             const float* __restrict__ s2, int K, int nbase,
                                             int N, int c) {
-    const float wscale2 = __ldg(s2);
-    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
-        const int nl = idx / KC, kl = idx % KC;
-        const int n = nbase + nl;
-        float v = 0.0f;
-        if (n < N) {
-            const int k = c * KC + kl;
-            // Lane-adjacent idx walks k, so this read is coalesced.
-            const uint8_t byte = __ldg(w + (size_t)n * (K >> 1) + (k >> 1));
-            const uint8_t nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
-            const float s =
-                e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (k >> 4))) * wscale2;
-            v = e2m1_to_float(nib) * s;
+    static_assert(GB10_TN == 64 && GB10_KC == 32, "staging map assumes 64x32");
+    // One thread per (row, 8-wide k segment). The naive element-at-a-time loop
+    // issues one scale load per element, i.e. 16 redundant loads per group
+    // byte -- that is 713 MB of staging traffic for a 44.6 MB matrix. Loading
+    // the packed byte as a uint32 and the scale once per segment makes it 2
+    // loads for 8 elements instead of 16.
+    const int nl = threadIdx.x >> 2;
+    const int seg = threadIdx.x & 3;
+    const int n = nbase + nl;
+    if (n < N) {
+        const int kbase = c * KC + seg * 8;
+        const uint32_t packed =
+            *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
+        const float s =
+            e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4))) * __ldg(s2);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t nib = (uint8_t)((packed >> (4 * j)) & 0xF);
+            wt[seg * 8 + j][nl] = e2m1_to_float(nib) * s;
         }
-        wt[kl][nl] = v;
     }
 }
 
@@ -77,13 +84,20 @@ __device__ __forceinline__ void stage_wtile_fp8(float (*wt)[GB10_WSTRIDE],
                                                 const uint8_t* __restrict__ w,
                                                 const float* __restrict__ s1, int K, int nbase,
                                                 int N, int c) {
-    const float wscale = __ldg(s1);
-    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
-        const int nl = idx / KC, kl = idx % KC;
-        const int n = nbase + nl;
-        float v = 0.0f;
-        if (n < N) v = e4m3_to_float(__ldg(w + (size_t)n * K + c * KC + kl)) * wscale;
-        wt[kl][nl] = v;
+    static_assert(GB10_TN == 64 && GB10_KC == 32, "staging map assumes 64x32");
+    // Same map as the NVFP4 path: one thread per (row, 8-wide k segment),
+    // reading two uint32 instead of eight bytes. FP8 has no group scales, so
+    // the per-tensor scale is hoisted out entirely.
+    const int nl = threadIdx.x >> 2;
+    const int seg = threadIdx.x & 3;
+    const int n = nbase + nl;
+    if (n < N) {
+        const int kbase = c * KC + seg * 8;
+        const uint2 pk = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
+        const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
+        const float wscale = __ldg(s1);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) wt[seg * 8 + j][nl] = e4m3_to_float(pb[j]) * wscale;
     }
 }
 
@@ -116,17 +130,28 @@ __device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
 __device__ __forceinline__ void gemm2d_outer(const float (*wt)[GB10_WSTRIDE],
                                              const float (*xt)[GB10_XSTRIDE],
                                              float (&acc)[GB10_TM][GB10_TNREG], int ty, int tx) {
+    static_assert(GB10_TM == 4 && GB10_TNREG == 4, "float4 path assumes 4x4 tiles");
 #pragma unroll
     for (int k = 0; k < GB10_KC; ++k) {
-        float wv[GB10_TM], xv[GB10_TNREG];
-#pragma unroll
-        for (int i = 0; i < GB10_TM; ++i) wv[i] = wt[k][ty * GB10_TM + i];
-#pragma unroll
-        for (int j = 0; j < GB10_TNREG; ++j) xv[j] = xt[k][tx * GB10_TNREG + j];
-#pragma unroll
-        for (int i = 0; i < GB10_TM; ++i)
-#pragma unroll
-            for (int j = 0; j < GB10_TNREG; ++j) acc[i][j] = fmaf(wv[i], xv[j], acc[i][j]);
+        // One 16-byte load per operand per k instead of four 4-byte ones.
+        const float4 wv = *reinterpret_cast<const float4*>(&wt[k][ty * GB10_TM]);
+        const float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        acc[0][0] = fmaf(wv.x, xv.x, acc[0][0]);
+        acc[0][1] = fmaf(wv.x, xv.y, acc[0][1]);
+        acc[0][2] = fmaf(wv.x, xv.z, acc[0][2]);
+        acc[0][3] = fmaf(wv.x, xv.w, acc[0][3]);
+        acc[1][0] = fmaf(wv.y, xv.x, acc[1][0]);
+        acc[1][1] = fmaf(wv.y, xv.y, acc[1][1]);
+        acc[1][2] = fmaf(wv.y, xv.z, acc[1][2]);
+        acc[1][3] = fmaf(wv.y, xv.w, acc[1][3]);
+        acc[2][0] = fmaf(wv.z, xv.x, acc[2][0]);
+        acc[2][1] = fmaf(wv.z, xv.y, acc[2][1]);
+        acc[2][2] = fmaf(wv.z, xv.z, acc[2][2]);
+        acc[2][3] = fmaf(wv.z, xv.w, acc[2][3]);
+        acc[3][0] = fmaf(wv.w, xv.x, acc[3][0]);
+        acc[3][1] = fmaf(wv.w, xv.y, acc[3][1]);
+        acc[3][2] = fmaf(wv.w, xv.z, acc[3][2]);
+        acc[3][3] = fmaf(wv.w, xv.w, acc[3][3]);
     }
 }
 

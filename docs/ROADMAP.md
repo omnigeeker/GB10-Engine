@@ -212,11 +212,25 @@ batched GEMV: for a matrix that small, re-reading it per token beats starving
 KC=64 was also tried (fewer barriers) and was worse -- 78-90 registers, less
 occupancy, 1025 ms against 847. Reverted to KC=32.
 
-**Where the remaining 10x is.** The GEMM still runs at ~22 GB/s against the
-GEMV's 178. Two candidates, both measured rather than assumed: only ~1.4 waves
-of 272 blocks (`grid.x = 17408/64`) so the tail wastes most of the last wave,
-and 320 `__syncthreads` per block that serialise staging against compute --
-the standard fix for the latter is double-buffering the shared tiles.
+**Further 2054 -> 588 ms (round 17)**, all three steps measured and all
+keeping the 64-layer gate exact:
+
+1. **float4 shared reads.** The inner loop did four LDS.32 per operand per k;
+   padding the tile strides to a multiple of 4 floats makes each row 16-byte
+   aligned and lets one LDS.128 fetch a whole 4-wide sub-tile. 778 -> 741 ms.
+2. **De-duplicated the group scales.** The element-at-a-time NVFP4 staging
+   issued one scale load *per element*, so each group byte was read 16 times:
+   713 MB of staging traffic for a 44.6 MB matrix. One thread per (row, 8-wide
+   k segment) now reads the packed weights as a `uint32` and the scale once --
+   2 loads per 8 elements instead of 16. 741 -> 627 ms.
+3. **Same treatment for FP8**, reading a `uint2` per segment and hoisting the
+   per-tensor scale out of the loop entirely. 627 -> 588 ms.
+
+**Where the remaining 8x is.** The GEMM still runs well below both rooflines.
+Remaining measured candidates: only ~1.4 waves of 272 blocks
+(`grid.x = 17408/64`), so the tail wastes most of the last wave; and 320
+`__syncthreads` per block serialising staging against compute, whose standard
+fix is double-buffering the shared tiles.
 
 **The design that should work** is a 2D register tile with *both* operands
 staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and
