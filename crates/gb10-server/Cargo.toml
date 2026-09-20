@@ -7,6 +7,9 @@ description = "OpenAI- and Anthropic-compatible local endpoint"
 
 [dependencies]
 gb10-core.workspace = true
+gb10-cuda.workspace = true
 gb10-model.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+serde.workspace = true

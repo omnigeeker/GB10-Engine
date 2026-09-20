@@ -300,6 +300,39 @@ looked like an obvious starvation case. It is not: raising the small-N GEMV
 fallback from 256 to 2048 made things *worse* (449.7 -> 463.5 ms), so the
 low-occupancy GEMM still beats re-reading the matrix per token. Reverted.
 
+**M6 endpoints: done (round 23).** `crates/gb10-server` was a stub printing
+"implemented in later rounds"; it is now a working local endpoint with no HTTP
+dependencies (`std::net` + `serde_json` only -- four routes and one SSE framing
+format do not justify an async runtime, and this keeps the engine's only
+external dependency the CUDA driver).
+
+Verified against the running server on the real model:
+
+| route | non-stream | stream |
+|---|---|---|
+| `POST /v1/chat/completions` (OpenAI) | ok | SSE + `[DONE]` |
+| `POST /v1/messages` (Anthropic) | ok | full event sequence |
+| `GET /v1/models`, `GET /health` | ok | -- |
+
+Anthropic's top-level `system` field is mapped into a system message, and both
+protocols flatten the string-or-parts content form.
+
+**A real bug this surfaced.** `QwenTokenizer::from_model_dir` was leaving
+`eos_ids` **empty**, so `is_eos` returned false for every token and any decode
+loop ran to its token limit rather than stopping. The ids are not derivable
+from `tokenizer.json`: Qwen ends a turn on `<|im_end|>`, which is not the
+tokenizer's own `eos_token`. `from_model_dir` now reads `eos_token_id` from
+`generation_config.json` (handling both the scalar and array forms). Before:
+`"The capital of France is **Paris**.<|im_end|>\n<|endoftext|><|im_start|>"`
+with `finish_reason: length`. After: `"The capital of France is **Paris**."`
+with `finish_reason: stop` at 8 tokens.
+
+This was latent in the engine, not just the server -- the verify gate never hit
+it because its fixture prompt generates 16 tokens without reaching EOS.
+
+Generation is still serialised (one request at a time, greedy). Continuous
+batching is the next milestone.
+
 **Strategic note.** TTFT has gone 6273 -> 450 ms and the remaining gap is a
 pure GEMM-tuning problem with a known ceiling. Meanwhile three things the
 objective explicitly asks for are still untouched: **MTP speculative decoding,

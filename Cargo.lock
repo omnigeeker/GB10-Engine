@@ -310,7 +310,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gb10-core",
+ "gb10-cuda",
  "gb10-model",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

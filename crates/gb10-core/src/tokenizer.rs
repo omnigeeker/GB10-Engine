@@ -14,15 +14,41 @@ pub struct QwenTokenizer {
 }
 
 impl QwenTokenizer {
-    /// Load `tokenizer.json` from a checkpoint directory.
+    /// Load `tokenizer.json` from a checkpoint directory, picking up the
+    /// stop-token ids from `generation_config.json` if it is present.
+    ///
+    /// Leaving `eos_ids` empty -- as this used to -- makes `is_eos` return
+    /// false for every token, so a decoder loop silently runs to its token
+    /// limit instead of stopping. The ids are not derivable from
+    /// `tokenizer.json` alone: Qwen ends a turn on `<|im_end|>`, which is not
+    /// the tokenizer's own `eos_token`.
     pub fn from_model_dir(dir: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = dir.as_ref().join("tokenizer.json");
+        let dir = dir.as_ref();
+        let path = dir.join("tokenizer.json");
         let inner = Tokenizer::from_file(&path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
-        Ok(Self {
-            inner,
-            eos_ids: Vec::new(),
-        })
+        let mut eos_ids = Vec::new();
+        let gc = dir.join("generation_config.json");
+        if let Ok(raw) = std::fs::read_to_string(&gc) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                match v.get("eos_token_id") {
+                    Some(serde_json::Value::Number(n)) => {
+                        if let Some(id) = n.as_u64() {
+                            eos_ids.push(id as u32);
+                        }
+                    }
+                    Some(serde_json::Value::Array(a)) => {
+                        for x in a {
+                            if let Some(id) = x.as_u64() {
+                                eos_ids.push(id as u32);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Self { inner, eos_ids })
     }
 
     /// Build directly from a `tokenizer.json` string.
