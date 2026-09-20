@@ -1,0 +1,38 @@
+{
+  "seq_len": 8,
+  "seed": 20260918,
+  "dtype": "float32",
+  "model": "models/Qwen3.8-27B-NVFP4",
+  "hidden": 5120,
+  "layers": {
+    "0": {
+      "type": "linear_attention",
+      "path": "fixtures/oracle/layer00.npz",
+      "out_mean": 0.01667952910065651,
+      "out_std": 1.2353112697601318,
+      "finite": true,
+      "captured": [
+        "gated_norm",
+        "input_ln",
+        "linear_attn",
+        "mlp",
+        "out_proj",
+        "post_ln"
+      ]
+    },
+    "3": {
+      "type": "full_attention",
+      "path": "fixtures/oracle/layer03.npz",
+      "out_mean": 0.009634466841816902,
+      "out_std": 1.3447990417480469,
+      "finite": true,
+      "captured": [
+        "input_ln",
+        "mlp",
+        "o_proj",
+        "post_ln",
+        "self_attn"
+      ]
+    }
+  }
+}

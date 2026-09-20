@@ -1,0 +1,76 @@
+{
+  "beta": {
+    "shape": [
+      8,
+      48
+    ],
+    "offset": 0,
+    "count": 384
+  },
+  "conv_out": {
+    "shape": [
+      8,
+      10240
+    ],
+    "offset": 1536,
+    "count": 81920
+  },
+  "decay": {
+    "shape": [
+      8,
+      48
+    ],
+    "offset": 329216,
+    "count": 384
+  },
+  "delta_out": {
+    "shape": [
+      384,
+      128
+    ],
+    "offset": 330752,
+    "count": 49152
+  },
+  "gnorm": {
+    "shape": [
+      384,
+      128
+    ],
+    "offset": 527360,
+    "count": 49152
+  },
+  "k_ln": {
+    "shape": [
+      8,
+      16,
+      128
+    ],
+    "offset": 723968,
+    "count": 16384
+  },
+  "proj_qkv": {
+    "shape": [
+      8,
+      10240
+    ],
+    "offset": 789504,
+    "count": 81920
+  },
+  "proj_z": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 1117184,
+    "count": 49152
+  },
+  "q_ln": {
+    "shape": [
+      8,
+      16,
+      128
+    ],
+    "offset": 1313792,
+    "count": 16384
+  }
+}

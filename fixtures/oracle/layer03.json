@@ -1,0 +1,65 @@
+{
+  "input": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 0,
+    "count": 40960
+  },
+  "input_ln": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 163840,
+    "count": 40960
+  },
+  "layer_index": {
+    "shape": [
+      1
+    ],
+    "offset": 327680,
+    "count": 1
+  },
+  "mlp": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 327684,
+    "count": 40960
+  },
+  "o_proj": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 491524,
+    "count": 40960
+  },
+  "output": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 655364,
+    "count": 40960
+  },
+  "post_ln": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 819204,
+    "count": 40960
+  },
+  "self_attn": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 983044,
+    "count": 40960
+  }
+}

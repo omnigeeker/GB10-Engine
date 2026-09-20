@@ -7,6 +7,7 @@
 //! kernels are shaped to keep the weight stream perfectly coalesced.
 
 pub mod kernels;
+pub mod ops;
 
 use cudarc::driver::{CudaContext, CudaModule, CudaStream, DriverError};
 use cudarc::nvrtc::Ptx;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 
 pub use cudarc::driver::{CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits};
 pub use kernels::Kernels;
+pub use ops::Ops;
 
 /// PTX files produced by `build.rs`, colon separated.
 const KERNEL_PTX: &str = env!("GB10_KERNEL_PTX");
@@ -39,6 +41,7 @@ pub struct Device {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     kernels: Kernels,
+    ops: Ops,
     modules: Vec<Arc<CudaModule>>,
 }
 
@@ -52,7 +55,10 @@ impl Device {
         let mut by_name: HashMap<String, cudarc::driver::CudaFunction> = HashMap::new();
         for path in KERNEL_PTX.split(':').filter(|p| !p.is_empty()) {
             let module = ctx.load_module(Ptx::from_file(path))?;
-            for name in kernels::KERNEL_NAMES {
+            for name in kernels::KERNEL_NAMES
+                .iter()
+                .chain(ops::OP_KERNEL_NAMES.iter())
+            {
                 if let Ok(f) = module.load_function(name) {
                     by_name.insert((*name).to_string(), f);
                 }
@@ -63,11 +69,13 @@ impl Device {
             return Err(CudaError::NoKernels);
         }
         let kernels = Kernels::from_map(&mut by_name)?;
+        let ops = Ops::from_map(&mut by_name)?;
 
         Ok(Self {
             ctx,
             stream,
             kernels,
+            ops,
             modules,
         })
     }
@@ -82,6 +90,10 @@ impl Device {
 
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
+    }
+
+    pub fn ops(&self) -> &Ops {
+        &self.ops
     }
 
     pub fn synchronize(&self) -> Result<()> {

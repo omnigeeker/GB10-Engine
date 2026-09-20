@@ -39,15 +39,21 @@ The kernels instead keep the activation tile in registers and hoist it out of
 the row loop, amortising activation traffic over `ROWS` output rows with no
 shared memory at all.
 
-## M2 — Qwen3.5 layer kernels
+## M2 — Qwen3.5 layer kernels (done)
 
-- [ ] Gated DeltaNet: `in_proj_qkv`, `in_proj_z`, conv1d (kernel 4), gated
+- [x] Gated DeltaNet: `in_proj_qkv`, `in_proj_z`, conv1d (kernel 4), gated
       delta rule recurrence in fp32 state, `out_proj`
-- [ ] Full attention: q (with output gate) / k / v projections, partial RoPE
-      (0.25) with mRoPE interleaving, GQA 24:4, causal softmax
-- [ ] MLP: gate/up/down NVFP4 with SiLU
-- [ ] **gate: each layer type matches the oracle to tolerance on a 4-layer
-      slice**
+- [x] Full attention: q (with output gate) / k / v projections, partial RoPE
+      (0.25), GQA 24:4, causal softmax, sigmoid output gate
+- [x] MLP: gate/up/down NVFP4 with SiLU, `post_attention_layernorm` applied
+- [x] **gate: 24 stage checks across layer 0 (DeltaNet) and layer 3
+      (attention), all `err/scale < 2e-3`, typically ~1e-7**
+
+The gate compares every intermediate the reference can expose, not just the
+layer output — see "Debugging methodology" in `docs/ARCHITECTURE.md`. Three
+semantic bugs were found this way: the head_dim^-0.5 factor applied to the key
+as well as the query, a missing `post_attention_layernorm`, and a fixture that
+had been generated with non-causal attention.
 
 ## M3 — Full forward and greedy decode
 

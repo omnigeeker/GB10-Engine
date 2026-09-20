@@ -1,0 +1,90 @@
+{
+  "attn_gated": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 0,
+    "count": 49152
+  },
+  "attn_out": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 196608,
+    "count": 49152
+  },
+  "gate": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 393216,
+    "count": 49152
+  },
+  "k_norm": {
+    "shape": [
+      8,
+      1024
+    ],
+    "offset": 589824,
+    "count": 8192
+  },
+  "k_proj": {
+    "shape": [
+      8,
+      1024
+    ],
+    "offset": 622592,
+    "count": 8192
+  },
+  "k_rope": {
+    "shape": [
+      8,
+      1024
+    ],
+    "offset": 655360,
+    "count": 8192
+  },
+  "o_proj": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 688128,
+    "count": 40960
+  },
+  "q_norm": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 851968,
+    "count": 49152
+  },
+  "q_proj": {
+    "shape": [
+      8,
+      12288
+    ],
+    "offset": 1048576,
+    "count": 98304
+  },
+  "q_rope": {
+    "shape": [
+      8,
+      6144
+    ],
+    "offset": 1441792,
+    "count": 49152
+  },
+  "v_proj": {
+    "shape": [
+      8,
+      1024
+    ],
+    "offset": 1638400,
+    "count": 8192
+  }
+}

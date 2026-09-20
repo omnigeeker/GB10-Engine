@@ -6,6 +6,7 @@ members = [
     "crates/gb10-model",
     "crates/gb10-server",
     "crates/gb10-bench",
+    "crates/gb10-verify",
 ]
 
 [workspace.package]

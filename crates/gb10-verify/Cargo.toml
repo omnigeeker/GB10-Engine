@@ -1,0 +1,20 @@
+[package]
+name = "gb10-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Correctness gate: layer and model parity against the frozen oracle"
+
+[[bin]]
+name = "gb10-verify"
+path = "src/main.rs"
+
+[dependencies]
+gb10-core.workspace = true
+gb10-cuda.workspace = true
+gb10-model.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

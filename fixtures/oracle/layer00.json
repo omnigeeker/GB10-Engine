@@ -1,0 +1,73 @@
+{
+  "gated_norm": {
+    "shape": [
+      384,
+      128
+    ],
+    "offset": 0,
+    "count": 49152
+  },
+  "input": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 196608,
+    "count": 40960
+  },
+  "input_ln": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 360448,
+    "count": 40960
+  },
+  "layer_index": {
+    "shape": [
+      1
+    ],
+    "offset": 524288,
+    "count": 1
+  },
+  "linear_attn": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 524292,
+    "count": 40960
+  },
+  "mlp": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 688132,
+    "count": 40960
+  },
+  "out_proj": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 851972,
+    "count": 40960
+  },
+  "output": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 1015812,
+    "count": 40960
+  },
+  "post_ln": {
+    "shape": [
+      8,
+      5120
+    ],
+    "offset": 1179652,
+    "count": 40960
+  }
+}

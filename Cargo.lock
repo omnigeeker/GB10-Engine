@@ -300,6 +300,7 @@ dependencies = [
  "anyhow",
  "gb10-core",
  "gb10-cuda",
+ "serde_json",
  "tracing",
 ]
 
@@ -311,6 +312,20 @@ dependencies = [
  "gb10-core",
  "gb10-model",
  "tracing",
+]
+
+[[package]]
+name = "gb10-verify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gb10-core",
+ "gb10-cuda",
+ "gb10-model",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

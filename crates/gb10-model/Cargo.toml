@@ -10,3 +10,6 @@ gb10-core.workspace = true
 gb10-cuda.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

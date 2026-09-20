@@ -93,7 +93,7 @@ attn = attn * sigmoid(g.reshape(B, S, 6144))     # SIGMOID
 out  = o_proj(attn)
 ```
 
-Two traps:
+Three traps:
 
 1. **The output gate is `sigmoid`, not `swish`.** `config.json` advertises
    `output_gate_type: "swish"` and `attn_output_gate: true`, but neither key is
@@ -104,6 +104,12 @@ Two traps:
    chunk on the last axis, so for head `h` the q_proj weight rows
    `[512h, 512h+256)` are query and `[512h+256, 512h+512)` are gate. It is not
    "all queries then all gates".
+3. **Attention is causal.** Obvious, but easy to lose when testing a single
+   layer in isolation: passing `attention_mask=None` to `Qwen3_5Attention`
+   makes eager/SDPA attention fully **bidirectional** over the test sequence.
+   The first version of the layer fixture did exactly that and encoded
+   non-causal semantics no correct decoder can reproduce. Fixtures must pass an
+   explicit additive causal mask (`tools/make_layer_fixtures.py`).
 
 ## Gated DeltaNet layer
 
@@ -208,3 +214,37 @@ which is out of scope (`docs/TARGETS.md`).
 `generation_config.json` ships `do_sample: true, temperature 1.0, top_k 20,
 top_p 0.95`, but the oracle and every correctness gate use **greedy argmax**
 over a fixed length. EOS is `{248046 (<|im_end|>), 248044 (<|endoftext|>)}`.
+
+## Debugging methodology: stage parity
+
+A layer-level mismatch says only "this block is wrong". Both blocks are ~10
+kernels deep, so `crates/gb10-verify` compares **every intermediate the
+reference can expose**, and `tools/delta_stages.py` / `tools/attn_stages.py`
+recompute those intermediates from the reference's own functions and weights
+dequantized from this checkpoint.
+
+Each script self-checks first: it recomputes the module output from the
+recomputed stages and asserts it equals the fixture (`max|diff|` 4.3e-6 for
+DeltaNet, 0.0 for attention). A stage reference that does not reproduce its own
+fixture is worthless, so this check is not optional.
+
+That methodology found both remaining M2 bugs in one pass each:
+
+| symptom | cause |
+|---|---|
+| `q_ln` exact, `k_ln` off by exactly `1 - 1/sqrt(128)` = 0.9116 | head_dim^-0.5 was applied to **both** q and k |
+| `input_ln` exact, `gated_norm` off by 0.84 | `post_attention_layernorm` was never applied before the MLP |
+| layer 3 wrong, reproduced only with a non-causal mask | fixture was generated non-causally |
+
+The key-scaling trap is worth stating explicitly, because the two are easy to
+conflate: `torch_recurrent_gated_delta_rule` normalises both q and k, but the
+`query.shape[-1] ** 0.5` division applies to the **query only**:
+
+```python
+query = l2norm(query, dim=-1, eps=1e-6)
+key   = l2norm(key,   dim=-1, eps=1e-6)
+query = query / (query.shape[-1] ** 0.5)   # query ONLY
+```
+
+Current status: 24 stage checks across one DeltaNet layer and one attention
+layer, all within `err/scale < 2e-3` and typically ~1e-7.
