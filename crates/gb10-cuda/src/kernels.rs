@@ -17,7 +17,7 @@ const WARPS_PER_BLOCK: u32 = GEMV_BLOCK / 32;
 
 /// Output rows each warp accumulates simultaneously. Must match the `ROWS`
 /// template argument used by the exported kernels in `kernels/gemv.cu`.
-pub const GEMV_ROWS_PER_WARP: u32 = 4;
+pub const GEMV_ROWS_PER_WARP: u32 = 1;
 
 /// Loaded kernel functions.
 pub struct Kernels {

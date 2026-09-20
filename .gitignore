@@ -30,3 +30,4 @@
 *.swp
 .idea/
 .vscode/
+tools/llama.cpp/

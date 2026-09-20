@@ -181,15 +181,37 @@ Per-shape numbers from `nsys` (model run, before the two fixes below):
 | 1024x5120 (k/v_proj) | fp8 | 32 | 90 |
 | 48x5120 (in_proj_a/b) | bf16 | 2 | 17 |
 
-Leading hypothesis for the 76%: **the activation tile is 2 KB per warp per
-k-tile while the weights it is multiplied against are only 1 KB** (NVFP4, at
-`ROWS=4`), because `x` is fp32 and 4 bytes per K-element against 0.5 bytes of
-NVFP4 weight. The kernel therefore issues 2x as many bytes of activation loads
-as weight loads, all of them from L2 rather than DRAM, on top of the
-`weight_scale` byte loads. `ROWS=8` would halve that ratio but was measured
-*slower* (110.2 -> 117.2 ms) because it halves the block count. Staging the
-activation tile in shared memory once per block instead of once per warp is the
-obvious next experiment.
+### Occupancy was the limit, not activation traffic
+
+The original hypothesis here was that the fp32 activation tile (2 KB per warp
+per k-tile, against 1 KB of NVFP4 weights at `ROWS=4`) was the cost, and that
+staging it in shared memory would help. Sweeping `ROWS` falsifies that
+directly:
+
+| rows/warp | registers | occupancy | GB/s |
+|---|---|---|---|
+| 8 | - | - | 157.8 |
+| 4 | 60 | 50% (4x256 of 1536) | 172.8 |
+| 2 | - | - | 174.5 |
+| **1** | **39** | **100% (6x256 = 1536)** | **178.6** |
+
+Bandwidth rises monotonically as `ROWS` falls -- i.e. as the kernel issues
+*more* activation traffic and *more* blocks. So activation traffic is close to
+free (it is L2-resident and reused by every block), and what actually matters is
+resident warps. `ROWS=1` drops register pressure enough to fit the device's
+hard cap of `maxThreadsPerMultiProcessor = 1536` (6 blocks of 256), taking
+occupancy from 50% to 100%.
+
+End to end that is 108.2 -> 102.7 ms/token, i.e. **9.24 -> 9.73 tok/s**, with
+the 64-layer oracle agreement still exact at 16/16.
+
+Remaining gap: 178.6 of 228 GB/s is 78%. With occupancy maxed, the next
+suspects are the `weight_scale` byte load (a 32-byte transaction per warp per
+row-tile against a 256-byte weight transaction) and the row-strided DRAM access
+pattern itself, which reads 256 contiguous bytes per warp per row with rows
+2560 bytes apart -- nothing like the purely sequential 16 GiB stream that
+`bw4.cu` measures 228 GB/s on. A probe that reads the real weights with the
+GEMV's access pattern but no arithmetic would separate those two.
 
 ### The 2x that wasn't (kept as a warning)
 

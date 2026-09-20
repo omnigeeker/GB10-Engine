@@ -323,17 +323,17 @@ extern "C" __global__ void __launch_bounds__(256)
 nvfp4_gemv_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                   const uint8_t* __restrict__ wscale, const float* __restrict__ scale2,
                   float* __restrict__ y, int N, int K) {
-    nvfp4_gemv_tmpl<4>(x, w, wscale, scale2, y, N, K);
+    nvfp4_gemv_tmpl<1>(x, w, wscale, scale2, y, N, K);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
 fp8_gemv_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 const float* __restrict__ wscale, float* __restrict__ y, int N, int K) {
-    fp8_gemv_tmpl<4>(x, w, wscale, y, N, K);
+    fp8_gemv_tmpl<1>(x, w, wscale, y, N, K);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
 bf16_gemv_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                  float* __restrict__ y, int N, int K) {
-    bf16_gemv_tmpl<4>(x, w, y, N, K);
+    bf16_gemv_tmpl<1>(x, w, y, N, K);
 }
