@@ -104,11 +104,49 @@ Three steps got here, each measured:
    ROWS=4 is the optimum; beyond it `acc[ROWS][BMAX]` spills. Applying the same
    to FP8 gave 380.3 ms and **42.08 tok/s**.
 
-Still ~5x above the ~77 ms/step weight floor (17.6 GB / 228 GB/s). Next
-suspect: the Gated DeltaNet recurrence. `gated_delta_rule_step_multi` declares
-`__shared__ float S[128][129]` = 66048 B, so only **one block fits per SM**
-(102400 B available); at n_seq=16 the grid is (48, 16) = 768 blocks over 48
-SMs, i.e. 16 sequential waves.
+### Where the remaining time actually is (profiled, not guessed)
+
+Re-profiling after the ROWS tuning, per batched step:
+
+| kernel | ms/step | share |
+|---|---|---|
+| `nvfp4_gemv_batch` | 202.4 | 53% |
+| `fp8_gemv_batch` | 104.3 | 27% |
+| `gated_delta_rule_step_multi` | 27.8 | 7% |
+| `bf16_gemv_batch` | 8.3 | 2% |
+| `attn_decode_multi` | 1.7 | <1% |
+
+The Gated DeltaNet recurrence was **not** the bottleneck -- it is 7%. The GEMV
+is 80%, and it runs at 17.6 GB / 380 ms = **46 GB/s, only 20% of the 228 GB/s
+roofline**, where the single-sequence kernel reaches 76%.
+
+### It is a register/occupancy problem, not a traffic problem
+
+`ptxas -Xptxas -v` on the batch kernels:
+
+| variant | registers | stack frame |
+|---|---|---|
+| single-sequence `nvfp4_gemv_kernel` | 40 | 0 |
+| batch, ROWS=4, `lo`/`hi` materialised | 128 | 256 B |
+| batch, ROWS=4, weights kept packed | **210** | 256 B |
+| batch, ROWS=1 + shared x staging | 40 | 0 |
+
+At ROWS=4 the kernel needs `acc[4][16]` + `lo[4][8]` + `hi[4][8]` = 128 live
+floats, which exactly exhausts the register file: ptxas spills 256 bytes to
+local memory and occupancy falls to 2 blocks/SM. Keeping the weights packed and
+re-running the dequant per sequence was *worse* (210 registers -- the compiler
+hoists more aggressively without the arrays).
+
+The x-vectors are only 328 KB for batch 16 and stay L2-resident, so x traffic
+is **not** the limiter: staging x in `__shared__` (with float4 loads, at 40
+registers) still measured 582 ms, worse than 448 ms, because the two
+`__syncthreads()` per k-tile are paid against only 8 rows of work per block.
+
+So the remaining fix is to give each block many more rows of work per staged
+x-tile -- roughly 64-128 rows -- with the per-row partial sums held in
+`__shared__` rather than registers, since 64 rows x 16 sequences cannot fit in
+registers at all. Shared budget: `xs[16][512]` = 32 KB plus `part[128][16]` =
+8 KB = 40 KB, inside the 48 KB static limit.
 
 ## Optimisation order (roofline-driven)
 
