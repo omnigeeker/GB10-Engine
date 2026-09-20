@@ -619,3 +619,40 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
 
     for (int i = threadIdx.x; i < D * D; i += blockDim.x) sh[i] = S[i / D][i % D];
 }
+
+// Batched `deinterleave_heads`: src is [T, n_heads * 2 * head_dim].
+extern "C" __global__ void deinterleave_heads_batched_kernel(const float* __restrict__ src,
+                                                             float* __restrict__ dst,
+                                                             int n_heads, int head_dim,
+                                                             int src_off) {
+    const int t = blockIdx.y;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_heads * head_dim;
+    if (idx >= total) return;
+    const int h = idx / head_dim;
+    const int d = idx % head_dim;
+    dst[(size_t)t * total + idx] =
+        src[(size_t)t * n_heads * 2 * head_dim + h * 2 * head_dim + src_off + d];
+}
+
+// Gather T token embeddings in one launch. `tokens` is a device array of T
+// int32 ids; `out` is [T, hidden] fp32 (bf16 bits widened by a shift).
+extern "C" __global__ void embed_gather_batched_kernel(const uint16_t* __restrict__ table,
+                                                       const int* __restrict__ tokens,
+                                                       float* __restrict__ out, int hidden) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hidden) return;
+    const uint16_t bits = table[(size_t)tokens[t] * hidden + i];
+    out[(size_t)t * hidden + i] = __uint_as_float((uint32_t)bits << 16);
+}
+
+// Copy row `t-1` of an `[t, n]` buffer to the front of `dst`. Prefill only
+// needs logits for the final prompt token, and running lm_head (715 MB of
+// weights) over every prompt row would cost a full extra pass.
+extern "C" __global__ void copy_last_row_kernel(const float* __restrict__ src,
+                                                float* __restrict__ dst, int t, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[(size_t)(t - 1) * n + i];
+}

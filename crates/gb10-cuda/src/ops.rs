@@ -36,6 +36,9 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "rope_neox_batched_kernel",
     "kv_cache_append_batched_kernel",
     "gated_delta_rule_chunk_kernel",
+    "deinterleave_heads_batched_kernel",
+    "embed_gather_batched_kernel",
+    "copy_last_row_kernel",
 ];
 
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
@@ -65,6 +68,9 @@ pub struct Ops {
     rope_neox_batched: CudaFunction,
     kv_cache_append_batched: CudaFunction,
     gated_delta_rule_chunk: CudaFunction,
+    deinterleave_heads_batched: CudaFunction,
+    embed_gather_batched: CudaFunction,
+    copy_last_row: CudaFunction,
 }
 
 fn take(map: &mut HashMap<String, CudaFunction>, n: &str) -> Result<CudaFunction> {
@@ -110,6 +116,9 @@ impl Ops {
             rope_neox_batched: take(map, "rope_neox_batched_kernel")?,
             kv_cache_append_batched: take(map, "kv_cache_append_batched_kernel")?,
             gated_delta_rule_chunk: take(map, "gated_delta_rule_chunk_kernel")?,
+            deinterleave_heads_batched: take(map, "deinterleave_heads_batched_kernel")?,
+            embed_gather_batched: take(map, "embed_gather_batched_kernel")?,
+            copy_last_row: take(map, "copy_last_row_kernel")?,
         })
     }
 
@@ -856,6 +865,47 @@ impl Ops {
                 .arg(qkv).arg(&qo).arg(&ko).arg(&vo).arg(&rs).arg(decay).arg(beta)
                 .arg(state).arg(out).arg(&tt).arg(&nv).arg(&nk).arg(&g)
                 .launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Batched `deinterleave_heads` over `t` rows.
+    pub fn deinterleave_heads_batched(
+        &self, dev: &Device, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>, n_heads: usize,
+        head_dim: usize, src_off: usize, t: usize,
+    ) -> Result<()> {
+        let (nh, hd, so) = (n_heads as i32, head_dim as i32, src_off as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.deinterleave_heads_batched)
+                .arg(src).arg(dst).arg(&nh).arg(&hd).arg(&so)
+                .launch(LaunchConfig { grid_dim: (cdiv(n_heads*head_dim,256), t as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Gather `t` token embeddings into a `[t, hidden]` fp32 buffer.
+    pub fn embed_gather_batched(
+        &self, dev: &Device, table: &CudaSlice<u16>, tokens: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>, hidden: usize, t: usize,
+    ) -> Result<()> {
+        let h = hidden as i32;
+        unsafe {
+            dev.stream().launch_builder(&self.embed_gather_batched)
+                .arg(table).arg(tokens).arg(out).arg(&h)
+                .launch(LaunchConfig { grid_dim: (cdiv(hidden,256), t as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Copy row `t-1` of `src` (`[t, n]`) to the front of `dst`.
+    pub fn copy_last_row(
+        &self, dev: &Device, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>, t: usize, n: usize,
+    ) -> Result<()> {
+        let (tt, nn) = (t as i32, n as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.copy_last_row)
+                .arg(src).arg(dst).arg(&tt).arg(&nn)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }

@@ -76,3 +76,17 @@ mod tests {
         }
     }
 }
+
+/// RoPE tables for `n` consecutive positions starting at `start`, flattened as
+/// `[n, rotary_dim/2]` so the batched prefill kernel can index them by row.
+pub fn rope_tables_range(cfg: &TextConfig, start: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = cfg.rotary_dim() / 2;
+    let mut cos = Vec::with_capacity(n * half);
+    let mut sin = Vec::with_capacity(n * half);
+    for i in 0..n {
+        let (c, s) = rope_tables(cfg, start + i);
+        cos.extend_from_slice(&c);
+        sin.extend_from_slice(&s);
+    }
+    (cos, sin)
+}

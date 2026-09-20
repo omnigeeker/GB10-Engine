@@ -91,6 +91,8 @@ pub struct ModelState {
     pub a: CudaSlice<f32>,
     pub b: CudaSlice<f32>,
     pub normed: CudaSlice<f32>,
+    /// Final-norm row of the last prompt token, consumed by `lm_head`.
+    pub last: CudaSlice<f32>,
     pub n_tokens: usize,
 }
 
@@ -106,9 +108,12 @@ impl ModelState {
             layers,
             logits: z(model.vocab_size())?,
             idx: dev.stream().alloc_zeros::<i32>(1)?,
-            a: z(text.hidden_size)?,
-            b: z(text.hidden_size)?,
-            normed: z(text.hidden_size)?,
+            // Per-token buffers are `max_seq` rows so prefill can run the
+            // whole prompt through the stack in one batched pass.
+            a: z(text.hidden_size * max_seq)?,
+            b: z(text.hidden_size * max_seq)?,
+            normed: z(text.hidden_size * max_seq)?,
+            last: z(text.hidden_size)?,
             n_tokens: 0,
         })
     }
@@ -171,11 +176,43 @@ impl Model {
         state: &mut ModelState,
         sc: &mut Scratch,
     ) -> Result<u32> {
-        let mut next = 0;
-        for &t in tokens {
-            next = self.step(dev, t, state, sc)?;
+        let t = tokens.len();
+        if t == 0 {
+            anyhow::bail!("prefill: empty prompt");
         }
-        Ok(next)
+        let text = self.text();
+        let hidden = text.hidden_size;
+        let eps = text.rms_norm_eps as f32;
+
+        let ids: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
+        let ids_dev = dev.stream().clone_htod(&ids)?;
+        dev.ops()
+            .embed_gather_batched(dev, &self.embed, &ids_dev, &mut state.a, hidden, t)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t)?;
+            std::mem::swap(&mut state.a, &mut state.b);
+        }
+
+        // Only the final prompt row needs logits; running lm_head over all `t`
+        // rows would re-read 715 MB of weights per prompt token.
+        dev.ops().rmsnorm_zero_centered(
+            dev,
+            &state.a,
+            &self.norm,
+            &mut state.normed,
+            t,
+            hidden,
+            eps,
+        )?;
+        dev.ops()
+            .copy_last_row(dev, &state.normed, &mut state.last, t, hidden)?;
+        self.lm_head.forward(dev, &state.last, &mut state.logits, 1)?;
+        dev.ops()
+            .argmax(dev, &state.logits, &mut state.idx, self.vocab_size())?;
+        state.n_tokens += t;
+        let v = dev.stream().memcpy_dtov(&state.idx)?;
+        Ok(v[0] as u32)
     }
 }
 

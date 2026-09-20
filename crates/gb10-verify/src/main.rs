@@ -151,7 +151,7 @@ fn layer_parity(args: &Args) -> Result<bool> {
 
     let layer = store.layer(&dev, &text, args.layer)?;
     let mut state = LayerState::new(&dev, &text, &layer, args.max_seq)?;
-    let mut sc = Scratch::new(&dev, &text)?;
+    let mut sc = Scratch::new(&dev, &text, 512)?;
 
     let mut xbuf = dev.stream().alloc_zeros::<f32>(hidden)?;
     let mut obuf = dev.stream().alloc_zeros::<f32>(hidden)?;
@@ -351,7 +351,7 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
     );
 
     let mut state = ModelState::new(&dev, &model, args.max_seq)?;
-    let mut sc = Scratch::new(&dev, &text)?;
+    let mut sc = Scratch::new(&dev, &text, 512)?;
 
     let t1 = std::time::Instant::now();
     let mut next = model.prefill(&dev, &ids, &mut state, &mut sc)?;

@@ -13,7 +13,7 @@ use gb10_core::config::TextConfig;
 use gb10_cuda::{CudaSlice, Device};
 use gb10_cuda::ops::{DELTA_KEY_HEAD_DIM, DELTA_VALUE_HEAD_DIM};
 
-use crate::rope::rope_tables;
+use crate::rope::{rope_tables, rope_tables_range};
 use crate::weights::{Linear, Store};
 
 /// SwiGLU MLP: `down(silu(gate(x)) * up(x))`.
@@ -40,12 +40,13 @@ impl Mlp {
         out: &mut CudaSlice<f32>,
         a: &mut CudaSlice<f32>,
         b: &mut CudaSlice<f32>,
+        batch: usize,
     ) -> Result<()> {
-        self.gate.forward(dev, x, a, 1)?;
-        self.up.forward(dev, x, b, 1)?;
+        self.gate.forward(dev, x, a, batch)?;
+        self.up.forward(dev, x, b, batch)?;
         // In-place is safe: element i is read before it is written.
-        dev.ops().swiglu_inplace(dev, a, b, self.gate.n)?;
-        self.down.forward(dev, a, out, 1)?;
+        dev.ops().swiglu_inplace(dev, a, b, self.gate.n * batch)?;
+        self.down.forward(dev, a, out, batch)?;
         Ok(())
     }
 
@@ -164,6 +165,206 @@ impl Layer {
             Layer::Attn(l) => l.forward(dev, cfg, x, out, state, sc),
         }
     }
+
+    /// Batched prefill over `t` tokens; `x` is `[t, hidden]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        t: usize,
+    ) -> Result<()> {
+        match self {
+            Layer::Delta(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t),
+            Layer::Attn(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t),
+        }
+    }
+}
+
+impl DeltaNetLayer {
+    /// Batched prefill over `t` prompt tokens. `x` is `[t, hidden]`.
+    ///
+    /// Everything except the recurrence is parallel across `t`; the
+    /// recurrence runs as a `t`-iteration loop inside one launch, so the
+    /// 3.1 MB state is read and written once for the whole prompt instead of
+    /// once per token.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        t: usize,
+    ) -> Result<()> {
+        let ops = dev.ops();
+        let eps = cfg.rms_norm_eps as f32;
+        let hidden = cfg.hidden_size;
+        let nk = cfg.linear_num_key_heads;
+        let nv = cfg.linear_num_value_heads;
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let qk_dim = cfg.linear_qk_dim();
+        let conv_dim = qk_dim * 2 + cfg.linear_value_dim();
+        let group = nv / nk;
+
+        ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
+        self.in_proj_qkv.forward(dev, &sc.hidden, &mut sc.qkv, t)?;
+        self.in_proj_z.forward(dev, &sc.hidden, &mut sc.z, t)?;
+        self.in_proj_a.forward(dev, &sc.hidden, &mut sc.a, t)?;
+        self.in_proj_b.forward(dev, &sc.hidden, &mut sc.b, t)?;
+
+        ops.conv1d_prefill_silu(
+            dev,
+            &sc.qkv,
+            &self.conv1d,
+            &mut state.conv_hist,
+            &mut sc.conv,
+            conv_dim,
+            t,
+        )?;
+
+        dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
+        let q_scale = 1.0 / (kd as f32).sqrt();
+        ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, 0, nk, kd, t, q_scale, 1e-6)?;
+        ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, qk_dim, nk, kd, t, 1.0, 1e-6)?;
+
+        ops.delta_gate_batched(
+            dev,
+            &sc.a,
+            &sc.b,
+            &self.a_log,
+            &self.dt_bias,
+            &mut sc.decay,
+            &mut sc.beta,
+            nv,
+            t,
+        )?;
+
+        ops.gated_delta_rule_chunk(
+            dev,
+            &sc.conv_ln,
+            0,
+            qk_dim,
+            2 * qk_dim,
+            conv_dim,
+            &sc.decay,
+            &sc.beta,
+            &mut state.rec,
+            &mut sc.attn,
+            t,
+            nv,
+            nk,
+            group,
+        )?;
+
+        ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, t * nv, vd, eps)?;
+        self.out_proj.forward(dev, &sc.gnorm, &mut sc.proj, t)?;
+
+        ops.add(dev, x, &sc.proj, &mut sc.res, t * hidden)?;
+        ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, t, hidden, eps)?;
+        self.mlp
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
+        ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
+        Ok(())
+    }
+}
+
+impl FullAttnLayer {
+    /// Batched prefill over `t` prompt tokens. `x` is `[t, hidden]`.
+    ///
+    /// Valid only when the cache is empty, because `attn_prefill_kernel`
+    /// hardcodes the causal window as `0..=t` rather than `0..=start+t`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        t: usize,
+    ) -> Result<()> {
+        let ops = dev.ops();
+        let eps = cfg.rms_norm_eps as f32;
+        let hidden = cfg.hidden_size;
+        let nh = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let rotary = cfg.rotary_dim();
+
+        ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
+        self.q_proj.forward(dev, &sc.hidden, &mut sc.fused, t)?;
+        self.k_proj.forward(dev, &sc.hidden, &mut sc.kb, t)?;
+        self.v_proj.forward(dev, &sc.hidden, &mut sc.vb, t)?;
+
+        ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.q, nh, hd, 0, t)?;
+        ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.gate, nh, hd, hd, t)?;
+
+        ops.rmsnorm_zero_centered_inplace(dev, &mut sc.q, &self.q_norm, t * nh, hd, eps)?;
+        ops.rmsnorm_zero_centered(dev, &sc.kb, &self.k_norm, &mut sc.kb_ln, t * nkv, hd, eps)?;
+
+        let pos = state.n_keys;
+        let (cos, sin) = rope_tables_range(cfg, pos, t);
+        dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
+        dev.stream().memcpy_htod(&sin, &mut sc.sin)?;
+        ops.rope_neox_batched(
+            dev,
+            &mut sc.q,
+            &mut sc.kb_ln,
+            &sc.cos,
+            &sc.sin,
+            nh,
+            nkv,
+            hd,
+            rotary / 2,
+            t,
+        )?;
+
+        ops.kv_cache_append_batched(
+            dev,
+            &sc.kb_ln,
+            &sc.vb,
+            &mut state.k_cache,
+            &mut state.v_cache,
+            pos,
+            nkv,
+            hd,
+            t,
+        )?;
+        state.n_keys = pos + t;
+
+        let scale = 1.0 / (hd as f32).sqrt();
+        ops.attn_prefill(
+            dev,
+            &sc.q,
+            &state.k_cache,
+            &state.v_cache,
+            &mut sc.attn,
+            state.n_keys,
+            nh,
+            nkv,
+            hd,
+            scale,
+        )?;
+
+        ops.sigmoid_mul(dev, &mut sc.attn, &sc.gate, t * nh * hd)?;
+        self.o_proj.forward(dev, &sc.attn, &mut sc.proj, t)?;
+
+        ops.add(dev, x, &sc.proj, &mut sc.res, t * hidden)?;
+        ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, t, hidden, eps)?;
+        self.mlp
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
+        ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
+        Ok(())
+    }
 }
 
 /// Per-sequence state. For DeltaNet layers this is the conv history plus the
@@ -254,8 +455,13 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub fn new(dev: &Device, cfg: &TextConfig) -> Result<Self> {
-        let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
+    pub fn new(dev: &Device, cfg: &TextConfig, max_seq: usize) -> Result<Self> {
+        // Every buffer below is per-token, so prefill needs `max_seq` copies
+        // of each. At 512 tokens that is ~300 MB, which is cheap next to the
+        // 17 GB of weights and buys a single batched pass over the prompt.
+        let z = |n: usize| -> Result<CudaSlice<f32>> {
+            Ok(dev.stream().alloc_zeros::<f32>(n * max_seq)?)
+        };
         let hidden = cfg.hidden_size;
         let inter = cfg.intermediate_size;
         let vdim = cfg.linear_value_dim();
@@ -369,7 +575,7 @@ impl DeltaNetLayer {
         // The MLP reads the *normalised* residual, not the residual itself.
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, 1, hidden, eps)?;
         self.mlp
-            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2)?;
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, 1)?;
         ops.add(dev, &sc.res, &sc.down, out, hidden)?;
         Ok(())
     }
@@ -450,7 +656,7 @@ impl FullAttnLayer {
         // The MLP reads the *normalised* residual, not the residual itself.
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, 1, hidden, eps)?;
         self.mlp
-            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2)?;
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, 1)?;
         ops.add(dev, &sc.res, &sc.down, out, hidden)?;
         Ok(())
     }

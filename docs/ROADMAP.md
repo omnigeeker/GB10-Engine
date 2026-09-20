@@ -118,6 +118,31 @@ round trip per token).
 `Linear::forward` already takes `batch`, so the projections and MLP need no new
 kernels.
 
+**Wired and verified (round 12):** `Model::prefill` now embeds all T tokens at
+once, runs all 64 layers through `forward_prefill`, and computes logits only
+for the final prompt row (`copy_last_row`), so `lm_head`'s 715 MB is read once
+rather than once per prompt token. The 64-layer oracle gate still passes
+**exactly, 16/16**, which is what makes this safe to build on. TTFT went
+6273 -> 4904 ms.
+
+**But that is only 22%, and the reason matters:** `Linear::forward(dev, x, y,
+batch=B)` launches `grid_dim = (ceil(N/rows_per_block), B)`, i.e. it runs B
+*independent* matrix-vector products. Each one re-reads the entire weight
+matrix. So batching the existing GEMV parallelises across tokens but reduces
+weight traffic by **zero** -- the 22% is launch-overhead and occupancy, not
+bandwidth.
+
+Real prefill needs a **GEMM** that reads each weight tile once and multiplies
+it against all T activations, which is the opposite tiling from the decode
+GEMV: decode blocks over N and streams W; prefill must block over (N, T) and
+reuse the W tile T times.
+
+Roofline for that: at T=59 the arithmetic intensity is
+`2*17408*5120 / 44.6e6 = 118` FLOP/byte against a crossover of ~87, so prefill
+becomes *compute*-bound rather than memory-bound. llama.cpp's 798.91 tok/s is
+1.25 ms/token, i.e. ~75 ms for 59 tokens, which is consistent with being
+compute-bound at a few TFLOPS effective. That is the target.
+
 **Remaining wiring:**
 - [ ] size `Scratch` and `ModelState::{a,b,normed}` by `max_seq` instead of 1
       token (~300 MB at 512, which is fine)
