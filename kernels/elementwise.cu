@@ -162,11 +162,12 @@ extern "C" __global__ void rope_neox_kernel(float* __restrict__ q, float* __rest
 extern "C" __global__ void conv1d_step_silu_kernel(const float* __restrict__ x,
                                                    const float* __restrict__ w,
                                                    float* __restrict__ hist,
-                                                   float* __restrict__ y, int channels) {
+                                                   float* __restrict__ y, int channels,
+                                                   int base) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* __restrict__ wc = w + (size_t)c * 4;
-    float* __restrict__ h = hist + (size_t)c * 3;
+    float* __restrict__ h = hist + base + (size_t)c * 3;
     const float xc = x[c];
     const float acc =
         fmaf(wc[0], h[0], fmaf(wc[1], h[1], fmaf(wc[2], h[2], wc[3] * xc)));
@@ -199,7 +200,7 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
     const float* __restrict__ qkv, int q_off, int k_off, int v_off, int row_stride,
     const float* __restrict__ decay, const float* __restrict__ beta,
     float* __restrict__ state, float* __restrict__ out, int n_v_heads, int n_k_heads,
-    int group) {
+    int group, int base) {
     constexpr int D = 128;
     const int hv = blockIdx.x;
     const int b = blockIdx.y;
@@ -213,7 +214,7 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
     const float* __restrict__ qh = row + q_off + (size_t)kh * D;
     const float* __restrict__ khp = row + k_off + (size_t)kh * D;
     const float* __restrict__ vh = row + v_off + (size_t)hv * D;
-    float* __restrict__ sh = state + ((size_t)b * n_v_heads + hv) * D * D;
+    float* __restrict__ sh = state + base + ((size_t)b * n_v_heads + hv) * D * D;
 
     // Load the persistent state. The caller zeroes it at sequence start; this
     // kernel must not, or every decode step would forget the whole prefix.
@@ -355,7 +356,7 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
                                               const float* __restrict__ v_cache,
                                               float* __restrict__ out, int n_keys,
                                               int n_q_heads, int n_kv_heads, int head_dim,
-                                              float scale) {
+                                              float scale, int base) {
     const int h = blockIdx.x;
     const int d = threadIdx.x;
     const int group = n_q_heads / n_kv_heads;
@@ -367,7 +368,8 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
     const float qv = active ? q[h * head_dim + d] : 0.0f;
 
     for (int s = 0; s < n_keys; ++s) {
-        const float kk = active ? k_cache[((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
+        const float kk =
+            active ? k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kk) * scale;
         if (d == 0) scores[s] = dot;
         __syncthreads();
@@ -383,7 +385,7 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
         float acc = 0.0f;
         for (int s = 0; s < n_keys; ++s) {
             const float p = __expf(scores[s] - mx) * inv;
-            acc = fmaf(p, v_cache[((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
+            acc = fmaf(p, v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
         }
         out[h * head_dim + d] = acc;
     }
@@ -394,12 +396,12 @@ extern "C" __global__ void kv_cache_append_kernel(const float* __restrict__ k,
                                                   const float* __restrict__ v,
                                                   float* __restrict__ k_cache,
                                                   float* __restrict__ v_cache, int pos,
-                                                  int n_kv_heads, int head_dim) {
+                                                  int n_kv_heads, int head_dim, int base) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = n_kv_heads * head_dim;
     if (i >= n) return;
-    k_cache[(size_t)pos * n + i] = k[i];
-    v_cache[(size_t)pos * n + i] = v[i];
+    k_cache[base + (size_t)pos * n + i] = k[i];
+    v_cache[base + (size_t)pos * n + i] = v[i];
 }
 
 // ---------------------------------------------------------------------------

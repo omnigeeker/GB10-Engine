@@ -521,6 +521,7 @@ impl Ops {
         need(w.len() >= channels * 4, "conv1d w")?;
         need(hist.len() >= channels * 3, "conv1d hist")?;
         let c = channels as i32;
+        let base = 0i32;  // per-sequence offset; 0 until batching lands
         unsafe {
             dev.stream()
                 .launch_builder(&self.conv1d_step_silu)
@@ -529,6 +530,7 @@ impl Ops {
                 .arg(hist)
                 .arg(y)
                 .arg(&c)
+                .arg(&base)
                 .launch(LaunchConfig {
                     grid_dim: (cdiv(channels, 256), 1, 1),
                     block_dim: (256, 1, 1),
@@ -570,6 +572,7 @@ impl Ops {
         let (qo, ko, vo, rs) =
             (q_off as i32, k_off as i32, v_off as i32, row_stride as i32);
         let (nv, nk, g) = (n_v_heads as i32, n_k_heads as i32, group as i32);
+        let base = 0i32;  // per-sequence offset; 0 until batching lands
         unsafe {
             dev.stream()
                 .launch_builder(&self.gated_delta_rule_step)
@@ -585,6 +588,7 @@ impl Ops {
                 .arg(&nv)
                 .arg(&nk)
                 .arg(&g)
+                .arg(&base)
                 .launch(LaunchConfig {
                     grid_dim: (n_v_heads as u32, batch as u32, 1),
                     block_dim: (d as u32, 1, 1),
@@ -687,6 +691,7 @@ impl Ops {
         )?;
         let (nk, nq, nkv, hd) =
             (n_keys as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
+        let base = 0i32;  // per-sequence offset; 0 until batching lands
         unsafe {
             dev.stream()
                 .launch_builder(&self.attn_decode)
@@ -699,6 +704,7 @@ impl Ops {
                 .arg(&nkv)
                 .arg(&hd)
                 .arg(&scale)
+                .arg(&base)
                 .launch(LaunchConfig {
                     grid_dim: (n_q_heads as u32, 1, 1),
                     block_dim: (block_for(head_dim, 256), 1, 1),
@@ -723,10 +729,11 @@ impl Ops {
         let n = n_kv_heads * head_dim;
         need(k.len() >= n && v.len() >= n, "kv append src")?;
         need(
-            k_cache.len() >= (pos + 1) * n && v_cache.len() >= (pos + 1) * n,
+            k_cache.len() >= pos * n + n && v_cache.len() >= pos * n + n,
             "kv append cache",
         )?;
         let (p, nkv, hd) = (pos as i32, n_kv_heads as i32, head_dim as i32);
+        let base = 0i32;  // per-sequence offset; 0 until batching lands
         unsafe {
             dev.stream()
                 .launch_builder(&self.kv_cache_append)
@@ -737,6 +744,7 @@ impl Ops {
                 .arg(&p)
                 .arg(&nkv)
                 .arg(&hd)
+                .arg(&base)
                 .launch(LaunchConfig {
                     grid_dim: (cdiv(n, 128), 1, 1),
                     block_dim: (128, 1, 1),

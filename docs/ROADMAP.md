@@ -372,6 +372,27 @@ gates OK. Doing it this way means the state-layout change is already proven
 safe before any kernel is touched -- the remaining work is the kernel strides,
 not the Rust.
 
+**Step 2 landed (round 26): the four decode kernels take a sequence base.**
+`conv1d_step_silu`, `gated_delta_rule_step`, `attn_decode` and
+`kv_cache_append` each gained an `int base` that is added to the state/cache
+pointer, so sequence `s` addresses `base = s * per_seq` without any other
+change to the address arithmetic. All four launchers pass `base = 0` for now,
+which keeps the current single-sequence path bit-identical.
+
+Gate: TTFT 452.0 ms (450.6 before -- within run-to-run noise), 64-layer oracle
+still 16/16 exact.
+
+Two notes for whoever picks this up. `gated_delta_rule_chunk_kernel` shares the
+`state + (...)` line with the step kernel but is a *prefill* kernel, so it was
+deliberately left without a base. And `kv_cache_append`'s bounds check had to
+change from `(pos + 1) * n` to `pos * n + n`, which is the same thing for
+`base = 0` but states the intent without the off-by-one shape.
+
+With the state dimension (round 25) and the kernel bases (round 26) both in and
+both proven behaviour-neutral, what remains is purely wiring: build the state
+with `n_seq = 16`, add `Model::step_batch`, and have the server schedule
+sequences onto it.
+
 Rough shape of the work: add a sequence stride to those four kernels, grow the
 four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add
 `Model::step_batch`, then have the server hold N states and schedule. The
