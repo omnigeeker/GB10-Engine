@@ -359,6 +359,19 @@ take a position and a cache base with no sequence stride, so each needs a
 `seq`/`stride` parameter and the address arithmetic redone. `rope_tables_range`
 already produces a per-position table, so RoPE itself is fine.
 
+**Step 1 landed (round 25): the state now has a sequence dimension.**
+`LayerState` gained `n_seq` and a per-sequence `n_keys: Vec<usize>`, its four
+buffers are allocated sequence-major (`[s * per_seq, (s + 1) * per_seq)`), and
+a `seq` index is threaded through `Layer::forward` / `Layer::forward_prefill`
+and both layer impls. `ModelState` still builds with `n_seq = 1`, so the sizes
+and the arithmetic are byte-for-byte what they were.
+
+This was deliberately a behaviour-neutral step and the gates confirm it: TTFT
+450.6 ms (unchanged), 64-layer oracle still 16/16 exact, layer parity all
+gates OK. Doing it this way means the state-layout change is already proven
+safe before any kernel is touched -- the remaining work is the kernel strides,
+not the Rust.
+
 Rough shape of the work: add a sequence stride to those four kernels, grow the
 four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add
 `Model::step_batch`, then have the server hold N states and schedule. The

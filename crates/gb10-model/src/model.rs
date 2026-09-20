@@ -101,7 +101,7 @@ impl ModelState {
         let text = model.text();
         let mut layers = Vec::with_capacity(model.layers.len());
         for l in &model.layers {
-            layers.push(LayerState::new(dev, text, l, max_seq)?);
+            layers.push(LayerState::new(dev, text, l, max_seq, 1)?);
         }
         let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
         Ok(Self {
@@ -145,7 +145,7 @@ impl Model {
             .embed_gather(dev, &self.embed, token, &mut state.a, hidden)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc)?;
+            layer.forward(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, 0)?;
             std::mem::swap(&mut state.a, &mut state.b);
         }
 
@@ -190,7 +190,7 @@ impl Model {
             .embed_gather_batched(dev, &self.embed, &ids_dev, &mut state.a, hidden, t)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t)?;
+            layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, 0)?;
             std::mem::swap(&mut state.a, &mut state.b);
         }
 
@@ -264,7 +264,7 @@ impl Model {
 
         for (i, layer) in self.layers.iter().enumerate() {
             t = std::time::Instant::now();
-            layer.forward(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc)?;
+            layer.forward(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, 0)?;
             dev.synchronize()?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if layer.is_delta() {

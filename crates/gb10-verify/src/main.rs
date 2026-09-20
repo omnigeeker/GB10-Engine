@@ -150,7 +150,7 @@ fn layer_parity(args: &Args) -> Result<bool> {
     );
 
     let layer = store.layer(&dev, &text, args.layer)?;
-    let mut state = LayerState::new(&dev, &text, &layer, args.max_seq)?;
+    let mut state = LayerState::new(&dev, &text, &layer, args.max_seq, 1)?;
     let mut sc = Scratch::new_single(&dev, &text)?;
 
     let mut xbuf = dev.stream().alloc_zeros::<f32>(hidden)?;
@@ -180,7 +180,7 @@ fn layer_parity(args: &Args) -> Result<bool> {
     for t in 0..tokens {
         dev.stream()
             .memcpy_htod(&x[t * hidden..(t + 1) * hidden], &mut xbuf)?;
-        layer.forward(&dev, &text, &xbuf, &mut obuf, &mut state, &mut sc)?;
+        layer.forward(&dev, &text, &xbuf, &mut obuf, &mut state, &mut sc, 0)?;
         dev.synchronize()?;
         let r = t * hidden..(t + 1) * hidden;
         got[r.clone()].copy_from_slice(&dev.stream().memcpy_dtov(&obuf)?);

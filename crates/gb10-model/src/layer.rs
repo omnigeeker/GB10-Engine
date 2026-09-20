@@ -176,10 +176,11 @@ impl Layer {
         out: &mut CudaSlice<f32>,
         state: &mut LayerState,
         sc: &mut Scratch,
+        seq: usize,
     ) -> Result<()> {
         match self {
-            Layer::Delta(l) => l.forward(dev, cfg, x, out, state, sc),
-            Layer::Attn(l) => l.forward(dev, cfg, x, out, state, sc),
+            Layer::Delta(l) => l.forward(dev, cfg, x, out, state, sc, seq),
+            Layer::Attn(l) => l.forward(dev, cfg, x, out, state, sc, seq),
         }
     }
 
@@ -194,10 +195,11 @@ impl Layer {
         state: &mut LayerState,
         sc: &mut Scratch,
         t: usize,
+        seq: usize,
     ) -> Result<()> {
         match self {
-            Layer::Delta(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t),
-            Layer::Attn(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t),
+            Layer::Delta(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t, seq),
+            Layer::Attn(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t, seq),
         }
     }
 }
@@ -219,6 +221,7 @@ impl DeltaNetLayer {
         state: &mut LayerState,
         sc: &mut Scratch,
         t: usize,
+        seq: usize,
     ) -> Result<()> {
         let ops = dev.ops();
         let eps = cfg.rms_norm_eps as f32;
@@ -308,6 +311,7 @@ impl FullAttnLayer {
         state: &mut LayerState,
         sc: &mut Scratch,
         t: usize,
+        seq: usize,
     ) -> Result<()> {
         let ops = dev.ops();
         let eps = cfg.rms_norm_eps as f32;
@@ -328,7 +332,7 @@ impl FullAttnLayer {
         ops.rmsnorm_zero_centered_inplace(dev, &mut sc.q, &self.q_norm, t * nh, hd, eps)?;
         ops.rmsnorm_zero_centered(dev, &sc.kb, &self.k_norm, &mut sc.kb_ln, t * nkv, hd, eps)?;
 
-        let pos = state.n_keys;
+        let pos = state.n_keys[seq];
         let (cos, sin) = rope_tables_range(cfg, pos, t);
         dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
         dev.stream().memcpy_htod(&sin, &mut sc.sin)?;
@@ -356,7 +360,7 @@ impl FullAttnLayer {
             hd,
             t,
         )?;
-        state.n_keys = pos + t;
+        state.n_keys[seq] = pos + t;
 
         let scale = 1.0 / (hd as f32).sqrt();
         ops.attn_prefill(
@@ -365,7 +369,7 @@ impl FullAttnLayer {
             &state.k_cache,
             &state.v_cache,
             &mut sc.attn,
-            state.n_keys,
+            state.n_keys[seq],
             nh,
             nkv,
             hd,
@@ -392,11 +396,26 @@ pub struct LayerState {
     pub rec: CudaSlice<f32>,
     pub k_cache: CudaSlice<f32>,
     pub v_cache: CudaSlice<f32>,
-    pub n_keys: usize,
+    /// Number of sequences this state is sliced into.
+    pub n_seq: usize,
+    /// Decoded length of each sequence. A `Vec` rather than a counter because
+    /// concurrent sequences sit at different positions in their own caches.
+    pub n_keys: Vec<usize>,
 }
 
 impl LayerState {
-    pub fn new(dev: &Device, cfg: &TextConfig, layer: &Layer, max_seq: usize) -> Result<Self> {
+    /// `n_seq` sequences share one state allocation, laid out sequence-major:
+    /// sequence `s` owns the contiguous slice `[s * per_seq, (s + 1) * per_seq)`.
+    /// With `n_seq == 1` the sizes are exactly what they were before
+    /// batching, so single-stream behaviour is unchanged.
+    pub fn new(
+        dev: &Device,
+        cfg: &TextConfig,
+        layer: &Layer,
+        max_seq: usize,
+        n_seq: usize,
+    ) -> Result<Self> {
+        assert!(n_seq >= 1, "n_seq must be at least 1");
         let zeros = |n: usize| -> Result<CudaSlice<f32>> {
             Ok(dev.stream().alloc_zeros::<f32>(n)?)
         };
@@ -404,24 +423,36 @@ impl LayerState {
             Layer::Delta(_) => {
                 let conv_dim = cfg.linear_qk_dim() * 2 + cfg.linear_value_dim();
                 Ok(Self {
-                    conv_hist: zeros(conv_dim * (cfg.linear_conv_kernel_dim - 1))?,
-                    rec: zeros(cfg.linear_num_value_heads * DELTA_KEY_HEAD_DIM * DELTA_VALUE_HEAD_DIM)?,
-                    k_cache: zeros(1)?,
-                    v_cache: zeros(1)?,
-                    n_keys: 0,
+                    conv_hist: zeros(conv_dim * (cfg.linear_conv_kernel_dim - 1) * n_seq)?,
+                    rec: zeros(
+                        cfg.linear_num_value_heads
+                            * DELTA_KEY_HEAD_DIM
+                            * DELTA_VALUE_HEAD_DIM
+                            * n_seq,
+                    )?,
+                    k_cache: zeros(n_seq)?,
+                    v_cache: zeros(n_seq)?,
+                    n_seq,
+                    n_keys: vec![0; n_seq],
                 })
             }
             Layer::Attn(_) => {
-                let n = max_seq * cfg.num_key_value_heads * cfg.head_dim;
+                let n = max_seq * cfg.num_key_value_heads * cfg.head_dim * n_seq;
                 Ok(Self {
-                    conv_hist: zeros(1)?,
-                    rec: zeros(1)?,
+                    conv_hist: zeros(n_seq)?,
+                    rec: zeros(n_seq)?,
                     k_cache: zeros(n)?,
                     v_cache: zeros(n)?,
-                    n_keys: 0,
+                    n_seq,
+                    n_keys: vec![0; n_seq],
                 })
             }
         }
+    }
+
+    /// Bytes of state for one sequence, i.e. the stride between sequences.
+    pub fn seq_stride(&self) -> usize {
+        self.conv_hist.len().max(self.rec.len()).max(self.k_cache.len()) / self.n_seq.max(1)
     }
 
     pub fn reset(&mut self, dev: &Device) -> Result<()> {
@@ -433,7 +464,7 @@ impl LayerState {
         ] {
             dev.stream().memset_zeros(b)?;
         }
-        self.n_keys = 0;
+        self.n_keys.iter_mut().for_each(|k| *k = 0);
         Ok(())
     }
 }
@@ -528,6 +559,7 @@ impl DeltaNetLayer {
         out: &mut CudaSlice<f32>,
         state: &mut LayerState,
         sc: &mut Scratch,
+        seq: usize,
     ) -> Result<()> {
         let ops = dev.ops();
         let eps = cfg.rms_norm_eps as f32;
@@ -613,6 +645,7 @@ impl FullAttnLayer {
         out: &mut CudaSlice<f32>,
         state: &mut LayerState,
         sc: &mut Scratch,
+        seq: usize,
     ) -> Result<()> {
         let ops = dev.ops();
         let eps = cfg.rms_norm_eps as f32;
@@ -638,7 +671,7 @@ impl FullAttnLayer {
         ops.rmsnorm_zero_centered(dev, &sc.kb, &self.k_norm, &mut sc.kb_ln, nkv, hd, eps)?;
 
         // RoPE on the first `rotary` channels of each head.
-        let pos = state.n_keys;
+        let pos = state.n_keys[seq];
         let (cos, sin) = rope_tables(cfg, pos);
         dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
         dev.stream().memcpy_htod(&sin, &mut sc.sin)?;
@@ -654,7 +687,7 @@ impl FullAttnLayer {
             nkv,
             hd,
         )?;
-        state.n_keys = pos + 1;
+        state.n_keys[seq] = pos + 1;
 
         let scale = 1.0 / (hd as f32).sqrt();
         ops.attn_decode(
@@ -663,7 +696,7 @@ impl FullAttnLayer {
             &state.k_cache,
             &state.v_cache,
             &mut sc.attn,
-            state.n_keys,
+            state.n_keys[seq],
             nh,
             nkv,
             hd,
