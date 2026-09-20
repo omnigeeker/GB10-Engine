@@ -39,9 +39,16 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "deinterleave_heads_batched_kernel",
     "embed_gather_batched_kernel",
     "copy_last_row_kernel",
+    "nvfp4_gemm_kernel",
+    "fp8_gemm_kernel",
+    "bf16_gemm_kernel",
 ];
 
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
+/// Prompt tokens covered by one prefill GEMM block; must match `GB10_TILE_T`
+/// in `kernels/gemm.cu`.
+pub const GB10_TILE_T: usize = 8;
+
 pub const DELTA_KEY_HEAD_DIM: usize = 128;
 pub const DELTA_VALUE_HEAD_DIM: usize = 128;
 
@@ -71,6 +78,9 @@ pub struct Ops {
     deinterleave_heads_batched: CudaFunction,
     embed_gather_batched: CudaFunction,
     copy_last_row: CudaFunction,
+    nvfp4_gemm: CudaFunction,
+    fp8_gemm: CudaFunction,
+    bf16_gemm: CudaFunction,
 }
 
 fn take(map: &mut HashMap<String, CudaFunction>, n: &str) -> Result<CudaFunction> {
@@ -119,6 +129,9 @@ impl Ops {
             deinterleave_heads_batched: take(map, "deinterleave_heads_batched_kernel")?,
             embed_gather_batched: take(map, "embed_gather_batched_kernel")?,
             copy_last_row: take(map, "copy_last_row_kernel")?,
+            nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
+            fp8_gemm: take(map, "fp8_gemm_kernel")?,
+            bf16_gemm: take(map, "bf16_gemm_kernel")?,
         })
     }
 
@@ -906,6 +919,51 @@ impl Ops {
             dev.stream().launch_builder(&self.copy_last_row)
                 .arg(src).arg(dst).arg(&tt).arg(&nn)
                 .launch(LaunchConfig { grid_dim: (cdiv(n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Prefill GEMM: `y[t, n] = sum_k W[n, k] * x[t, k]`, each weight read once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_gemm(
+        &self, dev: &Device, w: &CudaSlice<u8>, wscale: &CudaSlice<u8>, scale2: &CudaSlice<f32>,
+        x: &CudaSlice<f32>, y: &mut CudaSlice<f32>, n: usize, k: usize, t: usize,
+    ) -> Result<()> {
+        let (nn, kk, tt) = (n as i32, k as i32, t as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.nvfp4_gemm)
+                .arg(w).arg(wscale).arg(scale2).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,8), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Prefill GEMM for E4M3 weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemm(
+        &self, dev: &Device, w: &CudaSlice<u8>, scale: &CudaSlice<f32>, x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>, n: usize, k: usize, t: usize,
+    ) -> Result<()> {
+        let (nn, kk, tt) = (n as i32, k as i32, t as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.fp8_gemm)
+                .arg(w).arg(scale).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,8), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Prefill GEMM for bf16 weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bf16_gemm(
+        &self, dev: &Device, w: &CudaSlice<u16>, x: &CudaSlice<f32>, y: &mut CudaSlice<f32>,
+        n: usize, k: usize, t: usize,
+    ) -> Result<()> {
+        let (nn, kk, tt) = (n as i32, k as i32, t as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.bf16_gemm)
+                .arg(w).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,8), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }

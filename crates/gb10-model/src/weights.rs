@@ -56,6 +56,31 @@ impl Linear {
         Ok(())
     }
 
+    /// Batched prefill: `y[t, :] = W @ x[t, :]` for all `t` in one launch.
+    ///
+    /// Unlike `forward(batch = t)`, which runs `t` independent GEMVs and
+    /// re-reads W every time, this reads each weight once and reuses it across
+    /// all `t` activations.
+    pub fn forward_prefill(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<()> {
+        let kern = dev.ops();
+        match &self.data {
+            LinearData::NvFp4 { w, wscale, scale2 } => {
+                kern.nvfp4_gemm(dev, w, wscale, scale2, x, y, self.n, self.k, t)?
+            }
+            LinearData::Fp8 { w, scale } => {
+                kern.fp8_gemm(dev, w, scale, x, y, self.n, self.k, t)?
+            }
+            LinearData::Bf16 { w } => kern.bf16_gemm(dev, w, x, y, self.n, self.k, t)?,
+        }
+        Ok(())
+    }
+
     /// Bytes this matrix contributes to the per-token weight stream.
     pub fn traffic_bytes(&self) -> usize {
         match &self.data {

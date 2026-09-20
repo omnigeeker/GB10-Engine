@@ -50,6 +50,23 @@ impl Mlp {
         Ok(())
     }
 
+    /// Batched prefill: all `t` tokens in one GEMM per projection.
+    fn forward_prefill(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        a: &mut CudaSlice<f32>,
+        b: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<()> {
+        self.gate.forward_prefill(dev, x, a, t)?;
+        self.up.forward_prefill(dev, x, b, t)?;
+        dev.ops().swiglu_inplace(dev, a, b, self.gate.n * t)?;
+        self.down.forward_prefill(dev, a, out, t)?;
+        Ok(())
+    }
+
     fn traffic_bytes(&self) -> usize {
         self.gate.traffic_bytes() + self.up.traffic_bytes() + self.down.traffic_bytes()
     }
@@ -215,10 +232,10 @@ impl DeltaNetLayer {
         let group = nv / nk;
 
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
-        self.in_proj_qkv.forward(dev, &sc.hidden, &mut sc.qkv, t)?;
-        self.in_proj_z.forward(dev, &sc.hidden, &mut sc.z, t)?;
-        self.in_proj_a.forward(dev, &sc.hidden, &mut sc.a, t)?;
-        self.in_proj_b.forward(dev, &sc.hidden, &mut sc.b, t)?;
+        self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
+        self.in_proj_z.forward_prefill(dev, &sc.hidden, &mut sc.z, t)?;
+        self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
+        self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
 
         ops.conv1d_prefill_silu(
             dev,
@@ -265,12 +282,12 @@ impl DeltaNetLayer {
         )?;
 
         ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, t * nv, vd, eps)?;
-        self.out_proj.forward(dev, &sc.gnorm, &mut sc.proj, t)?;
+        self.out_proj.forward_prefill(dev, &sc.gnorm, &mut sc.proj, t)?;
 
         ops.add(dev, x, &sc.proj, &mut sc.res, t * hidden)?;
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, t, hidden, eps)?;
         self.mlp
-            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
+            .forward_prefill(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
         Ok(())
     }
@@ -301,9 +318,9 @@ impl FullAttnLayer {
         let rotary = cfg.rotary_dim();
 
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
-        self.q_proj.forward(dev, &sc.hidden, &mut sc.fused, t)?;
-        self.k_proj.forward(dev, &sc.hidden, &mut sc.kb, t)?;
-        self.v_proj.forward(dev, &sc.hidden, &mut sc.vb, t)?;
+        self.q_proj.forward_prefill(dev, &sc.hidden, &mut sc.fused, t)?;
+        self.k_proj.forward_prefill(dev, &sc.hidden, &mut sc.kb, t)?;
+        self.v_proj.forward_prefill(dev, &sc.hidden, &mut sc.vb, t)?;
 
         ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.q, nh, hd, 0, t)?;
         ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.gate, nh, hd, hd, t)?;
@@ -356,12 +373,12 @@ impl FullAttnLayer {
         )?;
 
         ops.sigmoid_mul(dev, &mut sc.attn, &sc.gate, t * nh * hd)?;
-        self.o_proj.forward(dev, &sc.attn, &mut sc.proj, t)?;
+        self.o_proj.forward_prefill(dev, &sc.attn, &mut sc.proj, t)?;
 
         ops.add(dev, x, &sc.proj, &mut sc.res, t * hidden)?;
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, t, hidden, eps)?;
         self.mlp
-            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
+            .forward_prefill(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
         Ok(())
     }

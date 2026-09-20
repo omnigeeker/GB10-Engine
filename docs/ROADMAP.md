@@ -143,6 +143,32 @@ becomes *compute*-bound rather than memory-bound. llama.cpp's 798.91 tok/s is
 1.25 ms/token, i.e. ~75 ms for 59 tokens, which is consistent with being
 compute-bound at a few TFLOPS effective. That is the target.
 
+**GEMM landed (round 14):** `kernels/gemm.cu` has NVFP4/FP8/bf16 (N,T)-tiled
+GEMMs. Each warp owns one output row, each block covers 8 prompt tokens, the x
+chunk is staged in shared memory, and the T-wide partials are reduced once at
+the end. All three entry points are `extern "C"` wrappers over a templated
+`__device__` body, because NVRTC looks symbols up by name and a template
+instantiation mangles.
+
+TTFT **4904 -> 2054 ms**, still 16/16 oracle-exact. Total so far: 6273 -> 2054.
+
+A regression to watch: the first wiring pass used a bulk `sed` that also
+rewrote the *decode* call sites to `forward_prefill(..., 1)`, dropping decode
+from 9.73 to 6.13 tok/s. Reverted; decode is back to 8.59 in this gate.
+
+**Why TTFT is still 2054 ms and not ~100 ms.** 17.6 GB read once at 178 GB/s
+is 99 ms, so we are 20x off the bandwidth bound -- i.e. compute-bound, as the
+roofline predicted. But 1.5e12 MACs / 2054 ms = **0.73 TFLOPS**, against ~20
+TFLOPS of fp32 peak. The kernel is shared-memory-bound, not FMA-bound: every
+one of the 8 warps in a block re-reads the same `xs[i][k]` from shared for its
+own row `n`, so each FMA pair costs 2 shared loads. At 128 B/cycle of shared
+throughput that is ~4x the FMA time.
+
+The fix is register blocking: have each lane own several `n` rows, load
+`xs[i][k]` once into a register, and reuse it across them. With 4 rows/lane the
+shared traffic per FMA drops 4x. That costs `TILE_T * rows_per_lane = 32`
+accumulator registers, which fits.
+
 **Remaining wiring:**
 - [ ] size `Scratch` and `ModelState::{a,b,normed}` by `max_seq` instead of 1
       token (~300 MB at 512, which is fine)
