@@ -93,27 +93,33 @@ pub struct ModelState {
     pub normed: CudaSlice<f32>,
     /// Final-norm row of the last prompt token, consumed by `lm_head`.
     pub last: CudaSlice<f32>,
+    /// Token ids staged on the device for a batched decode step.
+    pub tokens_dev: CudaSlice<i32>,
+    /// Number of sequences this state is sliced into.
+    pub n_seq: usize,
     pub n_tokens: usize,
 }
 
 impl ModelState {
-    pub fn new(dev: &Device, model: &Model, max_seq: usize) -> Result<Self> {
+    pub fn new(dev: &Device, model: &Model, max_seq: usize, n_seq: usize) -> Result<Self> {
         let text = model.text();
         let mut layers = Vec::with_capacity(model.layers.len());
         for l in &model.layers {
-            layers.push(LayerState::new(dev, text, l, max_seq, 1)?);
+            layers.push(LayerState::new(dev, text, l, max_seq, n_seq)?);
         }
         let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
         Ok(Self {
             layers,
-            logits: z(model.vocab_size())?,
-            idx: dev.stream().alloc_zeros::<i32>(1)?,
+            logits: z(model.vocab_size() * n_seq)?,
+            idx: dev.stream().alloc_zeros::<i32>(n_seq)?,
             // Per-token buffers are `max_seq` rows so prefill can run the
             // whole prompt through the stack in one batched pass.
             a: z(text.hidden_size * max_seq)?,
             b: z(text.hidden_size * max_seq)?,
             normed: z(text.hidden_size * max_seq)?,
             last: z(text.hidden_size)?,
+            tokens_dev: dev.stream().alloc_zeros::<i32>(n_seq)?,
+            n_seq,
             n_tokens: 0,
         })
     }
@@ -168,6 +174,62 @@ impl Model {
         Ok(v[0] as u32)
     }
 
+    /// One batched decode step: consume one token per sequence and return the
+    /// greedy next token for each.
+    ///
+    /// This is the throughput path. The projections and norms run once over all
+    /// `n_seq` rows, so the 17.6 GB of weights are streamed once per step
+    /// rather than once per sequence. Only the state-touching ops (conv
+    /// history, the recurrence, the KV cache) are per-sequence, and they are
+    /// indexed by `seq * stride` inside the shared state allocation.
+    pub fn step_batch(
+        &self,
+        dev: &Device,
+        tokens: &[u32],
+        state: &mut ModelState,
+        sc: &mut Scratch,
+    ) -> Result<Vec<u32>> {
+        let text = self.text();
+        let hidden = text.hidden_size;
+        let eps = text.rms_norm_eps as f32;
+        let n_seq = tokens.len();
+        anyhow::ensure!(n_seq > 0, "step_batch: empty batch");
+        anyhow::ensure!(n_seq <= state.n_seq, "step_batch: batch exceeds state");
+
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        dev.stream().memcpy_htod(&ids, &mut state.tokens_dev)?;
+        dev.ops().embed_gather_batched(
+            dev,
+            &self.embed,
+            &state.tokens_dev,
+            &mut state.a,
+            hidden,
+            n_seq,
+        )?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_batch(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, n_seq)?;
+            std::mem::swap(&mut state.a, &mut state.b);
+        }
+
+        dev.ops().rmsnorm_zero_centered(
+            dev,
+            &state.a,
+            &self.norm,
+            &mut state.normed,
+            n_seq,
+            hidden,
+            eps,
+        )?;
+        self.lm_head.forward(dev, &state.normed, &mut state.logits, n_seq)?;
+        dev.ops()
+            .argmax_multi(dev, &state.logits, &mut state.idx, self.vocab_size(), n_seq)?;
+
+        state.n_tokens += 1;
+        let v = dev.stream().memcpy_dtov(&state.idx)?;
+        Ok(v.iter().map(|&x| x as u32).collect())
+    }
+
     /// Feed a prompt, return the greedy token after the last prompt token.
     pub fn prefill(
         &self,
@@ -175,6 +237,22 @@ impl Model {
         tokens: &[u32],
         state: &mut ModelState,
         sc: &mut Scratch,
+    ) -> Result<u32> {
+        self.prefill_seq(dev, tokens, state, sc, 0)
+    }
+
+    /// `prefill` into one sequence slot of a multi-sequence state.
+    ///
+    /// The residual buffers are transient -- only the conv history, the
+    /// recurrence and the KV cache persist -- so `seq` affects where state
+    /// lands, not how the prompt is computed.
+    pub fn prefill_seq(
+        &self,
+        dev: &Device,
+        tokens: &[u32],
+        state: &mut ModelState,
+        sc: &mut Scratch,
+        seq: usize,
     ) -> Result<u32> {
         let t = tokens.len();
         if t == 0 {
@@ -190,7 +268,7 @@ impl Model {
             .embed_gather_batched(dev, &self.embed, &ids_dev, &mut state.a, hidden, t)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, 0)?;
+            layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, seq)?;
             std::mem::swap(&mut state.a, &mut state.b);
         }
 

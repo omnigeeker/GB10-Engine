@@ -77,6 +77,10 @@ pub struct Ops {
     embed_gather: CudaFunction,
     argmax: CudaFunction,
     argmax_multi: CudaFunction,
+    conv1d_step_silu_multi: CudaFunction,
+    gated_delta_rule_step_multi: CudaFunction,
+    kv_cache_append_multi: CudaFunction,
+    attn_decode_multi: CudaFunction,
     l2norm_scale_batched: CudaFunction,
     delta_gate_batched: CudaFunction,
     conv1d_prefill_silu: CudaFunction,
@@ -129,6 +133,10 @@ impl Ops {
             embed_gather: take(map, "embed_gather_kernel")?,
             argmax: take(map, "argmax_kernel")?,
             argmax_multi: take(map, "argmax_multi_kernel")?,
+            conv1d_step_silu_multi: take(map, "conv1d_step_silu_multi_kernel")?,
+            gated_delta_rule_step_multi: take(map, "gated_delta_rule_step_multi_kernel")?,
+            kv_cache_append_multi: take(map, "kv_cache_append_multi_kernel")?,
+            attn_decode_multi: take(map, "attn_decode_multi_kernel")?,
             l2norm_scale_batched: take(map, "l2norm_scale_batched_kernel")?,
             delta_gate_batched: take(map, "delta_gate_batched_kernel")?,
             conv1d_prefill_silu: take(map, "conv1d_prefill_silu_kernel")?,
@@ -341,6 +349,174 @@ impl Ops {
     }
 
     /// Index of the maximum element, ties resolving to the lowest index.
+    /// Batched decode counterparts. Each launches once for the whole batch with
+    /// `gridDim.y` selecting the sequence; `base_stride` is that sequence's
+    /// offset inside the shared state allocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_step_silu_multi(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        hist: &mut CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        channels: usize,
+        base_stride: usize,
+        n_seq: usize,
+    ) -> Result<()> {
+        need(x.len() >= channels * n_seq && y.len() >= channels * n_seq, "conv1d_multi x/y")?;
+        need(hist.len() >= base_stride * n_seq, "conv1d_multi hist")?;
+        let (c, bs) = (channels as i32, base_stride as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.conv1d_step_silu_multi)
+                .arg(x)
+                .arg(w)
+                .arg(hist)
+                .arg(y)
+                .arg(&c)
+                .arg(&bs)
+                .launch(LaunchConfig {
+                    grid_dim: (cdiv(channels, 256), n_seq as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_rule_step_multi(
+        &self,
+        dev: &Device,
+        qkv: &CudaSlice<f32>,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        row_stride: usize,
+        decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n_v_heads: usize,
+        n_k_heads: usize,
+        group: usize,
+        base_stride: usize,
+        n_seq: usize,
+    ) -> Result<()> {
+        const D: usize = 128;
+        need(decay.len() >= n_seq * n_v_heads && beta.len() >= n_seq * n_v_heads, "delta_multi decay/beta")?;
+        need(state.len() >= base_stride * n_seq, "delta_multi state")?;
+        need(out.len() >= n_seq * n_v_heads * D, "delta_multi out")?;
+        let (qo, ko, vo, rs) = (q_off as i32, k_off as i32, v_off as i32, row_stride as i32);
+        let (nv, nk, g, bs) =
+            (n_v_heads as i32, n_k_heads as i32, group as i32, base_stride as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.gated_delta_rule_step_multi)
+                .arg(qkv)
+                .arg(&qo)
+                .arg(&ko)
+                .arg(&vo)
+                .arg(&rs)
+                .arg(decay)
+                .arg(beta)
+                .arg(state)
+                .arg(out)
+                .arg(&nv)
+                .arg(&nk)
+                .arg(&g)
+                .arg(&bs)
+                .launch(LaunchConfig {
+                    grid_dim: (n_v_heads as u32, n_seq as u32, 1),
+                    block_dim: (D as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn kv_cache_append_multi(
+        &self,
+        dev: &Device,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        n_kv_heads: usize,
+        head_dim: usize,
+        base_stride: usize,
+    ) -> Result<()> {
+        let n = n_kv_heads * head_dim;
+        let n_seq = positions.len();
+        need(k.len() >= n * n_seq && v.len() >= n * n_seq, "kv_append_multi k/v")?;
+        need(k_cache.len() >= base_stride * n_seq, "kv_append_multi k_cache")?;
+        let (nkv, hd, bs) = (n_kv_heads as i32, head_dim as i32, base_stride as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.kv_cache_append_multi)
+                .arg(k)
+                .arg(v)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(positions)
+                .arg(&nkv)
+                .arg(&hd)
+                .arg(&bs)
+                .launch(LaunchConfig {
+                    grid_dim: (cdiv(n, 128), n_seq as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_multi(
+        &self,
+        dev: &Device,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaSlice<f32>,
+        v_cache: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        base_stride: usize,
+    ) -> Result<()> {
+        let n_seq = positions.len();
+        need(q.len() >= n_q_heads * head_dim * n_seq, "attn_decode_multi q")?;
+        need(k_cache.len() >= base_stride * n_seq, "attn_decode_multi k_cache")?;
+        let max_keys = base_stride / (n_kv_heads * head_dim);
+        need(max_keys > 0, "attn_decode_multi: empty cache")?;
+        let (nq, nkv, hd, bs) =
+            (n_q_heads as i32, n_kv_heads as i32, head_dim as i32, base_stride as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.attn_decode_multi)
+                .arg(q)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(out)
+                .arg(positions)
+                .arg(&nq)
+                .arg(&nkv)
+                .arg(&hd)
+                .arg(&scale)
+                .arg(&bs)
+                .launch(LaunchConfig {
+                    grid_dim: (n_q_heads as u32, n_seq as u32, 1),
+                    block_dim: (block_for(head_dim, 256), 1, 1),
+                    shared_mem_bytes: (max_keys * 4) as u32,
+                })?;
+        }
+        Ok(())
+    }
+
     /// Per-row argmax over a `[n_seq, n]` buffer.
     pub fn argmax_multi(
         &self,
@@ -865,12 +1041,13 @@ impl Ops {
     /// Causal depthwise conv + SiLU over `t` rows, threading `hist` through.
     pub fn conv1d_prefill_silu(
         &self, dev: &Device, x: &CudaSlice<f32>, w: &CudaSlice<f32>, hist: &mut CudaSlice<f32>,
-        y: &mut CudaSlice<f32>, channels: usize, t: usize,
+        y: &mut CudaSlice<f32>, channels: usize, t: usize, base: usize,
     ) -> Result<()> {
         let (c, tt) = (channels as i32, t as i32);
+        let bs = base as i32;
         unsafe {
             dev.stream().launch_builder(&self.conv1d_prefill_silu)
-                .arg(x).arg(w).arg(hist).arg(y).arg(&c).arg(&tt)
+                .arg(x).arg(w).arg(hist).arg(y).arg(&c).arg(&tt).arg(&bs)
                 .launch(LaunchConfig { grid_dim: (cdiv(channels,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
@@ -895,12 +1072,14 @@ impl Ops {
     /// Append `t` rows of k/v into the cache starting at `start_pos`.
     pub fn kv_cache_append_batched(
         &self, dev: &Device, k: &CudaSlice<f32>, v: &CudaSlice<f32>, k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>, start_pos: usize, n_kv_heads: usize, head_dim: usize, t: usize,
+        v_cache: &mut CudaSlice<f32>, start_pos: usize, n_kv_heads: usize, head_dim: usize,
+        t: usize, base: usize,
     ) -> Result<()> {
-        let (sp, nkv, hd) = (start_pos as i32, n_kv_heads as i32, head_dim as i32);
+        let (sp, nkv, hd, bs) =
+            (start_pos as i32, n_kv_heads as i32, head_dim as i32, base as i32);
         unsafe {
             dev.stream().launch_builder(&self.kv_cache_append_batched)
-                .arg(k).arg(v).arg(k_cache).arg(v_cache).arg(&sp).arg(&nkv).arg(&hd)
+                .arg(k).arg(v).arg(k_cache).arg(v_cache).arg(&sp).arg(&nkv).arg(&hd).arg(&bs)
                 .launch(LaunchConfig { grid_dim: (cdiv(n_kv_heads*head_dim,256), t as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
@@ -913,14 +1092,15 @@ impl Ops {
         &self, dev: &Device, qkv: &CudaSlice<f32>, q_off: usize, k_off: usize, v_off: usize,
         row_stride: usize, decay: &CudaSlice<f32>, beta: &CudaSlice<f32>,
         state: &mut CudaSlice<f32>, out: &mut CudaSlice<f32>, t: usize, n_v_heads: usize,
-        n_k_heads: usize, group: usize,
+        n_k_heads: usize, group: usize, base: usize,
     ) -> Result<()> {
         let (qo, ko, vo, rs, tt, nv, nk, g) =
             (q_off as i32, k_off as i32, v_off as i32, row_stride as i32, t as i32, n_v_heads as i32, n_k_heads as i32, group as i32);
+        let bs = base as i32;
         unsafe {
             dev.stream().launch_builder(&self.gated_delta_rule_chunk)
                 .arg(qkv).arg(&qo).arg(&ko).arg(&vo).arg(&rs).arg(decay).arg(beta)
-                .arg(state).arg(out).arg(&tt).arg(&nv).arg(&nk).arg(&g)
+                .arg(state).arg(out).arg(&tt).arg(&nv).arg(&nk).arg(&g).arg(&bs)
                 .launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())

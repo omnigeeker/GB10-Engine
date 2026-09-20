@@ -443,8 +443,41 @@ assembly. In order:
    compare token by token. Identical prompts would NOT catch a base-offset bug,
    because every sequence's state would then be identical.
 
-`argmax_multi` and its launcher landed this round; the tree builds and the
-64-layer oracle is still 16/16 exact.
+**Step 3b is implemented and its gate is failing -- on a real bug (round 29).**
+
+`forward_batch` for both layer types, `ModelState` with `n_seq`, `step_batch`,
+`prefill_seq` and a new `gb10-verify batch-parity` gate all landed. The
+existing gates are green (TTFT 453.5 ms, 64-layer oracle 16/16, layer parity
+OK). The new gate is **not** green, and that is the point of having written it.
+
+`batch-parity` runs N sequences both batched and one-at-a-time and compares
+token by token. Its prompts are deliberately of *different lengths*: with
+identical prompts every sequence holds identical state at identical positions,
+so a wrong per-sequence stride would read equivalent data, produce correct
+output, and pass. The gate immediately proved that reasoning right by failing
+on the first run, 0/4 sequences.
+
+**Bug found and fixed.** `prefill_seq` calls `gated_delta_rule_chunk` and
+`conv1d_prefill_silu`, and neither took a sequence base -- I had deliberately
+reverted the chunk kernel's base in round 26 on the grounds that it is a
+prefill kernel. That reasoning was wrong: prefill is *also* per-sequence once
+you prefill N prompts into N slots. Every sequence's prefill was therefore
+writing its recurrent state and conv history into slot 0, destroying sequence
+0's state. Both kernels now take a base. That took the gate from 0/4 to 1/4 and
+pushed first divergence from token 1 to token 3.
+
+**Still failing: 1/4.** Sequence 0 (shortest prompt, 5 tokens) is exact over 16
+tokens; sequences 1, 2 and 3 diverge at tokens 2, 3 and 3. The pattern -- a
+shorter prompt surviving longer -- points at state that is still indexed
+wrongly for `s >= 1`. The prime suspect is that `gated_delta_rule_step_multi`
+and `gated_delta_rule_chunk` both declare `__shared__ float S[128][129]` =
+66048 B, which exceeds the device's 49152 B `sharedPerBlock`; it is known to
+compile under NVRTC anyway (see PHYSICS.md), but it has never been exercised
+with `gridDim.y > 1`.
+
+Everything up to and including step 3a is verified behaviour-neutral. Step 3b
+is real new behaviour and is **not** yet correct; do not treat the batching as
+working until `batch-parity` reports 4/4.
 
 Rough shape of the work: add a sequence stride to those four kernels, grow the
 four state buffers by `n_seq`, give `ModelState` per-sequence `n_keys`, add

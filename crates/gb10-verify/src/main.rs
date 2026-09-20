@@ -116,6 +116,84 @@ fn compare(got: &[f32], want: &[f32]) -> Diff {
     }
 }
 
+/// Run `n_seq` sequences both batched and one-at-a-time and require the
+/// generated tokens to agree exactly.
+///
+/// The prompts are deliberately of *different lengths*. With identical prompts
+/// every sequence would hold identical state at identical positions, and a
+/// wrong per-sequence `base_stride` would read equivalent data and still
+/// produce correct output -- the gate would pass while the batching was broken.
+/// Different lengths put the sequences at different positions and in different
+/// cache slots, which is what makes cross-talk observable.
+fn batch_parity(args: &Args, n_seq: usize, n_new: usize) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let model = Model::load_from(&dev, cfg, &args.model)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+
+    let mut prompts = Vec::with_capacity(n_seq);
+    for i in 0..n_seq {
+        let p = format!("{}The capital of France is", "token ".repeat(i * 4));
+        prompts.push(tok.encode(&p, true)?);
+    }
+
+    // Reference: each sequence alone, one token at a time.
+    let mut refs: Vec<Vec<u32>> = Vec::with_capacity(n_seq);
+    {
+        let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+        let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+        for p in &prompts {
+            st.reset(&dev)?;
+            let mut next = model.prefill(&dev, p, &mut st, &mut sc)?;
+            let mut out = vec![next];
+            for _ in 1..n_new {
+                next = model.step(&dev, next, &mut st, &mut sc)?;
+                out.push(next);
+            }
+            refs.push(out);
+        }
+    }
+
+    // Batched: prefill each prompt into its own slot, then step all together.
+    let mut st = ModelState::new(&dev, &model, args.max_seq, n_seq)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut next: Vec<u32> = Vec::with_capacity(n_seq);
+    for (s, p) in prompts.iter().enumerate() {
+        next.push(model.prefill_seq(&dev, p, &mut st, &mut sc, s)?);
+    }
+    let mut got: Vec<Vec<u32>> = vec![Vec::with_capacity(n_new); n_seq];
+    for i in 0..n_new {
+        for s in 0..n_seq {
+            got[s].push(next[s]);
+        }
+        if i + 1 == n_new {
+            break;
+        }
+        next = model.step_batch(&dev, &next, &mut st, &mut sc)?;
+    }
+
+    let mut all_ok = true;
+    for s in 0..n_seq {
+        let agree = refs[s] == got[s];
+        if agree {
+            println!("  seq {s:2} (prompt {:4} tok): match", prompts[s].len());
+        } else {
+            let w = refs[s].iter().zip(&got[s]).position(|(a, b)| a != b).unwrap_or(0);
+            println!(
+                "  seq {s:2} (prompt {:4} tok): MISMATCH at token {w}\n    ref {:?}\n    got {:?}",
+                prompts[s].len(),
+                &refs[s][..(w + 4).min(refs[s].len())],
+                &got[s][..(w + 4).min(got[s].len())]
+            );
+        }
+        all_ok &= agree;
+    }
+    let n_match = (0..n_seq).filter(|&s| refs[s] == got[s]).count();
+    println!("batch parity: {n_match}/{n_seq} sequences exact over {n_new} tokens");
+    Ok(all_ok)
+}
+
 fn load_config(model_dir: &Path) -> Result<ModelConfig> {
     let p = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -350,7 +428,7 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
         model.traffic_bytes() as f64 / 1e9
     );
 
-    let mut state = ModelState::new(&dev, &model, args.max_seq)?;
+    let mut state = ModelState::new(&dev, &model, args.max_seq, 1)?;
     let mut sc = Scratch::new(&dev, &text, 512)?;
 
     let t1 = std::time::Instant::now();
@@ -457,6 +535,8 @@ struct Args {
     prompt: String,
     n_new: usize,
     profile: bool,
+    /// Number of sequences for the batch-parity gate.
+    n_seq: usize,
     /// Minimum token agreement with the bf16 oracle before the gate passes.
     /// The oracle is bf16-rounded, so bit-exactness is not expected; see
     /// docs/TARGETS.md T7.
@@ -483,6 +563,7 @@ fn parse_args() -> Result<(String, Args)> {
         raw: false,
         prompt: String::new(),
         n_new: 32,
+        n_seq: 4,
         min_agree: 0.85,
         profile: false,
     };
@@ -510,6 +591,10 @@ fn parse_args() -> Result<(String, Args)> {
             }
             "--max-seq" => {
                 a.max_seq = val()?.parse()?;
+                i += 2;
+            }
+            "--n-seq" => {
+                a.n_seq = val()?.parse()?;
                 i += 2;
             }
             "--tol-norm" => {
@@ -575,6 +660,14 @@ fn main() -> Result<()> {
             println!("\ngenerate: OK");
             return Ok(());
         }
+        "batch-parity" => {
+            let ok = batch_parity(&args, args.n_seq, args.n_new)?;
+            if !ok {
+                bail!("batch-parity gate FAILED");
+            }
+            println!("\nbatch-parity: OK");
+            return Ok(());
+        }
         "layer-parity" | "all" => {
             if args.layer == usize::MAX {
                 vec![0, 3]
@@ -582,7 +675,9 @@ fn main() -> Result<()> {
                 vec![args.layer]
             }
         }
-        other => bail!("unknown subcommand {other:?} (expected layer-parity|all)"),
+        other => bail!(
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity)"
+        ),
     };
 
     let mut all_ok = true;
@@ -598,6 +693,7 @@ fn main() -> Result<()> {
             raw: args.raw,
             prompt: args.prompt.clone(),
             n_new: args.n_new,
+            n_seq: args.n_seq,
             min_agree: args.min_agree,
             profile: args.profile,
         };

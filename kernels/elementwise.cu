@@ -503,11 +503,11 @@ extern "C" __global__ void conv1d_prefill_silu_kernel(const float* __restrict__ 
                                                       const float* __restrict__ w,
                                                       float* __restrict__ hist,
                                                       float* __restrict__ y, int channels,
-                                                      int T) {
+                                                      int T, int base) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const float* __restrict__ wc = w + (size_t)c * 4;
-    float* __restrict__ h = hist + (size_t)c * 3;
+    float* __restrict__ h = hist + base + (size_t)c * 3;
     float h0 = h[0], h1 = h[1], h2 = h[2];
     for (int t = 0; t < T; ++t) {
         const float xc = x[(size_t)t * channels + c];
@@ -556,13 +556,13 @@ extern "C" __global__ void kv_cache_append_batched_kernel(const float* __restric
                                                           float* __restrict__ k_cache,
                                                           float* __restrict__ v_cache,
                                                           int start_pos, int n_kv_heads,
-                                                          int head_dim) {
+                                                          int head_dim, int base) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = n_kv_heads * head_dim;
     if (i >= n) return;
     const int t = blockIdx.y;
-    k_cache[(size_t)(start_pos + t) * n + i] = k[(size_t)t * n + i];
-    v_cache[(size_t)(start_pos + t) * n + i] = v[(size_t)t * n + i];
+    k_cache[base + (size_t)(start_pos + t) * n + i] = k[(size_t)t * n + i];
+    v_cache[base + (size_t)(start_pos + t) * n + i] = v[(size_t)t * n + i];
 }
 
 // The Gated DeltaNet recurrence is the one part of prefill that cannot be
@@ -574,7 +574,7 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     const float* __restrict__ qkv, int q_off, int k_off, int v_off, int row_stride,
     const float* __restrict__ decay, const float* __restrict__ beta,
     float* __restrict__ state, float* __restrict__ out, int T, int n_v_heads, int n_k_heads,
-    int group) {
+    int group, int base) {
     constexpr int D = 128;
     const int hv = blockIdx.x;
     const int b = blockIdx.y;
@@ -584,7 +584,7 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     __shared__ float S[D][D + 1];
     __shared__ float sk[D];
 
-    float* __restrict__ sh = state + ((size_t)b * n_v_heads + hv) * D * D;
+    float* __restrict__ sh = state + base + ((size_t)b * n_v_heads + hv) * D * D;
     for (int i = threadIdx.x; i < D * D; i += blockDim.x) S[i / D][i % D] = sh[i];
     __syncthreads();
 

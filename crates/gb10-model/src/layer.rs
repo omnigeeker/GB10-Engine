@@ -202,6 +202,23 @@ impl Layer {
             Layer::Attn(l) => l.forward_prefill(dev, cfg, x, out, state, sc, t, seq),
         }
     }
+
+    /// One decode step for `n_seq` sequences at once.
+    pub fn forward_batch(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        n_seq: usize,
+    ) -> Result<()> {
+        match self {
+            Layer::Delta(l) => l.forward_batch(dev, cfg, x, out, state, sc, n_seq),
+            Layer::Attn(l) => l.forward_batch(dev, cfg, x, out, state, sc, n_seq),
+        }
+    }
 }
 
 impl DeltaNetLayer {
@@ -240,6 +257,7 @@ impl DeltaNetLayer {
         self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
         self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
 
+        let conv_base = seq * state.conv_stride();
         ops.conv1d_prefill_silu(
             dev,
             &sc.qkv,
@@ -248,6 +266,7 @@ impl DeltaNetLayer {
             &mut sc.conv,
             conv_dim,
             t,
+            conv_base,
         )?;
 
         dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
@@ -267,6 +286,7 @@ impl DeltaNetLayer {
             t,
         )?;
 
+        let rec_base = seq * state.rec_stride();
         ops.gated_delta_rule_chunk(
             dev,
             &sc.conv_ln,
@@ -282,6 +302,7 @@ impl DeltaNetLayer {
             nv,
             nk,
             group,
+            rec_base,
         )?;
 
         ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, t * nv, vd, eps)?;
@@ -292,6 +313,76 @@ impl DeltaNetLayer {
         self.mlp
             .forward_prefill(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
+        Ok(())
+    }
+
+    /// One decode step for `n_seq` sequences at once. `x` is `[n_seq, hidden]`.
+    ///
+    /// Structurally this is `forward_prefill` with `t` replaced by `n_seq`, but
+    /// the state-touching ops differ: prefill walks *t tokens of one sequence*,
+    /// whereas here each row is a *different sequence* at its own position and
+    /// with its own recurrent state, so those ops become the `_multi` kernels
+    /// and address state at `seq * stride`. Everything else -- the projections,
+    /// the norms, the gating -- is already batch-shaped and is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        n_seq: usize,
+    ) -> Result<()> {
+        let ops = dev.ops();
+        let eps = cfg.rms_norm_eps as f32;
+        let hidden = cfg.hidden_size;
+        let nk = cfg.linear_num_key_heads;
+        let nv = cfg.linear_num_value_heads;
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let qk_dim = cfg.linear_qk_dim();
+        let conv_dim = qk_dim * 2 + cfg.linear_value_dim();
+        let group = nv / nk;
+
+        ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, n_seq, hidden, eps)?;
+        self.in_proj_qkv.forward(dev, &sc.hidden, &mut sc.qkv, n_seq)?;
+        self.in_proj_z.forward(dev, &sc.hidden, &mut sc.z, n_seq)?;
+        self.in_proj_a.forward(dev, &sc.hidden, &mut sc.a, n_seq)?;
+        self.in_proj_b.forward(dev, &sc.hidden, &mut sc.b, n_seq)?;
+
+        let conv_stride = state.conv_stride();
+        ops.conv1d_step_silu_multi(
+            dev, &sc.qkv, &self.conv1d, &mut state.conv_hist, &mut sc.conv,
+            conv_dim, conv_stride, n_seq,
+        )?;
+
+        dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
+        let q_scale = 1.0 / (kd as f32).sqrt();
+        ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, 0, nk, kd, n_seq, q_scale, 1e-6)?;
+        ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, qk_dim, nk, kd, n_seq, 1.0, 1e-6)?;
+
+        ops.delta_gate_batched(
+            dev, &sc.a, &sc.b, &self.a_log, &self.dt_bias,
+            &mut sc.decay, &mut sc.beta, nv, n_seq,
+        )?;
+
+        let rec_stride = state.rec_stride();
+        ops.gated_delta_rule_step_multi(
+            dev, &sc.conv_ln, 0, qk_dim, 2 * qk_dim, conv_dim,
+            &sc.decay, &sc.beta, &mut state.rec, &mut sc.attn,
+            nv, nk, group, rec_stride, n_seq,
+        )?;
+
+        ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, n_seq * nv, vd, eps)?;
+        self.out_proj.forward(dev, &sc.gnorm, &mut sc.proj, n_seq)?;
+
+        ops.add(dev, x, &sc.proj, &mut sc.res, n_seq * hidden)?;
+        ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, n_seq, hidden, eps)?;
+        self.mlp
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, n_seq)?;
+        ops.add(dev, &sc.res, &sc.down, out, n_seq * hidden)?;
         Ok(())
     }
 }
@@ -349,6 +440,7 @@ impl FullAttnLayer {
             t,
         )?;
 
+        let kv_base = seq * state.kv_stride();
         ops.kv_cache_append_batched(
             dev,
             &sc.kb_ln,
@@ -359,6 +451,7 @@ impl FullAttnLayer {
             nkv,
             hd,
             t,
+            kv_base,
         )?;
         state.n_keys[seq] = pos + t;
 
@@ -386,6 +479,85 @@ impl FullAttnLayer {
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
         Ok(())
     }
+
+    /// One decode step for `n_seq` sequences at once. See
+    /// `DeltaNetLayer::forward_batch` for why the state ops differ from prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch(
+        &self,
+        dev: &Device,
+        cfg: &TextConfig,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        state: &mut LayerState,
+        sc: &mut Scratch,
+        n_seq: usize,
+    ) -> Result<()> {
+        let ops = dev.ops();
+        let eps = cfg.rms_norm_eps as f32;
+        let hidden = cfg.hidden_size;
+        let nh = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let half = cfg.rotary_dim() / 2;
+
+        ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, n_seq, hidden, eps)?;
+        self.q_proj.forward(dev, &sc.hidden, &mut sc.fused, n_seq)?;
+        self.k_proj.forward(dev, &sc.hidden, &mut sc.kb, n_seq)?;
+        self.v_proj.forward(dev, &sc.hidden, &mut sc.vb, n_seq)?;
+
+        ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.q, nh, hd, 0, n_seq)?;
+        ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.gate, nh, hd, hd, n_seq)?;
+
+        ops.rmsnorm_zero_centered_inplace(dev, &mut sc.q, &self.q_norm, n_seq * nh, hd, eps)?;
+        ops.rmsnorm_zero_centered(dev, &sc.kb, &self.k_norm, &mut sc.kb_ln, n_seq * nkv, hd, eps)?;
+
+        // `rope_neox_batched` indexes its table by `gridDim.y`, so the table
+        // needs one row per sequence. `rope_tables_range` cannot be used: it
+        // assumes consecutive positions, and the sequences are at unrelated
+        // positions.
+        let mut cos = Vec::with_capacity(n_seq * half);
+        let mut sin = Vec::with_capacity(n_seq * half);
+        for s in 0..n_seq {
+            let (c, sn) = rope_tables(cfg, state.n_keys[s]);
+            cos.extend_from_slice(&c);
+            sin.extend_from_slice(&sn);
+        }
+        dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
+        dev.stream().memcpy_htod(&sin, &mut sc.sin)?;
+        ops.rope_neox_batched(
+            dev, &mut sc.q, &mut sc.kb_ln, &sc.cos, &sc.sin, nh, nkv, hd, half, n_seq,
+        )?;
+
+        state.sync_positions(dev)?;
+        let kv_stride = state.kv_stride();
+        ops.kv_cache_append_multi(
+            dev, &sc.kb_ln, &sc.vb, &mut state.k_cache, &mut state.v_cache,
+            &state.positions, nkv, hd, kv_stride,
+        )?;
+        for k in state.n_keys.iter_mut() {
+            *k += 1;
+        }
+
+        // Attention must see the token just appended, so re-publish positions.
+        state.sync_positions(dev)?;
+        let scale = 1.0 / (hd as f32).sqrt();
+        ops.attn_decode_multi(
+            dev, &sc.q, &state.k_cache, &state.v_cache, &mut sc.attn,
+            &state.positions, nh, nkv, hd, scale, kv_stride,
+        )?;
+
+        // The output gate is sigmoid, NOT the swish in config.json.
+        ops.sigmoid_mul(dev, &mut sc.attn, &sc.gate, n_seq * nh * hd)?;
+        self.o_proj.forward(dev, &sc.attn, &mut sc.proj, n_seq)?;
+
+        ops.add(dev, x, &sc.proj, &mut sc.res, n_seq * hidden)?;
+        ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, n_seq, hidden, eps)?;
+        self.mlp
+            .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, n_seq)?;
+        ops.add(dev, &sc.res, &sc.down, out, n_seq * hidden)?;
+        Ok(())
+    }
 }
 
 /// Per-sequence state. For DeltaNet layers this is the conv history plus the
@@ -401,6 +573,8 @@ pub struct LayerState {
     /// Decoded length of each sequence. A `Vec` rather than a counter because
     /// concurrent sequences sit at different positions in their own caches.
     pub n_keys: Vec<usize>,
+    /// `n_keys` mirrored on the device, which is what the `_multi` kernels read.
+    pub positions: CudaSlice<i32>,
 }
 
 impl LayerState {
@@ -434,6 +608,7 @@ impl LayerState {
                     v_cache: zeros(n_seq)?,
                     n_seq,
                     n_keys: vec![0; n_seq],
+                    positions: dev.stream().alloc_zeros::<i32>(n_seq)?,
                 })
             }
             Layer::Attn(_) => {
@@ -445,14 +620,31 @@ impl LayerState {
                     v_cache: zeros(n)?,
                     n_seq,
                     n_keys: vec![0; n_seq],
+                    positions: dev.stream().alloc_zeros::<i32>(n_seq)?,
                 })
             }
         }
     }
 
-    /// Bytes of state for one sequence, i.e. the stride between sequences.
-    pub fn seq_stride(&self) -> usize {
-        self.conv_hist.len().max(self.rec.len()).max(self.k_cache.len()) / self.n_seq.max(1)
+    /// Push `n_keys` to the device for the `_multi` kernels.
+    pub fn sync_positions(&mut self, dev: &Device) -> Result<()> {
+        let p: Vec<i32> = self.n_keys.iter().map(|&k| k as i32).collect();
+        dev.stream().memcpy_htod(&p, &mut self.positions)?;
+        Ok(())
+    }
+
+    /// Per-sequence strides. These are *not* interchangeable: for a DeltaNet
+    /// layer `rec` is 786432 floats while `conv_hist` is only `conv_dim * 3`,
+    /// so a single shared stride would address past the end of one buffer into
+    /// another sequence's history. Only visible once `n_seq > 1`.
+    pub fn conv_stride(&self) -> usize {
+        self.conv_hist.len() / self.n_seq.max(1)
+    }
+    pub fn rec_stride(&self) -> usize {
+        self.rec.len() / self.n_seq.max(1)
+    }
+    pub fn kv_stride(&self) -> usize {
+        self.k_cache.len() / self.n_seq.max(1)
     }
 
     pub fn reset(&mut self, dev: &Device) -> Result<()> {
