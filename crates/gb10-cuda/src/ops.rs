@@ -47,9 +47,9 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
 /// Prompt tokens covered by one prefill GEMM block; must match `GB10_TILE_T`
 /// in `kernels/gemm.cu`.
-pub const GB10_TILE_T: usize = 8;
-/// Output rows owned by each lane in the prefill GEMM; matches `GB10_NR`.
-pub const GB10_NR: usize = 1;
+pub const GB10_TILE_T: usize = 64;
+/// Rows of N per prefill GEMM block; matches `GB10_TN` in `kernels/gemm.cu`.
+pub const GB10_NR: usize = 64;
 
 pub const DELTA_KEY_HEAD_DIM: usize = 128;
 pub const DELTA_VALUE_HEAD_DIM: usize = 128;
@@ -935,7 +935,7 @@ impl Ops {
         unsafe {
             dev.stream().launch_builder(&self.nvfp4_gemm)
                 .arg(w).arg(wscale).arg(scale2).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
-                .launch(LaunchConfig { grid_dim: (cdiv(n,8*GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+                .launch(LaunchConfig { grid_dim: (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }
@@ -950,7 +950,7 @@ impl Ops {
         unsafe {
             dev.stream().launch_builder(&self.fp8_gemm)
                 .arg(w).arg(scale).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
-                .launch(LaunchConfig { grid_dim: (cdiv(n,8*GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+                .launch(LaunchConfig { grid_dim: (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }
@@ -965,7 +965,7 @@ impl Ops {
         unsafe {
             dev.stream().launch_builder(&self.bf16_gemm)
                 .arg(w).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
-                .launch(LaunchConfig { grid_dim: (cdiv(n,8*GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+                .launch(LaunchConfig { grid_dim: (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }

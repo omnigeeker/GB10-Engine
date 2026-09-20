@@ -3,256 +3,238 @@
 // The decode GEMV and the prefill GEMM want opposite tilings. Decode reads
 // each weight exactly once and produces one output, so it blocks over N and
 // streams W -- it is purely DRAM-bound. Prefill reuses every weight across all
-// T prompt tokens, so it must block over (N, T) and hold a T-wide accumulator;
-// reusing the GEMV with `grid.y = T` instead re-reads the whole weight matrix
-// T times and buys nothing but launch overhead.
+// T prompt tokens, so it must block over (N, T) and hold a T-wide accumulator.
 //
-// Layout per block (256 threads = 8 warps):
-//   * each warp owns one output row `n`
-//   * each block covers TILE_T prompt tokens
-//   * the K loop is chunked; the x tile for the chunk is staged in shared
-//     memory and broadcast across the block's warps
-//   * lanes cover k with stride 1, so the weight read is coalesced and the
-//     shared-memory read is conflict-free
-//   * the T-wide partials are reduced across the warp once, at the very end
+// Two earlier attempts at this failed, and the failures are why the design
+// below looks the way it does:
 //
-// x traffic is `(N / (8*NR)) * T * K * 4` bytes but is served from L1/L2
-// because every warp in the block shares the same tile.
+//   * NR=1, TILE_T=8 (each warp owns one row, x staged in shared): 2054 ms.
+//     Every FMA pair costs 2 shared loads, so it is shared-throughput-bound.
+//   * NR=4 (register-blocking the rows): 2650 ms. Worse -- 80 registers drops
+//     occupancy to 50% and the kernel is latency-bound.
+//   * TILE_T=64, NR=1 (to read each weight once instead of once per T-tile):
+//     2838 ms. `xv0[64]`/`xv1[64]` is 128 registers on top of a 64-wide
+//     accumulator, so it spilled.
 //
-// Register blocking: each lane owns NR output rows and hoists the two x values
-// it needs per chunk into registers, reusing them NR times. Without this every
-// one of the block's 8 warps re-reads the same `xs[i][k]` from shared for its
-// own row, so each FMA pair costs 2 shared loads and the kernel runs at
-// ~0.7 TFLOPS -- shared-memory-bound, not FMA-bound. Hoisting drops the shared
-// traffic per FMA by NR.
+// So both obvious levers are blocked by register pressure, and the tiling
+// itself has to change. This version stages *both* operands in shared memory
+// and gives each thread a 2D register tile:
+//
+//   * block covers TILE_N=64 rows x TILE_T=64 tokens
+//   * Wtile and xtile are staged in shared, stored TRANSPOSED as [k][row] --
+//     stored as [row][k] every inner-loop read is a 32-way bank conflict,
+//     because the stride between threads is exactly the tile width
+//   * each thread owns a 4x4 sub-tile, so the inner loop reads 4 W and 4 x
+//     values per 16 FMAs (1:2 shared-to-FMA) with a 16-register accumulator
+//   * TILE_T covers the whole prompt, so each weight is read exactly once
+//
+// x traffic is `(N / 64) * T * K * 4` bytes but is served from L1/L2 because
+// every thread in the block shares the same tile.
 
 #include "gemv_common.cuh"
 
 using namespace gb10;
 
-// Prompt tokens covered by one block. 8 keeps the T-wide accumulator in 8
-// registers while still splitting a 59-token prompt across 8 blocks, which is
-// what keeps the SMs fed on short prompts.
-#define GB10_TILE_T 8
-// Output rows owned by each lane. Trades registers for x reuse: the
-// accumulator costs TILE_T*NR and the hoisted x pair another 2*TILE_T.
-#define GB10_NR 1
-#define GB10_GEMM_WARPS 8
-#define GB10_GEMM_BLOCK (GB10_GEMM_WARPS * 32)
+#define GB10_TN 64    // rows of N per block
+#define GB10_TT 64    // prompt tokens per block
+#define GB10_KC 32    // k values per chunk
+#define GB10_TM 4     // rows of N owned by one thread
+#define GB10_TNREG 4  // tokens owned by one thread
+#define GB10_GEMM_BLOCK 256
 
-// Stage the `[TILE_T, KC]` x chunk into shared memory. Every warp in the block
-// reads the same tile, so this is the only place x touches global memory.
-template <int TILE_T, int KC>
-__device__ __forceinline__ void gemm_stage_x(float (*xs)[KC], const float* __restrict__ x, int K,
-                                             int T, int t0, int c) {
-    for (int i = threadIdx.x; i < TILE_T * KC; i += GB10_GEMM_BLOCK) {
-        const int tt = i / KC, kk = i % KC;
-        const int gt = t0 + tt;
-        xs[tt][kk] = (gt < T) ? __ldg(x + (size_t)gt * K + c * KC + kk) : 0.0f;
+// Padded strides: one extra float so consecutive `k` slices do not start on the
+// same shared bank.
+#define GB10_WSTRIDE (GB10_TN + 1)
+#define GB10_XSTRIDE (GB10_TT + 1)
+
+// Stage the [TILE_N, KC] weight chunk, decoded to fp32, as `wt[k][n]`.
+template <int KC>
+__device__ __forceinline__ void stage_wtile(float (*wt)[GB10_WSTRIDE],
+                                            const uint8_t* __restrict__ w,
+                                            const uint8_t* __restrict__ sc,
+                                            const float* __restrict__ s2, int K, int nbase,
+                                            int N, int c) {
+    const float wscale2 = __ldg(s2);
+    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
+        const int nl = idx / KC, kl = idx % KC;
+        const int n = nbase + nl;
+        float v = 0.0f;
+        if (n < N) {
+            const int k = c * KC + kl;
+            // Lane-adjacent idx walks k, so this read is coalesced.
+            const uint8_t byte = __ldg(w + (size_t)n * (K >> 1) + (k >> 1));
+            const uint8_t nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
+            const float s =
+                e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (k >> 4))) * wscale2;
+            v = e2m1_to_float(nib) * s;
+        }
+        wt[kl][nl] = v;
     }
-    __syncthreads();
 }
 
-// Reduce the T-wide per-lane partials and write one row per warp.
-template <int TILE_T>
-__device__ __forceinline__ void gemm_store(float* __restrict__ y, float (&acc)[TILE_T], int n,
-                                           int N, int t0, int T, int lane) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i)
-            acc[i] += __shfl_down_sync(0xffffffffu, acc[i], off);
+template <int KC>
+__device__ __forceinline__ void stage_wtile_fp8(float (*wt)[GB10_WSTRIDE],
+                                                const uint8_t* __restrict__ w,
+                                                const float* __restrict__ s1, int K, int nbase,
+                                                int N, int c) {
+    const float wscale = __ldg(s1);
+    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
+        const int nl = idx / KC, kl = idx % KC;
+        const int n = nbase + nl;
+        float v = 0.0f;
+        if (n < N) v = e4m3_to_float(__ldg(w + (size_t)n * K + c * KC + kl)) * wscale;
+        wt[kl][nl] = v;
+    }
+}
 
-    if (lane == 0 && n < N) {
+template <int KC>
+__device__ __forceinline__ void stage_wtile_bf16(float (*wt)[GB10_WSTRIDE],
+                                                 const uint16_t* __restrict__ w, int K, int nbase,
+                                                 int N, int c) {
+    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
+        const int nl = idx / KC, kl = idx % KC;
+        const int n = nbase + nl;
+        float v = 0.0f;
+        if (n < N) v = bf16_to_float(__ldg(w + (size_t)n * K + c * KC + kl));
+        wt[kl][nl] = v;
+    }
+}
+
+// Stage the [TILE_T, KC] activation chunk as `xt[k][t]`.
+template <int KC>
+__device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
+                                            const float* __restrict__ x, int K, int T, int t0,
+                                            int c) {
+    for (int idx = threadIdx.x; idx < GB10_TT * KC; idx += GB10_GEMM_BLOCK) {
+        const int tl = idx / KC, kl = idx % KC;
+        const int t = t0 + tl;
+        xt[kl][tl] = (t < T) ? __ldg(x + (size_t)t * K + c * KC + kl) : 0.0f;
+    }
+}
+
+// The 4x4 outer product. Identical for every quantisation.
+__device__ __forceinline__ void gemm2d_outer(const float (*wt)[GB10_WSTRIDE],
+                                             const float (*xt)[GB10_XSTRIDE],
+                                             float (&acc)[GB10_TM][GB10_TNREG], int ty, int tx) {
 #pragma unroll
-        for (int i = 0; i < TILE_T; ++i) {
-            const int tt = t0 + i;
-            if (tt < T) y[(size_t)tt * N + n] = acc[i];
+    for (int k = 0; k < GB10_KC; ++k) {
+        float wv[GB10_TM], xv[GB10_TNREG];
+#pragma unroll
+        for (int i = 0; i < GB10_TM; ++i) wv[i] = wt[k][ty * GB10_TM + i];
+#pragma unroll
+        for (int j = 0; j < GB10_TNREG; ++j) xv[j] = xt[k][tx * GB10_TNREG + j];
+#pragma unroll
+        for (int i = 0; i < GB10_TM; ++i)
+#pragma unroll
+            for (int j = 0; j < GB10_TNREG; ++j) acc[i][j] = fmaf(wv[i], xv[j], acc[i][j]);
+    }
+}
+
+__device__ __forceinline__ void gemm2d_store(float (&acc)[GB10_TM][GB10_TNREG],
+                                             float* __restrict__ y, int nbase, int t0, int N,
+                                             int T, int ty, int tx) {
+#pragma unroll
+    for (int i = 0; i < GB10_TM; ++i) {
+        const int n = nbase + ty * GB10_TM + i;
+        if (n < N) {
+#pragma unroll
+            for (int j = 0; j < GB10_TNREG; ++j) {
+                const int t = t0 + tx * GB10_TNREG + j;
+                if (t < T) y[(size_t)t * N + n] = acc[i][j];
+            }
         }
     }
 }
 
-template <int TILE_T, int NR>
+__device__ __forceinline__ void gemm2d_begin(float (&acc)[GB10_TM][GB10_TNREG]) {
+#pragma unroll
+    for (int i = 0; i < GB10_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < GB10_TNREG; ++j) acc[i][j] = 0.0f;
+}
+
+__device__ __forceinline__ void gemm2d_ids(int& ty, int& tx) {
+    ty = threadIdx.x >> 4;  // 16 groups of 4 rows = 64
+    tx = threadIdx.x & 15;  // 16 groups of 4 tokens = 64
+}
+
+template <int DUMMY>
 __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
                                                 const uint8_t* __restrict__ sc,
                                                 const float* __restrict__ s2,
                                                 const float* __restrict__ x,
                                                 float* __restrict__ y, int N, int K, int T) {
-    constexpr int KC = 64;  // 32 packed bytes per chunk
-    __shared__ float xs[TILE_T][KC];
+    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
 
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int nbase = (blockIdx.x * GB10_GEMM_WARPS + warp) * NR;
-    const int t0 = blockIdx.y * TILE_T;
-    const int nchunk = K / KC;
-    const float wscale2 = __ldg(s2);
+    const int nbase = blockIdx.x * GB10_TN;
+    const int t0 = blockIdx.y * GB10_TT;
+    int ty, tx;
+    gemm2d_ids(ty, tx);
 
-    float acc[NR][TILE_T];
-#pragma unroll
-    for (int r = 0; r < NR; ++r)
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) acc[r][i] = 0.0f;
+    float acc[GB10_TM][GB10_TNREG];
+    gemm2d_begin(acc);
 
-    const uint8_t* __restrict__ wrow = w + (size_t)nbase * (K >> 1);
-    const uint8_t* __restrict__ srow = sc + (size_t)nbase * (K >> 4);
-    const int k = lane * 2;
-
-    for (int c = 0; c < nchunk; ++c) {
-        gemm_stage_x<TILE_T, KC>(xs, x, K, T, t0, c);
-
-        // Hoisted once per chunk and reused across all NR rows: this is the
-        // whole point of the register blocking.
-        float xv0[TILE_T], xv1[TILE_T];
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) {
-            xv0[i] = xs[i][k];
-            xv1[i] = xs[i][k + 1];
-        }
-
-#pragma unroll
-        for (int r = 0; r < NR; ++r) {
-            if (nbase + r < N) {
-                // Lane l owns packed byte `l` == k values {2l, 2l+1}; both live
-                // in group l/8, so one scale byte covers both nibbles.
-                const uint8_t byte = __ldg(wrow + (size_t)r * (K >> 1) + c * 32 + lane);
-                const float s =
-                    e4m3_to_float(__ldg(srow + (size_t)r * (K >> 4) + c * 4 + (lane >> 3))) *
-                    wscale2;
-                const float w0 = e2m1_to_float(byte & 0xF) * s;
-                const float w1 = e2m1_to_float(byte >> 4) * s;
-#pragma unroll
-                for (int i = 0; i < TILE_T; ++i) {
-                    acc[r][i] = fmaf(w0, xv0[i], acc[r][i]);
-                    acc[r][i] = fmaf(w1, xv1[i], acc[r][i]);
-                }
-            }
-        }
+    for (int c = 0; c < K / GB10_KC; ++c) {
+        stage_wtile<GB10_KC>(wt, w, sc, s2, K, nbase, N, c);
+        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
+        __syncthreads();
+        gemm2d_outer(wt, xt, acc, ty, tx);
         __syncthreads();
     }
 
-#pragma unroll
-    for (int r = 0; r < NR; ++r) {
-        float a[TILE_T];
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) a[i] = acc[r][i];
-        gemm_store<TILE_T>(y, a, nbase + r, N, t0, T, lane);
-    }
+    gemm2d_store(acc, y, nbase, t0, N, T, ty, tx);
 }
 
-template <int TILE_T, int NR>
 __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
                                               const float* __restrict__ s1,
                                               const float* __restrict__ x,
                                               float* __restrict__ y, int N, int K, int T) {
-    constexpr int KC = 128;
-    __shared__ float xs[TILE_T][KC];
+    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
 
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int nbase = (blockIdx.x * GB10_GEMM_WARPS + warp) * NR;
-    const int t0 = blockIdx.y * TILE_T;
-    const int nchunk = K / KC;
-    const float wscale = __ldg(s1);
+    const int nbase = blockIdx.x * GB10_TN;
+    const int t0 = blockIdx.y * GB10_TT;
+    int ty, tx;
+    gemm2d_ids(ty, tx);
 
-    float acc[NR][TILE_T];
-#pragma unroll
-    for (int r = 0; r < NR; ++r)
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) acc[r][i] = 0.0f;
+    float acc[GB10_TM][GB10_TNREG];
+    gemm2d_begin(acc);
 
-    const uint8_t* __restrict__ wrow = w + (size_t)nbase * K;
-
-    for (int c = 0; c < nchunk; ++c) {
-        gemm_stage_x<TILE_T, KC>(xs, x, K, T, t0, c);
-
-        float xv[4][TILE_T];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int kk = lane + 32 * j;
-#pragma unroll
-            for (int i = 0; i < TILE_T; ++i) xv[j][i] = xs[i][kk];
-        }
-
-#pragma unroll
-        for (int r = 0; r < NR; ++r) {
-            if (nbase + r < N) {
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int kk = lane + 32 * j;
-                    const float wv =
-                        e4m3_to_float(__ldg(wrow + (size_t)r * K + c * KC + kk)) * wscale;
-#pragma unroll
-                    for (int i = 0; i < TILE_T; ++i) acc[r][i] = fmaf(wv, xv[j][i], acc[r][i]);
-                }
-            }
-        }
+    for (int c = 0; c < K / GB10_KC; ++c) {
+        stage_wtile_fp8<GB10_KC>(wt, w, s1, K, nbase, N, c);
+        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
+        __syncthreads();
+        gemm2d_outer(wt, xt, acc, ty, tx);
         __syncthreads();
     }
 
-#pragma unroll
-    for (int r = 0; r < NR; ++r) {
-        float a[TILE_T];
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) a[i] = acc[r][i];
-        gemm_store<TILE_T>(y, a, nbase + r, N, t0, T, lane);
-    }
+    gemm2d_store(acc, y, nbase, t0, N, T, ty, tx);
 }
 
-template <int TILE_T, int NR>
 __device__ __forceinline__ void bf16_gemm_body(const uint16_t* __restrict__ w,
                                                const float* __restrict__ x,
                                                float* __restrict__ y, int N, int K, int T) {
-    constexpr int KC = 128;
-    __shared__ float xs[TILE_T][KC];
+    __shared__ float wt[GB10_KC][GB10_WSTRIDE];
+    __shared__ float xt[GB10_KC][GB10_XSTRIDE];
 
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int nbase = (blockIdx.x * GB10_GEMM_WARPS + warp) * NR;
-    const int t0 = blockIdx.y * TILE_T;
-    const int nchunk = K / KC;
+    const int nbase = blockIdx.x * GB10_TN;
+    const int t0 = blockIdx.y * GB10_TT;
+    int ty, tx;
+    gemm2d_ids(ty, tx);
 
-    float acc[NR][TILE_T];
-#pragma unroll
-    for (int r = 0; r < NR; ++r)
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) acc[r][i] = 0.0f;
+    float acc[GB10_TM][GB10_TNREG];
+    gemm2d_begin(acc);
 
-    const uint16_t* __restrict__ wrow = w + (size_t)nbase * K;
-
-    for (int c = 0; c < nchunk; ++c) {
-        gemm_stage_x<TILE_T, KC>(xs, x, K, T, t0, c);
-
-        float xv[4][TILE_T];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int kk = lane + 32 * j;
-#pragma unroll
-            for (int i = 0; i < TILE_T; ++i) xv[j][i] = xs[i][kk];
-        }
-
-#pragma unroll
-        for (int r = 0; r < NR; ++r) {
-            if (nbase + r < N) {
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int kk = lane + 32 * j;
-                    const float wv = bf16_to_float(__ldg(wrow + (size_t)r * K + c * KC + kk));
-#pragma unroll
-                    for (int i = 0; i < TILE_T; ++i) acc[r][i] = fmaf(wv, xv[j][i], acc[r][i]);
-                }
-            }
-        }
+    for (int c = 0; c < K / GB10_KC; ++c) {
+        stage_wtile_bf16<GB10_KC>(wt, w, K, nbase, N, c);
+        stage_xtile<GB10_KC>(xt, x, K, T, t0, c);
+        __syncthreads();
+        gemm2d_outer(wt, xt, acc, ty, tx);
         __syncthreads();
     }
 
-#pragma unroll
-    for (int r = 0; r < NR; ++r) {
-        float a[TILE_T];
-#pragma unroll
-        for (int i = 0; i < TILE_T; ++i) a[i] = acc[r][i];
-        gemm_store<TILE_T>(y, a, nbase + r, N, t0, T, lane);
-    }
+    gemm2d_store(acc, y, nbase, t0, N, T, ty, tx);
 }
 
 // NVRTC looks kernels up by symbol name, and a template instantiation mangles
@@ -262,17 +244,17 @@ extern "C" __global__ void __launch_bounds__(GB10_GEMM_BLOCK) nvfp4_gemm_kernel(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc,
     const float* __restrict__ s2, const float* __restrict__ x, float* __restrict__ y, int N,
     int K, int T) {
-    nvfp4_gemm_body<GB10_TILE_T, GB10_NR>(w, sc, s2, x, y, N, K, T);
+    nvfp4_gemm_body<0>(w, sc, s2, x, y, N, K, T);
 }
 
 extern "C" __global__ void __launch_bounds__(GB10_GEMM_BLOCK) fp8_gemm_kernel(
     const uint8_t* __restrict__ w, const float* __restrict__ s1, const float* __restrict__ x,
     float* __restrict__ y, int N, int K, int T) {
-    fp8_gemm_body<GB10_TILE_T, GB10_NR>(w, s1, x, y, N, K, T);
+    fp8_gemm_body(w, s1, x, y, N, K, T);
 }
 
 extern "C" __global__ void __launch_bounds__(GB10_GEMM_BLOCK) bf16_gemm_kernel(
     const uint16_t* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int N,
     int K, int T) {
-    bf16_gemm_body<GB10_TILE_T, GB10_NR>(w, x, y, N, K, T);
+    bf16_gemm_body(w, x, y, N, K, T);
 }

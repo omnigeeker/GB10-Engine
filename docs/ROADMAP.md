@@ -182,9 +182,41 @@ TILE_T=64 should read it once -- but it needs `xv0[64], xv1[64]` = 128
 registers on top of a 64-wide accumulator, so it **spilled** and got slower
 again (2838 ms). The experiment was invalid, so this hypothesis is still open.
 
-**What is actually known:** `NR=1, TILE_T=8` is the best configuration found
-(2054 ms). Both obvious levers are blocked by register pressure, which means
-the tiling itself has to change rather than its parameters.
+**Solved (round 16) by changing the tiling.** `kernels/gemm.cu` now stages
+*both* operands in shared and gives each thread a 2D register tile:
+
+* block covers TILE_N=64 rows x TILE_T=64 tokens
+* `Wtile`/`xtile` are stored **transposed** as `[k][row]` -- stored as
+  `[row][k]` every inner-loop read is a 32-way bank conflict, because the
+  stride between threads is exactly the tile width
+* each thread owns a 4x4 sub-tile: 4 W + 4 x shared reads per 16 FMAs (1:2
+  instead of 1:1), with a 16-register accumulator
+* TILE_T covers the whole prompt, so each weight is read exactly once
+
+64 registers, no spills, 16.6 KB shared, ~67% occupancy.
+
+**TTFT 2054 -> 778 ms.** The profile confirms the shift:
+
+| kernel | before | after |
+|---|---|---|
+| `nvfp4_gemm` | 1536.9 | 473.9 |
+| `fp8_gemm` | 1051.8 | 255.3 |
+| `bf16_gemm` | 16.5 | 73.5 -> 16.5 |
+
+`bf16_gemm` regressed because `in_proj_a/b` are [48, 5120] and TILE_N=64, so
+the entire grid collapsed to **one block on one SM**. Fixed with a
+`self.n < 256` threshold in `Linear::forward_prefill` that falls back to the
+batched GEMV: for a matrix that small, re-reading it per token beats starving
+47 of 48 SMs.
+
+KC=64 was also tried (fewer barriers) and was worse -- 78-90 registers, less
+occupancy, 1025 ms against 847. Reverted to KC=32.
+
+**Where the remaining 10x is.** The GEMM still runs at ~22 GB/s against the
+GEMV's 178. Two candidates, both measured rather than assumed: only ~1.4 waves
+of 272 blocks (`grid.x = 17408/64`) so the tail wastes most of the last wave,
+and 320 `__syncthreads` per block that serialise staging against compute --
+the standard fix for the latter is double-buffering the shared tiles.
 
 **The design that should work** is a 2D register tile with *both* operands
 staged in shared: block covers 64 rows x 64 tokens, `Wtile[64][KC]` and

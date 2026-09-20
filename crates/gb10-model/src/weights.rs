@@ -68,6 +68,14 @@ impl Linear {
         y: &mut CudaSlice<f32>,
         t: usize,
     ) -> Result<()> {
+        // The GEMM tiles N in blocks of 64. Below that the whole grid collapses
+        // to a single block on a single SM: `in_proj_a/b` are [48, 5120], which
+        // measured 73.5 ms that way against 16.5 ms for the batched GEMV. For a
+        // matrix this small, re-reading it per token is far cheaper than
+        // starving 47 of the 48 SMs.
+        if self.n < 256 {
+            return self.forward(dev, x, y, t);
+        }
         let kern = dev.ops();
         match &self.data {
             LinearData::NvFp4 { w, wscale, scale2 } => {
