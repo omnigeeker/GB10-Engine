@@ -283,6 +283,31 @@ de-duplicated scale loads, float4 x staging, double buffering); changes that
 only rearrange the tile shape or occupancy do not.** Whatever is left is on the
 memory side, not the execution side.
 
+**Re-profiled at 449.7 ms (round 22).** The GEMM is 398 ms of the 450 ms TTFT
+(88%); everything else -- recurrence, attention, norms, embedding -- is 52 ms.
+
+| kernel | launches | ms | ms each |
+|---|---|---|---|
+| `nvfp4_gemm` | 192 | 256.7 | 1.337 |
+| `fp8_gemm` | 208 | 141.3 | 0.679 |
+| `gated_delta_rule_chunk` | 48 | 21.9 | 0.456 |
+
+Against the corrected 41 TFLOPS roofline the whole prefill floor is ~73 ms, so
+the GEMM is still ~5.5x off.
+
+`k_proj`/`v_proj` are N=1024, giving `grid.x = 16` blocks on 48 SMs, which
+looked like an obvious starvation case. It is not: raising the small-N GEMV
+fallback from 256 to 2048 made things *worse* (449.7 -> 463.5 ms), so the
+low-occupancy GEMM still beats re-reading the matrix per token. Reverted.
+
+**Strategic note.** TTFT has gone 6273 -> 450 ms and the remaining gap is a
+pure GEMM-tuning problem with a known ceiling. Meanwhile three things the
+objective explicitly asks for are still untouched: **MTP speculative decoding,
+16-way concurrency, and the OpenAI/Anthropic HTTP endpoints.** The endpoints in
+particular are a hard deliverable and currently have no code at all. Further
+GEMM rounds should be balanced against starting those, rather than spending the
+whole loop chasing the last 5x on TTFT.
+
 **A calibration correction.** I had been computing the FMA roofline from
 48 SMs x 128 FP32 lanes x 1.7 GHz = 21 TFLOPS, which put prefill's floor at
 144 ms -- i.e. *above* llama.cpp's measured 74 ms for the same prompt. That is
