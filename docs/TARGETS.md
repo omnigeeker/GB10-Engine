@@ -320,12 +320,29 @@ The same tile is loaded and dequantised identically at `t=1` and `t=16`, which
 is consistent with the measured flat ~390 ms.
 
 The fix is to raise `GB10_KC` so each chunk carries enough bytes per thread to
-cover latency. That is a shared-memory budgeting exercise, not a rewrite:
-`xt[2][KC][GB10_TT+4]` floats plus `wt[2][KC][GB10_TN+4]` are already 26112 B at
-KC=32, and the 48 KB static limit blocks a naive doubling. Tightening the
-strides (`+4` padding to `+1`) buys KC=64 at roughly 50 KB, still marginal, so
-this needs a real look at the padding and the `xt` dtype rather than a constant
-flip.
+cover latency. Two hard constraints turn that into a design decision rather than
+a constant flip:
+
+**`GB10_KC` must be a power of two.** The K loop is `nchunk = K / GB10_KC` with
+no remainder handling, and the K values the GEMM sees are 5120 (mlp gate/up,
+q/k/v), 17408 (mlp down), 6144 (o_proj) and 10240 (mtp fc). Their GCD is
+**1024**, so KC can only be 32 or 64 -- there is no KC=48 to reach for.
+
+**KC=64 does not fit as laid out.** `xt[2][KC][GB10_TT+4]` floats plus
+`wt[2][KC][GB10_TN+4]` uint16 come to 26112 B at KC=32 and 52224 B at KC=64,
+against a 49152 B static limit. Three routes, in increasing order of work:
+
+| route | KC=64 footprint | cost |
+|---|---|---|
+| drop the `+4` padding (strides 64) | 49152 B | exactly at the limit, and reintroduces the bank conflicts the padding exists to avoid |
+| `GB10_TT` 64 -> 32 | 35840 B | also needs the register tiling reworked (256 threads x 16 accumulators currently covers 64x64) |
+| store `wt` packed (uint8) instead of dequantised bf16 | 43520 B | moves dequant into the inner loop |
+
+The `GB10_TT` route is the most promising for this workload specifically: at
+`t=1` and `t=16` the 64 token columns are nearly all idle anyway (which is why
+the forward costs the same at every `t`), so halving the token block costs
+nothing real while freeing enough shared for KC=64. It also doubles the block
+count in `y`, which helps the small-`t` case directly.
 
 This is the next thing to do, and it is worth doing carefully: a 3x gain here
 moves TTFT and unblocks MTP at the same time.
