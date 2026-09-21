@@ -478,12 +478,20 @@ time. **It is in (a) the FLOP/param count, or (b) what `prefill_seq` actually mo
 
 **One real amplification the model missed:** with `ty = threadIdx.x >> 4`, the 32 lanes of a
 warp span **two** `ty` values, so the same `uint4` is fetched for two row groups per warp
-per `k` instead of being broadcast. **That is a genuine 2x traffic factor -- and it is a
-concrete, fixable inefficiency** (a mapping with one `ty` per warp would halve the weight
-fetches), **though on its own it does not close the 9x.**
+per `k` instead of being broadcast. **That is a genuine 2x traffic factor -- but it is STRUCTURAL, not a fixable defect.** The
+mapping must satisfy `ty_groups * tx_groups == GB10_GEMM_BLOCK`, and at this tile that is
+`8 * 16 == 128`. **Getting one `ty` per warp needs `tx_groups = 32`, i.e. `TNREG = 2`,
+which gives `ty_groups * tx_groups = 8 * 32 = 256 != 128` -- the mapping rule breaks --
+and `acc = TM * TNREG = 16`, far below the `acc >= 64` the B/FMA ladder requires.**
+**Buying back the 2x costs the tile, and the tile is what makes B/FMA ~1.0 instead of ~2.0.**
 
-**So the prefill now has two independent, code-identified leads rather than a mystery:
-the warp-level weight refetch, and the unresolved factor of ~9 in the accounting.** It also fits the standing
+**So that lead closes too, and it closes the same way the recovery attempt did last round:
+by checking the arithmetic against the rule, not by argument.**
+
+**The prefill is now down to ONE open question: the unresolved factor of ~9 between the
+measured 2.47 TFLOPS and the 0.27 TFLOPS the closed form allows at 99.6 GB/s.** With the
+`B/FMA` term counted (~1.0) and the warp refetch explained, **that factor is most likely in
+the FLOP/param accounting -- i.e. in one of my own constants, not in the kernel.** It also fits the standing
 observation that the prefill sits at 18% of the bandwidth roofline and a small fraction of
 the FMA roofline: **a 9x accounting error would explain exactly that shape.**
 
