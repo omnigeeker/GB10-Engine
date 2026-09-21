@@ -236,10 +236,42 @@ Three changes -- two-pass loads (round 60), 16 elements per thread for nvfp4
 forward down by ~28%. All three came from the same method: isolate one stage with
 a timing probe, then fix the specific thing the probe exposed.
 
-What is left is still ~271 ms against a 77 ms roofline for 17.6 GB, so there is
-room, but no stage is now obviously dominant. The next probe should re-run the
-round-61 decomposition against the current numbers rather than against the old
-ones, since the shares will have moved.
+### Re-decomposition against the current numbers (round 64)
+
+The round-61 shares had moved, so the same probes were re-run against the
+271.46 ms baseline:
+
+| stage disabled | t=1 forward | implied cost | share |
+|---|---|---|---|
+| (none) | 271.46 ms | -- | -- |
+| nvfp4 weight staging | 200.52 ms | ~71 ms | 26% |
+| fp8 weight staging | 230.03 ms | ~41 ms | 15% |
+| outer product, 3/4 of k | 229.77 ms | ~56 ms | 21% |
+| xtile loads | 289.61 ms | none measurable | -- |
+
+Two things stand out.
+
+**The two stagings together are still 41%** -- 112 ms to move 15.2 GB, i.e.
+~136 GB/s, up from 64 GB/s before round 60 but still only 60% of the 228 GB/s
+roofline. The widening helped; it did not finish the job.
+
+**The remainder is now the largest single bucket at ~103 ms (38%)**, and the
+`xtile` probe came back with *no* measurable effect -- removing its global loads
+changed nothing. Since `stage_xtile` still writes every one of its shared slots
+(zeros for the `t >= T` lanes, which at t=1 is all but one lane per group), that
+points at the **shared-memory stores** rather than the loads, or at something
+outside `stage_xtile` entirely: `gemm2d_store`, the bf16 GEMM, or the non-GEMM
+ops.
+
+Note the probe for `xtile` was the weakest of the four -- it disabled the load
+branch only, so a null result there is suggestive rather than conclusive, and it
+should be redone by skipping the whole function.
+
+A caution learned this round: the probes were scripted with a `cp` restore from a
+scratch copy that predated round 63, which silently reverted that change. Always
+restore probes with `git checkout`, and check `git status` after -- the
+`generate` gate caught it only because the restore was noticed before the
+commit.
 
 ### Two real bugs found on the way (round 58)
 
