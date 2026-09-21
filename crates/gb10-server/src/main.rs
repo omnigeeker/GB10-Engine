@@ -11,6 +11,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::cell::RefCell;
+use std::sync::mpsc;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -292,7 +294,7 @@ fn openai_messages(body: &Value) -> Result<Vec<ChatMessage>> {
         .collect())
 }
 
-fn handle_chat_completions(eng: &mut Engine, body: &Value, stream: &mut TcpStream) -> Result<()> {
+fn handle_chat_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream) -> Result<()> {
     let messages = openai_messages(body)?;
     let max_tokens = body
         .get("max_tokens")
@@ -309,10 +311,10 @@ fn handle_chat_completions(eng: &mut Engine, body: &Value, stream: &mut TcpStrea
         .unwrap_or(true);
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
-    let name = eng.name.clone();
+    let name = MODEL_NAME.with(|n| n.borrow().clone());
 
     if !want_stream {
-        let r = eng.generate(&messages, max_tokens, thinking, |_| Ok(()))?;
+        let r = remote_generate(tx, &messages, max_tokens, thinking, |_| Ok(()))?;
         return respond_json(
             stream,
             200,
@@ -358,7 +360,7 @@ fn handle_chat_completions(eng: &mut Engine, body: &Value, stream: &mut TcpStrea
     let mut prompt_tokens = 0usize;
     {
         let (id2, name2) = (id.clone(), name.clone());
-        let res = eng.generate(&messages, max_tokens, thinking, |piece| {
+        let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
             send(&json!({
                 "id": id2, "object": "chat.completion.chunk", "created": created,
                 "model": name2,
@@ -424,7 +426,7 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
     }
 }
 
-fn handle_messages(eng: &mut Engine, body: &Value, stream: &mut TcpStream) -> Result<()> {
+fn handle_messages(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream) -> Result<()> {
     let messages = anthropic_messages(body)?;
     let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
     let want_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -433,10 +435,10 @@ fn handle_messages(eng: &mut Engine, body: &Value, stream: &mut TcpStream) -> Re
         .map(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"))
         .unwrap_or(true);
     let id = format!("msg_{}", now_secs());
-    let name = eng.name.clone();
+    let name = MODEL_NAME.with(|n| n.borrow().clone());
 
     if !want_stream {
-        let r = eng.generate(&messages, max_tokens, thinking, |_| Ok(()))?;
+        let r = remote_generate(tx, &messages, max_tokens, thinking, |_| Ok(()))?;
         return respond_json(
             stream,
             200,
@@ -483,7 +485,7 @@ fn handle_messages(eng: &mut Engine, body: &Value, stream: &mut TcpStream) -> Re
     let mut finish = "length";
     let mut n_out = 0usize;
     {
-        let res = eng.generate(&messages, max_tokens, thinking, |piece| {
+        let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
             ev(
                 "content_block_delta",
                 &json!({"type": "content_block_delta", "index": 0,
@@ -523,7 +525,7 @@ fn handle_messages(eng: &mut Engine, body: &Value, stream: &mut TcpStream) -> Re
 
 // ---------------------------------------------------------------------------
 
-fn handle(eng: &mut Engine, req: &Request, stream: &mut TcpStream) -> Result<()> {
+fn handle(tx: &mpsc::Sender<Job>, name: &str, req: &Request, stream: &mut TcpStream) -> Result<()> {
     let path = req.path.split('?').next().unwrap_or("/");
     match (req.method.as_str(), path) {
         ("GET", "/health") => {
@@ -536,16 +538,16 @@ fn handle(eng: &mut Engine, req: &Request, stream: &mut TcpStream) -> Result<()>
             stream,
             200,
             &json!({"object": "list", "data": [{
-                "id": eng.name, "object": "model", "owned_by": "gb10-engine",
+                "id": name, "object": "model", "owned_by": "gb10-engine",
             }]}),
         ),
         ("POST", "/v1/chat/completions") => {
             let body = req.json()?;
-            handle_chat_completions(eng, &body, stream)
+            handle_chat_completions(tx, &body, stream)
         }
         ("POST", "/v1/messages") => {
             let body = req.json()?;
-            handle_messages(eng, &body, stream)
+            handle_messages(tx, &body, stream)
         }
         (_, p) if p == "/v1/chat/completions" || p == "/v1/messages" => {
             respond_json(stream, 405, &json!({"error": {"message": "method not allowed"}}))
@@ -554,18 +556,170 @@ fn handle(eng: &mut Engine, req: &Request, stream: &mut TcpStream) -> Result<()>
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Batching scheduler
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The model name, published once so the request handlers do not need the
+    /// `Engine` (which now lives on the scheduler thread).
+    static MODEL_NAME: RefCell<String> = RefCell::new(String::new());
+}
+
+enum Msg {
+    Token(String),
+    Done(GenResult),
+    Fail(String),
+}
+
+/// One queued request. `out` carries tokens back to the connection thread.
+struct Job {
+    messages: Vec<ChatMessage>,
+    max_tokens: usize,
+    enable_thinking: bool,
+    out: mpsc::Sender<Msg>,
+}
+
+/// Same signature and return type as `Engine::generate`, so the handlers below
+/// did not have to change: it hands the work to the scheduler thread and
+/// forwards whatever comes back.
+fn remote_generate<F>(
+    tx: &mpsc::Sender<Job>,
+    messages: &[ChatMessage],
+    max_tokens: usize,
+    enable_thinking: bool,
+    mut on_token: F,
+) -> Result<GenResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let (out, rx) = mpsc::channel();
+    tx.send(Job { messages: messages.to_vec(), max_tokens, enable_thinking, out })
+        .map_err(|_| anyhow::anyhow!("engine stopped"))?;
+    loop {
+        match rx.recv().map_err(|_| anyhow::anyhow!("engine stopped"))? {
+            Msg::Token(p) => on_token(&p)?,
+            Msg::Done(r) => return Ok(r),
+            Msg::Fail(e) => anyhow::bail!("{e}"),
+        }
+    }
+}
+
+fn scheduler(mut eng: Engine, rx: mpsc::Receiver<Job>) {
+    loop {
+        // Block for one, then take whatever else is already waiting, so that
+        // requests that arrive together decode together.
+        let first = match rx.recv() {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        let mut group = vec![first];
+        while group.len() < MAX_CONCURRENT {
+            match rx.try_recv() {
+                Ok(j) => group.push(j),
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = run_group(&mut eng, group) {
+            eprintln!("batch: {e:#}");
+        }
+    }
+}
+
+/// Prefill every request in the group into its own slot, then step them
+/// together. A finished slot keeps being stepped with its own last token so the
+/// slot indices stay put; compacting would mean moving per-slot recurrent state
+/// and KV cache for no benefit.
+fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
+    let k = group.len();
+    let Engine { dev, model, tok, tmpl, state, sc, .. } = eng;
+    state.reset(dev)?;
+
+    let mut next: Vec<u32> = Vec::with_capacity(k);
+    let mut prompt_tokens = Vec::with_capacity(k);
+    let mut texts = vec![String::new(); k];
+    let mut ids: Vec<Vec<u32>> = vec![Vec::new(); k];
+    let mut emitted = vec![0usize; k];
+    let mut done = vec![false; k];
+    let mut finish = vec!["length"; k];
+
+    for (s, job) in group.iter().enumerate() {
+        let opts =
+            ChatTemplateOptions { enable_thinking: job.enable_thinking, ..Default::default() };
+        let prompt = tmpl.render(&job.messages, &opts)?;
+        let p = tok.encode(&prompt, true)?;
+        if p.is_empty() || p.len() >= MAX_SEQ {
+            let _ = job.out.send(Msg::Fail(format!("prompt is {} tokens", p.len())));
+            done[s] = true;
+            prompt_tokens.push(p.len());
+            next.push(0);
+            continue;
+        }
+        prompt_tokens.push(p.len());
+        next.push(model.prefill_seq(dev, &p, state, sc, s)?);
+    }
+
+    let mut live = done.iter().filter(|d| !**d).count();
+    while live > 0 {
+        for s in 0..k {
+            if done[s] {
+                continue;
+            }
+            let t = next[s];
+            if tok.is_eos(t) {
+                finish[s] = "stop";
+                done[s] = true;
+                live -= 1;
+                continue;
+            }
+            emitted[s] += 1;
+            ids[s].push(t);
+            let piece = tok.decode(&[t], true)?;
+            texts[s].push_str(&piece);
+            let _ = group[s].out.send(Msg::Token(piece));
+            if emitted[s] >= group[s].max_tokens {
+                done[s] = true;
+                live -= 1;
+            }
+        }
+        if live == 0 {
+            break;
+        }
+        next = model.step_batch(dev, &next, state, sc)?;
+    }
+
+    for (s, job) in group.into_iter().enumerate() {
+        let _ = job.out.send(Msg::Done(GenResult {
+            ids: std::mem::take(&mut ids[s]),
+            text: std::mem::take(&mut texts[s]),
+            prompt_tokens: prompt_tokens[s],
+            finish: finish[s],
+        }));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse()?;
     eprintln!("gb10-server: loading {}", args.model.display());
     let t = std::time::Instant::now();
-    let mut eng = Engine::new(&args)?;
+    let eng = Engine::new(&args)?;
+    MODEL_NAME.with(|n| *n.borrow_mut() = eng.name.clone());
     eprintln!("gb10-server: ready in {:.1}s", t.elapsed().as_secs_f64());
+
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    std::thread::Builder::new()
+        .name("scheduler".into())
+        .spawn(move || scheduler(eng, job_rx))
+        .context("spawning scheduler")?;
 
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
     eprintln!("gb10-server: listening on http://{addr}");
     eprintln!("  OpenAI:    POST http://{addr}/v1/chat/completions");
     eprintln!("  Anthropic: POST http://{addr}/v1/messages");
+    eprintln!("  concurrent slots: {MAX_CONCURRENT}");
 
     for conn in listener.incoming() {
         let mut stream = match conn {
@@ -575,19 +729,26 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        let req = match read_request(&mut stream) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("read: {e:#}");
-                continue;
+        let tx = job_tx.clone();
+        std::thread::spawn(move || {
+            let req = match read_request(&mut stream) {
+                Ok(Some(r)) => r,
+                Ok(None) => return,
+                Err(e) => {
+                    eprintln!("read: {e:#}");
+                    return;
+                }
+            };
+            let name = MODEL_NAME.with(|n| n.borrow().clone());
+            if let Err(e) = handle(&tx, &name, &req, &mut stream) {
+                eprintln!("{} {}: {e:#}", req.method, req.path);
+                let _ = respond_json(
+                    &mut stream,
+                    500,
+                    &json!({"error": {"message": format!("{e:#}")}}),
+                );
             }
-        };
-        if let Err(e) = handle(&mut eng, &req, &mut stream) {
-            eprintln!("{} {}: {e:#}", req.method, req.path);
-            let _ =
-                respond_json(&mut stream, 500, &json!({"error": {"message": format!("{e:#}")}}));
-        }
+        });
     }
     Ok(())
 }

@@ -118,6 +118,32 @@ The one correctness trap: a finished slot must keep contributing a token to
 alternative, compacting slots, would require moving per-slot recurrent state and
 KV cache and is not needed.
 
+### The scheduler is implemented and working (round 94)
+
+`crates/gb10-server/src/main.rs` now has a batching scheduler: `Engine` moved onto
+a scheduler thread, the accept loop spawns a thread per connection, and
+`remote_generate` has the same signature as `Engine::generate` so the two request
+handlers did not change at all. Each group prefills into slots `0..k`, then steps
+them together with `step_batch`; a finished slot keeps being stepped with its own
+last token so slot indices stay put.
+
+**The objective's end-to-end test, same command as round 92:**
+
+| | round 92 (serial) | round 94 (batched) |
+|---|---|---|
+| 16 concurrent, 256 completion tokens | 47.73 s | **21.63 s** |
+| aggregate | 5.36 tok/s | **11.84 tok/s** |
+
+**2.2x.** Correctness: `GET /health` ok, a single request returns normally, and
+**all 16 identical concurrent prompts produced exactly one distinct output**, so
+grouping is deterministic and does not perturb results.
+
+Still short of the 30 tok/s the objective asks for. The remaining wall time
+decomposes as roughly 16 serialised prefills of a 58-token prompt (~8 s at ~500 ms
+each) plus 16 batched decode steps (~4.6 s at ~287 ms/step). **So the next lever
+is prefill, not decode**: the group's prompts are still prefilled one at a time
+into their slots, and that is now the majority of the time.
+
 **The key enabler is confirmed:** `step_batch` sizes itself from `tokens.len()`
 (`model.rs:277`), so a group of `k` requests can be prefilled into slots `0..k` and
 stepped with `k` tokens -- no state compaction needed. A single request is just
