@@ -656,7 +656,39 @@ more `ROWS` (register-capped at 4) or a different blocking -- **not more bandwid
 the GEMM.** The design is already at a deliberate, documented sweet spot, and the
 `ROWS` knob has been searched (rounds 104/127).
 
-### The one concrete fix left for the endpoint (round 178)
+### RETRACTION (round 179): the shared-memory proposal was already measured and rejected
+
+**`docs/NEXT.md:3429-3440` already rules this out -- and does better than rule it out, it
+names the correct fix.** For `nvfp4_gemv_kernel`:
+
+> "54 GB/s is not traffic -- it is the load's presence in the dependency chain, i.e. **L2
+> latency**." ... "**shared memory did not help** -- shared has its own latency, plus a
+> `__syncwarp()`." ... "**The fix is therefore to break the dependency, not to move the
+> data**: software-pipeline the scale load one k-tile ahead."
+
+The supporting evidence recorded there is the signature to look for: **widening the load
+helped only 3.3%**, while **ablation steps 4 and 5 *raised* bandwidth** (210.5, 212.5) by
+adding work to overlap the latency.
+
+**So round 178's proposal was not unexplored. The codebase paid for that experiment once and
+it lost.**
+
+### The transferable hypothesis, which is what to test instead
+
+**`load_x` sits INSIDE the `b` loop and on the dependency chain of every FMA in that
+iteration -- the same shape as the scale load.** If that is the real mechanism, then:
+
+* **the fix is software-pipelining `load_x` one k-tile ahead**, not shared-memory staging;
+* **the cheapest confirmatory test comes first**: add independent work per k-tile and see
+  whether throughput *rises*. **A rise is the signature of a latency-bound load** -- it is
+  what already distinguished latency from traffic in this exact kernel family, and it costs
+  one measurement rather than a rewrite.
+
+**Note the discipline this round applied: the ruled-out list was checked BEFORE spending a
+round, not after.** That is the first time in this session a rejected mechanism was caught
+in advance rather than by re-measuring it.
+
+### Superseded: the round-178 proposal
 
 **The batched GEMV re-reads `x` from L2 for every row group.** The kernel header names the
 problem ("makes the kernel L2-bound"), `ROWS` is register-capped at 4, and round 127 already
