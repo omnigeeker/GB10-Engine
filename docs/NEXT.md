@@ -2451,6 +2451,51 @@ caught as 0/3 before any timing was taken.** So the ring must be built on `kc0`,
 **`chunked-prefill` is the test that matters here**: it exercises the `kc0 > 0` path, **and the
 ring's start index is exactly what that path stresses.**
 
+## THE RING NEEDS ALL THREE VARIANTS, AND THE OBVIOUS REFILL IS A RACE (round 231)
+
+**Implementing the 4-deep ring immediately exposed two things the round-230 plan had not
+accounted for. Neither cost a build: the edit script asserted before writing, and `diff -q`
+confirms `kernels/gemm.cu` is untouched (dirty: 0).**
+
+### Finding 1: there are THREE ring sites, not one
+
+**The pattern `const int cur = (c ^ 1) & 1, nxt = c & 1;` occurs at `:397` (`nvfp4_gemm_body`),
+`:431` (`fp8_gemm_body`) and `:464` (`bf16_gemm_body`)** -- and each variant declares its own
+`wt`/`xt`. **The pre-stage lines are per-variant too.** This is the round-198/199 lesson
+repeating: **a shape change that touches one variant and not the others compiles and runs, and
+reports wrong numbers.**
+
+### Finding 2, the more important one: the obvious refill is a DATA RACE
+
+**In the 2-buffer form `cur` and `nxt` differ, so refilling `nxt` while `cur` is consumed is
+safe. In a 4-slot ring the natural refill target is the slot JUST CONSUMED -- the same one other
+threads are still reading in `gemm2d_outer_bf16`.** That race does not crash; **it produces wrong
+tokens, which is exactly what the gate exists to catch.**
+
+### And the fix keeps ONE barrier per k-tile
+
+**Refill the slot consumed in the PREVIOUS iteration, at the TOP of the current one.** The barrier
+at the end of the previous iteration separates that slot's read from this write. **The ring then
+holds slots `c`, `c+1`, `c+2` pending plus the `c+3` refill just issued -- four loads in flight,
+which is the measured condition.**
+
+```c
+// pre-stage kc0..kc0+3 into slots 0..3
+__syncthreads();
+for (int c = kc0; c < kc1; ++c) {
+    const int cur = c & 3;
+    if (c + 3 < kc1) {                      // slot consumed LAST iteration
+        stage_wtile<GB10_KC>(wt[(c + 3) & 3], w, sc, s2, K, nbase, N, c + 3);
+        stage_xtile<GB10_KC>(xt[(c + 3) & 3], x, K, T, t0, c + 3);
+    }
+    gemm2d_outer_bf16(wt[cur], xt[cur], acc, ty, tx);
+    __syncthreads();
+}
+```
+
+**And the `kc_half` constraint tightens to a multiple of 4** (round 230): `kc_half = 80`, which is
+divisible by 4, **so it holds today** -- but the host fallback must test 4, not 2.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
