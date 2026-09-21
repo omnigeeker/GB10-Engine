@@ -659,6 +659,20 @@ extern "C" __global__ void copy_last_row_kernel(const float* __restrict__ src,
     dst[i] = src[(size_t)(t - 1) * n + i];
 }
 
+// Concatenate two `n`-vectors into `dst`: dst[0..n] = a, dst[n..2n] = b.
+//
+// The MTP head feeds `mtp.fc` with `concat(norm(embed(t+1)), norm(h_t))`, and
+// the RMSNorm ops write to a whole buffer rather than an offset, so the two
+// halves are staged separately and joined here.
+extern "C" __global__ void concat2_kernel(const float* __restrict__ a,
+                                          const float* __restrict__ b,
+                                          float* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = a[i];
+    dst[n + i] = b[i];
+}
+
 // ---------------------------------------------------------------------------
 // Multi-sequence decode variants
 //

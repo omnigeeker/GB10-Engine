@@ -44,6 +44,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "deinterleave_heads_batched_kernel",
     "embed_gather_batched_kernel",
     "copy_last_row_kernel",
+    "concat2_kernel",
     "nvfp4_gemm_kernel",
     "fp8_gemm_kernel",
     "bf16_gemm_kernel",
@@ -90,6 +91,7 @@ pub struct Ops {
     deinterleave_heads_batched: CudaFunction,
     embed_gather_batched: CudaFunction,
     copy_last_row: CudaFunction,
+    concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
     fp8_gemm: CudaFunction,
     bf16_gemm: CudaFunction,
@@ -146,6 +148,7 @@ impl Ops {
             deinterleave_heads_batched: take(map, "deinterleave_heads_batched_kernel")?,
             embed_gather_batched: take(map, "embed_gather_batched_kernel")?,
             copy_last_row: take(map, "copy_last_row_kernel")?,
+            concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
             bf16_gemm: take(map, "bf16_gemm_kernel")?,
@@ -1148,6 +1151,21 @@ impl Ops {
         unsafe {
             dev.stream().launch_builder(&self.copy_last_row)
                 .arg(src).arg(dst).arg(&tt).arg(&nn)
+                .launch(LaunchConfig { grid_dim: (cdiv(n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// `dst[0..n] = a`, `dst[n..2n] = b`. Used by the MTP head to join the two
+    /// normalised inputs of `mtp.fc`.
+    pub fn concat2(
+        &self, dev: &Device, a: &CudaSlice<f32>, b: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>, n: usize,
+    ) -> Result<()> {
+        let nn = n as i32;
+        unsafe {
+            dev.stream().launch_builder(&self.concat2)
+                .arg(a).arg(b).arg(dst).arg(&nn)
                 .launch(LaunchConfig { grid_dim: (cdiv(n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())

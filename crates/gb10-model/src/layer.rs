@@ -832,7 +832,7 @@ impl DeltaNetLayer {
 
 impl FullAttnLayer {
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         dev: &Device,
         cfg: &TextConfig,

@@ -16,7 +16,7 @@ use gb10_core::chat::{text_message, ChatTemplate};
 use gb10_core::config::ModelConfig;
 use gb10_core::tokenizer::QwenTokenizer;
 use gb10_cuda::Device;
-use gb10_model::mtp::Mtp;
+use gb10_model::mtp::{Mtp, MtpState};
 use gb10_model::{LayerState, Model, ModelState, Scratch, Store};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -681,7 +681,55 @@ fn mtp_probe(args: &Args) -> Result<()> {
         100.0 * head as f64 / decoder as f64
     );
     println!();
-    println!("mtp-probe: OK (weights loaded)");
+
+    // ---- does the head actually predict the decoder's next token? ----------
+    // Two candidate inputs, because the checkpoint is ambiguous about which one
+    // `pre_fc_norm_hidden` expects: the post-final-norm hidden the lm_head
+    // consumes, or the pre-norm residual stream leaving the last decoder
+    // layer (which is what DeepSeek-style MTP heads take). Measuring both
+    // settles it without guessing. Each variant needs its own KV cache, since
+    // a ruling-out pass must not consume the other's positions.
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+    let text = cfg.text_config.clone();
+    let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut a = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
+    let mut b = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
+    let mut idx: gb10_cuda::CudaSlice<i32> = dev.stream().alloc_zeros::<i32>(1)?;
+
+    let probe_prompt = if args.prompt.is_empty() {
+        "What is the capital of France?".to_string()
+    } else {
+        args.prompt.clone()
+    };
+    println!("  prompt: {probe_prompt:?}");
+    let ids = tok.encode(&probe_prompt, true)?;
+    let mut next = model.prefill_seq(&dev, &ids, &mut st, &mut sc, 0)?;
+
+    let (mut hit_post, mut hit_pre, mut total) = (0usize, 0usize, 0usize);
+    for _ in 0..args.n_new {
+        // `st.normed` is the post-final-norm hidden the lm_head just consumed;
+        // `st.a` is the residual stream leaving the last decoder layer.
+        mtp.forward(&dev, &text, &st.normed, next, &model.embed, &model.lm_head, &mut a)?;
+        dev.ops().argmax(&dev, &a.logits, &mut idx, model.vocab_size())?;
+        let d_post = dev.stream().memcpy_dtov(&idx)?[0] as u32;
+
+        mtp.forward(&dev, &text, &st.a, next, &model.embed, &model.lm_head, &mut b)?;
+        dev.ops().argmax(&dev, &b.logits, &mut idx, model.vocab_size())?;
+        let d_pre = dev.stream().memcpy_dtov(&idx)?[0] as u32;
+
+        let actual = model.step(&dev, next, &mut st, &mut sc)?;
+        total += 1;
+        if d_post == actual { hit_post += 1; }
+        if d_pre == actual { hit_pre += 1; }
+        next = actual;
+    }
+
+    println!("== MTP draft acceptance over {} greedy steps ==", total);
+    println!("  post-final-norm hidden : {:>3}/{total} = {:.1}%", hit_post, 100.0 * hit_post as f64 / total as f64);
+    println!("  pre-norm residual      : {:>3}/{total} = {:.1}%", hit_pre, 100.0 * hit_pre as f64 / total as f64);
+    println!();
+    println!("mtp-probe: OK");
     Ok(())
 }
 

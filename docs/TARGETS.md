@@ -85,6 +85,36 @@ further tuning of the batch GEMV, which is already at the register wall
 slower). At the current 42.44 tok/s at n_seq=16, a 1.6x gain lands at ~68 tok/s
 -- past the "50+ at concurrency 16" target.
 
+### The head is implemented and its acceptance rate is measured (round 41)
+
+`Mtp::forward` runs the full chain -- gather the next token's embedding, norm
+both inputs, `concat2`, `mtp.fc`, the full-attention layer with its own KV
+cache, `mtp.norm`, shared `lm_head` -- and `mtp-probe` measures how often its
+draft matches what the decoder actually emits next. Greedy acceptance over 48
+steps, four unrelated prompts:
+
+| prompt | acceptance |
+|---|---|
+| "What is the capital of France?" | 91.7% |
+| "Explain how a transformer attention mechanism works, step by step." | 85.4% |
+| "Write a Rust function that reverses a linked list and explain it." | 95.8% |
+| "List the planets in order, then describe each one in a sentence." | 89.6% |
+
+Average ~90%, and the spread across unrelated subjects is what rules out
+repetition inflating the number. At 90% acceptance the economics above give
+`18.45 / 1.90 = 9.71 GB/token`, a **1.81x** speedup -- 42.44 tok/s becomes
+roughly **77 tok/s at n_seq=16**, past the "50+ at concurrency 16" target, and
+8.69 becomes ~15.7 tok/s single-stream.
+
+Open question worth resolving before wiring it up: the two candidate hidden
+inputs (post-final-norm vs pre-norm residual) produced *identical* acceptance
+counts on every prompt tried. Two different vectors giving the same argmax
+every time suggests the hidden half of the concatenation may contribute little,
+which would be worth confirming -- if `concat2` or the second half of `mtp.fc`
+were being dropped, acceptance would look exactly like this. Check by running
+the head with the hidden half zeroed: if acceptance does not move, that half is
+not influencing the draft.
+
 The head's structure is confirmed: `mtp.fc` is `[5120, 10240]` (the
 concatenation of the two normalised inputs back down to hidden),
 `mtp.layers.0` is a single full-attention layer with the same geometry as the
