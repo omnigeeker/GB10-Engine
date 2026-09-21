@@ -475,9 +475,41 @@ streamed through a 25 MB L2. Either could hold the achievable rate below 228.
 
 **The cheap next step is therefore to measure the achievable rate for this
 exact pattern** -- a standalone probe that reads the real weight layout with the
-real warp access pattern and nothing else. If that comes back at ~136 GB/s, the
-staging is already at the hardware limit for this pattern and the remaining work
-belongs in the outer product and the non-GEMM ops instead.
+real warp access pattern and nothing else.
+
+### The roofline was wrong (round 73)
+
+`bench/hw/stage_bw.cu` does exactly that: two kernels, same bytes, one reading
+contiguously and one reproducing `stage_wtile`'s addresses with no dequant and
+no shared store. On a 44.6 MB matrix (one layer's NVFP4 weights), 64 reps:
+
+| pattern | GB/s |
+|---|---|
+| contiguous 16 B per thread | 206.2 |
+| **staging (the real addresses)** | **89.7** |
+
+**The staging pattern's own ceiling is ~90 GB/s, not 228.** The real kernel
+reaches 136 GB/s on this pattern -- *above* what the isolated probe manages, so
+the staging is not leaving performance on the table at all. It is at the limit of
+the addresses it issues.
+
+The reason is cache-line granularity. `KC = 64` NVFP4 elements is 32 bytes, and a
+warp's four `gr` lanes cover exactly those 32 bytes of a row; the next row starts
+2560 bytes away. So every row contributes a **32-byte sector to a 64-byte line**
+-- half of each fetched line is never used. That predicts ~114 GB/s against the
+228 GB/s contiguous figure, which is the right order for both the 90 measured in
+isolation and the 136 measured in the kernel.
+
+This reframes the whole line of attack. The two weight stagings were 41% of the
+forward, but they are not underperforming; they are reading 32 bytes per row when
+the hardware wants 64. **The fix is a layout change, not a tuning change**: get a
+warp to cover 64 consecutive bytes of one row. The direct route is `KC = 128`,
+which makes a row's chunk exactly one cache line -- but that needs
+`2*128*(TN+4)*2 + 2*128*(TT+4)*4 = 71680 B` of shared against a 49152 B budget, so
+it requires shrinking `TT` or storing `xt` in bf16 (both already scoped above).
+
+That is the next experiment, and it is the first one in several rounds with a
+clear mechanism behind it rather than an elimination.
 
 ### A caution learned in round 64
 
