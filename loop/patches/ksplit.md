@@ -184,3 +184,50 @@ yields plausible numbers**, so the only trustworthy signal is `generate --n 16` 
 16/16 plus `chunked-prefill --n 6` OK. **If a future round sees a *speedup* on the first
 run, check the gate before believing it** -- rounds 88, 110 and 119 each reported a
 faster kernel that was simply wrong.
+
+
+---
+
+## KERNEL HALF DONE (round 159) -- and the gate caught a real bug in it
+
+Items 1-4 are in `kernels/gemm.cu` and verified. **The host still launches
+`grid.z = 1`, so behaviour is unchanged and both gates pass: `generate --n 16` 16/16,
+`chunked-prefill --n 6` OK.**
+
+**The first attempt FAILED THE GATE 0/3, and it is worth recording why**, because it is
+this project's most-repeated failure mode arriving on schedule:
+
+```cuda
+const int kc_half = nchunk / GB10_KSPLIT;      // WRONG
+const int kc1 = min(kc0 + kc_half, nchunk);    // grid.z == 1 -> kc1 = 80, not 160
+```
+
+**Deriving the chunk range from the constant rather than from `gridDim.z` made a
+`grid.z == 1` launch cover only half of K.** It compiled, it ran, and it would have
+reported a *faster* prefill -- the same shape as rounds 88, 110 and 119. **The gate
+caught it before a single timing was taken.** The fix:
+
+```cuda
+const int nsplit = (int)gridDim.z;                        // 1 or 2
+const int kc_half = (nchunk + nsplit - 1) / nsplit;       // z==1 -> 160, the old loop
+const int kc0 = blockIdx.z * kc_half;
+const int kc1 = min(kc0 + kc_half, nchunk);
+```
+
+**The streaming fix in round 157 generalised:** derive the range from the launch, not
+from a compile-time assumption about the launch.
+
+## What is left: the host half (item 5)
+
+`crates/gb10-cuda/src/ops.rs` -- at each of the three NVFP4 prefill launch sites
+(1191, 1206, 1221):
+
+1. set the third grid dimension to `2` (and **only** when `nchunk / 2` is even, else 1);
+2. **zero `y` first**, because `blockIdx.z > 0` accumulates with `atomicAdd`. `y` is
+   `t * n` floats -- 59 x 17408 x 4 B = **4.1 MB**, negligible against the 17.6 GB the
+   same launch moves. Use whatever the crate already exposes for a device memset on the
+   same stream, or a small fill kernel.
+
+**Acceptance:** both gates must stay green, then `forward-cost` / TTFT with **>= 3 runs**
+against the 434 ms baseline, **ranges non-overlapping** before calling it a win.
+**Predicted ~2x: TTFT -> ~220 ms, endpoint 19.8 -> ~35-40 tok/s.**

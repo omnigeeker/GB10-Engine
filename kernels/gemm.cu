@@ -39,6 +39,16 @@ using namespace gb10;
 #define GB10_TN 64    // rows of N per block
 #define GB10_TT 64    // prompt tokens per block
 #define GB10_KC 32    // k values per chunk
+// K is split across blockIdx.z so the prefill GEMM can offer more than the 5.7
+// blocks/SM it does today (measured 47% occupancy, bound by BOTH the register
+// budget of 5.3 blocks/SM and the grid -- docs/NEXT.md round 148). The atomics
+// this needs were measured at ~100x the required rate (~1% of a prefill).
+//
+// kc_half must be EVEN: the double-buffer parity below is (c ^ 1) & 1, which
+// stays correct only because c now starts at an even number. nchunk = 160 and a
+// 2-way split gives 80, so it holds here. The host must fall back to grid.z = 1
+// when nchunk / GB10_KSPLIT is odd.
+#define GB10_KSPLIT 2 // chunks of K per block; host sets grid.z
 #define GB10_TM 8     // rows of N owned by one thread
 #define GB10_TNREG 4  // tokens owned by one thread
 #define GB10_GEMM_BLOCK 128
@@ -308,7 +318,13 @@ __device__ __forceinline__ void gemm2d_store(float (&acc)[GB10_TM][GB10_TNREG],
 #pragma unroll
             for (int j = 0; j < GB10_TNREG; ++j) {
                 const int t = t0 + tx * GB10_TNREG + j;
-                if (t < T) y[(size_t)t * N + n] = acc[i][j];
+                // With a K split, each block holds a PARTIAL sum for this element.
+                // block 0 writes, blocks > 0 accumulate -- which is why the host
+                // must zero y before launching grid.z > 1.
+                if (t < T) {
+                    if (blockIdx.z == 0) y[(size_t)t * N + n] = acc[i][j];
+                    else atomicAdd(&y[(size_t)t * N + n], acc[i][j]);
+                }
             }
         }
     }
@@ -362,12 +378,24 @@ __device__ __forceinline__ void nvfp4_gemm_body(const uint8_t* __restrict__ w,
     gemm2d_begin(acc);
 
     const int nchunk = K / GB10_KC;
-    stage_wtile<GB10_KC>(wt[1], w, sc, s2, K, nbase, N, 0);
-    stage_xtile<GB10_KC>(xt[1], x, K, T, t0, 0);
+    // This block's share of the K chunks. With grid.z == 1 (the host default)
+    // kc0 == 0 and kc1 == nchunk, so this is exactly the old loop.
+    // MUST derive from gridDim.z, not from GB10_KSPLIT. Using the constant made a
+    // grid.z == 1 launch cover only half of K, which the gate caught as 0/3 before
+    // any timing was taken -- the exact "a broken kernel reports a fast number"
+    // failure this project keeps hitting.
+    const int nsplit = (int)gridDim.z;
+    const int kc_half = (nchunk + nsplit - 1) / nsplit;
+    const int kc0 = blockIdx.z * kc_half;
+    const int kc1 = min(kc0 + kc_half, nchunk);
+    stage_wtile<GB10_KC>(wt[1], w, sc, s2, K, nbase, N, kc0);
+    stage_xtile<GB10_KC>(xt[1], x, K, T, t0, kc0);
     __syncthreads();
-    for (int c = 0; c < nchunk; ++c) {
+    // kc0 is even by construction (see GB10_KSPLIT above), so the existing parity
+    // expression stays correct with no change and no `rel` variable.
+    for (int c = kc0; c < kc1; ++c) {
         const int cur = (c ^ 1) & 1, nxt = c & 1;
-        if (c + 1 < nchunk) {
+        if (c + 1 < kc1) {
             stage_wtile<GB10_KC>(wt[nxt], w, sc, s2, K, nbase, N, c + 1);
             stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
         }
