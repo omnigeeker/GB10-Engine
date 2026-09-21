@@ -2415,6 +2415,42 @@ round 225's wider `GB10_KC`, and this round's wider `GB10_TN` -- has failed or w
 the units and the producing code before reasoning about a number.** Here the producing code is the
 thread-count derivation, **and it was one line away.**
 
+## THE PIPELINE'S EDIT SITES AND ITS ONE HARD CONSTRAINT (round 230)
+
+**Tree verified: 0 errors, 0 dirty, 0 unpushed, 228 rounds, head `4a43402 round 228: PASS`.**
+
+**The change is localized to four places in `kernels/gemm.cu`:**
+
+| # | site | current | change |
+|---|---|---|---|
+| 1 | `:369` | `__shared__ uint16_t wt[2][GB10_KC][GB10_WSTRIDE];` | **`wt[4]`** |
+| 2 | `:399` | `stage_wtile<GB10_KC>(wt[nxt], ..., c + 1);` | **stage `c+1..c+4`** |
+| 3 | outer product | `gemm2d_outer_bf16(wt[cur], xt[cur], acc, ty, tx);` | **`wt[c & 3]`** |
+| 4 | parity | `cur = (c ^ 1) & 1; nxt = c & 1;` | **`cur = c & 3`, slots `(c+1)&3 .. (c+4)&3`** |
+
+### And the one hard constraint is already documented in the file
+
+`kernels/gemm.cu:47-50` says: *"kc_half must be EVEN: the double-buffer parity below is `(c ^ 1) & 1`,
+which stays correct only because c now starts at an even number. nchunk = 160 and a 2-way split
+gives 80, so it holds here. The host must fall back to grid.z = 1 when nchunk / GB10_KSPLIT is odd."*
+
+**For four buffers that requirement tightens from "EVEN" to "a multiple of 4".** `nchunk = 160`,
+`nsplit = 2`, `kc_half = 80`, **and 80 is divisible by 4 -- so it holds today.** But **the host
+fallback at `:50` must be updated to test divisibility by 4, not by 2**, or a future `nsplit` could
+silently break the ring.
+
+**And `kc0` derives from `gridDim.z`, not from `GB10_KSPLIT`** -- the comment at `:383` records
+that using the constant once made a `grid.z == 1` launch cover only half of K, **which the gate
+caught as 0/3 before any timing was taken.** So the ring must be built on `kc0`, not on 0.
+
+### Acceptance
+
+**staging 322.33 -> ~80-100 ms, full kernel 435.94 -> ~195-215 ms, prefill 2.0-2.2x**, gated by
+`generate` 16/16 and `chunked-prefill`, **with 3 runs and spread reported for any keep or revert.**
+
+**`chunked-prefill` is the test that matters here**: it exercises the `kc0 > 0` path, **and the
+ring's start index is exactly what that path stresses.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
