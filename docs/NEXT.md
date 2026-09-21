@@ -1,5 +1,43 @@
 # SESSION HANDOFF (read this first)
 
+## T1 is a bandwidth-efficiency target, and it is narrow (round 123)
+
+`docs/TARGETS.md` records the owner's revised, hardware-feasible contract -- the
+original 100 tok/s was shown to be physically unreachable before implementation
+began. **T1 is single-stream decode >= 12.5 tok/s**, i.e. 95% of the 12.95 tok/s
+conservative roofline.
+
+Putting the measured numbers against it:
+
+| | ms/step | GB/s | % of the 228 GB/s peak | tok/s |
+|---|---|---|---|---|
+| **B=1 measured** | 104.2 | **169.0** | 74% | 9.59 |
+| weight floor (228 GB/s) | 77.2 | 228.0 | 100% | 12.95 |
+| **T1 target** | 80.0 | 220.1 | 96.5% | 12.5 |
+
+**So T1 is not a new algorithm -- it is 169 GB/s becoming ~220 GB/s on the
+single-sequence GEMV path**, a 1.30x lift, with no change to what is computed.
+
+Two things make this the right next target rather than more prefill work:
+
+* **It is the only target in the contract that is close and quantified.** The
+  engine is at 74% of a measured hardware limit; the prefill GEMM is at 32 GB/s
+  against its own 58 GB/s ceiling with **six candidate mechanisms already ruled out
+  by measurement** (rounds 102-111). The decode GEMV has never been through that
+  process -- no probe, no per-launch breakdown, nothing ruled out.
+* **otp is already a win over llama.cpp (8.48 vs 7.63, +11.1%) and T1 would widen
+  it to +64%.** The objective asks for otp to beat llama.cpp, and this is the path
+  that does it rather than the path that defends a lead.
+
+**Where to start:** the B sweep in round 104 gives `nvfp4_gemv_kernel` ~271 us avg
+at B=1 across 23,940 launches, but nothing has decomposed that 104.2 ms/step by
+kernel. **Profile one decode step at B=1 first** -- exactly the step that was
+skipped on the prefill side, where six rounds were spent testing mechanisms that a
+single profile would have ordered.
+
+**Do not re-derive the 228 GB/s peak**; it is measured in `bench/hw/bw4.cu` and
+reproducible with `bench/results/` artifacts.
+
 ## The tile shape WAS the cause: TM=8/TNREG=4 (round 115)
 
 After six resource hypotheses failed (rounds 102-111), round 111 concluded the 36%
