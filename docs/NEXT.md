@@ -2042,6 +2042,34 @@ available by measurement rather than by argument.**
 | full-model prefill at t=64 | **435.94 ms** |
 | staging / global read / outer product | **322.33 / 251.12 / 113.61 ms** |
 
+## LIVE MEASUREMENT CONFIRMS THE MODEL -- AND BOTH BRANCHES MATTER (round 218)
+
+**Ran the endpoint for real: 16 concurrent chat requests, `max_tokens = 24`.**
+
+| | value |
+|---|---|
+| measured wall | **16.13 s** |
+| prefill (16 x 0.436 s, serialized) | **6.98 s** |
+| decode (384 tokens / 47.78 tok/s) | **8.04 s** |
+| **sum** | **15.02 s vs 16.13 s -- within 7%** |
+
+**So round 186 is confirmed by a live run, not by arithmetic on notes. And the split is:**
+
+- **prefill: 43% of the wall**
+- **decode: 50% of the wall**
+
+**BOTH matter.** Rounds 186-216 spent their effort deciding which of the two branches was "the"
+target; **the answer is neither exclusively -- it is roughly half each.** A fix that halves
+either one buys about 20-25% of the wall.
+
+### And one measurement trap, recorded
+
+**TTFT == TOTAL in this run (16.12 s both), because the NON-STREAMING path buffers the whole
+response before sending anything.** So `time_starttransfer` cannot separate prefill from decode
+here. **A true TTFT needs the streaming path** -- `/v1/chat/completions` with `stream: true`, or
+the Anthropic `/v1/messages` SSE form -- **and that is the right instrument for any future TTFT
+work.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
