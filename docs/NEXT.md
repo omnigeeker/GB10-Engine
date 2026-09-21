@@ -961,6 +961,29 @@ when B grows. A batched GEMV that re-reads the weights once per token rather tha
 group would explain 190 -> 59 exactly, and that is checkable by reading the k-loop's
 indexing rather than by benchmarking.**
 
+## UNIFICATION (round 188): the two unmet targets are ONE problem
+
+**Targets still unmet:**
+
+1. **TTFT better than llama.cpp.** A 59-token prompt is one prefill = **~436 ms** (round
+   186's t=64 GEMM); llama.cpp does it in **59 x 1.25 = 74 ms**. **A 5.9x deficit.**
+2. **endpoint at 16 concurrent >= 30 tok/s.** Currently **20.08**; needs the GEMM at
+   **88.8 GB/s = 2.2x.**
+
+**Both are the prefill GEMM at 40.4 GB/s = 18% of the 228 GB/s peak. No other factor appears
+in either.**
+
+**So this is one mechanism with two thresholds, and the headroom check separates them:**
+
+| requirement | rate needed | verdict |
+|---|---|---|
+| endpoint (2.2x) | **88.9 GB/s** | **INSIDE known-achievable territory** -- below the 170 GB/s the single-row GEMV already sustains here |
+| TTFT (5.9x) | **238.4 GB/s** | **OUTSIDE it** -- 1.4x more than this machine has ever shown |
+
+**So the endpoint target is reachable and the TTFT target is not, and they are the same
+change.** Aim at 2.2x; if it is achieved, the endpoint target is met and TTFT improves by the
+same factor while remaining short of llama.cpp.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
