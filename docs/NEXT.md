@@ -1683,6 +1683,42 @@ staging alone (baseline **322.33 ms** at t=64), then the full kernel at t=32/64 
 **400.01 / 435.94 ms**).** The target is staging toward **77.2 ms**, total toward **190.8 ms**
 -- **2.28x.**
 
+## THE COALESCING TEST CLOSES THE TRANSPOSE (round 208)
+
+**One line, wrong data, valid timing.** Method: change the staging load's address so lane `u`
+reads bytes `[u*8, u*8+8)` -- **128 lanes covering 1024 CONTIGUOUS bytes, fully coalesced.** The
+data is wrong, which is fine: **the outer product is already removed by the dependency-preserving
+probe, so this measures the staging phase only.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **coalesced staging** | **235.86** [234.37-237.85] | **280.62** [278.65-281.96] |
+| row-per-lane staging (round 203) | 279.62 | 322.33 |
+| **improvement** | **-15.6%** | **-12.9%** |
+
+**Coalescing is real and worth ~13-16% on the staging phase -- NOT the 4x the line-efficiency
+argument predicted.**
+
+### And the decisive number
+
+**Even perfectly coalesced, the staging takes 280.62 ms for 17.608 GB = 62.7 GB/s = 27.5% of
+peak** -- barely above the 24.0% row-per-lane baseline.
+
+**So coalescing is NOT the main limiter.** The 25%-line-efficiency story was directionally right
+and quantitatively small. **The transpose would buy ~13% of the total (435.94 -> ~393 ms, not
+190.8 ms) at the cost of a loader pass plus all three staging variants. It is not worth it, and
+the round-190 proposal is now closed by DIRECT MEASUREMENT rather than by argument.**
+
+### Where the staging's 24% now stands
+
+| candidate | verdict |
+|---|---|
+| memory-level parallelism | **excluded** (round 206, +/-0.5%) |
+| coalescing / layout | **excluded as the main cause** (this round, ~13%) |
+| **still open** | **the shared-store path and the barriers themselves, or the address arithmetic** -- `(size_t)n * (K >> 1)` is a 64-bit multiply per load |
+
+**And the prize arithmetic changes with it: 2.28x is not available from the layout direction.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
