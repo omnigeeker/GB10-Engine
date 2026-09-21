@@ -1,5 +1,47 @@
 # SESSION HANDOFF (read this first)
 
+## The batch decode's 3.3x gap is x re-reads, and the fix is quantified (round 101)
+
+`nvfp4_gemv_batch_tmpl` is 392 ms/step at B=16 against a 119 ms weight bound. The
+cause is in its loop structure, not its weight handling:
+
+```cuda
+for (int i = 0; i < full_tiles; ++i) {          // k-tiles
+    load pk[ROWS], sc[ROWS];                    // weights, ROWS x 8 bytes
+    for (int b = 0; b < B; ++b) {
+        const XVec xv = load_x(x + b*K, e0);    // x, re-read per row group
+        for (int r = 0; r < ROWS; ++r) { ... }
+    }
+}
+```
+
+Weights are loaded once per k-tile and reused across all B -- that part is right.
+But **x is re-read once per row group**, and there are `N/ROWS = 4352` of them:
+
+| | per matrix (K=5120, N=17408, B=16) |
+|---|---|
+| weights | 44.6 MB, read once |
+| x, per k-tile | 327.7 KB |
+| row groups | 4,352 |
+| **x traffic** | **1.43 GB** |
+| **x / weight ratio** | **32x** |
+
+**So the kernel is x-bound, not weight-bound, and that is the whole 3.3x.**
+
+`ROWS` cannot simply be raised: `acc[ROWS][BMAX]` is 4 x 16 = 64 registers at
+ROWS=4, and ROWS=8 would be 128. That is why the kernel is shaped this way.
+
+**The fix is to stage the k-tile of x in shared memory.** At B=16 one k-tile of x is
+`B * kTile * 4 = 16 * 512 * 4 = 32,768 B`, which fits, and then x is read once per
+block per k-tile instead of once per row group -- removing the 1.43 GB entirely.
+The cost is one `__syncthreads()` per k-tile, i.e. `K/kTile = 10` barriers.
+
+**Expected: the decode becomes weight-bound at 17.6 GB / 148 GB/s = 119 ms/step
+against 392 now, up to 3.3x.** The endpoint's 16-concurrent figure would go from
+17.37 tok/s to roughly 35+, **crossing the 30 tok/s the objective asks for**. That
+makes this the single highest-value change remaining, and unlike the earlier
+GEMM work the bound and the shortfall are both measured rather than inferred.
+
 ## Final state of this session
 
 Everything below is measured, and every claim is backed by a gate or a number in
