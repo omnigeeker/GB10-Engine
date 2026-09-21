@@ -754,6 +754,40 @@ chain of rounds 177/179), NOT the weight stream -- which is already at 75% of pe
 read the whole table, and the harness had been printing all five points the entire time.
 The measurement was already taken; a filter hid it.**
 
+### REFINEMENT (round 182): the marginal cost RISES -- so it is L2 capacity, not a stall
+
+**Round 181 called the high end "nearly linear". It is actually SUPER-linear:**
+
+| interval | delta `pre_ms` | ms per added token |
+|---|---|---|
+| 4 -> 8 | 37.01 | **9.25** |
+| 8 -> 16 | 132.62 | **16.58** |
+
+**The marginal cost nearly DOUBLES.** That distinction decides the fix:
+
+* **a dependency-chain stall (round 179's hypothesis) would give a CONSTANT marginal cost;**
+* **a rising one points at a progressively closing REUSE WINDOW -- L2 capacity** -- which is
+  exactly what the kernel header warns about ("makes the kernel L2-bound").
+
+**The working-set arithmetic supports L2 capacity:** the `x` slab is `B x kTile x 4 B` =
+**8 KB at B=4, 16 KB at B=8, 32 KB at B=16**, and it is re-read once per row group, so the
+live working set is `slab x resident blocks`. **The slab grows with B; L2 does not.**
+
+### The proposal that follows, and how it differs from the rejected one
+
+**Not shared-memory staging** (round 179: measured, rejected, and its ruled-out entry names
+software pipelining as the alternative). **Instead: keep the same `x` slab resident while
+sweeping MORE rows per traversal.**
+
+**Concretely, `ROWS = 8` with the batch loop tiled to 8**, so `acc[8][8]` is **64 floats --
+identical to today's `acc[4][16]`** -- while the number of row-group traversals **halves**,
+halving the `x` re-reads. The `lo/hi[ROWS][8]` pair doubles to 128 floats, so total register
+pressure goes from ~128 to ~192 against 255 available: **tight, and the first thing to check
+is whether it spills.**
+
+**This is a distinct, register-budgeted change with a measured target (the 16.58 ms/token
+marginal cost) and a stated acceptance test (the t=4/8/16 curve, 3 runs, gate green).**
+
 ### Superseded: the round-178 proposal
 
 **The batched GEMV re-reads `x` from L2 for every row group.** The kernel header names the
