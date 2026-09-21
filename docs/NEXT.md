@@ -84,11 +84,40 @@ third explanation eliminated, after occupancy (round 56: fp8 2 -> 3 blocks/SM
 changed nothing) and tile size (round 53).
 
 What survives is that the cost is *fixed per launch* and insensitive to tile
-geometry, occupancy and bytes-in-flight. 192 nvfp4 GEMM launches per forward at
-~1.21 ms each is where the time is, and nothing about the tile changes it. The
-next thing to measure is therefore **a single launch in isolation** -- one
-`nvfp4_gemm_kernel` call with N=17408, K=5120, t=1, timed and byte-counted on
-its own -- to find out whether 1.21 ms is the kernel or the 192-launch cadence.
+geometry, occupancy and bytes-in-flight.
+
+### It is the kernel, not the cadence (round 59)
+
+`nsys` per-launch duration distribution, which separates "the kernel is slow"
+from "the launches are poorly scheduled":
+
+| kernel | launches | min | avg | max |
+|---|---|---|---|---|
+| `nvfp4_gemm_kernel` | 2880 | **0.992 ms** | 1.226 ms | 2.776 ms |
+| `fp8_gemm_kernel` | 3120 | 0.338 ms | 0.629 ms | 2.340 ms |
+
+The **minimum** nvfp4 launch is 0.992 ms, and min-to-max is only 2.8x. So there
+is no fast case being diluted by a slow tail: a best-case launch still moves
+44.6 MB at ~45 GB/s, a fifth of the roofline. This rules out the cadence, the
+tail and the launch count.
+
+That leaves the response surface, which is now measured in three directions and
+flat in all of them:
+
+| lever | change | effect on the forward |
+|---|---|---|
+| occupancy (fp8) | 2 -> 3 blocks/SM | none (round 56) |
+| bytes in flight | KC 32 -> 64 | ~2% (round 58) |
+| tile shape | TT 64 -> 32 | included above |
+
+A bandwidth-bound kernel that ignores occupancy *and* bytes-in-flight is not
+waiting on DRAM. The remaining suspects are internal: shared-memory traffic
+(each `wt` element is re-read by every token group, so shared reads scale with
+`TN * K * TT/4` -- 4.3 GB per launch at TT=64), or the dequantisation ALU in
+the staging path. Distinguishing those two is the next measurement, and it is
+worth doing before changing anything else, because the fix differs completely:
+shared traffic wants a different data flow (e.g. keeping `wt` in registers and
+streaming `xt`), while an ALU bound wants the dequant hoisted or vectorised.
 
 ### Two real bugs found on the way (round 58)
 
