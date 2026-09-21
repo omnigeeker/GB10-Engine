@@ -1,5 +1,41 @@
 # Ready-to-apply: TM=8 / TNREG=4 outer product
 
+## Next shape: 64-thread blocks, 0.750 B/FMA (added round 116)
+
+**Do not apply "TM=16/TNREG=2", which round 115 suggested.** The arithmetic:
+
+| TM | TNREG | threads | per k | B/FMA |
+|---|---|---|---|---|
+| 4 | 8 | 128 | wv 8 + xv 32 = 40 for 32 FMA | 1.250 |
+| 8 | 4 | 128 | wv 16 + xv 16 = 32 for 32 FMA | **1.000 (current)** |
+| 16 | 2 | 128 | wv 32 + xv 8 = 40 for 32 FMA | **1.250 (regression)** |
+| **8** | **8** | **64** | wv 16 + xv 32 = 48 for 64 FMA | **0.750** |
+| **16** | **4** | **64** | wv 32 + xv 16 = 48 for 64 FMA | **0.750** |
+
+Raising `TM` grows the weight load linearly while `TNREG` shrinks the activation
+load; at `TNREG`=2 the activation saving is gone and the shape is back where it
+started. **Only raising both helps.**
+
+**The closed form:** `B/FMA = 2/TNREG + 4/TM`, subject to `acc = TM*TNREG` (registers)
+and `threads = 4096/(TM*TNREG)`. Holding `acc`=64 minimises it at **0.750**, reached
+by both (8,8) and (16,4) -- so **0.750 is the floor of this tile structure**, and any
+future round should stop looking for a better ratio and change something else.
+
+**What (8,8) or (16,4) require, which is why neither is a one-liner:**
+
+1. `acc` goes from 32 to **64 registers** -- watch for spills at 97 now.
+2. **`GB10_GEMM_BLOCK` 128 -> 64**, *and* the three `LaunchConfig` block dims in
+   `crates/gb10-cuda/src/ops.rs` -- `stage_xtile`/`stage_wtile` stage cooperatively
+   over `blockDim`, so leaving this at 128 stages only half the tile.
+3. The mapping: (8,8) -> `ty = threadIdx.x >> 3`, `tx = threadIdx.x & 7`;
+   (16,4) -> `ty = threadIdx.x >> 4`, `tx = threadIdx.x & 15`. **Verify with the
+   rule below before writing the unrolled body.**
+4. The same `static_assert` update and regenerated bodies as the (8,4) change.
+
+**Mapping rule** (this is what round 96 got wrong and round 115 verified):
+`ty_groups = 64/TM`, `tx_groups = 64/TNREG`, and `ty_groups * tx_groups` must equal
+`GB10_GEMM_BLOCK`, with `ty = threadIdx.x / tx_groups` and `tx = threadIdx.x % tx_groups`.
+
 **Why.** Rounds 102-111 tested six resource mechanisms on `nvfp4_gemm_kernel` and
 all six failed to move it: x re-reads, local memory, the weight stream, occupancy
 (17% *worse*), shared bandwidth (bf16 `xt`: gate-failing), and inner-loop ALU
