@@ -2688,6 +2688,46 @@ hardware wall nor an exhausted kernel line.** The 2.4x gap was attributed to "th
 only as a guess until now; **the measurement says it is one specific thing: the batch window is
 not collecting the prefills.**
 
+## THE DEFECT IS ONE LINE; THE FIX NEEDS A BATCHED-PREFILL ENTRY POINT (round 237)
+
+**Located exactly.** In `crates/gb10-server/src/main.rs`, `run_group` prefills inside a per-job loop:
+
+```rust
+for (s, job) in group.iter().enumerate() {
+    ...
+    next.push(model.prefill_seq(dev, &p, state, sc, s)?);   // :768 -- ONE SEQUENCE AT A TIME
+}
+```
+
+**A group of 16 therefore does 16 sequential `prefill_seq` calls -- ~436 ms each, 6.98 s total.**
+
+**And the decode immediately below is CORRECTLY batched** (`next = model.step_batch(dev, &next,
+state, sc)?` over the whole group), **which is exactly why decode runs at 47.8 tok/s, the full
+engine rate. The asymmetry is the whole story: decode batched, prefill not.**
+
+### The fix
+
+**Add a batched-prefill entry point.** `prefill_seq` takes one `&[u32]`; the model already has
+`forward_prefill`, which is batch-shaped and gates to `forward` for `t <= 16` (round 184 verified
+that gate). **So the work is to add a `prefill_batch(&[&[u32]])`-style method that runs all prompts
+through one batched forward, and call it once instead of looping.**
+
+### Two things to check before trusting it
+
+1. **The gate is `t <= 16`** -- 16 prompts of ~59 tokens each is 16 SEQUENCES, not 16 tokens, **so
+   the batched path must be a true per-sequence batch; which branch it takes decides whether this
+   helps at all.**
+2. **The state/`sc` bookkeeping must record each sequence's own length**, since
+   `prefill_seq(.., s)` passes the slot index and a batch call has to set all 16 slots.
+
+### Expected, and acceptance
+
+**prefill 6.98 s -> ~0.44 s, wall 16.13 s -> ~8.5 s, endpoint 20.08 -> ~45 tok/s -- 1.5x the 30
+target, with no kernel work.**
+
+**Acceptance is the usual: `generate` 16/16 and `chunked-prefill` OK, then a live 16-concurrent
+run, 3 runs with spread.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
