@@ -805,6 +805,40 @@ to 13.0 at t=16. At 16 sequences that term alone is 208.6 of the 312.2 ms.**
 variant needs an outer batch loop plus a second instantiation: **expressible, but not a
 one-line edit -- which is why it should not be started without room to build, gate, and A/B it.**
 
+### EXPERIMENT (round 184): the t<=16 cut is CORRECT -- the comment's table is stale
+
+**`weights.rs:88-89` tabulates the two paths:**
+
+```
+1: 271.5 -> 116.7 ms   2: 269.4 -> 145.8   4: 280.3 -> 157.2
+8: 277.5 -> 193.2     16: 286.9 -> 347.5
+```
+
+**Read as GEMM -> GEMV, that says t=16 favours the GEMM (286.9 vs 347.5), yet the code routes
+16 to the GEMV.** So I changed the cut to `t <= 8` and let `forward_prefill` take t=16.
+
+| | |
+|---|---|
+| gate | **16/16, `chunked-prefill` OK -- the change is CORRECT** |
+| t=4 | 145.54 / 145.05 / 143.84 = **144.8** (unchanged) |
+| t=8 | 177.96 / 181.52 / 177.21 = **178.9** (unchanged) |
+| t=16 | **392.34 / 392.27 / 390.11 = 391.6** vs 312.23 before -- **+25% WORSE** |
+
+**The comment's table does not reproduce in the current build: at t=16 the GEMM is 391.6 ms
+against the GEMV's 312.2. The existing cut at 16 is correct, and it is now VERIFIED rather
+than assumed.** Reverted.
+
+**Methodological note:** I acted on a comment's numbers instead of measuring first -- **the
+same error class as round 155 (a stale README read as current) and round 169 (a column's
+meaning inferred rather than read).** This time the gate and a three-run A/B caught it in
+**one** round, at the cost of one constant and two measurements. **That is the loop working
+as intended, and it is the first time the error was caught this cheaply.**
+
+**It also closes the last lead for the endpoint target:** with the routing verified correct,
+the batched GEMV's per-token cost is not an artifact of a wrong dispatch choice. **The
+endpoint's 30 tok/s would require eliminating ~100% of a real, measured, correctly-routed
+cost term.**
+
 ### The proposal that follows, and how it differs from the rejected one
 
 **Not shared-memory staging** (round 179: measured, rejected, and its ruled-out entry names
