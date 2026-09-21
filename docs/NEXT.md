@@ -370,6 +370,34 @@ GEMV reaches 148 GB/s on the same weights. So the ceiling is not the memory
 system; the GEMM path is roughly 2.3x less efficient than the GEMV path at
 identical traffic.
 
+### Three ways to fill the xtile, and the boring one wins (rounds 65-69)
+
+`stage_xtile` costs ~71 ms (26%) of the forward and the cost is in its shared
+stores. Three variants have now been measured:
+
+| variant | t=1 | t=16 | |
+|---|---|---|---|
+| zero-fill the `t >= T` lanes (original) | **271.46** | **292.85** | best |
+| skip those lanes entirely | 278.66 | 307.80 | +2.6% / +5.1% |
+| branchless: redirect them to a spare column | 289.92 | 310.48 | +6.8% / +6.0% |
+
+All three are correct (`generate` 16/16, `chunked-prefill` agrees). The original
+wins, and the reason is now clear from having tried both alternatives:
+
+* Skipping the lanes splits the warp, and the divergence costs more than the
+  dead stores saved.
+* Redirecting them keeps the store sequence uniform but makes those lanes load
+  token `t0` as well, so it *adds* real global traffic to remove a branch.
+
+So the 71 ms is not recoverable by touching the fill logic at all: the dead
+stores are cheaper than either removing them or paying to keep them uniform.
+Any further gain there has to come from a different tile layout that does not
+need `TT` columns when the prompt is shorter than `TT` -- not from the fill.
+
+That closes out the `stage_xtile` line of attack, and with it the shared-store
+hypothesis from round 65. The remaining measured shares are the two weight
+stagings (41% together, ~136 GB/s) and the outer product (21%).
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
