@@ -839,6 +839,38 @@ the batched GEMV's per-token cost is not an artifact of a wrong dispatch choice.
 endpoint's 30 tok/s would require eliminating ~100% of a real, measured, correctly-routed
 cost term.**
 
+### REATTRIBUTION (round 185): the endpoint prefill uses the GEMM, not the GEMV
+
+**This is the most important structural fact for the endpoint target, and it invalidates the
+target of rounds 173-184.**
+
+* The endpoint's prompts are **~59 tokens**.
+* `weights.rs:95` routes **`t <= 16`** to the batched GEMV, so **59 goes to
+  `forward_prefill` -- the GEMM.**
+* **`forward-cost` sweeps `t` in `[1, 2, 4, 8, 16]` -- entirely inside the GEMV branch.**
+  **The sweep cannot see the GEMM at any point.**
+
+**So the whole GEMV analysis (the two-regime sweep, the fixed-vs-per-token decomposition, the
+L2 reuse window, the `ROWS` proposal) characterises a path the endpoint's prefill never
+enters.** The endpoint's prefill cost -- **~7.63 s of the 12.909 s wall** -- lives in **the
+GEMM**, which is exactly what rounds 148-168 targeted.
+
+**Which restores the K split as the live lever.** It changes precisely the kernel the
+endpoint uses; its correctness is verified (16/16 on three consecutive runs plus
+`chunked-prefill` OK); and its performance was retired (round 168) on an A/B that round 174
+showed could not contain it. **It is simultaneously the best-motivated and the only
+gate-verified option left for this target.**
+
+**A valid test is cheap and now well-defined:** re-apply the split, then measure `pre_ms` at
+**t=32 or t=64** -- outside the GEMV branch -- or measure the endpoint directly.
+**Three runs, gate first, and the acceptance test is the endpoint number, not `pre_ms` at 16.**
+
+**Generalization, now paid for the fifth time: when a measurement shows no effect, first ask
+whether the measured path contains the changed code.** Round 174 established that the split's
+A/B failed this test; round 185 establishes that **the entire `forward-cost` instrument fails
+it for any GEMM change** -- so no `forward-cost` result can ever license a GEMM keep/revert
+decision.
+
 ### The proposal that follows, and how it differs from the rejected one
 
 **Not shared-memory staging** (round 179: measured, rejected, and its ruled-out entry names
