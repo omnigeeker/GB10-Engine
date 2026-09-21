@@ -412,6 +412,46 @@ theory in round 36), so it has to be measured, not assumed. The gate is
 If KC=64 alone does not lift the bandwidth, the next lever is the tile shape --
 and at that point the retiling tables above become the fallback, not the plan.
 
+### Which kernels actually need the opt-in (round 54)
+
+Working the static budget out per kernel at KC=64 shows the two are not in the
+same position. Writing `P` for the `+4` padding, the two buffers cost
+
+```
+nvfp4 (wt uint16):  4 * KC * (TN + 2*TT + 3P)
+fp8   (wt float):   8 * KC * (TN +  TT + 2*P)
+```
+
+At TN = TT = 64, KC = 64, P = 4 that is 52224 B for nvfp4 and **69632 B** for
+fp8. Sweeping P against the 49152 B static limit:
+
+| P | nvfp4 | fp8 |
+|---|---|---|
+| 4 | 52224 | 69632 |
+| 2 | 50688 | 66560 |
+| 1 | 49920 | 65536 |
+| 0 | **49152 (exactly)** | 65536 |
+
+So **fp8 cannot fit statically at this geometry at all** -- even with no padding
+it is 65536 B, and it would need `TN + TT <= 96` (e.g. TT=32) to reach 49152.
+nvfp4 only fits with the padding removed entirely, i.e. exactly at the limit and
+with the bank conflicts the padding exists to prevent.
+
+That settles the design: dynamic shared memory is not an optimisation here, it is
+required, and it is required for fp8 first.
+
+The API is available -- `cudarc` binds `sys::cuFuncSetAttribute` and
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, and there is a safe wrapper
+`set_function_attribute(f, attribute, value)` in `driver/result.rs`. Its owning
+type still needs confirming before use (the `impl` block is indented, so a
+column-0 grep does not find it).
+
+Next step is therefore narrow and mechanical: confirm the wrapper's receiver,
+move the three `__shared__` declarations to `extern __shared__` typed pointers,
+set `GB10_KC` to 64, and pass the dynamic size plus the opt-in attribute at the
+three launch sites. Gate on `nvfp4_gemm_kernel` GB/s (41 -> 100+), with
+`generate` (16/16 exact) and `chunked-prefill` as the correctness net.
+
 This is the next thing to do, and it is worth doing carefully: a 3x gain here
 moves TTFT and unblocks MTP at the same time.
 
