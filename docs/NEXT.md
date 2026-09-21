@@ -136,9 +136,44 @@ The TTFT reading of 469.2 ms taken during that attempt was **invalid** -- the
 kernel was broken and decoded one token -- and must not be quoted. Reverted;
 baseline re-verified at TTFT 569.1 ms with agreement 16/16.
 
-**So the next change is a tile-shape change, not a load-pattern change:** TT=64
-with either a bf16 `xt` (risk: activation precision) or `KC`=32 (risk: twice the
-barriers). Both fit; both need the generate gate to pass.
+**So the next change is a tile-shape change, not a load-pattern change.**
+
+### TT=64 is blocked by the accumulator layout, not shared memory (round 89)
+
+TT=64 with `KC`=32 -- the combination that *does* fit -- was tried and **also
+fails the generate gate (0/1)**. So the shared-memory budget was not the real
+blocker.
+
+The real one is the outer product's accumulator shape. `GB10_TT` is the **column**
+count of the tile, and the shared declaration shows it:
+
+```cuda
+__shared__ uint16_t wt[2][GB10_KC][GB10_WSTRIDE];   // [k][n]
+__shared__ float    xt[2][GB10_KC][GB10_XSTRIDE];   // [k][t]   <- KC rows, TT cols
+```
+
+`xt` is indexed by `GB10_KC` in the first dimension, so `GB10_TT` only sets the
+width. Each thread holds `acc[GB10_TM][GB10_TNREG]` = `acc[4][4]` = **16
+accumulators**, and the 128 threads are mapped as 16 `ty` groups x 8 `tx` groups,
+covering `16*4 = 64` rows by `8*4 = 32` columns. **That is a 64x32 tile -- TT=32,
+baked into the thread mapping and the register count, not into a `#define`.**
+
+So raising `GB10_TT` to 64 leaves the top half of every tile unwritten, which is
+exactly the 0/1 divergence at index 0 that both attempts produced. **TT=64 needs
+`acc[4][8]` (32 registers per thread) and a 16x4 thread mapping** -- a rewrite of
+the outer product and its launch, not a constant change, and one that will cost
+registers in a kernel already sensitive to them.
+
+Also worth correcting from round 88: the shared-memory table there attributed
+`xt = 2*64*68*4 = 34816` to TT=64, but that is the `KC`=64 figure. With `KC`=32
+the real total is `2*32*68*4 + 2*32*68*2 = 26,112 B`, comfortably inside budget.
+The budget is a constraint on *combinations*; the accumulator shape is the actual
+blocker.
+
+**Conclusion: the prefill's 2x weight traffic is real and worth 90% of TTFT, but
+capturing it requires reworking the outer product's thread mapping to a 64x64
+tile.** That is a self-contained change with a clear success test (`generate`
+16/16 plus a TTFT drop), and it is the highest-value remaining item.
 
 ## Verified state
 
