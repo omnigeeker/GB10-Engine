@@ -177,6 +177,24 @@ struct Engine {
     name: String,
 }
 
+/// Qwen's chat template puts the opening ` thinking` into the *prompt*, so generation
+/// returns the reasoning block, then `</think>`, then the answer. Passing that through
+/// verbatim means a short response shows only reasoning and never the answer -- see the
+/// 200-token example recorded in round 152 of `docs/NEXT.md`.
+///
+/// Strip everything through the closing tag. If there is no closing tag the reasoning
+/// was truncated (or the model answered directly), and the text is returned unchanged
+/// rather than emptied.
+fn visible(text: &str) -> &str {
+    match text.find("</think") {
+        Some(i) => match text[i..].find('>') {
+            Some(j) => text[i + j + 1..].trim_start(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
 struct GenResult {
     ids: Vec<u32>,
     text: String,
@@ -325,7 +343,7 @@ fn handle_chat_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut Tc
                 "model": name,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": r.text},
+                    "message": {"role": "assistant", "content": visible(&r.text)},
                     "finish_reason": r.finish,
                 }],
                 "usage": {
@@ -447,7 +465,7 @@ fn handle_messages(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream)
                 "type": "message",
                 "role": "assistant",
                 "model": name,
-                "content": [{"type": "text", "text": r.text}],
+                "content": [{"type": "text", "text": visible(&r.text)}],
                 "stop_reason": anthropic_stop_reason(r.finish),
                 "stop_sequence": Value::Null,
                 "usage": {"input_tokens": r.prompt_tokens, "output_tokens": r.ids.len()},

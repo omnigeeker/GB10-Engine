@@ -253,7 +253,33 @@ deliverable the objective names explicitly. **It is also entirely in Rust, so it
 none of the kernel-change risk that `loop/patches/ksplit.md` does** -- which makes it the
 better next task while the K split waits.
 
-**Two fixes, both cheap:**
+### FIXED in round 153 -- with the acceptance test, on both protocols
+
+`visible()` was added to `crates/gb10-server/src/main.rs` and applied at both
+non-streaming response sites (OpenAI `message.content`, Anthropic `content[].text`).
+It strips everything through the closing `</think>` tag, and **returns the text
+unchanged when there is no closing tag** -- so a truncated generation degrades to the
+old behaviour rather than returning an empty answer.
+
+Same prompt, 200 tokens, before and after:
+
+| | |
+|---|---|
+| before | `'User asks: "..." Final: "The capital of France is Paris."\n</think>\n\nThe capital of France is Paris.'` |
+| **after (OpenAI)** | **`'The capital of France is Paris.'`** |
+| **after (Anthropic)** | **`'The capital of France is Paris.'`** |
+
+Gate **16/16**, build 0 errors -- **the tokenizer path is untouched, only response
+assembly.**
+
+**Known remaining half: streaming.** The streaming path emits each piece as it is
+produced, so it still shows the reasoning block. `visible()` cannot be applied there
+as-is because the `</think>` boundary is not known until it arrives; the fix is to
+suppress emitted pieces until the boundary is seen, which **changes
+time-to-first-visible-token and must be measured as its own change rather than
+smuggled into this one.**
+
+**The original analysis and fix options, kept for the record:**
 
 * **strip** everything up to and including `</think>` from `content` before returning;
 * or **expose it separately** -- OpenAI's `reasoning_content`, Anthropic's `thinking`
