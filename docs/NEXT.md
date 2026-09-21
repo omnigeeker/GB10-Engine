@@ -1719,6 +1719,28 @@ the round-190 proposal is now closed by DIRECT MEASUREMENT rather than by argume
 
 **And the prize arithmetic changes with it: 2.28x is not available from the layout direction.**
 
+## LIVE END-TO-END VERIFICATION (round 209)
+
+**Started the server the correct way: `--model models/Qwen3.8-27B-NVFP4 --port 8099`.** The first
+attempt failed with `Error: unknown argument: models/Qwen3.8-27B-NVFP4` -- **the CLI takes
+`--model` / `--host` / `--port` / `--name`, not a positional path.** Ready in **~48 s.**
+
+| protocol | request | response |
+|---|---|---|
+| **OpenAI** `/v1/chat/completions` | "What is 17*23? Answer with just the number." | **`'391'`** |
+| **Anthropic** `/v1/messages` | "What is 12*12? Answer with just the number." | **`'144'`** |
+
+**Both answers are arithmetically correct and both are bare numbers -- the `ThinkGate` stripped
+the reasoning exactly as designed. Server stopped cleanly; tree untouched.**
+
+**One honest note on the first OpenAI attempt:** with `max_tokens=40` it returned the *thinking*
+text rather than a number. **That is the gate's designed fallback, not a leak** -- the answer
+never began within the budget, so holding the reasoning back would have produced an empty
+response. With `max_tokens=300` the same request returns `'391'`.
+
+**The behaviour is: hold the reasoning until the answer starts; if the budget runs out first,
+emit what there is rather than nothing.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
