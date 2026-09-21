@@ -1248,6 +1248,36 @@ tried, which is what makes it new rather than a repeat.**
 **Acceptance test, unchanged: the gate first, then 3 runs at t=32/64 against the recorded
 baseline of 400.01 / 435.94 ms.**
 
+## EXECUTION PLAN: the 256-thread / 64x128 tile experiment (round 197)
+
+**Round 196 derived the shape but ran out of context before executing it. This is the edit
+list, so the next session does not re-derive it.**
+
+**Why it is plausibly a win, in one line:** at 256 threads with an 8192-output tile, `acc = 32`
+and **B/FMA stays at 1.0** while **each staged byte feeds 2x the FMAs** -- and the round-195
+decomposition says staging is 49% and the outer product 51%, so this is the only lever that
+addresses both halves at once.
+
+**All five edits are coupled. Change them together or the gate fails.**
+
+| # | file | change |
+|---|---|---|
+| 1 | `kernels/gemm.cu` | `GB10_TN` 64 -> **128**. `GB10_WSTRIDE` follows automatically (line 60: `#define GB10_WSTRIDE GB10_TN`). |
+| 2 | `kernels/gemm.cu` | `GB10_GEMM_BLOCK` 128 -> **256**. |
+| 3 | `kernels/gemm.cu` | `gemm2d_ids` -- the mapping must satisfy `ty_groups * tx_groups == GB10_GEMM_BLOCK` with `ty_groups = 64/TM = 8`, so `tx_groups = 256/8 = 32`: **`tx = threadIdx.x & 31`, `ty = threadIdx.x >> 5`**. |
+| 4 | `crates/gb10-cuda/src/ops.rs` | `GB10_NR` 64 -> **128**, and the NVFP4 prefill launch's `block_dim` `(128,1,1)` -> `(256,1,1)` (~line 1191). |
+| 5 | `kernels/gemm.cu` | Verify `static_assert(GB10_TM == 8 && GB10_TNREG == 4)` in `gemm2d_outer_bf16` still holds -- it should, since the tile grows along **n**, which is `TN`, not `TM`/`TNREG`. Confirm the inner column loops now cover 128. |
+
+**Edit 3 is the one most likely to be forgotten, and it is the one the gate catches.**
+
+**Acceptance: gate first (`generate --n 16`, `chunked-prefill --n 6`), then 3 runs of
+`forward-cost` at t=32/64 against the recorded baseline of 400.01 / 435.94 ms.** If the gate
+fails, revert -- do not tune.
+
+**Risk, stated plainly: five coupled edits, and the session that derived them ran out of context
+before executing them. The failure mode is a broken gate and the safety net is
+`git checkout -- kernels/gemm.cu crates/gb10-cuda/src/ops.rs`.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
