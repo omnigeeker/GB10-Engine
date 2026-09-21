@@ -44,7 +44,32 @@ known and small, while the prefill win is ~45%.
 4. `crates/gb10-cuda/src/kernels.rs`: the batch launch must pick the GEMV for
    `B <= 32` (check that `GB10_BATCH_MAX` there matches).
 
-**Expected signals:** `generate` **must be 16/16**; TTFT should fall from 434 ms
-toward ~238; `batch-parity` must still report the same aggregate at its own batch
-sizes. If TTFT does not move, the GEMV's real rate at `B`=16..32 is worse than the
-119 ms implied by the B sweep, and the idea is dead.
+## TESTED AND REJECTED (round 121)
+
+Applied as steps 1 and 3 (`GB10_BATCH_MAX` 16 -> 32, `t <= 16` -> `t <= 32`):
+
+| | baseline | with `BATCH_MAX`=32 |
+|---|---|---|
+| `generate` | 16/16 | **16/16** |
+| TTFT | 434 ms | **433.1 ms (no change)** |
+| `nvfp4_gemv_batch_kernel` | 128 regs, 256 B stack | 128 regs, **512 B stack** |
+
+Reverted.
+
+**The spec above was wrong, and the reason matters: `BATCH_MAX`=32 lets the GEMV
+serve `t <= 32`, NOT `t = 59`.** The kernel takes `B` as a runtime parameter bounded
+by the compile-time `BMAX`, so a 59-token prefill needs `BMAX >= 59` -- which means
+`acc[ROWS][59]`, far past the register budget. **Serving an arbitrary `t` through the
+GEMV needs a t-tiled outer loop in the GEMV path, which does not exist.** Raising the
+constant cannot get there, and the crossover table above is therefore not actionable
+as written.
+
+The change is also not free: `BMAX`=32 grows the decode kernel's stack frame from 256
+to 512 B even at `B`=16, and round 104 already measured that added pressure in this
+kernel as harmful (12% at `B`=16). So it costs on the decode path and buys nothing on
+the prefill path.
+
+**What would actually work**, if a future round wants the GEMV for long prefills: a
+loop over `t` in `BMAX`-sized tiles *inside* `forward`/`forward_prefill`, so a
+59-token prefill becomes 2 calls at `B`=32. That is real code, not a constant, and it
+must be measured against the GEMM's single pass rather than assumed.
