@@ -209,6 +209,21 @@ shared usage could drop under 20,480 B, the register limit would become the only
 Neither is the binding constraint against a 5.7-block grid, which is why this is
 recorded as a diagnosis and not presented as a fix.
 
+### The K split is specified and ready (round 149)
+
+`loop/patches/ksplit.md` has the complete edit list: `GB10_KSPLIT 2`, the `kc0..kc1`
+chunk range, `atomicAdd` at the store (line 311), `grid_dim.2 = 2`, and a
+`cudaMemsetAsync` of the 4.1 MB output that `atomicAdd` requires.
+
+**It also records the risk that could kill it, before anyone implements it:** with
+`TM x TNREG = 32` accumulators per thread x 128 threads x 544 blocks, the split issues
+**~2.2M atomics per matrix** against 1.03M output elements -- roughly one atomic per
+output element, across 192 matrices per prefill. **If atomic throughput becomes the
+bottleneck, the split loses**, and the fallback is a second reduction kernel.
+
+**Acceptance is the gate plus >= 3 runs**, and if TTFT does not move the result is to be
+recorded as the tenth prefill mechanism eliminated -- not quietly dropped.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
