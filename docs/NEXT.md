@@ -66,6 +66,33 @@ chunk re-reads every weight, so 8 chunks of 8 cost 8x the traffic of one
 the case the dispatch change cannot help. The 8..16 crossover should still be
 measured, but it will not address TTFT.
 
+### The cut is confirmed at 8 (round 87)
+
+Three thresholds on the same grid:
+
+| cut | t=1 | t=2 | t=4 | t=8 | t=16 |
+|---|---|---|---|---|---|
+| `t <= 8` | 118.40 | 148.51 | 159.97 | 194.37 | 292.10 |
+| `t <= 12` | 117.21 | 146.17 | 152.39 | 192.00 | 293.75 |
+| `t <= 16` | 118.72 | 149.82 | 160.37 | 191.70 | **350.59** |
+
+`t <= 8` and `t <= 12` are indistinguishable on this grid (which samples 1, 2, 4,
+8, 16 -- not 12), and `t <= 16` is clearly worse at t=16. So **`t <= 8` is
+correct** and no change is needed.
+
+**One thing this rules out:** `GEMV_BATCH_MAX` is already 16 (`kernels.rs:21`,
+`GB10_BATCH_MAX` in `gemv.cu:340`), so the batched kernel -- the one that reads W
+once and reuses it across all `t` -- *is* used at t=16. Its loss there is real,
+not a fallback to the per-token path. At batch 16 the GEMV does 16 FMAs per weight
+element and becomes compute-bound, which is exactly where the tiled GEMM's reuse
+wins. Raising the batch limit further would not help; the crossover is genuine.
+
+So the dispatch is settled: **`n < 256 || t <= 8`**. TTFT is a separate problem,
+and it lives in the GEMM at moderate `t` (59 tokens -> 560 ms, i.e. only ~31 GB/s
+of weight traffic against the GEMM's own 58 GB/s). **That gap -- prefill at t=59
+running at half the GEMM's measured rate -- is the next thing to explain**, and it
+is a fresh anomaly rather than a continuation of the staging work.
+
 ## Verified state
 
 `generate` 16/16 exact, `chunked-prefill` OK, `batch-parity` OK. t=1 forward
