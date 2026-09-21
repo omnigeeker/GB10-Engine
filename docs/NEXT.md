@@ -205,10 +205,41 @@ Cumulative against the round-59 baseline, both changes together:
 | 1 | 377.31 | **287.58** | **-24%** |
 | 16 | 401.48 | **312.19** | **-22%** |
 
-The same widening is the obvious next thing for `stage_wtile_fp8`, which still
-loads 8 bytes per thread, and for `stage_xtile`, which still loads 16 bytes per
-thread but only from the handful of lanes where `t < T` -- so at small `t` almost
-all of its work is writing zeros into shared rather than loading.
+### The same widening on fp8 and xtile (round 63)
+
+`stage_wtile_fp8` now takes 16 elements per thread as one `uint4` (fp8 carries a
+single per-tensor scale, so there is nothing to index), and `stage_xtile` takes
+16 k-values as four `float4`s. The latter matters most at small `t`: it used to
+be one iteration of almost entirely zero-writes whenever `t < T`, which at t=1
+is every thread but one.
+
+| t | round 62 | round 63 | |
+|---|---|---|---|
+| 1 | 287.58 | **271.46** | -6% |
+| 2 | 284.42 | 271.85 | -4% |
+| 4 | 288.52 | 273.77 | -5% |
+| 8 | 295.93 | 280.94 | -5% |
+| 16 | 312.19 | **292.85** | -6% |
+
+`generate` still **16/16 exact**.
+
+### Cumulative
+
+| t | round-59 baseline | now | |
+|---|---|---|---|
+| 1 | 377.31 | **271.46** | **-28%** |
+| 4 | 379.00 | 273.77 | -28% |
+| 16 | 401.48 | **292.85** | **-27%** |
+
+Three changes -- two-pass loads (round 60), 16 elements per thread for nvfp4
+(round 62), and the same for fp8 and xtile (round 63) -- have taken the prefill
+forward down by ~28%. All three came from the same method: isolate one stage with
+a timing probe, then fix the specific thing the probe exposed.
+
+What is left is still ~271 ms against a 77 ms roofline for 17.6 GB, so there is
+room, but no stage is now obviously dominant. The next probe should re-run the
+round-61 decomposition against the current numbers rather than against the old
+ones, since the shares will have moved.
 
 ### Two real bugs found on the way (round 58)
 

@@ -104,32 +104,32 @@ __device__ __forceinline__ void stage_wtile_fp8(uint16_t (*wt)[GB10_WSTRIDE],
                                                 const uint8_t* __restrict__ w,
                                                 const float* __restrict__ s1, int K, int nbase,
                                                 int N, int c) {
-    constexpr int SEGS = KC / 8;
-    constexpr int UNITS = GB10_TN * SEGS;
+    // 16 elements per thread, matching the nvfp4 path: one 16-byte load and no
+    // group scales to fetch (fp8 carries a single per-tensor scale).
+    constexpr int GROUPS = KC / 16;
+    constexpr int UNITS = GB10_TN * GROUPS;
     constexpr int P = (UNITS + GB10_GEMM_BLOCK - 1) / GB10_GEMM_BLOCK;
-    uint2 pk[P];
     const float wscale = __ldg(s1);
+    uint4 pk[P];
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
-        const int nl = u / SEGS, seg = u % SEGS;
+        const int nl = u / GROUPS, gr = u % GROUPS;
         const int n = nbase + nl;
-        pk[p] = make_uint2(0u, 0u);
-        if (u < UNITS && n < N) {
-            const int kbase = c * KC + seg * 8;
-            pk[p] = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
-        }
+        pk[p] = make_uint4(0u, 0u, 0u, 0u);
+        if (u < UNITS && n < N)
+            pk[p] = *reinterpret_cast<const uint4*>(w + (size_t)n * K + c * KC + gr * 16);
     }
 #pragma unroll
     for (int p = 0; p < P; ++p) {
         const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
-        const int nl = u / SEGS, seg = u % SEGS;
+        const int nl = u / GROUPS, gr = u % GROUPS;
         const int n = nbase + nl;
         if (u < UNITS && n < N) {
             const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk[p]);
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                wt[seg * 8 + j][nl] =
+            for (int j = 0; j < 16; ++j)
+                wt[gr * 16 + j][nl] =
                     __bfloat16_as_ushort(__float2bfloat16_rn(e4m3_to_float(pb[j]) * wscale));
         }
     }
@@ -159,25 +159,44 @@ template <int KC>
 __device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
                                             const float* __restrict__ x, int K, int T, int t0,
                                             int c) {
-    constexpr int SEGS = KC / 8;
-    for (int u = threadIdx.x; u < GB10_TT * SEGS; u += GB10_GEMM_BLOCK) {
-        const int tl = u / SEGS, seg = u % SEGS;
-        const int t = t0 + tl;
-        const int kbase = c * KC + seg * 8;
-        if (t < T) {
-            const float4 a = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase);
-            const float4 b = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase + 4);
-            xt[seg * 8 + 0][tl] = a.x;
-            xt[seg * 8 + 1][tl] = a.y;
-            xt[seg * 8 + 2][tl] = a.z;
-            xt[seg * 8 + 3][tl] = a.w;
-            xt[seg * 8 + 4][tl] = b.x;
-            xt[seg * 8 + 5][tl] = b.y;
-            xt[seg * 8 + 6][tl] = b.z;
-            xt[seg * 8 + 7][tl] = b.w;
-        } else {
+    // 16 k-values per thread as four float4 loads. Previously each thread took
+    // 8, which at the block sizes here meant one iteration of mostly-zero writes
+    // whenever `t < T` -- and at t=1 that is every thread but one.
+    constexpr int GROUPS = KC / 16;
+    constexpr int UNITS = GB10_TT * GROUPS;
+    constexpr int P = (UNITS + GB10_GEMM_BLOCK - 1) / GB10_GEMM_BLOCK;
+    float4 v[P][4];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) xt[seg * 8 + j][tl] = 0.0f;
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
+        const int tl = u / GROUPS, gr = u % GROUPS;
+        const int t = t0 + tl;
+        if (u < UNITS && t < T) {
+            const float* src = x + (size_t)t * K + c * KC + gr * 16;
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+                v[p][q] = *reinterpret_cast<const float4*>(src + q * 4);
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
+        const int tl = u / GROUPS, gr = u % GROUPS;
+        const int t = t0 + tl;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (u < UNITS && t < T) {
+                const float4 f = v[p][q];
+                xt[gr * 16 + q * 4 + 0][tl] = f.x;
+                xt[gr * 16 + q * 4 + 1][tl] = f.y;
+                xt[gr * 16 + q * 4 + 2][tl] = f.z;
+                xt[gr * 16 + q * 4 + 3][tl] = f.w;
+            } else if (u < UNITS) {
+                xt[gr * 16 + q * 4 + 0][tl] = 0.0f;
+                xt[gr * 16 + q * 4 + 1][tl] = 0.0f;
+                xt[gr * 16 + q * 4 + 2][tl] = 0.0f;
+                xt[gr * 16 + q * 4 + 3][tl] = 0.0f;
+            }
         }
     }
 }
