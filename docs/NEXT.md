@@ -2710,3 +2710,16 @@ latency.** The cost is the second stream's existence, not its width -- so it has
 If the `__syncwarp()` and shared traffic eat the gain, revert and record -- the
 ablation is still the only thing that has located this, and a negative here would mean
 the 26% is not addressable from the scale path at all.
+
+---
+
+**STATUS OF THE ABOVE NOTE: implemented and REJECTED in round 134** (+2.5% worse, and
+that regression is outside the ~1% `forward-cost` noise). It is kept only as the record
+of the design and its constraints. **Do not implement it again.** The 26% it was meant
+to recover did not come from moving the data -- see the L2-latency re-reading and the
+round-135 measurement rule earlier in this file.
+
+**The current, verified target is narrower:** `nvfp4_gemv_kernel` at **174 GB/s** against
+its own pattern's **272 GB/s** (1.56x). fp8 is already at 232 GB/s with no gap, so the
+entire decode shortfall is that one kernel. Everything ruled out on the way there is
+listed above, each with its measurement.
