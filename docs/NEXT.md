@@ -1071,6 +1071,43 @@ it rules out the alternative explanation ("the kernel is moving the weights more
 **The GEMM needs 88.9 GB/s for the endpoint target -- 2.2x from 40.4. The machine has
 demonstrated 170 GB/s elsewhere, so the requirement sits inside known-achievable territory.**
 
+## THE CONTIGUITY HYPOTHESIS IS FALSIFIED (round 192)
+
+**Tested it directly instead of building the transpose. `GB10_KC 32 -> 64` (`kernels/gemm.cu:41`)
+makes `PAIRS = KC/16` go 2 -> 4, doubling the contiguous bytes read per row from 16 to 32 -- a
+minimal, one-constant intervention on exactly the quantity rounds 189-190 blamed.**
+
+**Gate: 16/16, `chunked-prefill` OK. `dirty:1`, so the change was live. Result -- WORSE:**
+
+| t | baseline | KC=64 | |
+|---|---|---|---|
+| 32 | 400.01 | **413.85** [410.54-416.17] | **+3.5%** |
+| 64 | 435.94 | **452.76** [448.23-455.59] | **+3.9%** |
+
+**Doubling the per-row contiguity made the GEMM slower. So the "16 B per 128 B line" story does
+not survive its own intervention, and the round-190 transpose proposal -- which rested entirely
+on it -- is demoted. Reverted.**
+
+**The confound, stated because it keeps this honest:** `KC` also changes shared-memory size and
+halves the outer-product iteration count. **But the confound does not rescue the hypothesis: if
+contiguity were the limiter, doubling it should have produced a gain large enough to survive a
+modest shared-memory increase. It produced the opposite sign.**
+
+### Where this leaves the prefill GEMM
+
+**Five mechanisms are now closed by measurement:**
+
+1. occupancy / K split -- **real, 2-3%** (merged);
+2. the batched GEMV path -- **wrong branch**;
+3. the dispatch cut -- **correct as-is**;
+4. redundant weight traffic -- **ruled out** (each weight read once);
+5. **weight-layout contiguity -- FALSIFIED** (this round).
+
+**The GEMM sits at 40.4 GB/s, 5.6x its 77.2 ms floor, and no lever in hand moves it.** The
+endpoint target is still reachable *in principle* -- 88.9 GB/s is below the 170 GB/s this
+machine demonstrates elsewhere -- **but no mechanism for it is currently identified.** That is
+the honest state, and it is different from "impossible": it is "not yet found".
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
