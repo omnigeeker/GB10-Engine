@@ -172,8 +172,47 @@ blocker.
 
 **Conclusion: the prefill's 2x weight traffic is real and worth 90% of TTFT, but
 capturing it requires reworking the outer product's thread mapping to a 64x64
-tile.** That is a self-contained change with a clear success test (`generate`
-16/16 plus a TTFT drop), and it is the highest-value remaining item.
+tile.**
+
+### The 64x64 tile is implemented and correct -- and it is a wash (round 90)
+
+Done: `GB10_TT` 32->64, `GB10_KC` 64->32 (to fit shared: 26,112 B), `GB10_TNREG`
+4->8, and both outer products widened to two `float4` x-loads plus eight
+accumulators per row. `GB10_TILE_T` -> 64 in `ops.rs`.
+
+**It is correct** -- `generate` 16/16 (100%), `chunked-prefill` OK, `batch-parity`
+OK. Results:
+
+| | TT=32 (baseline) | TT=64 |
+|---|---|---|
+| TTFT | 555.7 ms | **516.0 ms (-7.1%)** |
+| t=1 | 116.56 | 111.14 |
+| t=2 | 145.98 | 146.81 |
+| t=4 | 156.80 | 154.99 |
+| t=8 | 193.36 | 193.19 |
+| **t=16** | **292.10** | **465.47 (+59%)** |
+
+TTFT improves 7.1%, but `t=16` regresses 59%: a 64-column tile evaluated at T=16
+wastes three quarters of its outer product. **Reverted.** TTFT is an explicit
+goal, but a 7% gain there does not pay for a 59% regression on short prompts,
+which are the common interactive case.
+
+Note the TTFT gain is far below the ~50% the traffic halving predicts, because
+`KC`=32 doubles the chunk count and therefore the barriers -- the same
+serialisation that has capped every staging change since round 60.
+
+**The fix is to instantiate both and dispatch on `T`**, which captures TTFT -7%
+*and* restores `t=16`:
+
+* template the kernel body on `(TT, TNREG)` and emit two entry points --
+  `nvfp4_gemm_kernel` with `(32, 4)` and `nvfp4_gemm_kernel_tt64` with `(64, 8)`;
+* `GB10_XSTRIDE` must be templated too, since it is `TT + 4`;
+* `KC` can stay 32 for both, so the shared budget is 26,112 B either way;
+* `ops.rs` selects on `t > 32`, keeping `GB10_TILE_T` per instantiation for the
+  grid.
+
+That is mechanical and self-contained, and the correctness test is the same
+`generate` gate.
 
 ## Verified state
 
