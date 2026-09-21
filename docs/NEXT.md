@@ -560,6 +560,37 @@ the prefill/endpoint bottleneck -- **not the GEMM, and not occupancy.** The endp
 occupancy work, the K split, and the tile discussion all target `forward_prefill`, and the
 `pre_ms`/endpoint path at these sizes never enters it.
 
+### CORRECTION (round 175): the "59.0 GB/s" figure must be withdrawn
+
+**I read `kernels/gemv.cu:106-107`:**
+
+```cuda
+const int b = blockIdx.y;
+const float* __restrict__ xb = x + (size_t)b * K;
+```
+
+`blockIdx.y` is the batch index, `xb` is per-batch, and the weight row loop
+(`for (rbase = ...; rbase < N; rbase += row_stride)`) is indexed by `row` and **does not
+depend on `b`**. Read naively that means every batch element walks all the weights.
+
+**The arithmetic forbids it:**
+
+| t | traffic if re-read per batch element | implied |
+|---|---|---|
+| 8 | 8 x 17.608 = 140.9 GB in 176.77 ms | **797 GB/s** |
+| 16 | 16 x 17.608 = 281.7 GB in 298.27 ms | **945 GB/s** |
+
+**Both exceed the measured 228 GB/s peak by 3.5-4x. So the weights are NOT re-read per
+batch element, my reading of the grid is incomplete, and the "99.6 / 59.0 GB/s" figures
+derived from that traffic model cannot be quoted until this is settled.**
+
+**What is established:** `blockIdx.y` is batch, `xb` is per-batch, the weight access is
+independent of `b`. **What is not:** how many times the weights are actually fetched.
+
+**The check is the same instrument that settled `gridDim.z` for the GEMM in one run: print
+`gridDim` and `blockIdx.y` from the GEMV, or read the host launch site's `grid_dim`.**
+**Do that before any further reasoning about this kernel's bandwidth.**
+
 ### Next step
 
 **A shape question about the GEMV's batch handling** (`kernels/gemv.cu`, `GB10_BATCH_MAX`,
