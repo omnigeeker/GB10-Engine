@@ -17,9 +17,20 @@ load; at `TNREG`=2 the activation saving is gone and the shape is back where it
 started. **Only raising both helps.**
 
 **The closed form:** `B/FMA = 2/TNREG + 4/TM`, subject to `acc = TM*TNREG` (registers)
-and `threads = 4096/(TM*TNREG)`. Holding `acc`=64 minimises it at **0.750**, reached
-by both (8,8) and (16,4) -- so **0.750 is the floor of this tile structure**, and any
-future round should stop looking for a better ratio and change something else.
+and `threads = 4096/(TM*TNREG)`. This is a ladder in `acc`, and it does **not** stop at 0.750 -- an earlier version of
+this note claimed that and it was wrong:
+
+| acc | threads | best B/FMA |
+|---|---|---|
+| 32 | 128 | 1.000 (what round 115 replaced) |
+| 64 | 64 | **0.750** |
+| 128 | 32 | **0.500** |
+
+**The real limit is register pressure, not the structure.** `acc`=64 costs 64
+accumulator registers on top of ~97, and `acc`=128 costs 128 -- so the ladder ends
+where ptxas starts spilling, which is what the next round should measure rather
+than assume. `acc`=64 is the safe next step; `acc`=128 is worth testing only if 64
+comes back with 0 spills and room to spare.
 
 **What (8,8) or (16,4) require, which is why neither is a one-liner:**
 
