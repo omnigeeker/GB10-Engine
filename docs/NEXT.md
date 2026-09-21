@@ -1525,6 +1525,51 @@ co-bottleneck it appeared to be.**
 
 **Round 202 predicted this. Round 203 confirmed it and put a number on it: 108 ms.**
 
+## WHY THE STAGING RUNS AT 24% (round 204) -- one load per thread per barrier
+
+**Read out of the code, not inferred:**
+
+```cuda
+constexpr int PAIRS = KC / 16;                                  // 32/16 = 2
+constexpr int UNITS = GB10_TN * PAIRS;                          // 64 * 2 = 128
+constexpr int P = (UNITS + GB10_GEMM_BLOCK - 1) / GB10_GEMM_BLOCK;  // ceil(128/128) = 1
+```
+
+**`P = 1`: exactly ONE load per thread per k-tile.** And there are
+`nchunk = K / GB10_KC = 5120/32 = 160` k-tiles, **each followed by a `__syncthreads()` before
+the outer product consumes the buffer.**
+
+**So the pipeline is:**
+
+```
+issue 1 load -> store to shared -> BARRIER -> compute -> BARRIER -> next k-tile
+```
+
+**The memory pipeline drains at every barrier.** One 8-byte load in flight per thread cannot
+cover DRAM latency across a barrier, which is exactly the 24%-of-peak signature.
+
+**Note this is consistent with the ruled-out list** -- "bytes in flight" and "DRAM latency" were
+both tested and dismissed -- **but those tests were on the GEMV, not on this kernel.** The
+ruled-out list is per-kernel and does not transfer.
+
+### The fix is local to the staging loop, not a layout change
+
+**Issue MORE loads per thread before the barrier:**
+
+1. **Unroll the k-loop by 2 and stage two k-tiles per barrier** -- `P` becomes 2 with two
+   independent loads in flight per thread;
+2. **Have each thread load more than one 8-byte unit per k-tile** -- raise the effective `PAIRS`
+   without raising `KC`, by splitting a row across fewer lanes.
+
+### And the instrument to test it is now trustworthy
+
+**The dependency-preserving probe from round 203 is the right tool** -- it keeps the staged data
+live so the compiler cannot drop the loads. **Measure the staging phase alone, before and after
+the unroll.**
+
+**The prize, unchanged and now well-founded:** staging 322.33 ms -> 77.2 ms at peak, total
+435.94 -> 190.8 ms, **2.28x against a 2.2x target.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
