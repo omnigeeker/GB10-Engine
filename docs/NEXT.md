@@ -1,5 +1,39 @@
 # SESSION HANDOFF (read this first)
 
+## BREAKTHROUGH (round 85): route short prompts to the batched GEMV
+
+The single biggest win of the project. `forward_prefill` was routing everything
+with `n >= 256` to the tiled GEMM; that GEMM's weight loads run at ~58 GB/s
+against ~148 GB/s for the GEMV path, because the GEMM's staging scatters each
+load instruction across 8 rows to fill a shared tile while the GEMV has no tile
+and streams 256 contiguous bytes of one row per instruction.
+
+The batched GEMV reads each weight once and reuses it across all `t` activations,
+so it wins whenever re-reading W is cheaper than the GEMM's slower loads:
+
+| t | GEMM | batched GEMV | |
+|---|---|---|---|
+| 1 | 271.46 | **118.40** | **-56%** |
+| 2 | 269.40 | 148.51 | -45% |
+| 4 | 280.26 | 159.97 | -43% |
+| 8 | 277.47 | 194.37 | -30% |
+| 16 | 286.93 | 292.10 | +2% (kept on the GEMM) |
+
+The crossover is between 8 and 16, so the dispatch is `n < 256 || t <= 8`, with
+8 the conservative cut (the 8..16 range is unmeasured). `generate` 16/16 exact,
+`chunked-prefill` OK, `batch-parity` OK.
+
+**This is also the answer to the whole GEMM investigation.** Rounds 60-84 tried to
+make the GEMM's loads match the GEMV's pattern. The constraint computed in round
+85 explains why they could not: one warp instruction covers 256 bytes = 512 NVFP4
+elements, so one-row-per-instruction needs a 512-deep tile, which is 65536 B at
+TN=64 -- over the 49152 B budget. **The GEMV is fast precisely because it has no
+tile to fill.** The fix was never to speed up the GEMM; it was to stop using it
+for short prompts.
+
+Next: measure the 8..16 crossover properly and raise the cut, and check whether
+the fp8 and bf16 paths want the same treatment.
+
 ## Verified state
 
 `generate` 16/16 exact, `chunked-prefill` OK, `batch-parity` OK. t=1 forward

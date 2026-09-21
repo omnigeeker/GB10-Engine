@@ -73,7 +73,26 @@ impl Linear {
         // measured 73.5 ms that way against 16.5 ms for the batched GEMV. For a
         // matrix this small, re-reading it per token is far cheaper than
         // starving 47 of the 48 SMs.
-        if self.n < 256 {
+        //
+        // The same trade-off turns out to hold for short prompts, and much more
+        // strongly than expected. `nsys` puts the GEMM's weight loads at ~58 GB/s
+        // against ~148 GB/s for the GEMV path on the same weights -- a 2.5x gap
+        // -- because the GEMM's staging scatters each load instruction across 8
+        // rows to fill a shared tile, while the GEMV has no tile and streams 256
+        // contiguous bytes of one row per instruction.
+        //
+        // So the batched GEMV wins whenever the prompt is short enough that
+        // re-reading W is cheaper than the GEMM's slower loads. Measured on
+        // `forward-cost` (t: GEMM -> batched GEMV):
+        //
+        //     1: 271.5 -> 116.7 ms   2: 269.4 -> 145.8   4: 280.3 -> 157.2
+        //     8: 277.5 -> 193.2     16: 286.9 -> 347.5
+        //
+        // The crossover is between 8 and 16; 16 is worse because the batched
+        // GEMV then re-reads every weight once per token, which outweighs its
+        // better load pattern. The 8..16 range is unmeasured, so 8 is the
+        // conservative cut.
+        if self.n < 256 || t <= 8 {
             return self.forward(dev, x, y, t);
         }
         let kern = dev.ops();
