@@ -2310,6 +2310,48 @@ volume, the same number of barriers, **just more loads in flight per thread.**
 the full kernel's 435.94 ms toward ~200 ms -- a 2.2x on prefill.** **That is the 2.28x the earlier
 rounds kept referring to, now with a mechanism instead of a hope.**
 
+## THE FIX, SPECIFIED FOR IMPLEMENTATION (round 227)
+
+**The mechanism is measured (round 226): the staging has ONE 8 B load in flight per thread, and
+giving each thread 4x the work reaches 208 GB/s = 91% of peak.** So the fix is to raise the loads
+in flight per thread **without changing the total volume or the barrier count.**
+
+### The constraint that shapes it
+
+`stage_wtile` has `PAIRS = KC/16 = 2`, `UNITS = GB10_TN * PAIRS = 128`, and
+`P = ceil(UNITS / GB10_GEMM_BLOCK) = ceil(128/128) = 1` -- **exactly one load per thread.** The
+function already declares `uint2 pk[P]` and `float scl[P]`, **so it is written for `P > 1`; only
+the shape keeps `P` at 1.**
+
+Raising `GB10_KC` raises `UNITS` but was measured **slower** (round 225), **because it also widens
+the shared tile and the staging stride.**
+
+### Three shapes, in increasing order of work
+
+1. **Multi-k-tile software pipeline (preferred).** Keep `GB10_KC` at 32 and stage **4 k-tiles
+   ahead** instead of 1: `wt[4][GB10_KC][GB10_XSTRIDE]` instead of `wt[2][...]`. Each thread then
+   issues **4 loads before any barrier** -- exactly the measured 4x condition -- **and the volume
+   and barrier count are unchanged. Shared cost: 4 x 2 KB x 2 arrays = 16 KB, within budget.**
+2. **Fewer loading threads, more units each.** 32 of the 128 threads load 4 units each per
+   k-tile. **Cheaper to write, but idles 96 threads during the load and does not overlap with the
+   outer product**, so it captures less than shape 1.
+3. **Wider `GB10_TN`.** Raises `UNITS` directly, **but round 199 already showed a wider tile is
+   50% slower at the endpoint's ~59-token prefill.**
+
+**Recommended: shape 1.** It reproduces the measured condition exactly -- **4 loads in flight per
+thread, same volume, same barriers** -- **and it is the only shape that also overlaps the loads
+with the outer product.**
+
+### Acceptance
+
+**Expected if the mechanism is right: staging 322.33 -> ~85 ms, full kernel 435.94 -> ~200 ms,
+prefill 2.2x.** The gate (`generate` 16/16 plus `chunked-prefill`) decides whether it is kept,
+**and any keep or revert needs 3 runs with spread reported.**
+
+**Fallback if it does not deliver**: the measurement says the memory system does 208 GB/s on this
+layout, **so a failure would mean the staging loop is not actually issuing the loads
+concurrently -- itself diagnosable by counting the loads in the generated PTX.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
