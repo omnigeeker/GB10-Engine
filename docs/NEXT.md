@@ -155,9 +155,32 @@ kernel**, not a bandwidth-bound one. That is a *different* diagnosis from the de
 GEMV's, and it is the first time the prefill GEMM has been placed between the two
 rooflines rather than simply called "32 GB/s".
 
-**It is also checkable with what is already known:** 97 registers, 24,576 B shared, and
-128 threads per block -- three numbers that together decide how many tile iterations can
-be in flight, and none of which has been varied since round 115.
+**And the "neither roofline" has a measured cause: the prefill GEMM runs at 47% occupancy.**
+
+| | value |
+|---|---|
+| launch | `grid.x = cdiv(17408, GB10_NR=64)` = **272 blocks**, 128 threads |
+| blocks/SM | 272 / 48 = **5.7** |
+| threads/SM | 725 of 1536 = **47%** |
+| register limit | 97 x 128 = 12,416 regs/block; 65536 / 12416 = **5.28 blocks/SM** |
+| shared limit | 24576 B/block; 102400 / 24576 = **4.2 blocks/SM** |
+
+**Both bind at once: the register budget allows 5.3 blocks/SM and the grid only offers
+5.7.** So the kernel is latency-bound with no spare parallel work to schedule -- which is
+exactly what "18% of the bandwidth roofline and 7.4 TFLOPS" looks like.
+
+**The important consequence: raising the blocks/SM *capacity* cannot help** -- e.g.
+`__launch_bounds__` to force 6 blocks would find no sixth block to run, because the grid
+has only 272. **More parallelism requires more blocks**, which means either a smaller
+n-tile (tied to `GB10_TT`=64 by the tile mapping) or a K split (which needs a reduction
+across blocks). **Neither is a one-line change**, and both are shape changes of the kind
+round 115's tile work already showed to be the only moves that pay on this engine.
+
+**Also checkable:** 97 registers and 24,576 B shared have not been varied since round
+115, and the shared limit (4.2 blocks/SM) is *below* the register limit (5.3) -- so if
+shared usage could drop under 20,480 B, the register limit would become the only one.
+Neither is the binding constraint against a 5.7-block grid, which is why this is
+recorded as a diagnosis and not presented as a fix.
 
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
