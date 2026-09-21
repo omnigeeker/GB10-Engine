@@ -2229,6 +2229,47 @@ number a long way is not necessarily a change that moves the quantity the object
 **The 14.4 s -> 0.53 s movement was in the DELIVERY of the first token; the PRODUCTION cost was
 unchanged at ~434 ms throughout.**
 
+## BARRIER CADENCE REFUTED -- THE EIGHTH CANDIDATE EXCLUDED (round 225)
+
+**Round 224 named the barrier structure as the last untested difference from the GEMV path: 160
+barriers per block, each gating only 1 KB. The cheap test was to double `GB10_KC` from 32 to 64,
+halving the barrier count and doubling the bytes per barrier without changing the total volume.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| KC=64 | **415.11** [413.11-417.11] | **454.84** [452.92-456.75] |
+| KC=32 (baseline) | 400.01 | 435.94 |
+| change | **+3.8%** | **+4.3%** |
+
+**So halving the barriers made it SLOWER, and the barrier cadence is not the limiter.** The
+slowdown is itself explicable -- a 64-wide k-tile doubles the shared footprint and the staging
+stride, and the endpoint prefill is ~59 tokens so a wider tile wastes more -- **but for this
+question the direction is what matters, and it is not the direction the hypothesis predicted.**
+
+### The list is now eight
+
+| # | candidate | how excluded |
+|---|---|---|
+| 1 | memory-level parallelism | measured (round 206, +/-0.5%) |
+| 2 | coalescing within a warp | measured (round 208, 13%) |
+| 3 | instruction count | arithmetic (0.17 ms) |
+| 4 | address arithmetic | arithmetic (7.64 ms) |
+| 5 | in-flight bytes | arithmetic + measurement |
+| 6 | shared store | **measured, a real 16%** (round 211) |
+| 7 | row stride / DRAM locality | measured (round 212, -0.4%) |
+| 8 | **barrier cadence** | **measured (this round, +4%)** |
+
+### And the decisive comparison stands
+
+**A plain read of this layout does 52.4 GB/s. The GEMV path on the same machine does 170 GB/s.
+Peak is 228 GB/s.** So the limit is in the **access pattern or the layout** -- **but it is not any
+of the eight things tested.**
+
+**The one structural difference not yet tested is that the GEMV reads MANY elements per thread in
+a grid-stride loop while this reads ONE 8 B element per thread per k-tile.** Round 206 added a
+second load **within** a k-tile and saw nothing -- **but it did not change the number of elements
+each thread owns across the whole reduction, which is what a grid-stride loop does.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
