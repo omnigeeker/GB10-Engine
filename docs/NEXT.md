@@ -1,5 +1,49 @@
 # SESSION HANDOFF (read this first)
 
+## Where the endpoint's 14.74 s goes, and both remaining gaps (round 99)
+
+All gates green at `959557b`: `generate` 16/16 (100%), TTFT 508.3 ms, decode
+8.48 tok/s single-stream, `chunked-prefill` OK, `batch-parity` OK, `mtp-probe` OK.
+
+16 concurrent requests, 256 completion tokens, 14.74 s = 17.37 tok/s:
+
+| part | time | vs its own bound |
+|---|---|---|
+| prefill (16 serial `prefill_seq`) | ~8.2 s | 16 weight passes |
+| decode (16 x ~392 ms) | ~6.2 s | 16 x 119 ms bandwidth bound |
+
+**Both halves are ~2-3x off their bound, and the bounds are the same kind of
+number, so this is one problem, not two:**
+
+* **prefill**: 16 serial prefills cost 16 weight passes, one per request. That is
+  inherent to `prefill_seq` being per-sequence -- but it is also 1.8x more than
+  16 passes should cost (16 x 17.6 GB / 58 GB/s = 4.85 s), so there is ~1.8x in
+  the prefill GEMM itself. Concatenating the group into one masked sequence would
+  save only ~6% (15 tile-passes instead of 16), so **the win is in the GEMM, not
+  in the batching** -- worth knowing before anyone builds a block-diagonal mask.
+* **decode**: 392 ms/step for 16 sequences against a 119 ms bandwidth bound and a
+  ~41 ms compute bound. **3.3x off**, and `batch-parity`'s 40.75 tok/s aggregate is
+  the same number, so the engine's batch decode has been 3.3x off its bound all
+  along. This is the GEMV batch kernel, which is where the 148 GB/s figure came
+  from -- at B=16 it does not hold.
+
+**The two open objectives (TTFT, and 30 tok/s at 16 concurrent) both reduce to
+making the GEMM/GEMV paths reach their bandwidth bound**, which is the same
+problem that consumed rounds 60-84 on the single-stream side. The difference now
+is that the bounds and the shortfalls are measured per path rather than inferred
+from a probe.
+
+## Round 85 was the single biggest win, and it was an `if`
+
+`forward_prefill` routed every matrix with `n >= 256` to the tiled GEMM; the
+batched GEMV reads each weight once and reuses it across all `t`, and at 148 GB/s
+against the GEMM's 58 GB/s it wins for any short prompt. One condition took the
+t=1 forward from 271.46 ms to 118.40 ms. Rounds 60-84 had been trying to make the
+GEMM's loads match the GEMV's pattern; the constraint that made that impossible
+(one warp instruction covers 256 B = 512 NVFP4 elements, so one row per
+instruction needs a 512-deep tile = 65,536 B at TN=64) is computed in the round-85
+notes. **The fix was never to speed up the GEMM; it was to stop using it.**
+
 ## TT=64 is landed, with a measured tradeoff (round 96)
 
 The 64x64 tile from round 90 is reinstated together with a wider GEMV cut, and it
