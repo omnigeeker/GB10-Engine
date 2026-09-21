@@ -1048,6 +1048,29 @@ check that falsified the previous four mechanisms.**
 code that assumes `row * (K/2)` addressing -- including the model loader. **Read all three
 before writing any of them.**
 
+## FLOOR CHECK (round 191): the GEMM is 5.6x its floor, and it is efficiency, not traffic
+
+**The roofline floor for one weight pass is `17.608 GB / 228 GB/s = 77.2 ms`. The GEMM at t=64
+measures 435.94 ms -- 5.6x the floor, i.e. 40.4 GB/s.**
+
+**And `stage_wtile` reads each weight exactly once** (`UNITS = GB10_TN * PAIRS` per k-tile per
+block, covering the block's full strip). **So the shortfall is not redundant traffic: it is
+pure access-pattern efficiency.** That is exactly what the round-190 transpose targets, and
+it rules out the alternative explanation ("the kernel is moving the weights more than once").
+
+**State of the endpoint target, complete:**
+
+| lever | result |
+|---|---|
+| occupancy / K split | **real, 2-3%** (merged, round 187) |
+| batched GEMV path | **irrelevant -- wrong branch** (round 185) |
+| dispatch cut | **correct as-is** (round 184) |
+| redundant weight traffic | **ruled out** (round 191) |
+| **weight layout (row-major, 16 B/line)** | **the open mechanism**; fix = transpose to `[k][row]`, ~0.154 s once |
+
+**The GEMM needs 88.9 GB/s for the endpoint target -- 2.2x from 40.4. The machine has
+demonstrated 170 GB/s elsewhere, so the requirement sits inside known-achievable territory.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
