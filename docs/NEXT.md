@@ -1017,6 +1017,37 @@ cover one row's full 128 B before moving on.** That is where the 2.2x would live
 have implied a flat 12.5% with no L2 recovery. The real decomposition changes both the
 arithmetic and the fix.
 
+## CORRECTION (round 190): the round-189 fix is IMPOSSIBLE -- the real fix is a transpose
+
+**Arithmetic on the row stride kills the round-189 proposal. The weight matrix is row-major
+with row stride `K/2` bytes (NVFP4 = 0.5 B/element). At `K = 5120` that is 2560 bytes, and a
+`KC = 32` k-tile covers exactly **16 contiguous bytes of a row**.
+
+**So "128 contiguous bytes of one row" does not exist. 128 contiguous bytes spans 8 different
+rows instead. Lane reordering cannot coalesce this load, because the 16 B per line IS what the
+row-major layout permits for a 32-element k-tile.**
+
+### The real fix: transpose the weights
+
+**Store them `[k][row]` instead of `[row][k]`. Then 128 contiguous bytes cover 8 rows for a
+single k, the staging load is fully coalesced, and the group-scale factors transpose with it
+(they are per 16 elements along k).**
+
+**The shared tile `wt` stays as it is and keeps serving the outer product unchanged -- only the
+global layout and the `stage_wtile` copy change.**
+
+**Cost: a one-time transpose at load. 17.608 GB read + write is ~35 GB, which is ~0.154 s once,
+against a prefill of 6.98 s per endpoint request. It pays for itself in the first request.**
+
+**This is the first proposal in the session derived from the memory layout rather than from a
+timing -- and the check that produced it was arithmetic on the row stride, the same kind of
+check that falsified the previous four mechanisms.**
+
+**Caveat before implementing:** the transposed layout touches **all three staging variants**
+(`stage_wtile`, `stage_wtile_fp8`, and the bf16 path), the NVFP4 group-scale layout, and any
+code that assumes `row * (K/2)` addressing -- including the model loader. **Read all three
+before writing any of them.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
