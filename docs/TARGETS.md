@@ -446,11 +446,50 @@ The API is available -- `cudarc` binds `sys::cuFuncSetAttribute` and
 type still needs confirming before use (the `impl` block is indented, so a
 column-0 grep does not find it).
 
-Next step is therefore narrow and mechanical: confirm the wrapper's receiver,
-move the three `__shared__` declarations to `extern __shared__` typed pointers,
-set `GB10_KC` to 64, and pass the dynamic size plus the opt-in attribute at the
-three launch sites. Gate on `nvfp4_gemm_kernel` GB/s (41 -> 100+), with
-`generate` (16/16 exact) and `chunked-prefill` as the correctness net.
+### ...but cudarc cannot reach the opt-in (round 55)
+
+The dynamic-shared route is blocked at the API, not at the driver. `cudarc`
+0.19.9:
+
+* `CudaFunction`'s handle is `pub(crate) cu_function: sys::CUfunction`, and
+  `CudaModule`'s is `pub(crate) module` -- neither is reachable from this crate,
+  so `set_function_attribute` cannot be handed a function;
+* `CudaStream::launch` passes `shared_mem_bytes` straight to `cuLaunchKernel`
+  without setting `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` first, so
+  anything over 48 KB would fail at launch.
+
+The bindings exist (`sys::cuFuncSetAttribute`,
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, and a free
+`result::set_function_attribute`), but nothing public yields the `CUfunction` to
+call them with. So the opt-in would mean patching or vendoring `cudarc`, which
+is not worth it for this.
+
+**The retiling route is therefore the real one**, and the budget table settles
+its shape. `wt` is the term that differs between the quantisations, and fp8's
+`float` storage is pure waste: e4m3 has 3 mantissa bits and bf16 has 7, so
+**storing fp8 weights as bf16 is lossless** and halves that buffer exactly as
+nvfp4 already does. With both kernels on uint16 `wt`:
+
+```
+both:  4 * KC * (TN + 2*TT + 3P)
+```
+
+At `KC = 64`, `P = 4` (padding kept, so no bank conflicts) that needs
+`TN + 2*TT <= 180`. The clean solution is **TN=64, TT=32, KC=64**:
+
+| | shared at KC=64 | accumulators/thread | threads |
+|---|---|---|---|
+| TN=64, TT=32 | **35840 B** | 16 (TM=4, TNREG=4) | 128 |
+
+Comfortably inside 49152 B, padding intact. The cost is that TT halves, which
+needs three coordinated edits: `gemm2d_ids` becomes `ty = tid >> 3`,
+`tx = tid & 7`; `stage_xtile` needs two passes over the k segments (32 token
+lanes x 4 segments x 8 k = 32 k per pass, two passes for KC=64); and the launch
+`block_dim` goes 256 -> 128. Halving TT also doubles the block count in `y`,
+which is the direction that helps the small-`t` case anyway.
+
+Gate on `nvfp4_gemm_kernel` GB/s (41 -> 100+), with `generate` (16/16 exact)
+and `chunked-prefill` as the correctness net.
 
 This is the next thing to do, and it is worth doing carefully: a 3x gain here
 moves TTFT and unblocks MTP at the same time.
