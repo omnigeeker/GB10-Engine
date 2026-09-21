@@ -695,6 +695,10 @@ fn mtp_probe(args: &Args) -> Result<()> {
     let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
     let mut a = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
     let mut b = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
+    let mut c = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
+    // Control: feed a zero hidden. If acceptance is unchanged, the hidden half
+    // of the concatenation is not reaching the prediction at all.
+    let zeros: gb10_cuda::CudaSlice<f32> = dev.stream().alloc_zeros::<f32>(text.hidden_size)?;
     let mut idx: gb10_cuda::CudaSlice<i32> = dev.stream().alloc_zeros::<i32>(1)?;
 
     let probe_prompt = if args.prompt.is_empty() {
@@ -706,7 +710,7 @@ fn mtp_probe(args: &Args) -> Result<()> {
     let ids = tok.encode(&probe_prompt, true)?;
     let mut next = model.prefill_seq(&dev, &ids, &mut st, &mut sc, 0)?;
 
-    let (mut hit_post, mut hit_pre, mut total) = (0usize, 0usize, 0usize);
+    let (mut hit_post, mut hit_pre, mut hit_zero, mut total) = (0usize, 0usize, 0usize, 0usize);
     for _ in 0..args.n_new {
         // `st.normed` is the post-final-norm hidden the lm_head just consumed;
         // `st.a` is the residual stream leaving the last decoder layer.
@@ -718,16 +722,22 @@ fn mtp_probe(args: &Args) -> Result<()> {
         dev.ops().argmax(&dev, &b.logits, &mut idx, model.vocab_size())?;
         let d_pre = dev.stream().memcpy_dtov(&idx)?[0] as u32;
 
+        mtp.forward(&dev, &text, &zeros, next, &model.embed, &model.lm_head, &mut c)?;
+        dev.ops().argmax(&dev, &c.logits, &mut idx, model.vocab_size())?;
+        let d_zero = dev.stream().memcpy_dtov(&idx)?[0] as u32;
+
         let actual = model.step(&dev, next, &mut st, &mut sc)?;
         total += 1;
         if d_post == actual { hit_post += 1; }
         if d_pre == actual { hit_pre += 1; }
+        if d_zero == actual { hit_zero += 1; }
         next = actual;
     }
 
     println!("== MTP draft acceptance over {} greedy steps ==", total);
     println!("  post-final-norm hidden : {:>3}/{total} = {:.1}%", hit_post, 100.0 * hit_post as f64 / total as f64);
     println!("  pre-norm residual      : {:>3}/{total} = {:.1}%", hit_pre, 100.0 * hit_pre as f64 / total as f64);
+    println!("  hidden half ZEROED     : {:>3}/{total} = {:.1}%", hit_zero, 100.0 * hit_zero as f64 / total as f64);
     println!();
     println!("mtp-probe: OK");
     Ok(())

@@ -85,7 +85,7 @@ further tuning of the batch GEMV, which is already at the register wall
 slower). At the current 42.44 tok/s at n_seq=16, a 1.6x gain lands at ~68 tok/s
 -- past the "50+ at concurrency 16" target.
 
-### The head is implemented and its acceptance rate is measured (round 41)
+### The head is implemented and verified with a control (rounds 41-42)
 
 `Mtp::forward` runs the full chain -- gather the next token's embedding, norm
 both inputs, `concat2`, `mtp.fc`, the full-attention layer with its own KV
@@ -106,14 +106,26 @@ repetition inflating the number. At 90% acceptance the economics above give
 roughly **77 tok/s at n_seq=16**, past the "50+ at concurrency 16" target, and
 8.69 becomes ~15.7 tok/s single-stream.
 
-Open question worth resolving before wiring it up: the two candidate hidden
-inputs (post-final-norm vs pre-norm residual) produced *identical* acceptance
-counts on every prompt tried. Two different vectors giving the same argmax
-every time suggests the hidden half of the concatenation may contribute little,
-which would be worth confirming -- if `concat2` or the second half of `mtp.fc`
-were being dropped, acceptance would look exactly like this. Check by running
-the head with the hidden half zeroed: if acceptance does not move, that half is
-not influencing the draft.
+### The head was verified with a control, not just a happy path
+
+The two candidate hidden inputs (post-final-norm vs pre-norm residual) produced
+*identical* acceptance counts on every prompt tried, which is exactly what
+dropping the hidden half of the concatenation would also look like. So the
+probe runs a third variant that feeds a **zero** hidden state:
+
+| draft input | acceptance |
+|---|---|
+| post-final-norm hidden | 44/48 = 91.7% |
+| pre-norm residual | 44/48 = 91.7% |
+| **hidden half zeroed** | **5/48 = 10.4%** |
+
+The control collapses to near-chance, so the hidden half is genuinely driving
+the draft and `concat2` plus the second half of `mtp.fc` are both wired
+correctly. The identical counts from the two real variants are therefore a
+coincidence of those two vectors agreeing on the argmax, not a dropped input.
+
+This is the same discipline the round-37 failure taught: a passing result on the
+happy path proves nothing until a control that *should* fail actually does.
 
 The head's structure is confirmed: `mtp.fc` is `[5120, 10240]` (the
 concatenation of the two normalised inputs back down to hidden),
