@@ -805,6 +805,57 @@ it correctly showed the round-77 pattern was fast. It simply cannot tell you
 whether a fast pattern is what the kernel is waiting on. **A probe measures what
 a pattern can reach, never what the kernel is blocked by.**
 
+### The dequant and the stores are ruled out too (round 81)
+
+With the load side excluded, the remaining staging work was cut 4x -- the
+inner `j` loop in `stage_wtile` from 8 to 2, so one quarter of the
+`e2m1_to_float` calls and one quarter of the shared stores, with the loads kept
+live through `lo`/`hi`:
+
+| | t=1 |
+|---|---|
+| baseline | 271.46 ms |
+| staging dequant + stores at 1/4 | 266.84 ms |
+
+**1.7%.** So the dequantisation and the shared stores are not the cost either.
+
+That is now three separate exclusions inside the staging:
+
+| mechanism | test | result |
+|---|---|---|
+| load pattern | probe + kernel change (76, 77, 79) | not the cost |
+| dequant ALU | 4x fewer calls (71, 81) | not the cost |
+| shared stores | 4x fewer stores (81) | not the cost |
+
+### What that actually means
+
+The staging was attributed **218 ms of 271 (80%)** by disabling it (round 64/71:
+`if (false) stage_wtile(...)` -> 200.52 ms). But every component of the staging
+has now been individually tested and none of them is expensive. Those two facts
+cannot both be true of a well-behaved probe.
+
+**The disable-probe is the thing that is wrong.** Setting `stage_wtile` to
+`if (false)` does not merely remove the staging work: it removes the global
+loads entirely, changes the kernel's shared-memory footprint and its scheduling,
+and leaves the outer product reading uninitialised shared memory. It measures
+"the kernel without this stage", which is not the same as "the cost of this
+stage", and the difference is large.
+
+So the decomposition quoted for the last several rounds -- staging 80%, outer
+product 20% -- should not be trusted, and neither should the round-61/64 numbers
+built on it. The outer-product figure (53 ms) came from shortening its k loop,
+which is a genuine component test and does survive; the staging figure came from
+a disable-probe and does not.
+
+**The rule from here: change a component's size and measure, never disable a
+component and subtract.** And prefer the profiler's per-launch number, which is
+absolute.
+
+The profiler numbers stand on their own and remain the target:
+`nvfp4_gemm_kernel` 825.6 us average, 635.9 us minimum, moving 44.6 MB per
+launch -- 54 GB/s average, 70 GB/s at best, against 148 GB/s for the GEMV path on
+the same weights.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
