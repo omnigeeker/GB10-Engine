@@ -319,12 +319,30 @@ independent loads*: 4, then 2, then 1. Going 8 -> 16 helped because it halved th
 instruction count without reducing the load count below 2; going 16 -> 32 crosses
 that line and buys instruction count at the cost of memory-level parallelism.
 
-So **16 elements per thread with P=2 is the optimum for this geometry**, and the
-way to get more is not wider loads but a larger `P` at 16 elements -- i.e. fewer
-threads covering the same tile, so each has more independent loads outstanding.
-`GB10_GEMM_BLOCK` is 128 with `UNITS = TN*KC/16 = 256`, giving P=2; a block of 64
-would give P=4 while keeping the 8-byte load. That is the concrete next
-experiment, and it is cheap.
+So **16 elements per thread with P=2 is the optimum for this geometry**. Note
+that `P` itself is not the lever: the total loads in flight is `UNITS`, not
+`P * BLOCK`, so redistributing the same units over fewer threads changes nothing.
+The lever is `UNITS = TN * KC/16`.
+
+That was tested directly by doubling `TN` (64 -> 128) and halving `TT` (32 -> 16),
+which doubles `UNITS` to 512 and still fits the shared budget at 44032 B:
+
+| | t=1 | t=16 | registers | smem |
+|---|---|---|---|---|
+| TN=64, TT=32 | **271.46** | **292.85** | 52 | 35840 |
+| TN=128, TT=16 | 303.62 | 317.10 | **122** | 44032 |
+
+Correct (`generate` 16/16) but **12% slower**. Doubling `TN` doubles the live
+accumulator and index state per thread -- 122 registers against 52 -- and pushes
+the tile to one block per SM. The extra loads in flight do not compensate.
+
+So the geometry is boxed in from both sides: `UNITS` cannot grow without `TN`,
+and `TN` cannot grow without register pressure. The remaining headroom is in the
+shared-memory budget, which is what caps occupancy at 2 blocks/SM: `wt` is
+`2*KC*(TN+4)` uint16 and `xt` is `2*KC*(TT+4)` float, 35840 B together. Shrinking
+the `+4` padding, or storing `xt` in bf16, would fit a third block per SM and
+raise the aggregate loads in flight without touching `TN`. That is the next
+experiment.
 
 ### A caution learned in round 64
 
