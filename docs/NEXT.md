@@ -118,6 +118,40 @@ The one correctness trap: a finished slot must keep contributing a token to
 alternative, compacting slots, would require moving per-slot recurrent state and
 KV cache and is not needed.
 
+### Batching window, and where the time actually goes (round 95)
+
+The group was whatever happened to be queued when the first request arrived --
+`try_recv` drains only what is already there. Instrumented with a group-size log
+(`GB10_BATCH_LOG=1`), a 25 ms window after the first `recv` turns that into
+**two groups of exactly 16**.
+
+Separating prefill from decode by varying `max_tokens`:
+
+| max_tokens | wall (16 concurrent) |
+|---|---|
+| 1 | 9.45 s |
+| 16 | **15.73 s** (was 21.80) |
+
+so the intercept is prefill + 1 step and the slope is the step cost:
+
+| part | before window | after |
+|---|---|---|
+| prefill | ~8.8 s | **~9.0 s** |
+| decode | 15 x 815 ms = 12.2 s | 15 x 419 ms = 6.7 s |
+
+**Aggregate is now 256/15.73 = 16.28 tok/s**, against 5.36 for the serial server
+-- **3.0x** -- and against the 30 tok/s target.
+
+**Prefill is now the majority (57%) and the next target.** The 9.0 s is 16
+serialised `prefill_seq` calls of a 58-token prompt at ~563 ms each, which matches
+the measured TTFT of 566 ms exactly. Batching prefill means running several
+prompts through one forward with a per-sequence causal mask -- the same O(T^2)
+`attn_prefill_kernel` that the TTFT work is already aimed at, so **the two open
+performance items have the same fix**.
+
+Note the step cost is 419 ms against `forward-cost`'s 287 ms for t=16; the extra is
+per-step channel traffic and HTTP writes for 16 sequences, not compute.
+
 ### The scheduler is implemented and working (round 94)
 
 `crates/gb10-server/src/main.rs` now has a batching scheduler: `Engine` moved onto

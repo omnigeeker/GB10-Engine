@@ -615,14 +615,23 @@ fn scheduler(mut eng: Engine, rx: mpsc::Receiver<Job>) {
             Err(_) => return,
         };
         let mut group = vec![first];
+        // Batching window. Without it the group is whatever happened to be
+        // queued at the instant the first request arrived, which for clients
+        // started together is 1 or 2 -- and then the whole group decodes at
+        // roughly the single-stream rate instead of the batched one. Measured
+        // 815 ms/step against the 287 ms/step that a full batch of 16 costs.
+        std::thread::sleep(std::time::Duration::from_millis(25));
         while group.len() < MAX_CONCURRENT {
             match rx.try_recv() {
                 Ok(j) => group.push(j),
                 Err(_) => break,
             }
         }
+        let k = group.len();
         if let Err(e) = run_group(&mut eng, group) {
             eprintln!("batch: {e:#}");
+        } else if std::env::var_os("GB10_BATCH_LOG").is_some() {
+            eprintln!("batch of {k}");
         }
     }
 }
