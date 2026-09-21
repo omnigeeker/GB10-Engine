@@ -2655,6 +2655,39 @@ or shared budget -- improves it.**
 reason to expect less from it, not more: it changes where the loads land, but the last two
 experiments show that raising loads in flight does not move this kernel.**
 
+## THE ENDPOINT GAP IS SERIALIZED PREFILL, NOT SERVICE OVERHEAD (round 236)
+
+**The gap to explain**: the engine does **47.78 tok/s** at B=16; the endpoint does **20.08**. That
+is 2.4x, and it had never been decomposed -- "the service layer" was a guess.
+
+**Decomposed from the round-218 live measurement** (16 concurrent, `max_tokens = 24`, 384 tokens,
+**16.13 s** wall):
+
+| component | time | rate |
+|---|---|---|
+| prefill: 16 requests x ~436 ms, **serialized** | **6.98 s** | -- |
+| decode: 384 tokens | **8.04 s** | **47.8 tok/s** |
+| **wall** | **16.13 s** | **23.8 tok/s** |
+
+**The decode is at 47.8 tok/s -- the engine's 47.78 exactly.** So the service layer is not the
+problem at all: **every token after the first is produced at full engine speed.**
+
+**The problem is that the 16 prefills are SERIALIZED.** Each request's prefill is a separate
+~436 ms full-model pass, run one after another -- **6.98 s of the 16.13 s wall, 43%.**
+
+**And they should not be.** The 25 ms batching window exists precisely to collect concurrent
+requests, **and the engine already has a batched path** (`prefill_seq` over a batch, with
+`forward_prefill` gating to `forward` for `t <= 16`). **If the 16 prefills became one batched
+pass, the prefill would be ~436 ms, not 6.98 s.**
+
+**The projection: 0.44 + 8.04 = 8.47 s -> 45.3 tok/s.** That is **1.5x the 30 tok/s target** and a
+**1.67x** on the endpoint -- **and it needs no kernel work at all. It is a scheduling change.**
+
+**This is the first endpoint-target mechanism this session has identified that is neither a
+hardware wall nor an exhausted kernel line.** The 2.4x gap was attributed to "the service layer"
+only as a guess until now; **the measurement says it is one specific thing: the batch window is
+not collecting the prefills.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
