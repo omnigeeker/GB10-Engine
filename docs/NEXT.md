@@ -2856,6 +2856,44 @@ t=1 **-56%**; endpoint **3.7x**; **streaming correctness on both protocols** (ve
 | TTFT vs llama.cpp | **~434 ms vs ~74 ms** | needs 238 GB/s vs 170 demonstrated |
 | endpoint 16-conc >= 30 | **20.1 now; 26.3 with the measured fix** | batched prefill (1.11x, real feature) + 3.7 tok/s from the prefill line |
 
+## THE AMORTIZATION MEASUREMENT FAILED (round 242)
+
+**Recorded as a failure, not a result.**
+
+### The hypothesis, which is still worth testing
+
+**The endpoint's 20.1 tok/s came from a workload of 24 tokens per request, where prefill is 43% of
+the wall. The decode itself runs at 47.8 tok/s -- the full engine rate.** So for longer
+generations the prefill share shrinks, **and the endpoint should approach the decode rate, which is
+already above the 30 tok/s target.**
+
+**If that holds, the 30 tok/s target is met for realistic generation lengths, and the 20.08 figure
+is an artifact of a 24-token benchmark rather than a property of the engine.** That is a
+significant claim and it needs a real measurement.
+
+### The measurement did not run
+
+**The harness reported wall 0.01 s for both `max_tokens = 24` and `max_tokens = 128`** -- i.e.
+**42147 and 239741 tok/s.** Those numbers are impossible: **the 16 requests returned instantly, so
+they failed rather than generated.** The readiness poll passed, **so the failure is in the request
+loop or the timing, not the server start.**
+
+**No number from this run is recorded. The only honest statement is that the test has not been
+made.**
+
+### The sixth failure of its kind, and the tell was in the output
+
+**A command chain where every layer succeeds and the measurement still does not happen.** Here the
+tell was the number itself: **42k tok/s is not a fast result, it is an impossible one.** The check
+that would have caught it is the one this session keeps re-learning -- **ask what the number would
+be if the instrument were measuring something else. A wall time of 0.01 s for 16 LLM requests
+means the requests did not run.**
+
+### How to run it properly
+
+**Same 16-concurrent workload at `max_tokens` 24 and 128, and VERIFY the requests returned tokens
+-- check response content, not just exit codes -- before computing any rate.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
