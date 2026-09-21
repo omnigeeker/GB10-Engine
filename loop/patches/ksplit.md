@@ -279,3 +279,56 @@ vetted; the host half is not.**
 
 **And the rule that held: the gate blocked a faster-and-wrong prefill three times in a
 row. Do not take a timing on this path until it is green.**
+
+
+---
+
+## `0/0` DECODED (round 162) -- and it condemns the memset, not the arithmetic
+
+`crates/gb10-verify/src/main.rs:509`:
+
+```rust
+let n = out.len().min(want.len());
+let agree = (0..n).filter(|&i| out[i] == want[i]).count();
+```
+
+**`0/0` means either side was empty.** The failing run still printed
+`reference=Qwen3_5ForCausalLM, weights dequantized from NVFP4 to bf16`, which comes from
+`o["reference"]` -- **so the oracle file loaded and `want` is populated. Therefore
+`out` is empty: generation produced ZERO tokens.**
+
+**That is a crash-or-degenerate-generation signal, not a numerics signal**, which is why
+both store forms failed identically while `batch-parity` (no prefill GEMM) stayed green.
+
+### The cause: `memset_zeros(y)` does not mean what the spec assumed
+
+`dev.stream().memset_zeros(y)?` zeroes **the entire `CudaSlice`**. But the prefill GEMM's
+`y` is not necessarily a freshly-allocated output -- it is whatever the caller passes, and
+in this engine the GEMM result feeds the next op in the same forward pass, so that slice
+can be a view into a larger activation buffer whose contents are **live**. **Zeroing all
+of it mid-forward destroys the activations**, the model emits EOS immediately, `out` is
+empty, and the gate reports `0/0`.
+
+**So the premise "atomicAdd requires zeroing y" is the design problem** -- the same shape
+as rounds 156/157, where the gate could not be written until the emitter was taken out of
+it. **The requirement exists only because the element needs a known starting value.**
+
+### The design that removes the requirement: scratch + reduction, no memset
+
+Do not accumulate into `y` at all. Have the `nsplit` blocks write **disjoint** regions of
+a private scratch buffer, then have one pass sum them into `y`:
+
+* scratch is `nsplit * t * n` floats = 2 x 59 x 17408 x 4 B = **8.2 MB** (the same launch
+  moves 17.6 GB of weights, so this is nothing);
+* `y` is **written once and never zeroed**, so no live buffer is touched;
+* no atomics at all -- which also retires the ~2.2M atomics/matrix the round-150 probe was
+  measuring, and the race between block 0's store and the others' `atomicAdd`;
+* the reduction is one extra pass over 1.03M elements per matrix.
+
+**Cost: one extra small kernel and 8.2 MB of scratch. Benefit: the correctness argument
+becomes "disjoint writes then a sum" instead of "a memset that must not land on live
+data".**
+
+**Do not re-attempt the memset form.** The next attempt should be the scratch+reduction
+form, and it should still land the kernel change first with `grid.z = 1` and prove both
+gates green before the host ever asks for `nsplit = 2`.
