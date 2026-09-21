@@ -154,6 +154,38 @@ not fall substantially, the hypothesis is dead** -- and it is the same change th
 rounds 97-98 rejected on a confounded comparison and round 107 could not reach
 through occupancy, so this round trip finally gives it a mechanism *and* a test.
 
+### bf16 `xt`: built, fails the gate, and the hypothesis is falsified (round 110)
+
+The change was implemented exactly as the round-109 prediction required -- 91
+registers, **shared down from 24,576 B to 16,384 B**, 0 spills, xt shared traffic
+per k down from 64 B to 32 B:
+
+| | baseline | bf16 `xt` |
+|---|---|---|
+| `generate` oracle agreement | 16/16 (100%) | **0/16 (0.0%)** |
+| TTFT | 461.2 ms | 446.2 ms |
+
+**The gate fails outright, so the change is out** -- and this is the *third* verdict
+on it, after round 97-98 rejected it on a confounded `KC`/padding comparison and
+round 107 could not reach it through occupancy. **This verdict is the one that
+counts, because it is on correctness rather than on a timing comparison**, and it
+is now recorded so that no future round re-litigates it: **bf16 activations do not
+survive comparison with the bf16 oracle.**
+
+**The shared-bandwidth hypothesis is also falsified.** It predicted that halving
+the xt shared traffic would trim the critical path by 1.8x. It moved TTFT by
+-3.3%, inside noise. So the outer product is **not** shared-bandwidth-bound, and
+the round-109 44%-vs-36% agreement was the round-106 coincidence again -- **the
+fourth time this session that arithmetic compressing onto a measured number turned
+out to mean nothing.**
+
+**Do not quote the 446.2 ms.** A gate-failing kernel produces a number that looks
+like an improvement for the same reason round 88's broken TT=64 kernel reported
+469.2 ms: the model is not decoding what the measurement assumes. **Five mechanisms
+are now ruled out on this GEMM by measurement** -- load pattern, dequant, shared
+stores, occupancy, shared bandwidth -- and the 36% FMA efficiency at T=58 remains
+unexplained.
+
 **So the lever is outer-product FMA efficiency (36%), and it is the opposite end of
 the kernel from rounds 60-84, which spent 25 rounds on the load side.** The earlier
 conclusion that the load pattern was the problem was measured against a
