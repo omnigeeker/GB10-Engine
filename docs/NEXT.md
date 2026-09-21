@@ -2760,6 +2760,32 @@ around 944 **to see what one large prefill actually costs.** If it is near 436 m
 fix is worth building; **if it scales linearly with `t`, padding buys nothing and only true
 variable-length batching would.**
 
+## THE LARGE-`t` MEASUREMENT DID NOT RUN (round 239)
+
+**The intent was to measure one large prefill at `t` up to 944**, because round 238 established
+that the endpoint fix depends on whether a `t ~= 944` pass costs about the same as a `t = 64` pass
+or scales with `t`.
+
+**The `sed` that was supposed to widen the sweep did not match.** The actual line is
+`for t in [1usize, 2, 4, 8, 16, 32, 64] {`, **and the pattern omitted the `usize` type suffix.**
+So the sweep ran unchanged and the output is the ORIGINAL small-`t` sweep, **not the intended one.**
+
+**The run did produce output** -- `t=1 103.95`, `t=2 206.99`, `t=4 411.36`, `t=8 831.58`,
+`t=16 1660.09`, `t=32 3316.06` -- **but those are the CUMULATIVE column, not the per-call column,
+so they are not comparable to the recorded 435.94 ms at `t=64` without knowing which column the
+notes used.** That ambiguity is exactly why **no number from this run is being recorded.**
+
+**Reverted; tree clean (`dirty: 0`).**
+
+### The lesson, in its simplest form
+
+**A command that succeeds is not a command that did what was intended.** `sed` exits 0 when its
+pattern does not match; the build exits 0; the binary runs and prints numbers. **Four layers of
+success, and the measurement still did not happen.**
+
+**The check that catches it -- and the one that would have caught it here -- is to print the target
+line before and after the edit.** This session has now paid for that class of error five times.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
