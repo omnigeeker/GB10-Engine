@@ -2496,6 +2496,46 @@ for (int c = kc0; c < kc1; ++c) {
 **And the `kc_half` constraint tightens to a multiple of 4** (round 230): `kc_half = 80`, which is
 divisible by 4, **so it holds today** -- but the host fallback must test 4, not 2.
 
+## THE 4-DEEP RING WAS IMPLEMENTED AND IS SLOWER (round 232)
+
+**The latency-bound hypothesis was carried all the way to code: a 4-slot k-tile ring in
+`nvfp4_gemm_body`, race-free with one barrier per k-tile (the round-231 design), keeping four
+loads in flight per thread -- the exact measured condition from round 226.**
+
+**It is CORRECT and it is SLOWER.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **4-deep ring** | **418.85** [417.77-419.94] | **455.73** [454.18-458.24] |
+| 2-buffer baseline | 400.01 | 435.94 |
+| change | **+4.7%** | **+4.5%** |
+
+**Gate: `generate` 16/16 and `chunked-prefill` OK both before and after. Reverted; tree clean.**
+
+### Why the predicted 2.0-2.2x did not appear
+
+**The ring doubles the shared footprint -- `wt` and `xt` both go from 2 buffers to 4, so 2 x 2 KB x
+2 arrays becomes 4 x 2 KB x 2 arrays = 16 KB.** That lowers occupancy, **and the occupancy loss
+eats the latency win.** The mechanism from round 226 is real -- **4 loads in flight DO reach 208
+GB/s in isolation -- but buying them with shared memory costs more than they return.**
+
+**So the round-226/227/228 projection was wrong, and this is the honest correction: the probe
+measured a condition, not an achievable change. Adding in-flight loads by widening the ring is
+self-defeating because the ring is what the shared budget pays for.**
+
+### The ninth candidate, closed
+
+| # | candidate | how excluded |
+|---|---|---|
+| 9 | **in-flight loads per thread via a deeper ring** | **implemented, gated, measured: +4.5%** |
+
+**And the useful residue**: the measurement says the staging is latency-bound **and** that the
+shared-memory budget is the binding constraint on fixing it. **Any future attempt has to raise
+loads in flight WITHOUT growing the shared footprint** -- for example by having each thread load
+more elements of the SAME k-tile into registers and staging them from registers, which costs
+registers rather than shared. **That is the one shape not yet tried, and it is now the only one
+consistent with both measurements.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
