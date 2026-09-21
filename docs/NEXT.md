@@ -97,6 +97,43 @@ measured reason: rounds 97-98 rejected it on the strength of a confounded
 if bf16 activations do not survive the oracle comparison, the change is out
 regardless of the occupancy arithmetic.
 
+### The prefill is compute-bound in the outer product, and here is the number (round 108)
+
+`nsys` on `generate --n 2` (TTFT 461.2 ms, 59 tokens) under the **current**
+TT=64/`KC`=32 configuration:
+
+| kernel | launches | avg | what it is |
+|---|---|---|---|
+| `nvfp4_gemm_kernel` | 192 | **1,379.5 us** | 64 layers x 3 (gate/up/down) |
+| `fp8_gemm_kernel` | 208 | 710.6 us | 64 layers x 3.25 |
+
+192 x 1,379.5 us + 208 x 710.6 us = **413 ms of the 461 ms TTFT. 89% of TTFT is
+the GEMM**, and the launch counts are exactly the model's matrix counts, so this
+is the whole prefill and nothing else.
+
+**Two things this settles:**
+
+1. **The old 825.6 us figure was from TT=32/`KC`=64 and is not comparable.** The
+   round-107 flag was correct: the "35 GB/s against 58 GB/s" comparison was
+   invalid. Under one configuration, the same matrix is **1,379.5 us**.
+2. **The prefill is compute-bound, not bandwidth-bound.** This matrix is 44.6 MB,
+   so the launch moves it at **32.3 GB/s**, and it executes 5.17 G MACs in
+   1,379.5 us = 3.75 T MAC/s = **36% of the 10.4 T MAC/s peak**. At t=1 the same
+   matrix ran at 54 GB/s and was bandwidth-bound. TT=64 with `TNREG`=8 does 2x the
+   outer-product FMAs per weight byte that TT=32 with `TNREG`=4 did, and costs
+   1.67x the time -- **the ratio, not the absolute, is the evidence.**
+
+**So the lever is outer-product FMA efficiency (36%), and it is the opposite end of
+the kernel from rounds 60-84, which spent 25 rounds on the load side.** The earlier
+conclusion that the load pattern was the problem was measured against a
+bandwidth-bound kernel; the prefill is not one.
+
+**A benchmark trap worth recording:** `forward-cost` **no longer exercises the GEMM
+at all.** Its t range is 1-16 and the GEMV cut is `t <= 16`, so every one of its
+points goes through `nvfp4_gemv_batch_kernel`. Any GEMM work must be measured
+through `generate` or `chunked-prefill`. Profiling `forward-cost` and concluding
+anything about the GEMM is now meaningless.
+
 **Three separate times this session a plausible mechanism was counted rather than
 measured and turned out to be wrong** (rounds 59, 101, 104). The rule that works
 is: change one variable, read an absolute per-launch number, and run the gate
