@@ -116,6 +116,20 @@ pub struct ModelState {
     pub logits_all: CudaSlice<f32>,
     /// Argmax of each of those rows.
     pub idx_all: CudaSlice<i32>,
+    /// Copies of every layer's recurrent state, taken before a speculative
+    /// verification pass.
+    ///
+    /// The KV cache is append-ordered, so rejected drafts can be discarded just
+    /// by rewinding `n_keys` -- the slots get overwritten. The Gated DeltaNet
+    /// recurrence is *not* reversible: its 48 layers carry 150 MB per sequence
+    /// of running state that a rejected draft has already folded in. So
+    /// verification snapshots it first and restores it afterwards. That costs
+    /// ~300 MB of traffic per round against the 17.6 GB a decoder step reads,
+    /// about 1.7%, which is affordable for the multi-token verify it enables.
+    pub rec_snapshot: Vec<CudaSlice<f32>>,
+    pub conv_snapshot: Vec<CudaSlice<f32>>,
+    /// `n_keys` before the verification pass, per sequence.
+    pub n_keys_snapshot: Vec<Vec<usize>>,
     /// Token ids staged on the device for a batched decode step.
     pub tokens_dev: CudaSlice<i32>,
     /// Number of sequences this state is sliced into.
@@ -132,6 +146,17 @@ impl ModelState {
         }
         let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
         let vocab_hint = model.vocab_size();
+        // Built before `layers` is moved into the struct below.
+        let rec_snapshot: Vec<CudaSlice<f32>> = layers
+            .iter()
+            .map(|l| z(l.rec.len()))
+            .collect::<Result<_>>()?;
+        let conv_snapshot: Vec<CudaSlice<f32>> = layers
+            .iter()
+            .map(|l| z(l.conv_hist.len()))
+            .collect::<Result<_>>()?;
+        let n_keys_snapshot: Vec<Vec<usize>> =
+            layers.iter().map(|l| l.n_keys.clone()).collect();
         Ok(Self {
             layers,
             logits: z(model.vocab_size() * n_seq)?,
@@ -144,6 +169,9 @@ impl ModelState {
             last: z(text.hidden_size)?,
             logits_all: z(vocab_hint * VERIFY_MAX)?,
             idx_all: dev.stream().alloc_zeros::<i32>(VERIFY_MAX)?,
+            rec_snapshot,
+            conv_snapshot,
+            n_keys_snapshot,
             tokens_dev: dev.stream().alloc_zeros::<i32>(n_seq)?,
             n_seq,
             n_tokens: 0,
@@ -151,6 +179,28 @@ impl ModelState {
     }
 
     /// Drop all context: KV caches, conv history and recurrent state.
+    /// Capture the recurrent state of every layer, plus the cache lengths.
+    pub fn snapshot_recurrent(&mut self, dev: &Device) -> Result<()> {
+        for (i, l) in self.layers.iter().enumerate() {
+            dev.stream().memcpy_dtod(&l.rec, &mut self.rec_snapshot[i])?;
+            dev.stream().memcpy_dtod(&l.conv_hist, &mut self.conv_snapshot[i])?;
+            self.n_keys_snapshot[i].copy_from_slice(&l.n_keys);
+        }
+        Ok(())
+    }
+
+    /// Undo everything after `snapshot_recurrent`. `positions` is rebuilt from
+    /// `n_keys` rather than snapshotted, since it is a pure function of it.
+    pub fn restore_recurrent(&mut self, dev: &Device) -> Result<()> {
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            dev.stream().memcpy_dtod(&self.rec_snapshot[i], &mut l.rec)?;
+            dev.stream().memcpy_dtod(&self.conv_snapshot[i], &mut l.conv_hist)?;
+            l.n_keys.copy_from_slice(&self.n_keys_snapshot[i]);
+            l.sync_positions(dev)?;
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self, dev: &Device) -> Result<()> {
         for l in &mut self.layers {
             l.reset(dev)?;

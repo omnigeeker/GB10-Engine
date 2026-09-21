@@ -910,13 +910,23 @@ fn chunked_prefill(args: &Args, n_dec: usize) -> Result<bool> {
     let rows = dev.stream().clone_dtoh(&st3.idx_all)?;
     let row_last = rows[ids.len() - 1] as u32;
     let rows_ok = row_last == last;
+
+    // Snapshot/restore must make a decoder step exactly reversible -- that is
+    // what lets a speculative round throw away rejected drafts, since the
+    // Gated DeltaNet recurrence cannot be rewound the way the KV cache can.
+    st3.snapshot_recurrent(&dev)?;
+    let first = model.step(&dev, last, &mut st3, &mut sc3)?;
+    st3.restore_recurrent(&dev)?;
+    let again = model.step(&dev, last, &mut st3, &mut sc3)?;
+    let rev_ok = first == again;
+    println!("  snapshot/restore: step gave {first} then {again} -> {}", if rev_ok { "reversible" } else { "DIVERGED" });
     println!("  all_logits row {} = {}, prefill_seq = {}", ids.len() - 1, row_last, last);
 
     println!("== chunked prefill (start > 0) ==");
     println!("  prompt {} tokens, split {}+{}", ids.len(), split, ids.len() - split);
     println!("  one shot : {:?}", &one[..one.len().min(8)]);
     println!("  two chunk: {:?}", &two[..two.len().min(8)]);
-    let same = one == two && rows_ok;
+    let same = one == two && rows_ok && rev_ok;
     println!("  decoded  : {:?}", tok.decode(&one, false)?);
     println!("  agree: {}", if same { "YES" } else { "NO" });
     println!();

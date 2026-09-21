@@ -204,9 +204,35 @@ all_logits row 31 = 271, prefill_seq = 271
 chunked-prefill: OK
 ```
 
-Both prerequisites for the batched MTP verify now exist and are individually
-verified. What remains is to compose them into the draft/verify/accept loop and
-measure whether the composed path actually beats 1.0x -- the naive per-token
+### ...and the third: making a speculative round reversible (round 47)
+
+Composing the loop surfaced a blocker that is not obvious until you try to write
+the reject path. The KV cache is append-ordered, so discarding rejected drafts
+is just rewinding `n_keys` -- the slots get overwritten next append. **The Gated
+DeltaNet recurrence is not like that.** Its 48 layers carry 150 MB per sequence
+of running state that a rejected draft has already folded in, and there is no
+way to subtract it back out. A verify pass that runs 4 drafted tokens and
+accepts 1 would leave the recurrence polluted by 3 tokens that were never
+emitted.
+
+`ModelState::snapshot_recurrent` / `restore_recurrent` copy every layer's
+recurrent state and cache lengths before a verify pass and put them back after.
+That costs ~300 MB of traffic per round against the 17.6 GB a decoder step
+reads -- about 1.7% -- which is a fair price for the multi-token verify it
+unlocks. `positions` is rebuilt from `n_keys` rather than snapshotted, since it
+is a pure function of it.
+
+Verified by making a step happen twice:
+
+```
+snapshot/restore: step gave 16 then 16 -> reversible
+all_logits row 31 = 271, prefill_seq = 271
+```
+
+All three prerequisites for the batched MTP verify now exist and are
+individually verified: a forward from a non-empty cache, per-row scoring, and a
+reversible round. What remains is to compose them into the draft/verify/accept
+loop and measure whether the composed path beats 1.0x -- the naive per-token
 loop measured 0.95x, and only batching the verification changes that.
 
 ### The head was verified with a control, not just a happy path
