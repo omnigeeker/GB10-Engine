@@ -31,9 +31,27 @@ Full reasoning, all the constraint arithmetic, and the two rejected routes
 
 ### Concrete plan
 
-1. **Store fp8 weights as uint16 (bf16) instead of float.** e4m3 has 3 mantissa
-   bits, bf16 has 7, so this is lossless. It halves the fp8 `wt` buffer and is
-   what makes KC=64 fit at all.
+Step 1 is self-contained and worth doing on its own, because it is the
+prerequisite for step 2 and is independently verifiable. Exact edits, since the
+line numbers are known:
+
+* `stage_wtile_fp8` (gemm.cu:84) -- change the parameter from
+  `float (*wt)[GB10_WSTRIDE]` to `uint16_t (*wt)[GB10_WSTRIDE]` and store
+  `__bfloat16_as_ushort(__float2bfloat16_rn(e4m3_to_float(...)))`, exactly as
+  `stage_wtile` (gemm.cu:55) already does for nvfp4. e4m3 has 3 mantissa bits
+  and bf16 has 7, so **this conversion is lossless**.
+* the fp8 body (gemm.cu:299) and the bf16 body (gemm.cu:332) -- change
+  `__shared__ float wt[...]` to `__shared__ uint16_t wt[...]`, and at
+  gemm.cu:311/317 switch `stage_wtile_fp8` stays, but the compute call must
+  become `gemm2d_outer_bf16` (gemm.cu:181) instead of `gemm2d_outer`.
+
+That alone halves fp8's shared from 34816 B to 26112 B, matching nvfp4, and
+drops fp8 from 2 to 3 blocks/SM. Gate: `generate` must still be 16/16 exact --
+if bf16 were not lossless for e4m3, this is where it would show.
+
+Step 2 then becomes possible:
+
+1. ~~Store fp8 weights as uint16 (bf16) instead of float.~~ (above)
 2. **`GB10_TT` 64 -> 32, `GB10_KC` 32 -> 64, block 256 -> 128.** At
    TN=64/TT=32/KC=64 the shared cost is 35840 B with the `+4` padding intact --
    comfortably inside the 49152 B static limit, no bank conflicts.
