@@ -2204,6 +2204,31 @@ llama.cpp, **and it is measurable for the first time.**
 
 **Gate status: `generate` 16/16, `chunked-prefill` OK.**
 
+## THE STREAMING FIX MADE TTFT VISIBLE, NOT FASTER (round 223)
+
+**Stated plainly so the 27x number is not over-read: the fix changed WHEN the first token reaches
+the client, NOT how long the model takes to produce it.**
+
+| | ours | llama.cpp |
+|---|---|---|
+| TTFT per prompt token | **7.36 ms** | **1.25 ms** |
+| prompt | ~59 tokens | ~59 tokens |
+| **TTFT** | **~434 ms** | **~74 ms** |
+
+**The measured value after the fix is 523-530 ms -- consistent with 434 ms plus the first decode
+step. And the deficit is 5.9x, EXACTLY the figure recorded before the fix.**
+
+**So the streaming fix is a STREAM-CORRECTNESS fix, not a TTFT win.** It is still worth having --
+a non-incremental stream is broken for any interactive use, **and it made the TTFT target
+measurable for the first time.** But **the objective's "TTFT better than llama.cpp" remains
+unmet, at the same 5.9x, and it is a prefill-bandwidth problem: ~238 GB/s needed against ~170
+demonstrated.**
+
+**The general lesson, and it is the fourth of its kind this session:** a change that moves a
+number a long way is not necessarily a change that moves the quantity the objective names.
+**The 14.4 s -> 0.53 s movement was in the DELIVERY of the first token; the PRODUCTION cost was
+unchanged at ~434 ms throughout.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
