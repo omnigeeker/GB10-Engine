@@ -340,9 +340,51 @@ against a 49152 B static limit. Three routes, in increasing order of work:
 
 The `GB10_TT` route is the most promising for this workload specifically: at
 `t=1` and `t=16` the 64 token columns are nearly all idle anyway (which is why
-the forward costs the same at every `t`), so halving the token block costs
-nothing real while freeing enough shared for KC=64. It also doubles the block
+the forward costs the same at every `t`), so shrinking the token block costs
+nothing real while freeing enough shared for KC=64. It also raises the block
 count in `y`, which helps the small-`t` case directly.
+
+### The tile geometry is over-constrained (round 52)
+
+Working out what KC=64 requires shows the current geometry is pinned from three
+sides at once, so this is a real rework and not a constant flip:
+
+**The shared budget.** Two buffers each of `wt[KC][TN+4]` and `xt[KC][TT+4]`,
+where `wt` is uint16 for nvfp4 (dequantised to bf16) but **float** for fp8:
+
+```
+nvfp4:  4 * KC * (TN + 2*TT + 12) <= 49152
+fp8:    8 * KC * (TN +  TT +  8) <= 49152     <- the binding one
+```
+
+**The float4 tiling.** `gemm2d_outer` loads both operands as `float4`, which
+forces `GB10_TM == 4 && GB10_TNREG == 4` (asserted), hence 16 accumulators per
+thread, hence `TN * TT == 16 * GB10_GEMM_BLOCK`.
+
+**The id map.** `gemm2d_ids` hardcodes `ty = tid >> 4`, `tx = tid & 15`, i.e. the
+16x16 grouping of the 64x64 tile. Any new `TN`/`TT`/block size needs its own
+map, and `stage_xtile`'s `tl = tid >> 2`, `seg = tid & 3` (4 segments x 8 = 32 =
+KC) is likewise specific to `KC == 32`.
+
+Solving the fp8 constraint at `KC = 64` needs `TN + TT <= 88`, and the float4
+rule needs `TN * TT = 16 * BLOCK`. Those are compatible only at small blocks:
+
+| kernel | TN | TT | KC | block | shared |
+|---|---|---|---|---|---|
+| nvfp4 | 64 | 32 | 64 | 128 | 35840 B |
+| fp8 | 64 | 16 | 64 | 64 | 45056 B |
+
+They do not share a geometry, so `GB10_TN`/`GB10_TT`/`GB10_GEMM_BLOCK` have to
+become per-kernel template parameters (or per-kernel macros) rather than the
+single set of `#define`s used today, and `gemm2d_ids`/`stage_xtile` need to be
+parameterised with them.
+
+That is the shape of the next change. It is worth doing because the prize is
+large and doubly motivated -- 41 GB/s to 100+ GB/s on both GEMMs moves TTFT and
+unblocks MTP -- but it touches staging, tiling, id mapping and the launch
+configuration together, so it should be done as one deliberate step with the
+GEMM bandwidth as the gate and `generate`/`chunked-prefill` as the correctness
+net, not incrementally by constant.
 
 This is the next thing to do, and it is worth doing carefully: a 3x gain here
 moves TTFT and unblocks MTP at the same time.
