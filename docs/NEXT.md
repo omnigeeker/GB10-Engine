@@ -615,6 +615,47 @@ from `xb = x + b*K` was inferred from the *wrong kernel's* template.
 **That is where the endpoint's prefill cost actually lives, and no bandwidth claim about
 the batched path is usable until it has been read.**
 
+### RESOLVED (round 177): the batched GEMV is L2-bound on ACTIVATION re-reads, not weights
+
+`kernels/gemv.cu:367` `nvfp4_gemv_batch_tmpl`, instantiated as
+`nvfp4_gemv_batch_tmpl<4, GB10_BATCH_MAX>` (line 592). Loop order:
+
+**`rbase` (row groups) -> `i` (k-tiles) -> `b` (batch, INNERMOST)**
+
+```cuda
+uint2 pk[ROWS]; float sc[ROWS];
+for (int r = 0; r < ROWS; ++r) { ... pk[r] = ...w...; sc[r] = ...; }   // weights 1x
+for (int b = 0; b < B; ++b) {
+    const XVec xv = load_x(x + (size_t)b * K, e0);                     // activations per b
+    ... acc[r][b] = fmaf(t, sc[r], ...) ...
+}
+```
+
+**The weights are read ONCE per (row, k-tile) -- correct. The activations are re-read inside
+the batch loop: 4352 row groups x 16 batch x 10 k-tiles = 696,320 `load_x` calls per GEMM.**
+
+**The kernel's own header already states the tradeoff:**
+> "With ROWS = 1 the x-vectors are re-read once per row, which at batch 16 is ~8x the weight
+> traffic and makes the kernel L2-bound."
+
+**And the register cost is what caps `ROWS`:** `acc[ROWS][BMAX]` = 64 floats plus
+`lo/hi[ROWS][8]`x2 = 64 floats, so **ROWS=4/BMAX=16 already holds ~128 floats per thread and
+ROWS=8 would need 256.** That is why round 127's `ROWS=2` at B=16 measured 12% worse.
+
+### This resolves the whole endpoint question
+
+**The batched GEMV is not weight-bandwidth-bound at all.** The weights still stream once
+(17.608 GB); the time goes to **L2-resident activation re-reads**. **That is why its
+"effective bandwidth", computed as weights/time, falls from 190 to 99.6 to 59 GB/s as batch
+grows -- the extra time is not being spent on weights, so dividing weights by time measures
+nothing about this kernel.** Every one of those three figures should be read as a *time*,
+not a bandwidth.
+
+**So the endpoint's prefill cost is an activation-reuse problem**, and the fix direction is
+more `ROWS` (register-capped at 4) or a different blocking -- **not more bandwidth, and not
+the GEMM.** The design is already at a deliberate, documented sweet spot, and the
+`ROWS` knob has been searched (rounds 104/127).
+
 ### Next step
 
 **A shape question about the GEMV's batch handling** (`kernels/gemv.cu`, `GB10_BATCH_MAX`,
