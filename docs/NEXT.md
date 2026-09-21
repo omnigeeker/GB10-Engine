@@ -267,11 +267,46 @@ Note the probe for `xtile` was the weakest of the four -- it disabled the load
 branch only, so a null result there is suggestive rather than conclusive, and it
 should be redone by skipping the whole function.
 
-A caution learned this round: the probes were scripted with a `cp` restore from a
-scratch copy that predated round 63, which silently reverted that change. Always
-restore probes with `git checkout`, and check `git status` after -- the
-`generate` gate caught it only because the restore was noticed before the
-commit.
+### The xtile probe redone, and a fix that did not work (round 65)
+
+The round-64 `xtile` probe was the weakest of the four -- it disabled only the
+load branch. Redone by skipping the whole function:
+
+| | t=1 forward |
+|---|---|
+| baseline | 271.46 ms |
+| all `stage_xtile` calls disabled | **200.52 ms** |
+
+So `stage_xtile` really does cost ~71 ms (26%), and since disabling the loads
+alone had shown nothing, the cost is in the **shared stores**.
+
+At `t=1` the block is partial (`T=1 < TT=32`), so 31 of every 32 columns take
+the `else` branch and write zeros -- and `gemm2d_store` guards every token with
+`if (t < T)`, so those columns are never read back. That looked like 71 ms of
+dead work, and removing it was implemented and measured:
+
+| t | with zero-fill | without | |
+|---|---|---|---|
+| 1 | 271.46 | 278.66 | +2.6% |
+| 4 | 273.77 | 280.75 | +2.6% |
+| 16 | 292.85 | 307.80 | **+5.1%** |
+
+`generate` and `chunked-prefill` both stayed correct, but it is **slower**, so it
+was reverted. The likely reason is divergence: with the zero-fill every thread
+runs the same store sequence, while removing it makes the `t < T` lanes skip out
+of the inner loop and splits the warp. The stores were dead, but they were also
+free -- they filled a branch that would otherwise have diverged.
+
+That is a useful negative result. It means `stage_xtile`'s 71 ms is not
+recoverable by deleting work; it needs the stores restructured so the tile is
+filled without per-lane branching, or the tile layout changed so that partial
+blocks do not need 32 columns at all.
+
+### A caution learned in round 64
+
+The probes were scripted with a `cp` restore from a scratch copy that predated
+round 63, which silently reverted that change. Always restore probes with
+`git checkout`, and check `git status` after.
 
 ### Two real bugs found on the way (round 58)
 
