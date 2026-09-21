@@ -1863,6 +1863,43 @@ actual weight tensor, from a trivial standalone kernel, also lands near 70 GB/s,
 is the memory system or the tensor's placement -- not this kernel.** That is a small,
 self-contained test and it is the right next step.
 
+## THE DECISIVE TEST, SPECIFIED (round 213)
+
+**Checked for a shortcut first: no `bandwidthTest`, no `torch`, and the CUDA toolkit ships only
+`bin2c`, `compute-sanitizer` and the debuggers -- nothing that measures bandwidth.** So the test
+needs a kernel, but it is a trivial one.
+
+### The kernel, in full
+
+```cuda
+__global__ void read_bw_kernel(const uint4* __restrict__ p, size_t n4, float* out) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    uint32_t acc = 0;
+    for (; i < n4; i += stride) { uint4 v = __ldg(p + i); acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+    if (acc == 0xDEADBEEF) out[blockIdx.x] = (float)acc;   // keeps the loads live
+}
+```
+
+**Host side:** allocate a 17.608 GB device buffer (or point at the real tensor), launch with
+~1024 blocks x 256 threads, time it, report GB/s. **A `forward-cost`-style subcommand or a tiny
+standalone binary -- a few dozen lines either way.**
+
+### How to read the result -- this is the whole point
+
+| outcome | conclusion |
+|---|---|
+| plain read also lands near **70 GB/s** | **the limit is the memory system or the tensor's placement, not the GEMM kernel** -- and the endpoint target needs a different machine or precision, not a different kernel |
+| plain read reaches **170-228 GB/s** | **the limit IS in the kernel**, and since seven in-kernel candidates are already excluded, the search moves to the interaction between the staging loop and the outer product -- the one thing never isolated |
+
+### Baselines, all at t=64
+
+| measurement | ms | rate |
+|---|---|---|
+| global weight read (probe) | **251.12** | 70.1 GB/s |
+| staging incl. shared store | **322.33** | 54.6 GB/s |
+| full kernel | **435.94** | 40.4 GB/s |
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
