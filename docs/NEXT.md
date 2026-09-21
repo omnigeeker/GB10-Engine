@@ -773,6 +773,38 @@ The measurement was already taken; a filter hid it.**
 **8 KB at B=4, 16 KB at B=8, 32 KB at B=16**, and it is re-read once per row group, so the
 live working set is `slab x resident blocks`. **The slab grows with B; L2 does not.**
 
+### DEFINITIVE (round 183): the weight stream is FINE -- the target is per-token work
+
+**`kernels/gemv.cu:360-364` states the design intent explicitly:**
+
+> "Weight traffic must be independent of batch size, so these variants loop over the batch
+> inside the block: **the weight tile is loaded once and applied to all B x-vectors.**"
+
+**And the curve confirms the design works. Decomposing `pre_ms` into a fixed weight cost plus
+per-token work:**
+
+| t | `pre_ms` | minus fixed | per-token |
+|---|---|---|---|
+| 1 | 103.64 | 0 | -- |
+| 2 | 133.66 | 30.02 | 30.0 (small-batch artefact) |
+| 4 | 142.60 | 38.96 | **9.7** |
+| 8 | 179.61 | 75.97 | **9.5** |
+| 16 | 312.23 | 208.59 | **13.0** |
+
+**Fixed weight cost: 17.608 GB in 103.64 ms = 170 GB/s = 75% of the 228 GB/s peak.**
+
+**So the weight stream is already good, and "56.4 GB/s" was never a bandwidth measurement at
+all: 312.23 ms = 103.6 ms of weight streaming + 208.6 ms of per-token work. Dividing 17.608 GB
+by the total measures nothing about the weight stream. That figure and the "falls from 132 to
+56 GB/s" framing are both withdrawn.**
+
+**The remaining target is unambiguous: the per-token term, ~9.5-9.7 ms/token at t<=8 rising
+to 13.0 at t=16. At 16 sequences that term alone is 208.6 of the 312.2 ms.**
+
+**And `#define GB10_BATCH_MAX 16` is a hard template bound**, so a `ROWS=8`/batch-tile-8
+variant needs an outer batch loop plus a second instantiation: **expressible, but not a
+one-line edit -- which is why it should not be started without room to build, gate, and A/B it.**
+
 ### The proposal that follows, and how it differs from the rejected one
 
 **Not shared-memory staging** (round 179: measured, rejected, and its ruled-out entry names
