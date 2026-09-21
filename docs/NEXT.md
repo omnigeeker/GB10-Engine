@@ -416,6 +416,40 @@ empty stream; `generate --n 16` stays 16/16.
 Paris.` (or that plus a separate reasoning field), and `generate --n 16` must stay 16/16
 -- the tokenizer path must not change, only the response assembly.
 
+## CORRECTION (round 169): identify the units before reasoning about the numbers
+
+`forward-cost` prints `t | step_ms | pre_ms | ratio | ms/row`
+(`crates/gb10-verify/src/main.rs:1030`). At t=8 that is **step 831.62 ms, pre 177.50 ms**.
+
+**I attributed 17.608 GB -- the weight traffic of one FULL forward over all 64 layers -- to
+`pre_ms`, and built a "the prefill is compute-bound, not weight-bound, because doubling
+rows costs 1.69x while the weights are constant" argument on it. That argument is void:
+the 17.6 GB belongs to `step_ms`, not to `pre_ms`.** The "9x disagreement" between the
+B/FMA model and the measured FLOPs was an artifact of the mis-attribution.
+
+**Nothing about the kernel was learned from it.** Recorded because this is the same error
+class as rounds 152 (a valid JSON shape read as a valid answer) and 155 (a stale README
+read as current): **a number that parses is not a number that means what you assumed.**
+
+**What does survive from rounds 168-169:**
+
+* **The K split is correct** -- 16/16 on three consecutive runs, `chunked-prefill --n 6`
+  OK -- **and it is not faster**: `pre_ms` 176.77 -> 176.07 at t=8 (neutral), and
+  **298.27 -> 307.81 at t=16 (+3.2%, worse)**. **Reverted; not in the tree.**
+* **The occupancy explanation is falsified.** The prefill GEMM genuinely runs at 47% with
+  the register budget (5.3 blocks/SM) and the grid (5.7) binding at once -- measured in
+  round 148 and still true -- **but doubling the block count to 544 bought nothing**,
+  because that kernel's printed `nsplit=2`/`nchunk=160` confirmed the split was live.
+  **That is the eleventh prefill mechanism eliminated.**
+
+**The open question is now simply stated and unanswered: the prefill GEMM is at 18% of the
+bandwidth roofline and a small fraction of the FMA roofline, and it is not short of
+blocks. What is it waiting on?** The next instrument should be a **`clock64()` accumulation
+inside the kernel** -- time spent in the staging vs the outer-product loop -- because every
+hypothesis tested so far was tested from outside the kernel, and the two inside-kernel
+facts established this session (`y.len()` = 16x, `gridDim.z` = 2) each settled a question
+in one run.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
