@@ -68,6 +68,41 @@ The remaining candidates are the FMA issue rate (16 FMAs per weight element per
 batch element is a lot of arithmetic per byte) and the accumulator register
 pressure that forces `ROWS = 4`.
 
+### Profiling the batch path, and a correction about batch sizes (round 103)
+
+`nsys` on `batch-parity`:
+
+| kernel | % | launches | avg |
+|---|---|---|---|
+| `nvfp4_gemv_kernel` | 36.2 | 23,940 | 271.3 us |
+| `fp8_gemv_kernel` | 25.0 | 25,792 | 173.4 us |
+| `nvfp4_gemv_batch_kernel` | 16.7 | 7,135 | **418.4 us** |
+| `fp8_gemv_batch_kernel` | 10.8 | 7,696 | **251.4 us** |
+| `nvfp4_gemm_kernel` | 2.8 | 384 | 1,319.5 us |
+
+**Correction: `batch-parity` runs 4 sequences, not 16.** It reports *"26.59 tok/s
+aggregate (4 seq x 6.6 tok/s each), 150.4 ms/step"*. The **40.75 tok/s** figure
+quoted earlier in this document for concurrency 16 came from a 16-sequence
+invocation, and the two must not be mixed -- they are different batch sizes with
+different per-step costs.
+
+Step cost against the 77 ms weight floor, which holds at every batch size:
+
+| batch | ms/step | vs floor |
+|---|---|---|
+| 4 | 150.4 | 2.0x |
+| 16 | 392 | 5.1x |
+
+**The gap grows with batch**, which rules out the weight stream (read once either
+way) and points at something that scales with the number of sequences. The compute
+bound at B=16 is only ~41 ms, so it is not raw FMA throughput either.
+
+**Next step: a dedicated sweep of the batch GEMV's time against B** (1, 2, 4, 8, 16)
+on one matrix, so the per-sequence and fixed components can be separated. The
+endpoint and `batch-parity` disagree about B, and that has been quietly confusing
+several rounds of reasoning -- fix the measurement before theorising about the
+cause.
+
 ## Final state of this session
 
 Everything below is measured, and every claim is backed by a gate or a number in

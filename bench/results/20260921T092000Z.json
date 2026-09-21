@@ -1,0 +1,11 @@
+{
+  "bandwidth_gbps": 199.2215413850187,
+  "bandwidth_utilisation_pct": 87.37786902851697,
+  "device": "NVIDIA GB10",
+  "kind": "stream",
+  "matrices": 401,
+  "per_token_bytes": 17555293764,
+  "projected_tok_s": 11.348231710799112,
+  "roofline_gbps": 228.0,
+  "seconds_per_token": 0.08811945556666667
+}
