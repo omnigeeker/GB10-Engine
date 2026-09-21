@@ -1,5 +1,48 @@
 # SESSION HANDOFF (read this first)
 
+## The remaining target, precisely (round 105)
+
+All gates green at `15a826e`: `generate` 16/16 (100%), `chunked-prefill` OK,
+`batch-parity` OK, `mtp-probe` OK, 0 build errors.
+
+**The engine already beats the concurrency target**: `batch-parity --n-seq 16`
+gives **47.78 tok/s aggregate**, against the 30 the objective asks for.
+
+**What falls short is the delivered endpoint**: 16 concurrent requests take
+14.74 s for 256 tokens = **17.37 tok/s**. Decomposed with `max_tokens` 1 vs 16:
+
+| part | time | its own bound | gap |
+|---|---|---|---|
+| prefill (16 serial `prefill_seq`) | **7.63 s** | 4.85 s (16 passes at 58 GB/s) | **1.57x** |
+| decode (16 steps) | 6.5 s | 1.9 s (16 passes at 148 GB/s) | 3.4x, but it matches the engine's own 335 ms/step |
+
+So the endpoint's shortfall is **prefill**, and prefill is the *same* GEMM that
+makes TTFT ~500 ms. **One number, two objectives.** Closing it takes the endpoint
+from 17.37 to ~30+, and TTFT from ~500 ms toward its own bound.
+
+**What is known about that prefill pass**: 58 tokens fits one 64-wide tile, so it
+is one weight pass = 303 ms at the 58 GB/s the GEMM achieves at t=1 -- but it
+measures ~477-500 ms, i.e. **35 GB/s**. It is not the weight stream and not raw
+FMA throughput (the whole model's prefill is only ~151 ms of MACs). Candidates
+left: the outer product's per-chunk barrier count at `KC`=32, and the 64-wide tile
+wasting 6 of 64 columns at T=58.
+
+**Ruled out by measurement, do not retry these:**
+
+* x re-reads in the batch GEMV (1.43 GB, 32x the weights) -- staging x in shared
+  was neutral, because 327 KB already lives in a 25 MB L2 (round 102);
+* local memory in the batch GEMV -- `ROWS` 4->2 removes half the stack frame and
+  is 12% *worse* at B=16 (round 104);
+* the weight stream, by the shape of the B sweep (round 104);
+* the GEMM's load pattern, dequant and shared stores (rounds 76-81);
+* one-row-per-warp loads in the GEMM -- impossible at TN=64, needs 65,536 B of
+  tile against a 49,152 B budget (round 85).
+
+**Three separate times this session a plausible mechanism was counted rather than
+measured and turned out to be wrong** (rounds 59, 101, 104). The rule that works
+is: change one variable, read an absolute per-launch number, and run the gate
+before believing the result.
+
 ## The batch decode's 3.3x gap is x re-reads, and the fix is quantified (round 101)
 
 `nvfp4_gemv_batch_tmpl` is 392 ms/step at B=16 against a 119 ms weight bound. The
