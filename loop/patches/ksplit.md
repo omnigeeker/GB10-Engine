@@ -433,3 +433,57 @@ sums into the same region.
 reasoning could not** -- `y.len()` vs `t * n` is one line and it is decisive. The
 correction in round 163 was right to say "one print, before any further design work",
 **and acting on it immediately was worth more than the design work it replaced.**
+
+
+---
+
+## Round 165: the diagnostic was not run -- the patch script failed twice
+
+**No diagnostic result exists.** Both attempts to build it failed **in the patch script,
+not in the code**, and both times the tree was restored and re-verified (0 errors,
+`generate` 16/16, `chunked-prefill` OK, `git status` empty).
+
+| attempt | failure | consequence |
+|---|---|---|
+| 1 | asserted on a plain store line | **the committed kernel has the CONDITIONAL store** from round 160, not the plain one. The script writes at the end, so **nothing was written** -- the 16/16 it printed was the **unchanged baseline**, not a diagnostic. |
+| 2 | stale anchor in `gemm.cu` | a comment sits between `const int nchunk` and `stage_wtile`, so the kernel edit did not apply while `ops.rs` did -- **leaving the tree in the known-failing `nsplit = 2` state.** Reverted with `git checkout`. |
+
+**This is the third and fourth patch-script failure of the session** (after the `/1e6`
+format bug and the unclosed paren in a heredoc). **All four failed safe, but the pattern
+is consistent and it is now the main risk to this task: a python heredoc doing
+multi-anchor string surgery on a 400-line CUDA kernel is the wrong tool for this edit.
+Stop using it here.**
+
+### How to actually run this diagnostic
+
+It needs exactly **two** edits, and the kernel one is three adjacent lines whose current
+text is known:
+
+* **`ops.rs`** -- force `nsplit = 2` and keep the region-scoped memset. **The scripted
+  edit for this file has applied cleanly every time**, so it is safe to script.
+* **`kernels/gemm.cu:388-391`** -- currently
+  ```cuda
+  const int kc_half = (nchunk + nsplit - 1) / nsplit;
+  const int kc0 = blockIdx.z * kc_half;
+  const int kc1 = min(kc0 + kc_half, nchunk);
+  ```
+  replace with the diagnostic values:
+  ```cuda
+  const int kc0 = 0;
+  const int kc1 = (blockIdx.z == 0) ? nchunk : 0;
+  ```
+  **Do this with the `edit` tool against those exact lines, not a heredoc.**
+
+**The store line needs no change for this diagnostic.** The committed kernel already has
+`if (blockIdx.z == 0) store else atomicAdd`, so with block 1 taking an empty range its
+`atomicAdd(0)` is harmless and block 0's plain store is correct. **That is also why
+attempt 1's assertion was wrong: it assumed code that had already been superseded.**
+
+### Interpretation, once it runs
+
+* **gate passes** -> the `grid.z=2` launch, the scoped memset and the `atomicAdd` store
+  are all sound, and **the bug is purely in `kc0`/`kc1`** -- look at the parity next.
+* **gate fails** -> one of those three is wrong, and the range arithmetic is not the
+  place to look.
+
+**Do not take a TTFT measurement before this returns green.**
