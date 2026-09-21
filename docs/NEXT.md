@@ -197,6 +197,47 @@ scale lookup and multiply, and 16 FMAs. **That is the 30%, and it is the first
 explanation this session that is supported by a controlled comparison rather than
 by arithmetic on a resource.**
 
+#### ...but that explanation does not survive first-order arithmetic (same round)
+
+Checked before handing it forward, because it is the kind of claim that has failed
+nine times already:
+
+| | value | capacity | used |
+|---|---|---|---|
+| bytes/cycle/SM at 190 GB/s | 2.33 | -- | -- |
+| ALU, ~33 ops per 8 B | **9.6 ops/cycle/SM** | ~128 FMA/cycle | **7.5%** |
+| issue, ~38 instr per 256 B | **28.2 Ginstr/s** | 326 Ginstr/s | **8.6%** |
+
+**The kernel is below 10% of both ALU and issue capacity and still reaches only 70%
+of its own pattern's bandwidth.** So the per-element work is *not* the 30% either,
+and round 129's explanation is falsified by the same class of arithmetic that
+falsified the eight before it.
+
+**What is left is a latency/concurrency problem**, which round 126 "ruled out" by
+counting 768 KB in flight against 78 KB needed -- but that count assumed 8 bytes in
+flight per thread and ~350 ns latency, i.e. it counted *bytes issued*, not *loads
+outstanding per warp*. **With `ROWS`=1 the body has exactly one weight load per
+k-tile, and the probe has the same structure and reaches 271.5 GB/s**, so the
+difference is not the count of weight loads either. That contradiction is unresolved
+and is the honest state of this investigation.
+
+#### The move that actually resolves it: bisect the probe, not the kernel
+
+`ncu` is unavailable (`ERR_NVGPUCTRPERM`, no sudo), so hardware counters cannot
+answer it. **But `bench/hw/gemv_bw.cu` can: add the kernel's work to the probe one
+piece at a time and watch 271.5 GB/s fall.**
+
+1. probe as-is -> **271.5 GB/s** (measured)
+2. probe + NVFP4 unpack of the loaded bytes (no scale, no FMA)
+3. + the scale lookup and multiply
+4. + the 16 FMAs
+5. + the x loads (`load_x`, four `__ldg` float4)
+
+**Whichever step drops the bandwidth is the answer, and it is a five-line change per
+step in a file that cannot break the engine.** That is the same ablation logic that
+located the tile shape on the prefill GEMM, applied to the one measurement that has
+been decisive so far this session.
+
 **Round 127's `ROWS`=2 failed because it kept every one of those per-element
 operations and only changed how many rows shared a loop.** The lever is to reduce
 the *per-element* work, or to process more rows per thread so that the x loads and
