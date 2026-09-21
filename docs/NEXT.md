@@ -302,6 +302,30 @@ recoverable by deleting work; it needs the stores restructured so the tile is
 filled without per-lane branching, or the tile layout changed so that partial
 blocks do not need 32 columns at all.
 
+### Where the widening stops paying (round 66)
+
+The widening from 8 to 16 elements per thread paid (round 62, -8%). Carrying it to
+32 does not:
+
+| elements/thread | loads in flight | t=1 | t=16 |
+|---|---|---|---|
+| 8 | P=4 x 4 B = 16 B | 312.27 | 341.81 |
+| **16** | **P=2 x 8 B = 16 B** | **271.46** | **292.85** |
+| 32 | P=1 x 16 B = 16 B | 276.11 | 301.65 |
+
+All three configurations put the same 16 bytes in flight per thread, so the
+bytes-in-flight is not what separates them. What changes is the *number of
+independent loads*: 4, then 2, then 1. Going 8 -> 16 helped because it halved the
+instruction count without reducing the load count below 2; going 16 -> 32 crosses
+that line and buys instruction count at the cost of memory-level parallelism.
+
+So **16 elements per thread with P=2 is the optimum for this geometry**, and the
+way to get more is not wider loads but a larger `P` at 16 elements -- i.e. fewer
+threads covering the same tile, so each has more independent loads outstanding.
+`GB10_GEMM_BLOCK` is 128 with `UNITS = TN*KC/16 = 256`, giving P=2; a block of 64
+would give P=4 while keeping the 8-byte load. That is the concrete next
+experiment, and it is cheap.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
