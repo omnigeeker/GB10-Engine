@@ -56,7 +56,25 @@ difference -- stddev 302 us against a 234.6 us median, with a **maximum of
 4,858 us, 20x the median**. There are 6,190 launches in the profile and the tail is
 expensive enough to move the mean by 12 percentage points of bandwidth.
 
-**That tail is the new, unexamined thing.** Rounds 102-111 spent six rounds testing
+**Correction (round 125): the tail is not a pathology, it is `lm_head`.** The
+launches over 3x the median are **118 of 6,190 = 1.91%**, but they carry **253.6 ms
+= 15% of all `nvfp4_gemv_kernel` time**. Their positions (3243, 4145, 4348, 4560,
+6361, ...) are scattered, so it is **not** L2-cold first touches. Their durations --
+3230, 1361, 1477, 4288, 3206, 1549, 1302, 3220 us -- are what settles it:
+
+* `lm_head` is **248,320 x 5,120 NVFP4 = 636 MB**, 14x a normal MLP matrix's 44.6 MB.
+  At the median's 190 GB/s that is **3,347 us**, which is the ~3.2 ms cluster.
+* The ~1.3-1.5 ms launches are proportionally-sized other matrices.
+
+**So the slow launches are running at the same bandwidth as the fast ones -- they
+are just bigger.** There is no tail to fix. The mean of 274 us is simply the
+weighted average of 44.6 MB and 636 MB matrices, and I mis-read it as variance.
+
+**The real number is that the streaming GEMV runs at ~190 GB/s = 83% of the measured
+228 GB/s peak, consistently, across 6,190 launches.** That gives 17.608 GB / 190 GB/s
+= **92.7 ms/step** against the measured 104.2, and T1 at 220 GB/s would be
+**80.0 ms**. **So T1 is +15.8% of bandwidth efficiency on a kernel that is already
+consistent -- not a bug hunt, an efficiency question.** Rounds 102-111 spent six rounds testing
 mechanisms on the *prefill* GEMM; the single-stream GEMV has never been decomposed
 before this round, and the first decomposition says the win is not in the typical
 launch but in the outliers. **Find out what the slow launches have in common before
