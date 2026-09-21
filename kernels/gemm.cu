@@ -37,11 +37,11 @@
 using namespace gb10;
 
 #define GB10_TN 64    // rows of N per block
-#define GB10_TT 64    // prompt tokens per block
-#define GB10_KC 32    // k values per chunk
+#define GB10_TT 32    // prompt tokens per block
+#define GB10_KC 64    // k values per chunk
 #define GB10_TM 4     // rows of N owned by one thread
 #define GB10_TNREG 4  // tokens owned by one thread
-#define GB10_GEMM_BLOCK 256
+#define GB10_GEMM_BLOCK 128
 
 // Padded strides. The pad must keep each row 16-byte aligned (a multiple of 4
 // floats) so the inner loop can read a whole 4-wide sub-tile with one LDS.128
@@ -57,25 +57,22 @@ __device__ __forceinline__ void stage_wtile(uint16_t (*wt)[GB10_WSTRIDE],
                                             const uint8_t* __restrict__ sc,
                                             const float* __restrict__ s2, int K, int nbase,
                                             int N, int c) {
-    static_assert(GB10_TN == 64 && GB10_KC == 32, "staging map assumes 64x32");
-    (void)s2;  // folded into the accumulator at store time
-    // One thread per (row, 8-wide k segment). The naive element-at-a-time loop
-    // issues one scale load per element, i.e. 16 redundant loads per group
-    // byte -- that is 713 MB of staging traffic for a 44.6 MB matrix. Loading
-    // the packed byte as a uint32 and the scale once per segment makes it 2
-    // loads for 8 elements instead of 16.
-    const int nl = threadIdx.x >> 2;
-    const int seg = threadIdx.x & 3;
-    const int n = nbase + nl;
-    if (n < N) {
-        const int kbase = c * KC + seg * 8;
-        const uint32_t packed =
-            *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
-        const float s = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
+    constexpr int SEGS = KC / 8;
+    (void)s2;
+    for (int u = threadIdx.x; u < GB10_TN * SEGS; u += GB10_GEMM_BLOCK) {
+        const int nl = u / SEGS, seg = u % SEGS;
+        const int n = nbase + nl;
+        if (n < N) {
+            const int kbase = c * KC + seg * 8;
+            const uint32_t packed =
+                *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
+            const float s = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const uint8_t nib = (uint8_t)((packed >> (4 * j)) & 0xF);
-            wt[seg * 8 + j][nl] = __bfloat16_as_ushort(__float2bfloat16_rn(e2m1_to_float(nib) * s));
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t nib = (uint8_t)((packed >> (4 * j)) & 0xF);
+                wt[seg * 8 + j][nl] =
+                    __bfloat16_as_ushort(__float2bfloat16_rn(e2m1_to_float(nib) * s));
+            }
         }
     }
 }
@@ -85,34 +82,32 @@ __device__ __forceinline__ void stage_wtile_fp8(uint16_t (*wt)[GB10_WSTRIDE],
                                                 const uint8_t* __restrict__ w,
                                                 const float* __restrict__ s1, int K, int nbase,
                                                 int N, int c) {
-    static_assert(GB10_TN == 64 && GB10_KC == 32, "staging map assumes 64x32");
-    // Same map as the NVFP4 path: one thread per (row, 8-wide k segment),
-    // reading two uint32 instead of eight bytes. FP8 has no group scales, so
-    // the per-tensor scale is hoisted out entirely.
-    const int nl = threadIdx.x >> 2;
-    const int seg = threadIdx.x & 3;
-    const int n = nbase + nl;
-    if (n < N) {
-        const int kbase = c * KC + seg * 8;
-        const uint2 pk = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
-        const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
-        const float wscale = __ldg(s1);
+    constexpr int SEGS = KC / 8;
+    for (int u = threadIdx.x; u < GB10_TN * SEGS; u += GB10_GEMM_BLOCK) {
+        const int nl = u / SEGS, seg = u % SEGS;
+        const int n = nbase + nl;
+        if (n < N) {
+            const int kbase = c * KC + seg * 8;
+            const uint2 pk = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
+            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
+            const float wscale = __ldg(s1);
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-            wt[seg * 8 + j][nl] =
-                __bfloat16_as_ushort(__float2bfloat16_rn(e4m3_to_float(pb[j]) * wscale));
+            for (int j = 0; j < 8; ++j)
+                wt[seg * 8 + j][nl] =
+                    __bfloat16_as_ushort(__float2bfloat16_rn(e4m3_to_float(pb[j]) * wscale));
+        }
     }
 }
 
 template <int KC>
-__device__ __forceinline__ void stage_wtile_bf16(float (*wt)[GB10_WSTRIDE],
+__device__ __forceinline__ void stage_wtile_bf16(uint16_t (*wt)[GB10_WSTRIDE],
                                                  const uint16_t* __restrict__ w, int K, int nbase,
                                                  int N, int c) {
-    for (int idx = threadIdx.x; idx < GB10_TN * KC; idx += GB10_GEMM_BLOCK) {
-        const int nl = idx / KC, kl = idx % KC;
+    for (int u = threadIdx.x; u < GB10_TN * GB10_KC; u += GB10_GEMM_BLOCK) {
+        const int nl = u / GB10_KC, kl = u % GB10_KC;
         const int n = nbase + nl;
-        float v = 0.0f;
-        if (n < N) v = bf16_to_float(__ldg(w + (size_t)n * K + c * KC + kl));
+        uint16_t v = 0;
+        if (n < N) v = __ldg(w + (size_t)n * K + c * GB10_KC + kl);
         wt[kl][nl] = v;
     }
 }
@@ -128,25 +123,26 @@ template <int KC>
 __device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
                                             const float* __restrict__ x, int K, int T, int t0,
                                             int c) {
-    static_assert(GB10_TT == 64 && GB10_KC == 32, "staging map assumes 64x32");
-    const int tl = threadIdx.x >> 2;
-    const int seg = threadIdx.x & 3;
-    const int t = t0 + tl;
-    const int kbase = c * KC + seg * 8;
-    if (t < T) {
-        const float4 a = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase);
-        const float4 b = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase + 4);
-        xt[seg * 8 + 0][tl] = a.x;
-        xt[seg * 8 + 1][tl] = a.y;
-        xt[seg * 8 + 2][tl] = a.z;
-        xt[seg * 8 + 3][tl] = a.w;
-        xt[seg * 8 + 4][tl] = b.x;
-        xt[seg * 8 + 5][tl] = b.y;
-        xt[seg * 8 + 6][tl] = b.z;
-        xt[seg * 8 + 7][tl] = b.w;
-    } else {
+    constexpr int SEGS = KC / 8;
+    for (int u = threadIdx.x; u < GB10_TT * SEGS; u += GB10_GEMM_BLOCK) {
+        const int tl = u / SEGS, seg = u % SEGS;
+        const int t = t0 + tl;
+        const int kbase = c * KC + seg * 8;
+        if (t < T) {
+            const float4 a = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase);
+            const float4 b = *reinterpret_cast<const float4*>(x + (size_t)t * K + kbase + 4);
+            xt[seg * 8 + 0][tl] = a.x;
+            xt[seg * 8 + 1][tl] = a.y;
+            xt[seg * 8 + 2][tl] = a.z;
+            xt[seg * 8 + 3][tl] = a.w;
+            xt[seg * 8 + 4][tl] = b.x;
+            xt[seg * 8 + 5][tl] = b.y;
+            xt[seg * 8 + 6][tl] = b.z;
+            xt[seg * 8 + 7][tl] = b.w;
+        } else {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) xt[seg * 8 + j][tl] = 0.0f;
+            for (int j = 0; j < 8; ++j) xt[seg * 8 + j][tl] = 0.0f;
+        }
     }
 }
 
@@ -248,8 +244,8 @@ __device__ __forceinline__ void gemm2d_begin(float (&acc)[GB10_TM][GB10_TNREG]) 
 }
 
 __device__ __forceinline__ void gemm2d_ids(int& ty, int& tx) {
-    ty = threadIdx.x >> 4;  // 16 groups of 4 rows = 64
-    tx = threadIdx.x & 15;  // 16 groups of 4 tokens = 64
+    ty = threadIdx.x >> 3;  // 16 groups of 4 rows = 64
+    tx = threadIdx.x & 7;   // 8 groups of 4 tokens = 32
 }
 
 template <int DUMMY>
@@ -331,7 +327,7 @@ __device__ __forceinline__ void bf16_gemm_body(const uint16_t* __restrict__ w,
                                                float* __restrict__ y, int N, int K, int T) {
     // Double buffered: staging chunk c+1 while computing chunk c hides the
     // staging load latency, which is what this kernel is actually bound by.
-    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    __shared__ uint16_t wt[2][GB10_KC][GB10_WSTRIDE];
     __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
@@ -352,7 +348,7 @@ __device__ __forceinline__ void bf16_gemm_body(const uint16_t* __restrict__ w,
             stage_wtile_bf16<GB10_KC>(wt[nxt], w, K, nbase, N, c + 1);
             stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
         }
-        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
+        gemm2d_outer_bf16(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 

@@ -62,7 +62,49 @@ to 3 blocks/SM and gained nothing), which further isolates the cause to the
 per-chunk load latency that `GB10_KC = 32` produces. It also leaves the fp8
 kernel in the shape step 2 needs.
 
-### Step 2 attempted and reverted (round 57)
+### Step 2 landed -- and refuted its own hypothesis (round 58)
+
+KC=64 is in, correct, and verified: `generate` **16/16 exact**,
+`chunked-prefill` agrees. All three GEMMs now stage 35840 B of tile, twice the
+bytes in flight per chunk that KC=32 gave.
+
+**It changed almost nothing.**
+
+| t | KC=32 | KC=64 |
+|---|---|---|
+| 1 | 386.13 | 377.31 |
+| 2 | 384.85 | 378.68 |
+| 4 | 389.01 | 379.00 |
+| 8 | 396.70 | 389.52 |
+| 16 | 404.59 | 401.48 |
+
+~2%, when the hypothesis predicted a move from 41 GB/s toward 100+. So
+**"too few bytes per thread per chunk" is not the cause either.** That is the
+third explanation eliminated, after occupancy (round 56: fp8 2 -> 3 blocks/SM
+changed nothing) and tile size (round 53).
+
+What survives is that the cost is *fixed per launch* and insensitive to tile
+geometry, occupancy and bytes-in-flight. 192 nvfp4 GEMM launches per forward at
+~1.21 ms each is where the time is, and nothing about the tile changes it. The
+next thing to measure is therefore **a single launch in isolation** -- one
+`nvfp4_gemm_kernel` call with N=17408, K=5120, t=1, timed and byte-counted on
+its own -- to find out whether 1.21 ms is the kernel or the 192-launch cadence.
+
+### Two real bugs found on the way (round 58)
+
+Worth keeping because both produced misleading failures:
+
+1. **The `ops.rs` launch sites.** The GEMMs use a one-line
+   `LaunchConfig { ... block_dim: (256,1,1) ... }`, which is *not* the
+   `block_dim: (block_for(n, 256), 1, 1)` form used by the rmsnorm kernels. A
+   blanket replace of the latter hit five rmsnorm sites and left the three real
+   GEMM sites at 256 -- so the kernels declared `__launch_bounds__(128)` and were
+   launched with 256, giving `CUDA_ERROR_INVALID_VALUE` on every call.
+2. **`GB10_TILE_T` in `ops.rs` must match `GB10_TT` in `gemm.cu`** (the comment
+   says so). Leaving it at 64 while the kernel tile became 32 halved the grid's
+   `y` extent and silently produced wrong tokens rather than an error.
+
+### The earlier, reverted attempt (round 57)
 
 The KC=64 rework was applied in full and **reverted**. Recording it so the next
 attempt starts from the failure rather than from scratch.
