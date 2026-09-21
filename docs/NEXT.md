@@ -33,6 +33,37 @@ majority of both TTFT and the endpoint's 16-concurrent time.
 
 Remaining gap to the objective's 30 tok/s at 16 concurrent: 17.0 measured.
 
+### KC=64 at TT=64 is reachable but slower (round 97)
+
+The padding was removed from both tiles so that TT=64 with `KC`=64 fits exactly at
+the 49,152 B budget:
+
+| | shared | TTFT |
+|---|---|---|
+| TT=64, `KC`=32, padded (68) | 26,112 B | **518.2 ms** |
+| TT=64, `KC`=64, unpadded (64) | **49,152 B** | 537.7 ms |
+
+Correct (`generate` 16/16) but **3.8% slower**. So the padding is worth more than
+halving the chunk count and its barriers, and **`KC`=64 at TT=64 is not reachable
+with padding at all** -- the next step up is over budget in every combination:
+
+```
+xt[2][64][68] + wt[2][64][64] = 51,200 B
+xt[2][64][64] + wt[2][64][68] = 50,176 B
+xt[2][64][66] + wt[2][64][64] = 50,176 B
+```
+
+Reverted; **TT=64 with `KC`=32 and padding stays the best configuration found** at
+TTFT 518.2 ms and 17.0 tok/s at 16 concurrent.
+
+**So the prefill gain is capped here unless `xt` stops being f32.** Making `xt`
+bf16 would free 17,408 B, which is exactly what `KC`=64 with padding needs
+(34,816 + 17,408 = 52,224 - 17,408 = 34,816). That is the one remaining lever, and
+it trades activation precision for roughly 2x on prefill -- the majority of both
+TTFT and the endpoint's concurrency time. It should be tried with the generate
+gate as the arbiter, since bf16 activations may or may not survive the oracle
+comparison.
+
 ## THE DELIVERED ENDPOINT DOES NOT SERVE CONCURRENT REQUESTS (round 91)
 
 This is an objective-level gap and it outranks TTFT. The objective asks for
