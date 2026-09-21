@@ -94,3 +94,51 @@ The remaining work is the four edits and the gate.
 * If TTFT does not move, the occupancy hypothesis is wrong for this kernel and the
   result should be recorded as such -- **it would be the tenth mechanism eliminated on
   the prefill side, and `docs/NEXT.md` wants that recorded, not quietly dropped.**
+
+---
+
+## TWO CORRECTIONS FOUND BY READING THE LOOP (round 151)
+
+An implementation attempt failed on a Python syntax error **before any write** --
+`git status --short` was empty and `kernels/gemm.cu` was byte-identical to its backup.
+But reading the loop first turned up two things this spec did not have, and **both
+would have produced a kernel that runs and reports a fast number with wrong output.**
+
+### 1. The chunk loop is software-pipelined, and the parity breaks with `kc0 > 0`
+
+```cuda
+stage_wtile<GB10_KC>(wt[1], w, sc, s2, K, nbase, N, 0);   // prologue, hardcoded 0
+stage_xtile<GB10_KC>(xt[1], x, K, T, t0, 0);
+__syncthreads();
+for (int c = 0; c < nchunk; ++c) {
+    const int cur = (c ^ 1) & 1, nxt = c & 1;             // double-buffer parity
+    if (c + 1 < nchunk) { stage_*(... c + 1); }
+```
+
+**`cur = (c ^ 1) & 1` is only correct because `c` starts at 0.** With `kc0 > 0` the
+parity must be relative to the block's own start:
+
+```cuda
+const int rel = c - kc0;
+const int cur = (rel ^ 1) & 1, nxt = rel & 1;
+```
+
+and the prologue must stage `kc0`, not `0`. **Getting this wrong swaps the weight and
+activation tiles -- it does not crash, and the numbers stay plausible.** This is the
+single most dangerous part of the change and it was missing from the edit list above.
+
+### 2. The store is not only at line 311
+
+`gemm2d_store_scaled` holds the NVFP4 store, but the fp8 and bf16 bodies each have
+their own store, and the kernel is instantiated per dtype. **Any `atomicAdd`
+conversion has to be applied to every store site, or the split corrupts only the dtypes
+that were missed** -- which would show up as a partial correctness failure rather than a
+clean one.
+
+### Consequence for acceptance
+
+The gate is not optional here and `>= 3` runs is not enough by itself: **the parity bug
+yields plausible numbers**, so the only trustworthy signal is `generate --n 16` at
+16/16 plus `chunked-prefill --n 6` OK. **If a future round sees a *speedup* on the first
+run, check the gate before believing it** -- rounds 88, 110 and 119 each reported a
+faster kernel that was simply wrong.
