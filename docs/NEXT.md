@@ -74,7 +74,38 @@ weighted average of 44.6 MB and 636 MB matrices, and I mis-read it as variance.
 228 GB/s peak, consistently, across 6,190 launches.** That gives 17.608 GB / 190 GB/s
 = **92.7 ms/step** against the measured 104.2, and T1 at 220 GB/s would be
 **80.0 ms**. **So T1 is +15.8% of bandwidth efficiency on a kernel that is already
-consistent -- not a bug hunt, an efficiency question.** Rounds 102-111 spent six rounds testing
+consistent -- not a bug hunt, an efficiency question.**
+
+### Bytes-in-flight is not the limit either (round 126)
+
+Round 125 proposed checking outstanding loads. Done:
+
+| | |
+|---|---|
+| kernel | `nvfp4_gemv_kernel` -> `nvfp4_gemv_tmpl<1>` |
+| ROWS | **1** -- one 8-byte `uint2` weight load in flight per thread |
+| registers | **39**, 0 spills |
+| occupancy | register count is far below the limit, so 2048 threads/SM = 64 warps |
+
+Bytes in flight: 64 warps x 32 lanes x 8 B = **16 KB per SM**, 786 KB across 48 SMs.
+At 228 GB/s and a ~350 ns DRAM latency you need ~80 KB. **So there is ~10x more in
+flight than required, and latency is not what is costing the 17%.** The 39-register
+count also confirms occupancy was never the issue on this kernel.
+
+**The remaining structural suspect, and it is the round-101 one seen from a new
+angle:** with `ROWS`=1 the x-vector is re-read once per row, so per matrix the x
+traffic is `N/ROWS = 17,408` passes over the same 5,120 floats -- roughly 348 MB
+against the 44.6 MB of weights, **7.8x the weight traffic**. Round 102 measured
+staging x in shared as **neutral**, which rules out L2->SM bandwidth as the limit,
+but it does not rule out the *instruction slots* those 64 B x-loads consume: per
+k-tile each thread issues one 8 B weight load and four 16 B x-loads, so **x-loads
+are 4 of every 5 loads in the inner loop.**
+
+**That is the thing to look at next**: not bandwidth, not latency, not occupancy --
+the *load instruction mix*. `ROWS`=2 would halve the x-load count per unit of
+weight, and round 104 already measured its cost at B=16 (12% worse) but never
+measured it at **B=1**, which is the case T1 is about. **At B=1 there is no batch
+to amortise x across, so `ROWS` matters more, not less.** Rounds 102-111 spent six rounds testing
 mechanisms on the *prefill* GEMM; the single-stream GEMV has never been decomposed
 before this round, and the first decomposition says the win is not in the typical
 launch but in the outliers. **Find out what the slow launches have in common before
