@@ -2574,6 +2574,29 @@ generated and then built three rounds of reasoning on.
 the real kernel's 190 GB/s. That gap is **1.43x**, far outside the noise, and it is the
 one number driving this investigation that survives repetition.
 
+### The re-measurement vindicates round 132 (round 136)
+
+Three runs per build, same harness, the discipline round 135's rule requires:
+
+| build | runs | mean | spread |
+|---|---|---|---|
+| plain per-lane byte load (pre-132) | 105.18 / 105.87 / 105.85 | **105.63 ms** | 0.7% |
+| **wide `uint32` + `__shfl_sync` (round 132)** | 103.29 / 103.03 / 104.11 | **103.48 ms** | 1.0% |
+
+**-2.0%, and the two ranges do not overlap** (105.18-105.87 against 103.03-104.11).
+**The widening is a real gain, and it is now established rather than assumed.**
+Restored -- it is the better build on evidence.
+
+**The harness itself is far better than the ablation:** `forward-cost` t=1 repeats to
+**~1%**, against the probe/ablation's **~7-8%**. That is why round 132's single reading
+of 100.79 was misleading -- it happened to land 2.7% below the same build's own mean
+of 103.48 -- and it is why round 135's rule matters more for the ablation than for
+this harness: **`forward-cost` can resolve a 2% effect in 3 runs; the ablation cannot.**
+
+Round 134's shared-memory rejection is consistent with this: a +2.5% regression is
+outside the 1% harness noise, so that rejection stands on its own measurement, which
+the round-135 rule had left open.
+
 ## Shared-memory hoist: tested and rejected -- and it re-reads the ablation (round 134)
 
 Implemented exactly as designed below (nvfp4 template only, `use_smem` guard, static
