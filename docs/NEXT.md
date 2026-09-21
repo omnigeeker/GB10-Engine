@@ -1776,6 +1776,54 @@ and the barrier structure.
 directly into the accumulator.** That isolates the global load from the shared path -- **the one
 ablation shape not yet tried, and the only one that can separate candidates 6 and 7.**
 
+## THE GLOBAL READ ITSELF IS THE BOTTLENECK (round 211)
+
+**Method: bypassed the shared `wt` store entirely (`stage_wtile` commented out) and made the probe
+read the weights DIRECTLY FROM GLOBAL MEMORY, keeping the `xt` read.** `w`, `K`, `nbase` and `c`
+are all in scope at the outer-product site, **so this needed no signature change** -- contrary to
+what round 210 assumed.
+
+| | t=32 | t=64 |
+|---|---|---|
+| **global read only (no shared store, no FMA)** | **208.50** [207.75-209.10] | **251.12** [247.35-253.33] |
+| with shared store (round 203) | 279.62 | 322.33 |
+| **saving from dropping the shared store** | **-25.4%** | **-22.1%** |
+
+### The corrected three-way decomposition at t=64
+
+| phase | ms | share | rate |
+|---|---|---|---|
+| **global weight read** | **251.12** | **58%** | **70.1 GB/s = 30.8% of peak** |
+| shared store + barrier | **71.21** | **16%** | -- |
+| outer product | **113.61** | **26%** | -- |
+| total | 435.94 | | 40.4 GB/s |
+
+**Both new facts matter.** The shared-store path costs a real **16%** and had never been isolated.
+**But the dominant term is the global read itself: 58% of the time, at 30.8% of peak, with no
+shared store and no FMA in the loop.**
+
+### And that closes the space
+
+**The global read is not limited by:**
+
+| candidate | excluded by |
+|---|---|
+| memory-level parallelism | round 206 (+/-0.5% for a 2nd in-flight load) |
+| coalescing | round 208 (24.0% -> 27.5% only) |
+| instruction count | round 210 (0.17 ms) |
+| address arithmetic | round 210 (7.64 ms) |
+| in-flight bytes | round 210 (160 KB vs 156 KB needed) |
+
+**What remains is the DRAM access pattern across blocks.** The 80 n-blocks each stream a 64-row
+strip, **and consecutive rows are `K/2 = 2560` bytes apart -- so each block's stream strides by
+2560 B. That is a row-buffer locality problem, and it is the first candidate to survive every
+exclusion.**
+
+**This is also the one mechanism a transposed `[k][row]` layout would genuinely fix**: in that
+layout a block's 64 rows are contiguous within each k, so the stride disappears. **Round 208
+tested coalescing WITHIN a warp and found only 13%; it did not test the stride ACROSS rows, which
+is what this round identifies.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches

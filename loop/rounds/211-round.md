@@ -1,0 +1,58 @@
+# Round 211 — 20260921T201610Z
+
+## Gates
+
+| gate | result |
+|---|---|
+| build | pass |
+| test | pass |
+| correctness (layers) | pass |
+| correctness (64-layer) | pass |
+| benchmark | pass |
+
+**status: PASS**
+
+## Log
+
+```
+  seq  2 (prompt   13 tok): match
+  seq  3 (prompt   17 tok): match
+  seq  4 (prompt   21 tok): match
+  seq  5 (prompt   25 tok): match
+  seq  6 (prompt   29 tok): match
+  seq  7 (prompt   33 tok): match
+  seq  8 (prompt   37 tok): match
+  seq  9 (prompt   41 tok): match
+  seq 10 (prompt   45 tok): match
+  seq 11 (prompt   49 tok): match
+  seq 12 (prompt   53 tok): match
+  seq 13 (prompt   57 tok): match
+  seq 14 (prompt   61 tok): match
+  seq 15 (prompt   65 tok): match
+batch parity: 16/16 sequences exact over 16 tokens
+
+batch-parity: OK
+[round 211] batch-parity OK
+[round 211] gb10-bench
+== decode-path weight streaming ==
+
+device: NVIDIA GB10
+uploaded 401 matrices, 17.56 GB in 43.9s
+interleave: false
+  iter  0: 86.66 ms  202.6 GB/s
+  iter  5: 88.56 ms  198.2 GB/s
+  iter 10: 87.10 ms  201.6 GB/s
+  iter 15: 87.73 ms  200.1 GB/s
+  iter 20: 86.99 ms  201.8 GB/s
+  iter 25: 86.48 ms  203.0 GB/s
+  iter 29: 87.07 ms  201.6 GB/s
+
+per-token weight traffic : 17.555 GB
+time per token           : 86.82 ms
+achieved bandwidth       : 202.2 GB/s
+projected decode         : 11.52 tok/s (single stream)
+roofline at 228 GB/s    : 12.99 tok/s
+bandwidth utilisation    : 88.7% of measured 228 GB/s
+wrote /home/wayne/dsh/QWen3.8-27B-GB10/bench/results/20260921T201610Z.json
+[round 211] bench OK -> /home/wayne/dsh/QWen3.8-27B-GB10/bench/results/20260921T201610Z.json
+```
