@@ -1741,6 +1741,41 @@ response. With `max_tokens=300` the same request returns `'391'`.
 **The behaviour is: hold the reasoning until the answer starts; if the budget runs out first,
 emit what there is rather than nothing.**
 
+## FIVE CANDIDATES EXCLUDED, CAUSE UNIDENTIFIED (round 210)
+
+**Three more excluded by arithmetic this round, with no build spent:**
+
+| candidate | arithmetic | verdict |
+|---|---|---|
+| **address arithmetic** (`(size_t)n*(K>>1)` per 8 B load) | 2.201e9 multiplies at ~288 G/s = **7.64 ms** | negligible vs 322 ms |
+| **instruction bound** (~15 instr per k-tile x 160 k-tiles) | 49.2 M instructions at 288 G/s = **0.17 ms** | negligible |
+| **in-flight bytes** (grid `(80,1,2)` = 160 blocks x 128 threads x 8 B) | **160 KB in flight vs 156 KB** needed by Little's law | sufficient |
+
+**The full excluded list:**
+
+| # | candidate | how excluded |
+|---|---|---|
+| 1 | memory-level parallelism | **measured** (round 206: +/-0.5% for a 2nd in-flight load) |
+| 2 | coalescing / layout | **measured** (round 208: 24.0% -> 27.5% only) |
+| 3 | address arithmetic | **arithmetic** (7.64 ms) |
+| 4 | instruction bound | **arithmetic** (0.17 ms) |
+| 5 | in-flight bytes / occupancy | **arithmetic + measurement** |
+
+### And the staging is not a pure weight stream either
+
+**The 322.33 ms includes the shared stores and ~320 `__syncthreads()` per block, neither of which
+has been isolated.** The round-203 probe removes the FMA but keeps both.
+
+**So the honest state is: the staging runs at 62.7 GB/s even when perfectly coalesced, and no
+candidate in hand explains it.** Five are excluded; the remaining space is the shared-store path
+and the barrier structure.
+
+### The next instrument, and it is a different shape
+
+**A probe that keeps the GLOBAL load, drops the SHARED store, and consumes the loaded value
+directly into the accumulator.** That isolates the global load from the shared path -- **the one
+ablation shape not yet tried, and the only one that can separate candidates 6 and 7.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
