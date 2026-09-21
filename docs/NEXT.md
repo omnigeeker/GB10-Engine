@@ -1900,6 +1900,33 @@ standalone binary -- a few dozen lines either way.**
 | staging incl. shared store | **322.33** | 54.6 GB/s |
 | full kernel | **435.94** | 40.4 GB/s |
 
+## A SELF-AUDIT THAT CAME BACK CLEAN (round 214)
+
+**The concern:** every GB/s and %-of-peak figure in this session divides by **17.608 GB**, but
+multiplying out what `stage_wtile` reads for one forward pass gives
+**80 n-blocks x 160 k-tiles x 1 KB x 64 layers = 0.84 GB** -- **21x short of the tensor size.**
+If that were real, every absolute rate in the session would be wrong.
+
+**It is not real, and the error was mine.**
+
+| quantity | value |
+|---|---|
+| one 5120x5120 NVFP4 matrix | 5120 x 5120 x 0.5 B = **13.1 MB** |
+| what staging reads for that matrix | 80 blocks x 160 k-tiles x 1 KB = **13.1 MB** |
+| **verdict** | **match to rounding -- per-matrix traffic is correct** |
+
+**17.608 GB is the WHOLE model, which is many matrices per layer** (gate, up, down, q, k, v, o,
+plus the Gated-DeltaNet projections). `17.608 GB / 13.1 MB ~= 1344` matrices, against roughly
+64 layers x 7 attention/MLP matrices plus ~48 layers of linear-attention projections -- **the
+right order. No contradiction.**
+
+**So the absolute rates stand, including the headline "the global read runs at 30.8% of peak".**
+
+**And the lesson belongs with the others:** the check that raised the alarm was itself arithmetic
+done on the wrong object -- **one matrix compared against all matrices.** This session has now
+caught that class of error five times (rounds 169, 176, 184, 193, and here), **and this is the
+first time the check and the correction happened in the same round.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
