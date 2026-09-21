@@ -123,6 +123,37 @@ is the whole prefill and nothing else.
    outer-product FMAs per weight byte that TT=32 with `TNREG`=4 did, and costs
    1.67x the time -- **the ratio, not the absolute, is the evidence.**
 
+### The outer product's ceiling is its shared traffic -- hypothesis, untested (round 109)
+
+Per k, per thread, `gemm2d_outer` at TM=4/TNREG=8 issues:
+
+| | bytes |
+|---|---|
+| `wt` 4 x bf16 | 8 |
+| `xt` first 8 floats | 32 |
+| `xt` second 8 floats | 32 |
+| **total shared** | **72 B** |
+| FMAs | 32 |
+
+Per block per k that is 9,216 B of shared against 4,096 FMAs, and GB10's shared
+bandwidth is 128 B/cycle: **72 cycles of shared against 32 cycles of FMA -- a 44%
+ceiling**, against the **36% measured** at T=58.
+
+**But this is exactly the round-106 pattern and must be treated as such.** There, an
+occupancy figure and an FMA figure agreed at 33% and the agreement was a
+coincidence; the mechanism connecting them had never been tested. Here the
+agreement is again between a *calculated ceiling* and a *measured efficiency*, and
+**calculating a ceiling is not measuring a bottleneck.** The round-106 test that
+falsified its own hypothesis -- raise occupancy, see if it helps -- is the standard
+to meet, not the agreement itself.
+
+**The falsifiable prediction:** the `xt` loads are 64 of the 72 bytes, so if the
+shared path is the limit, making `xt` bf16 takes it to 40 B per k (8 + 16 + 16),
+raising the ceiling to 80% and trimming the critical path by 1.8x. **If TTFT does
+not fall substantially, the hypothesis is dead** -- and it is the same change that
+rounds 97-98 rejected on a confounded comparison and round 107 could not reach
+through occupancy, so this round trip finally gives it a mechanism *and* a test.
+
 **So the lever is outer-product FMA efficiency (36%), and it is the opposite end of
 the kernel from rounds 60-84, which spent 25 rounds on the load side.** The earlier
 conclusion that the load pattern was the problem was measured against a
