@@ -130,6 +130,35 @@ are what is costing.
 **Test with `forward-cost` t=1, >= 3 runs, mean against 103.48 ms** (the round-132
 build), and the gate must stay 16/16.
 
+### The endpoint arithmetic closes exactly, and the prefill is bound by neither roofline (round 146)
+
+| | tok/s |
+|---|---|
+| endpoint measured (256 tokens / 12.909 s) | **19.83** |
+| the same, if prefill were free (256 / 5.36 s) | **47.76** |
+| `batch-parity` B=16 engine result | **47.78** |
+
+**The endpoint loses nothing to scheduling or overhead -- it is exactly the prefill,
+and the decode half already runs at the engine's own B=16 rate.**
+
+**And that prefill is bound by neither roofline.** A 59-token prefill is one 64-wide tile
+pass, so it moves the full weight set and does the full arithmetic:
+
+| | value | as a rate | against peak |
+|---|---|---|---|
+| bandwidth | 17.608 GB in 434 ms | **40.6 GB/s** | **18%** of 228 GB/s |
+| compute | 27.3 G params x 59 x 2 = 3.2 TFLOP in 434 ms | **7.4 TFLOPS** | far below any FP16/FP8 peak |
+
+**A kernel that is at 18% of the bandwidth roofline and a small fraction of the compute
+roofline is bound by neither -- which is the signature of a latency/occupancy-bound
+kernel**, not a bandwidth-bound one. That is a *different* diagnosis from the decode
+GEMV's, and it is the first time the prefill GEMM has been placed between the two
+rooflines rather than simply called "32 GB/s".
+
+**It is also checkable with what is already known:** 97 registers, 24,576 B shared, and
+128 threads per block -- three numbers that together decide how many tile iterations can
+be in flight, and none of which has been varied since round 115.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
