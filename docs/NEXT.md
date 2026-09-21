@@ -2610,6 +2610,51 @@ protocols**.
 200, 215); four instrument traps (rounds 202-203, 218, 219, 220); and one projection corrected by
 implementation (round 232, where a measured mechanism turned out not to be an achievable change).
 
+## THE WEIGHT-ONLY RING IS NEUTRAL -- THE PREFILL LINE IS CLOSED (round 235)
+
+**Round 232's full ring (4-deep on both `wt` and `xt`) was +4.5%, and the diagnosis was that the
+doubled shared footprint cost occupancy. That diagnosis made a prediction: halve the shared cost by
+deepening ONLY the weight ring and keeping `xt` double-buffered, and the latency win should
+survive.**
+
+**Tested. The prediction is wrong.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **weight-only ring (12 KB)** | **395.81** [392.75-397.88] | **435.60** [434.25-436.98] |
+| 2-buffer baseline (8 KB) | 400.01 | 435.94 |
+| full ring (16 KB, round 232) | 418.85 | 455.73 |
+| **change** | **-1.1%** | **-0.1%** |
+
+**Gate: `generate` 16/16 and `chunked-prefill` OK. Reverted; tree clean.**
+
+### What this settles
+
+**Halving the shared cost removed the +4.5% penalty exactly as predicted -- and produced no gain.**
+So the occupancy diagnosis was right about the PENALTY and wrong about the PRIZE. **The latency
+mechanism is real in isolation (the probe does reach 208 GB/s with four loads in flight) but it
+does not translate into a prefill win in the real kernel at all.**
+
+**Which closes the prefill line, and it is worth being precise about why.** Three separate
+explanations were tested and all three are now excluded:
+
+| explanation | test | result |
+|---|---|---|
+| the shared cost caused the loss | weight-only ring, 12 KB | **penalty gone, gain absent** |
+| four loads in flight is the lever | full ring, 16 KB | **+4.5%** |
+| the staging is latency-bound and fixable | round 226 probe | **real in isolation, not transferable** |
+
+### The honest conclusion
+
+**The prefill GEMM's staging has been characterised from nine angles, and the only surviving
+statement is descriptive: it reads 17.608 GB at 40.4 GB/s in the full kernel, and no change tried
+-- tile shape (199, 225, 229), layout (212), coalescing (208), in-flight loads (232, this round),
+or shared budget -- improves it.**
+
+**The one thing not tried remains the register relay (round 233), and this round's result is a
+reason to expect less from it, not more: it changes where the loads land, but the last two
+experiments show that raising loads in flight does not move this kernel.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
