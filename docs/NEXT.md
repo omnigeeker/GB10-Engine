@@ -602,6 +602,44 @@ That is the version to build. It keeps `TN = 64`, `TT = 32`, the float `xt`
 tile, and the 35840 B budget, and it changes only the staging/consumption order
 in the three GEMM bodies.
 
+### Built it, and the cache-line story is wrong (round 76)
+
+The paired version was implemented for nvfp4 -- `stage_wtile_pair` stages two
+adjacent k-chunks in one pass, so a warp's four `pr` lanes cover 64 contiguous
+bytes of a row, and the body computes both halves before restaging. Correct
+(`generate` 16/16) and **completely neutral**:
+
+| | t=1 | t=16 |
+|---|---|---|
+| baseline | 271.46 | 292.85 |
+| paired staging (64 B/row) | 271.18 | 295.43 |
+
+Reverted.
+
+**This falsifies the cache-line explanation.** Doubling the bytes a warp touches
+per row, with the load count unchanged, does nothing. So the probe's 93.7 ->
+176.9 GB/s was **not** caused by cache-line utilisation.
+
+The probe was confounded. `read_staging64` changed two things at once:
+
+* 8 lanes x 8 B per row instead of 4 lanes x 8 B -- the bytes-per-row difference
+* `P = 4` instead of `P = 2` -- because `UNITS` went from 256 to 512
+
+so it also doubled the number of independent loads in flight. The kernel
+experiment separates the two and shows the bytes-per-row half is worth nothing.
+The effect the probe measured must belong to the load count.
+
+That is consistent with round 66, which found 16 elements per thread optimal and
+32 worse: at 32 the loads in flight halve. So the through-line across rounds 60,
+62, 66 and now 76 is **loads in flight**, and the honest state is that the
+staging's 136 GB/s is explained by neither cache lines (now tested) nor any of
+the other mechanisms eliminated above.
+
+**The lesson is about the probe, not the kernel.** A probe that changes two
+variables at once is as misleading as a guess, and it is more dangerous because
+it looks like evidence. The next probe must vary bytes-per-row with `UNITS`
+pinned, so that only the cache-line variable moves.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
