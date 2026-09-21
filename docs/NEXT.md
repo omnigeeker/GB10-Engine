@@ -101,6 +101,34 @@ but it does not rule out the *instruction slots* those 64 B x-loads consume: per
 k-tile each thread issues one 8 B weight load and four 16 B x-loads, so **x-loads
 are 4 of every 5 loads in the inner loop.**
 
+### `ROWS`=2 at B=1: tested and rejected (round 127)
+
+The one-line test round 126 proposed, run at the batch size T1 is actually about:
+
+| | ROWS=1 (current) | ROWS=2 |
+|---|---|---|
+| registers | 39 | 48 |
+| spills | 0 | 0 |
+| `generate` | 16/16 | **16/16** |
+| **t=1 one-row forward** | **104.2 ms** | **107.46 ms (+3.1%)** |
+
+Reverted. **So the load-instruction-mix hypothesis is falsified, and round 104's
+negative `ROWS`=2 result now extends to B=1 as well** -- it is worse at both ends of
+the batch range, not just at B=16 where it was first measured.
+
+**Seven mechanisms are now ruled out on this single-stream GEMV**, six of them by
+measurement: x traffic (shared staging, neutral), bytes in flight (10x more than
+needed), DRAM latency, occupancy (39 registers), local memory, the weight stream,
+and now the load instruction mix. **The kernel sits at 190 GB/s = 83% of the
+measured 228 GB/s peak and nothing that has been counted explains the missing 17%.**
+
+**That is the same shape of result as the prefill GEMM** (rounds 102-111, six
+mechanisms ruled out, shape turned out to be the cause). The lesson that transferred
+there was to stop counting resources and change the *shape* -- and the single-stream
+GEMV's shape is `ROWS`=1, one warp per row, one 8-byte weight load per instruction
+per thread. **A shape change, not a resource, is the only kind of move that has
+worked on this engine.**
+
 **That is the thing to look at next**: not bandwidth, not latency, not occupancy --
 the *load instruction mix*. `ROWS`=2 would halve the x-load count per unit of
 weight, and round 104 already measured its cost at B=16 (12% worse) but never
