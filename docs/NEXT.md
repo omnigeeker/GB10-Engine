@@ -327,7 +327,44 @@ else {
 
 **Do the same at the Anthropic site** (`main.rs:483`, `event:`/`data:` framing).
 
-### Attempted twice in round 156, reverted twice -- the exact compile error
+### FIXED in round 157 -- by taking the emitter OUT of the gate
+
+After two failed attempts, the second of which is documented below, the change landed
+with one structural insight: **the gate must not hold the emitter at all.** `push` and
+`flush` return `Option<String>` and the *caller* writes it:
+
+```rust
+struct ThinkGate { held: String, opened: bool }          // no callback, no lifetime
+fn push(&mut self, piece: &str) -> Option<String>        // Some(text) to emit
+fn flush(&mut self) -> Option<String>                    // whatever is still held
+```
+
+**That removes both problems at once.** With no `&mut F` field there is no `E0631`
+(`send` is `FnMut(&Value)`, the gate wanted `FnMut(&str)`), and no adapter closure whose
+lifetime has to end before the trailing finish chunks reuse `send`. **The callback simply
+captures the gate and the writer as two independent variables, and no scope has to be
+arranged.** Both failed attempts were fighting a problem the design was creating.
+
+**Verified, both protocols, including the trap:**
+
+| test | result |
+|---|---|
+| `generate --n 16` | **16/16** |
+| stream 200 tok, OpenAI | `'\n\nThe capital of France is Paris.'` -- **reasoning gone** |
+| **stream 8 tok, OpenAI** (truncated mid-reasoning) | `'User asks: "What is the capital'` -- **not empty** |
+| stream 200 tok, Anthropic | `'\n\nThe capital of France is Paris.'` |
+
+**The 8-token case is the one that matters:** without the `flush` fallback the stream
+would have delivered *nothing*, which is exactly the regression the round-154 note
+predicted. **The prediction was right, and testing it was the reason it did not ship.**
+
+**Cosmetic, not fixed:** the answer begins with the `\n\n` that separated it from the
+closing tag, because later pieces are passed through untouched and only the piece
+containing `</think>` is trimmed. Stripping leading whitespace from the accumulation
+until the first non-space character would fix it, but that needs its own state and is
+not worth the risk for two newlines.
+
+### The two failed attempts in round 156, kept as the record of the wrong design
 
 Both attempts hit the borrow fight the note above predicts, and **both were reverted
 cleanly with `git status` empty and `generate` still 16/16. Nothing about streaming

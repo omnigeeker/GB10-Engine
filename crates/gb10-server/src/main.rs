@@ -195,6 +195,53 @@ fn visible(text: &str) -> &str {
     }
 }
 
+/// Holds pieces until the model's reasoning block is closed, then yields everything
+/// after `</think>`.
+///
+/// **It deliberately does not hold the emitter.** An earlier design stored a
+/// `&mut F` callback, which failed with `E0631` (`send` is `FnMut(&Value)`, the gate
+/// wanted `FnMut(&str)`) and then forced an adapter closure that had to drop before the
+/// trailing finish chunks reused `send` -- a lifetime problem solved only by moving a
+/// closing brace. Returning the text instead means the caller keeps ownership of both
+/// the writer and the gate, and neither depends on the other's scope.
+///
+/// Pieces are `tok.decode(&[next], true)` and `</think>` spans several of them, so the
+/// tag has to be matched once complete. If generation is truncated before the tag
+/// closes, `flush` yields the held text through `visible()` -- **otherwise the stream
+/// would deliver nothing at all, which is worse than not gating.**
+struct ThinkGate {
+    held: String,
+    opened: bool,
+}
+
+impl ThinkGate {
+    fn new() -> Self {
+        Self { held: String::new(), opened: false }
+    }
+    /// `Some(text)` when there is something to emit, `None` while still holding.
+    fn push(&mut self, piece: &str) -> Option<String> {
+        if self.opened {
+            return Some(piece.to_string());
+        }
+        self.held.push_str(piece);
+        let i = self.held.find("</think")?;
+        let j = self.held[i..].find('>')?;
+        self.opened = true;
+        let rest = self.held[i + j + 1..].trim_start().to_string();
+        self.held.clear();
+        if rest.is_empty() { None } else { Some(rest) }
+    }
+    /// Emit whatever is still held when generation ends without a closing tag.
+    fn flush(&mut self) -> Option<String> {
+        if self.opened || self.held.is_empty() {
+            return None;
+        }
+        let rest = visible(&self.held).to_string();
+        self.held.clear();
+        if rest.is_empty() { None } else { Some(rest) }
+    }
+}
+
 struct GenResult {
     ids: Vec<u32>,
     text: String,
@@ -378,13 +425,24 @@ fn handle_chat_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut Tc
     let mut prompt_tokens = 0usize;
     {
         let (id2, name2) = (id.clone(), name.clone());
+        let mut gate = ThinkGate::new();
         let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
+            match gate.push(piece) {
+                Some(t) => send(&json!({
+                    "id": id2, "object": "chat.completion.chunk", "created": created,
+                    "model": name2,
+                    "choices": [{"index": 0, "delta": {"content": t}, "finish_reason": null}],
+                })),
+                None => Ok(()),
+            }
+        });
+        if let Some(t) = gate.flush() {
             send(&json!({
                 "id": id2, "object": "chat.completion.chunk", "created": created,
                 "model": name2,
-                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}],
-            }))
-        });
+                "choices": [{"index": 0, "delta": {"content": t}, "finish_reason": null}],
+            }))?;
+        }
         match res {
             Ok(r) => {
                 finish = r.finish;
@@ -503,13 +561,24 @@ fn handle_messages(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream)
     let mut finish = "length";
     let mut n_out = 0usize;
     {
+        let mut gate = ThinkGate::new();
         let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
+            match gate.push(piece) {
+                Some(t) => ev(
+                    "content_block_delta",
+                    &json!({"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta", "text": t}}),
+                ),
+                None => Ok(()),
+            }
+        });
+        if let Some(t) = gate.flush() {
             ev(
                 "content_block_delta",
                 &json!({"type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta", "text": piece}}),
-            )
-        });
+                        "delta": {"type": "text_delta", "text": t}}),
+            )?;
+        }
         match res {
             Ok(r) => {
                 finish = r.finish;
