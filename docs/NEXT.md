@@ -984,6 +984,39 @@ in either.**
 change.** Aim at 2.2x; if it is achieved, the endpoint target is met and TTFT improves by the
 same factor while remaining short of llama.cpp.
 
+## A CODE-DERIVED CANDIDATE FOR THE GEMM'S 18% (round 189)
+
+**Every mechanism proposed for the prefill GEMM so far was inferred from a timing. This one is
+read out of the staging loop, and it is the first that can account for 18% of peak.**
+
+`kernels/gemm.cu:65` `stage_wtile`:
+
+```cuda
+constexpr int PAIRS = KC / 16;            // KC = 32 -> 2
+constexpr int UNITS = GB10_TN * PAIRS;    // 64 * 2 = 128
+const int u  = threadIdx.x + p * GB10_GEMM_BLOCK;
+const int nl = u / PAIRS, pr = u % PAIRS; // <- decomposed, not n = u
+const int n  = nbase + nl;
+pk[p] = *reinterpret_cast<const uint2*>(w + (size_t)n * (K >> 1) + ...);
+```
+
+**Two consecutive lanes cover 16 contiguous bytes of one row; the next pair moves to the next
+row. A warp therefore touches 16 different rows, taking 16 B from each: 16 B used per 128 B
+line = 12.5%, against the measured 18%. Same order -- and now verified against the code.**
+
+**Why 18% and not 12.5%:** successive `c` iterations advance by `KC = 32` bytes, so the next
+`stage_wtile` reads the *next* 16 bytes of the same rows. **The rest of each line is recovered
+from L2 if it survives**, which lifts 12.5% toward 18%. **Each 128-byte line is being filled
+over four k-tile iterations.**
+
+**The fix is now precise:** have a warp read **128 contiguous bytes of ONE row** instead of
+16 B from each of 16 rows -- i.e. **lane-order the staging loop `PAIRS`-major so 16 lanes
+cover one row's full 128 B before moving on.** That is where the 2.2x would live.
+
+**And the falsification check earned its keep:** the first reading was `n = u`, which would
+have implied a flat 12.5% with no L2 recovery. The real decomposition changes both the
+arithmetic and the fix.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
