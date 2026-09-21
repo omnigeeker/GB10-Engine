@@ -34,6 +34,38 @@ for short prompts.
 Next: measure the 8..16 crossover properly and raise the cut, and check whether
 the fp8 and bf16 paths want the same treatment.
 
+### TTFT: the quoted baseline was stale (round 86)
+
+The dispatch change does **not** move TTFT, and the reason is now clear: the real
+prefill scores all 59 prompt tokens in a single `prefill_seq` call, so `t = 59`,
+which is above the cut and still takes the GEMM.
+
+Measured properly, before and after:
+
+| | TTFT | decode |
+|---|---|---|
+| baseline (GEMM for t > 8) | 560.2 ms | 8.56 tok/s |
+| batched GEMV for t <= 8 | 563.0 ms | 8.62 tok/s |
+
+Neutral, as expected.
+
+**The number quoted for TTFT throughout this document -- 452.6 ms -- is from
+round 27**, i.e. before rounds 60, 62 and 63 cut the GEMM forward by 28%. It was
+never re-measured and should be replaced everywhere by **560.2 ms**. Worse, the
+GEMM got faster while TTFT got *slower* (452.6 -> 560.2), which is unexplained and
+worth its own investigation: either the round-27 figure was taken under different
+conditions, or something in rounds 36-59 cost prefill time that the `forward-cost`
+benchmark does not see.
+
+**Do not quote 452.6 ms again.** The measured baseline is 560.2 ms against
+llama.cpp's ~74 ms, so TTFT is ~7.6x off rather than ~6x.
+
+Since `t = 59` takes the GEMM, and chunking the prefill would make it worse (each
+chunk re-reads every weight, so 8 chunks of 8 cost 8x the traffic of one
+59-token pass), the TTFT problem is the GEMM at moderate `t` -- which is exactly
+the case the dispatch change cannot help. The 8..16 crossover should still be
+measured, but it will not address TTFT.
+
 ## Verified state
 
 `generate` 16/16 exact, `chunked-prefill` OK, `batch-parity` OK. t=1 forward
