@@ -43,6 +43,39 @@ comes back with 0 spills and room to spare.
    rule below before writing the unrolled body.**
 4. The same `static_assert` update and regenerated bodies as the (8,4) change.
 
+## (8,8) at acc=64 is rejected on correctness (round 119)
+
+The generator was fixed and `TM`=8/`TNREG`=8 applied with `GB10_GEMM_BLOCK`=64 and the
+matching `LaunchConfig` block dims. It compiles, and it is **wrong**:
+
+| | (8,4) current | (8,8) |
+|---|---|---|
+| registers | 97 | **162** |
+| smem | 24,576 B | 24,576 B |
+| `generate` | 16/16 | **0/1 (0.0%)** |
+| TTFT | 434.6 ms | 544.4 ms (meaningless -- gate failed) |
+
+Reverted; baseline re-verified at 97 registers, 16/16, TTFT 434.6 ms.
+
+**Do not quote the 544.4 ms** -- the same gate-failure trap as rounds 88 and 110.
+
+**Two things this establishes:**
+
+1. **The mapping rule was followed and still failed**, so unlike round 96 this is
+   *not* a mapping error. `acc[8][8]` = 64 accumulators pushed registers from 97 to
+   **162**, and at that pressure the shape does not hold together. The 0.750 B/FMA
+   the ladder promised does not materialise because the shape does not work at all.
+2. **The ladder in `acc` is not climbable past 64-with-128-threads.** (8,4) is the
+   sweet spot of this structure: it raised `acc` from 32 to 64 while *keeping* the
+   128-thread block, and it is the only step that has ever passed the gate. The
+   `acc`=64 row in the ladder was reached at **64 threads**, and 64 threads with a
+   64-wide tile is what breaks.
+
+**So the prefill GEMM's tile shape is settled at TM=8/TNREG=4.** Further prefill
+gains have to come from somewhere other than this ratio -- and the earlier
+candidates are all already ruled out by measurement, so the honest position is that
+the GEMM's 434 ms prefill is where this session's understanding ends.
+
 ## The body generator, and the operand asymmetry that bit twice (round 118)
 
 `acc`=64 (`TM`=8/`TNREG`=8, 64 threads) was attempted twice and **both attempts failed
