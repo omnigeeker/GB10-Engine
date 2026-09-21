@@ -511,6 +511,63 @@ it requires shrinking `TT` or storing `xt` in bf16 (both already scoped above).
 That is the next experiment, and it is the first one in several rounds with a
 clear mechanism behind it rather than an elimination.
 
+### The hypothesis tested before acting on it (round 74)
+
+Rather than restructure the kernel on the strength of a mechanism, the probe was
+extended with a third pattern: same layout, same bytes, but 8 lanes x 8 B so a
+warp covers **64 consecutive bytes of a row** instead of 32.
+
+| pattern | bytes per row per warp | GB/s |
+|---|---|---|
+| contiguous | -- | 221.5 |
+| staging32 (current) | 32 | 93.7 |
+| **staging64** | **64** | **176.9** |
+
+**Confirmed, and the effect is large: 93.7 -> 176.9 GB/s, +89%.** Cache-line
+granularity is the mechanism; half of every fetched line was being discarded.
+
+Projected on the real forward: the two stagings cost ~112 ms (41%) at ~136 GB/s.
+At 177 GB/s the same bytes take ~86 ms, so **t=1 should fall from 271 to roughly
+245 ms (-10%)**, and further if the kernel tracks the contiguous figure rather
+than the isolated one.
+
+### The change this implies, and its cost
+
+`KC` has to become 128, because a row's chunk is `KC/2` bytes and only `KC = 128`
+makes it a full 64-byte line. `KC = 128` divides every K in the model (5120/128 =
+40, 17408/128 = 136, 6144/128 = 48, 10240/128 = 80), so the constraint is met.
+
+The obstacle is shared memory. With `KC = 128`, `TN = 64`, `TT = 32`:
+
+```
+wt  2*128*(64+4)*2 = 34816
+xt  2*128*(32+4)*4 = 36864
+                    ------
+                    71680   vs a 49152 budget
+```
+
+The options, in order of intrusiveness:
+
+| wt | xt | total | fits |
+|---|---|---|---|
+| `TT=32`, xt float, pad 4 | 34816 + 36864 | 71680 | no |
+| `TT=16`, xt float, pad 4 | 34816 + 20480 | 55296 | no |
+| `TT=32`, xt bf16, pad 4 | 34816 + 18432 | 53248 | no |
+| `TT=16`, xt bf16, pad 4 | 34816 + 10240 | **45056** | **yes** |
+| `TT=32`, xt bf16, no pad | 32768 + 16384 | **49152** | exactly at the limit |
+
+So it needs `TT = 16` **and** a bf16 `xt` tile, or a bf16 `xt` with no padding.
+`TT = 16` also changes `gemm2d_ids` (32 row-groups x 4 token-groups) and
+`GB10_TILE_T` in `ops.rs`, and a bf16 `xt` changes every `gemm2d_outer` reader.
+That is a coupled change across three places, so it should be done in one step
+with the `generate` 16/16 gate as the check, and reverted as a whole if the
+timing does not improve.
+
+**The cheapest version to try first is `TT=32` + bf16 `xt` + no padding**, since
+it touches only the `xt` type and the two stride macros and leaves the tiling
+alone -- at the cost of sitting exactly on the 49152 B limit, which may need a
+little slack.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated

@@ -63,12 +63,35 @@ __global__ void read_staging(const uint2* __restrict__ w, int K, int N, int nchu
     if (s == 0xdeadbeefULL) *out = s;
 }
 
+// C: 64 consecutive bytes per row per warp -- 8 lanes x 8 B, i.e. a full cache
+// line per row, which is what KC=128 would give.
+__global__ void read_staging64(const uint2* __restrict__ w, int K, int N, int nchunk,
+                               unsigned long long* out) {
+    const int nbase = blockIdx.x * TN;
+    unsigned long long s = 0;
+    for (int c = 0; c < nchunk; ++c) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int u = threadIdx.x + p * BLOCK;
+            const int nl = u / 8, gr = u % 8;
+            const int n = nbase + nl;
+            if (n < N) {
+                const size_t off = (size_t)n * (K >> 1) + c * 64 + gr * 8;
+                const uint2 v = __ldg(reinterpret_cast<const uint2*>(
+                    reinterpret_cast<const char*>(w) + off));
+                s += v.x + v.y;
+            }
+        }
+    }
+    if (s == 0xdeadbeefULL) *out = s;
+}
+
 int main(int argc, char** argv) {
     // One layer's NVFP4 weights are ~150 MB; the model streams ~9.63 GB of them
     // across 64 layers, so a 150 MB buffer repeated 64x reproduces both the
     // working-set size and the total traffic.
     const size_t bytes = 150ull << 20;
-    const int K = 5120, N = 17408, nchunk = K / KC;
+    const int K = 5120, N = 17408, nchunk = K / KC, nchunk64 = K / 128;
     const int reps = 64;
 
     void* buf = nullptr;
@@ -84,20 +107,24 @@ int main(int argc, char** argv) {
     const int gridA = (int)(bytes / 16 / BLOCK);
     const int gridB = (N + TN - 1) / TN;
 
-    for (int which = 0; which < 2; ++which) {
+    for (int which = 0; which < 3; ++which) {
         // warm
         if (which == 0)
             read_contig<<<gridA, BLOCK>>>((const uint4*)buf, bytes / 16, out);
-        else
+        else if (which == 1)
             read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
+        else
+            read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
         check(cudaDeviceSynchronize(), "warmup");
 
         check(cudaEventRecord(a), "record");
         for (int r = 0; r < reps; ++r) {
             if (which == 0)
                 read_contig<<<gridA, BLOCK>>>((const uint4*)buf, bytes / 16, out);
-            else
+            else if (which == 1)
                 read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
+            else
+                read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
         }
         check(cudaEventRecord(b), "record");
         check(cudaEventSynchronize(b), "sync");
@@ -106,11 +133,11 @@ int main(int argc, char** argv) {
         check(cudaEventElapsedTime(&ms, a, b), "elapsed");
         // The staging pattern reads the whole N x K/2 matrix per rep -- which is
         // smaller than the buffer -- so count what it actually touches.
-        const double per_rep = (which == 0) ? (double)bytes
-                                            : (double)N * (K / 2);
+        const double per_rep = (which == 0) ? (double)bytes : (double)N * (K / 2);
         const double gb = per_rep * reps / 1e9;
         std::printf("%-10s %8.1f ms   %7.1f GB   %7.1f GB/s\n",
-                    which == 0 ? "contig" : "staging", ms, gb, gb / (ms / 1000.0));
+                    which == 0 ? "contig" : (which == 1 ? "staging32" : "staging64"),
+                    ms, gb, gb / (ms / 1000.0));
     }
 
     check(cudaFree(buf), "free");
