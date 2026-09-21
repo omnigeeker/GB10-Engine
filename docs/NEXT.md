@@ -111,13 +111,42 @@ flat in all of them:
 | tile shape | TT 64 -> 32 | included above |
 
 A bandwidth-bound kernel that ignores occupancy *and* bytes-in-flight is not
-waiting on DRAM. The remaining suspects are internal: shared-memory traffic
-(each `wt` element is re-read by every token group, so shared reads scale with
-`TN * K * TT/4` -- 4.3 GB per launch at TT=64), or the dequantisation ALU in
-the staging path. Distinguishing those two is the next measurement, and it is
-worth doing before changing anything else, because the fix differs completely:
-shared traffic wants a different data flow (e.g. keeping `wt` in registers and
-streaming `xt`), while an ALU bound wants the dequant hoisted or vectorised.
+waiting on DRAM, so the next step was a probe rather than a theory.
+
+### The probe, and the fix (round 60)
+
+Disabling the nvfp4 weight staging outright -- wrong results, timing only --
+dropped the t=1 forward from 377.31 ms to **227.30 ms**. So the staging pass
+alone was 150 ms, moving 9.63 GB at **64 GB/s**, 28% of roofline.
+
+That is the signature of too little memory-level parallelism, not of shared
+traffic or ALU. The staging loop issued **one 4-byte load per thread per
+iteration**, and with 128 threads x 2 blocks/SM there were only ~256 outstanding
+4-byte loads per SM -- about 1 KB in flight where 228 GB/s x ~600 ns needs
+~2.8 KB. Occupancy and tile size could never fix that, which is exactly why
+both came back flat.
+
+The fix is to issue every load the thread owns *before* consuming any of them.
+`stage_wtile` and `stage_wtile_fp8` now run in two passes -- load into a small
+register array, then dequantise and store -- so `P = TN*SEGS/BLOCK = 4` loads
+are in flight per thread instead of one.
+
+| t | before | after | |
+|---|---|---|---|
+| 1 | 377.31 | **312.27** | -17% |
+| 2 | 378.68 | 312.22 | -18% |
+| 4 | 379.00 | 319.96 | -16% |
+| 8 | 389.52 | 323.73 | -17% |
+| 16 | 401.48 | **341.81** | -15% |
+
+`generate` is still **16/16 exact**. This is the first change in this sequence
+that moved the number, and it moves TTFT, which is one of the objective's
+targets.
+
+Note what it does *not* say: the earlier flat results were not wasted. They are
+what ruled out occupancy and tile shape, leaving memory-level parallelism as the
+only remaining explanation -- and that one was then confirmed by a probe before
+being acted on.
 
 ### Two real bugs found on the way (round 58)
 

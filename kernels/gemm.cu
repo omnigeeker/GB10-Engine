@@ -58,20 +58,38 @@ __device__ __forceinline__ void stage_wtile(uint16_t (*wt)[GB10_WSTRIDE],
                                             const float* __restrict__ s2, int K, int nbase,
                                             int N, int c) {
     constexpr int SEGS = KC / 8;
+    constexpr int UNITS = GB10_TN * SEGS;
+    constexpr int P = (UNITS + GB10_GEMM_BLOCK - 1) / GB10_GEMM_BLOCK;
     (void)s2;
-    for (int u = threadIdx.x; u < GB10_TN * SEGS; u += GB10_GEMM_BLOCK) {
+    // Every load for this thread is issued before any of them is consumed.
+    // One outstanding 4-byte load per thread cannot cover DRAM latency at this
+    // occupancy: measured, the staging pass moved 9.63 GB at only 64 GB/s.
+    uint32_t pk[P];
+    float scl[P];
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
         const int nl = u / SEGS, seg = u % SEGS;
         const int n = nbase + nl;
-        if (n < N) {
+        pk[p] = 0;
+        scl[p] = 0.0f;
+        if (u < UNITS && n < N) {
             const int kbase = c * KC + seg * 8;
-            const uint32_t packed =
-                *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
-            const float s = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
+            pk[p] = *reinterpret_cast<const uint32_t*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
+            scl[p] = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
+        const int nl = u / SEGS, seg = u % SEGS;
+        const int n = nbase + nl;
+        if (u < UNITS && n < N) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const uint8_t nib = (uint8_t)((packed >> (4 * j)) & 0xF);
+                const uint8_t nib = (uint8_t)((pk[p] >> (4 * j)) & 0xF);
                 wt[seg * 8 + j][nl] =
-                    __bfloat16_as_ushort(__float2bfloat16_rn(e2m1_to_float(nib) * s));
+                    __bfloat16_as_ushort(__float2bfloat16_rn(e2m1_to_float(nib) * scl[p]));
             }
         }
     }
@@ -83,14 +101,28 @@ __device__ __forceinline__ void stage_wtile_fp8(uint16_t (*wt)[GB10_WSTRIDE],
                                                 const float* __restrict__ s1, int K, int nbase,
                                                 int N, int c) {
     constexpr int SEGS = KC / 8;
-    for (int u = threadIdx.x; u < GB10_TN * SEGS; u += GB10_GEMM_BLOCK) {
+    constexpr int UNITS = GB10_TN * SEGS;
+    constexpr int P = (UNITS + GB10_GEMM_BLOCK - 1) / GB10_GEMM_BLOCK;
+    uint2 pk[P];
+    const float wscale = __ldg(s1);
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
         const int nl = u / SEGS, seg = u % SEGS;
         const int n = nbase + nl;
-        if (n < N) {
+        pk[p] = make_uint2(0u, 0u);
+        if (u < UNITS && n < N) {
             const int kbase = c * KC + seg * 8;
-            const uint2 pk = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
-            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
-            const float wscale = __ldg(s1);
+            pk[p] = *reinterpret_cast<const uint2*>(w + (size_t)n * K + kbase);
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+        const int u = threadIdx.x + p * GB10_GEMM_BLOCK;
+        const int nl = u / SEGS, seg = u % SEGS;
+        const int n = nbase + nl;
+        if (u < UNITS && n < N) {
+            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk[p]);
 #pragma unroll
             for (int j = 0; j < 8; ++j)
                 wt[seg * 8 + j][nl] =
