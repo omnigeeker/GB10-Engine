@@ -47,7 +47,21 @@ per-element bit-manipulation chain, not 8 ops per call. **The cost is the dequan
 why a count-based check passed while the measurement says 29% -- the same failure mode
 as rounds 59/101/104/106, now for the fourth time.
 
-**The lever is to make the unpack cheaper or less serial:**
+**Checked the first two levers by reading the code (round 142), and both are dead:**
+
+`e2m1_to_float` is **already branchless** -- `>>`, `&`, select, `<<`, `|` -- about 6 ALU
+ops per element, so `e2m1x8_to_float` is ~96 ops per 8 bytes (12 ops/byte, ~22% of the
+128/cycle capability at 2.33 bytes/cycle/SM). **A shared-memory or `__constant__` table
+would replace those 6 ops with one load, but the index is a 4-bit nibble: only 16
+distinct values across 32 lanes**, so a shared table suffers heavy bank conflicts and a
+constant table serializes on divergent indices. **Both are likely worse, not better.**
+The 256-entry `prmt` variant has the same distribution problem with 8x the footprint.
+
+**So the decode is already near its floor in op count**, and the remaining 29% has to
+be dependency structure -- the 16 elements are independent, so the ILP exists and the
+question is whether the compiler is extracting it.
+
+**The remaining lever, if any:**
 
 * a shared-memory lookup table (16 entries, 64 B) replacing per-element bit
   manipulation with one shared load;
