@@ -1,5 +1,45 @@
 # SESSION HANDOFF (read this first)
 
+## The endpoint's batching is verified correct, and its gap is now arithmetic (round 112)
+
+First time this was actually checked rather than assumed: `GB10_BATCH_LOG=1` on 16
+concurrent requests logs **`batch of 16`** -- one group, all sixteen collected by
+the 25 ms window. 16 responses, 256 tokens, **1 distinct output** (the identical
+prompt gives an identical answer 16 times), wall **13.60 s = 18.82 tok/s**.
+
+That closes the diagnosis end to end. The endpoint's own decomposition:
+
+| | |
+|---|---|
+| prefill (16 serial `prefill_seq`) | 7.63 s |
+| decode (16 steps at the engine's measured 334.9 ms) | 5.36 s |
+| overhead | ~0.6 s |
+| **total** | **13.60 s, matching the measured wall time** |
+
+**So the batching infrastructure is right and the prefill is the entire gap.** If
+prefill hit its own 4.85 s bound the total would be 10.2 s = **25 tok/s**; the 30
+tok/s target needs prefill near 4.0 s, i.e. the prefill GEMM at ~70 GB/s against
+the 32.3 GB/s it actually reaches.
+
+**The best measured endpoint number is 18.82 tok/s** (13.60 s), against 17.37
+recorded earlier -- the same test, so prefer the newer figure and treat ~18 tok/s
+as the current value.
+
+## Six ruled-out mechanisms point at the tile shape, not a resource (round 111)
+
+Rounds 102-111 tested, one mechanism at a time, and **all six failed to move the
+prefill GEMM**: x re-reads, local memory, the weight stream, occupancy (raising it
+17% *worse*), shared bandwidth (bf16 `xt`: correct-but-gate-failing, and -3.3%),
+and inner-loop ALU issue pressure (hardware CVT: neutral). `nvdisasm` shows the
+kernel is 1024 FFMA, 16 FMA per LDS.128, with nothing obviously starved.
+
+**Six failures to find a resource bottleneck is itself the information: the 36% FMA
+efficiency at T=58 comes from the tile shape, so the next attempt should change the
+shape rather than relieve a resource.** The specific proposal is to split the
+`TNREG`=8 outer product into two `TNREG`=4 halves so each `xt` load feeds twice the
+FMAs -- while *preserving* the TT=64 thread mapping, since round 96 failed when
+`TNREG`=4 was combined with a mapping that assumed 8.
+
 ## The remaining target, precisely (round 105)
 
 All gates green at `15a826e`: `generate` 16/16 (100%), `chunked-prefill` OK,
