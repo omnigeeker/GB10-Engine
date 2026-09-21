@@ -2597,6 +2597,33 @@ Round 134's shared-memory rejection is consistent with this: a +2.5% regression 
 outside the 1% harness noise, so that rejection stands on its own measurement, which
 the round-135 rule had left open.
 
+### The widening does not generalise -- and the fp8 path is the real next target (round 137)
+
+Round 136 proposed applying the same widening to the fp8 and bf16 templates. Checked
+before implementing, and **there is nothing to widen**:
+
+* `fp8_gemv_tmpl` takes `wscale` as a `const float*` and has **no per-lane scale byte
+  load inside the k loop** -- fp8's scale is per-channel and applied outside it.
+* `bf16_gemv_tmpl` has no scale at all.
+
+**So the round-132 gain was specific to NVFP4's group-16 layout**, and that path is
+now done. The proposal was empty rather than wrong, and one grep settled it.
+
+**What that leaves is the largest untouched block in the decode step.** From round
+124's decomposition of the 104.2 ms B=1 step:
+
+| kernel | launches | avg | total/step | share of step |
+|---|---|---|---|---|
+| `nvfp4_gemv_kernel` | 192 | 274.3 us | 52.7 ms | 51% |
+| **`fp8_gemv_kernel`** | **208** | **174.2 us** | **36.2 ms** | **35%** |
+| `gated_delta_rule_{chunk,step}` + `rmsnorm` | ~9,600 | small | ~15 ms | 14% |
+
+**`fp8_gemv_kernel` is 35% of the step and has never been decomposed.** The NVFP4 path
+looked equally unremarkable until the ablation ran on it, and that ablation found its
+scale path -- so the same treatment is the obvious next move: extend the `LEVEL`
+ablation in `bench/hw/gemv_bw.cu` to fp8's layout (one `uint8` weight byte per lane per
+k-tile plus a per-channel float scale) and see which step costs the bandwidth.
+
 ## Shared-memory hoist: tested and rejected -- and it re-reads the ablation (round 134)
 
 Implemented exactly as designed below (nvfp4 template only, `use_smem` guard, static
