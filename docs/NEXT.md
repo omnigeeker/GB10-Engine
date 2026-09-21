@@ -529,6 +529,48 @@ hypothesis tested so far was tested from outside the kernel, and the two inside-
 facts established this session (`y.len()` = 16x, `gridDim.z` = 2) each settled a question
 in one run.
 
+## RESOLVED (round 173): there was never a ~9x error -- I compared a GEMV to a GEMM
+
+`crates/gb10-model/src/weights.rs:95`:
+
+```rust
+if self.n < 256 || t <= 16 { return self.forward(dev, x, y, t); }
+```
+
+**At BOTH t=8 and t=16 the `pre_ms` path routes to the batched GEMV, not to
+`forward_prefill`/the GEMM.** The 0.75 B/FMA closed form is a property of the **GEMM tile**.
+The GEMV instead does **`t` FMAs per 2-byte weight** -- ~12 FMA/byte at t=8 -- so at
+99.6 GB/s it predicts **2.47 TFLOPS**, exactly the measured value. **The arithmetic closes.
+The "9x discrepancy" was a model applied to the wrong kernel.**
+
+### And that reattributes the endpoint bottleneck
+
+| path | rows | effective bandwidth |
+|---|---|---|
+| decode GEMV | 1 | **174-190 GB/s** |
+| same GEMV, batched | 8 | **99.6 GB/s** |
+| same GEMV, batched | 16 | **59.0 GB/s** |
+
+**Batching the GEMV halves its effective bandwidth by 8 rows and thirds it by 16.** That is
+the prefill/endpoint bottleneck -- **not the GEMM, and not occupancy.** The endpoint's
+19.8 tok/s comes from this: **the same kernel that sustains 190 GB/s at one row sustains
+59 GB/s at sixteen.**
+
+**Which means rounds 148-172 spent twenty-five rounds on the wrong kernel.** The
+occupancy work, the K split, and the tile discussion all target `forward_prefill`, and the
+`pre_ms`/endpoint path at these sizes never enters it.
+
+### Next step
+
+**A shape question about the GEMV's batch handling** (`kernels/gemv.cu`, `GB10_BATCH_MAX`,
+and the `ROWS` experiments of rounds 104/121/127):
+
+**why does the batched GEMV lose bandwidth as batch size grows?** Rounds 104 and 127
+rejected `ROWS=2` at B=1 and B=16, but **nobody has asked what happens to the weight stream
+when B grows. A batched GEMV that re-reads the weights once per token rather than once per
+group would explain 190 -> 59 exactly, and that is checkable by reading the k-loop's
+indexing rather than by benchmarking.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
