@@ -234,7 +234,44 @@ piece at a time and watch 271.5 GB/s fall.**
 5. + the x loads (`load_x`, four `__ldg` float4)
 
 **Whichever step drops the bandwidth is the answer, and it is a five-line change per
-step in a file that cannot break the engine.** That is the same ablation logic that
+step in a file that cannot break the engine.**
+
+### The ablation answers it: it is the SCALE LOAD (round 131)
+
+Run as a `LEVEL` template parameter so every step is the same kernel with work added:
+
+| step | GB/s | delta |
+|---|---|---|
+| 1 loads only (2 XOR) | **254.3** | -- |
+| 2 + NVFP4 unpack | 248.9 | -2% |
+| **3 + scale lookup and multiply** | **194.8** | **-22%** |
+| 4 + 16 FMAs | 210.5 | +8% (hides latency) |
+| 5 + x loads (4x `__ldg` float4) | 212.5 | +1% |
+| **the real `nvfp4_gemv_kernel`** | **190.0** | |
+
+**One step accounts for the entire gap, and it lands on the real kernel's number: the
+scale lookup.** Both the unpack and the FMAs are ~free; round 130's first-order check
+(ALU at 7.5% of capacity) predicted exactly that, which is why the cost had to be a
+memory effect -- and it is:
+
+```cuda
+const uint8_t sc = __ldg(ws + (size_t)row * scalerow + (i * kWarp + lane));   // scalerow = K/16
+```
+
+**The scale is a SECOND MEMORY STREAM, read one byte per thread per k-tile.** One
+warp instruction fetches **32 lanes x 1 B = 32 bytes**, against the weight load's
+**32 lanes x 8 B = 256 bytes** -- **8x less efficient per instruction**, and a stream
+the memory system has to interleave with the weights. The scale row is only
+`K/16 = 320` bytes, so this is not volume; it is efficiency. This also explains round
+111's observation that the NVFP4 dequant path carries the LOP3/SHF, while ALU
+utilisation stays at 7.5%: the instructions are there, the *loads* are what cost.
+
+**The fix is specific and testable:** each warp's k-tile needs 32 *consecutive* scale
+bytes. Load them as 8 lanes x `uint32` (128 B per instruction) or 2 lanes x `uint4`
+and broadcast with `__shfl_sync`, or hoist the whole 320-byte scale row into registers
+or shared once per row. **Any of those turns a 32 B/instruction stream into a 128 B
+one, and the ablation says that step is worth 54 GB/s** -- 190 -> ~235, which is
+above T1's 220. That is the same ablation logic that
 located the tile shape on the prefill GEMM, applied to the one measurement that has
 been decisive so far this session.
 
