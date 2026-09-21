@@ -2934,6 +2934,37 @@ prefill dominated.**
 | TTFT vs llama.cpp | **NOT met: ~434 ms vs ~74 ms** |
 | single decoder >= 100 tok/s | **physically impossible: needs 1.76 TB/s vs 228 measured** |
 
+## THE TTFT SHORTCUT IS REFUTED BY A MEASUREMENT ALREADY IN THE FILE (round 244)
+
+**No build spent.**
+
+**The idea**: TTFT is ~434 ms against llama.cpp's ~74 ms, and the prefill runs on the GEMM path at
+**40 GB/s** while the GEMV path achieves **170 GB/s** on the same weights. **A single-sequence
+prefill fits the GEMV's batch-1 shape, so raising the dispatch gate at
+`crates/gb10-model/src/weights.rs:95` from `t <= 16` to `t <= 64` looked like a ~4x TTFT win for a
+one-line change.**
+
+**It is not, and the file already says why.** The comment directly above the gate:
+
+> *"The crossover is between 8 and 16; 16 is worse because the batched GEMV then re-reads every
+> weight once per token, which outweighs its better load pattern. The 8..16 range is unmeasured, so
+> 8 is the conservative cut."*
+
+**The arithmetic agrees**: the batched GEMV re-reads the weights **once per token**, so at `t = 64`
+it would move **64 x 17.608 GB = 1.1 TB** against the GEMM's **17.608 GB once**. Even at the GEMV's
+170 GB/s that is **6.6 s** versus the GEMM's **435 ms** -- **15x worse, not 4x better.**
+
+**So the gate is correct, the crossover was measured, and the TTFT line is not reachable through
+dispatch.** The prefill's cost is the per-token weight traffic, **and the only way to reduce it is
+to reduce what each token reads -- which is what every closed prefill candidate tried to do.**
+
+### And this is worth recording as a positive result
+
+**The file's own comment prevented a change that looked like a 4x win and was a 15x loss.** That is
+the round-198/199 lesson in reverse: **there, the danger was a change that compiled and reported
+wrong numbers; here it is a change that would have compiled and reported slower ones.** Both are
+caught by the same habit -- **read the code that produces the number before changing it.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
