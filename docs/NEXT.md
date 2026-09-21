@@ -398,6 +398,41 @@ That closes out the `stage_xtile` line of attack, and with it the shared-store
 hypothesis from round 65. The remaining measured shares are the two weight
 stagings (41% together, ~136 GB/s) and the outer product (21%).
 
+### Where the two weight stagings stand (round 70)
+
+Arithmetic on the staging, to work out what its 136 GB/s actually is:
+
+* Coalescing is fine. Thread `u` reads `w + n*(K/2) + (c*KC + gr*16)/2` with
+  `gr` fastest, so threads 0-3 cover 32 consecutive bytes of one row and a warp
+  covers 8 rows x 32 B = 256 B in 8 fully-used sectors.
+* Memory-level parallelism is fine. The two-pass loop issues 4 independent loads
+  (2 units x 1 weight + 1 scale) per thread, 32 B in flight, ~8 KB per SM against
+  the ~2.8 KB needed to cover 600 ns at 228 GB/s.
+* Latency per chunk cannot explain it either: 80 chunks x 600 ns is 48 us per
+  block, and ~2.8 waves of blocks gives ~0.14 ms -- nowhere near the 71 ms
+  measured for the nvfp4 staging.
+
+So 136 GB/s is a *bandwidth* figure, not a latency one, and neither coalescing
+nor outstanding loads explain the shortfall from 228 GB/s. That leaves two
+candidates, and they are cheap to tell apart:
+
+1. **The dequantisation ALU.** Per 8-byte load the staging runs 16 `e2m1_to_float`
+   calls plus 16 bf16 converts and 16 multiplies. If `e2m1_to_float` is a branch
+   or a lookup rather than pure bit arithmetic, that is a lot of work per byte.
+2. **The shared-memory stores**, which are bank-conflicted: `wt` has stride
+   `TN+4 = 68` uint16 = 136 B = 34 banks, so consecutive `nl` land 2 banks apart
+   and 32 threads hit 16 banks twice.
+
+The discriminator is to replace `e2m1_to_float(nib) * s` with a plain constant
+inside the staging (wrong results, timing only, as in round 60). If the staging
+time collapses, it is the ALU and the fix is a cheaper dequant -- a 16-entry
+`__constant__` table indexed by the nibble would do it, or hoisting the scale
+multiply into the outer product where it is already done for fp8. If it does not
+move, it is the shared stores and the fix is the tile layout.
+
+This is the same method that produced every gain so far: isolate one thing,
+measure, then act.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
