@@ -2786,6 +2786,43 @@ success, and the measurement still did not happen.**
 **The check that catches it -- and the one that would have caught it here -- is to print the target
 line before and after the edit.** This session has now paid for that class of error five times.
 
+## PREFILL COST IS PER-TOKEN, NOT PER-PASS -- THE ENDPOINT FIX IS WORTH 1.11x (round 240)
+
+**The measurement round 239 failed to make, made properly this time** (the edited line was printed
+and verified before the run):
+
+| t | per-call | per row |
+|---|---|---|
+| 64 (recorded) | **435.94 ms** | 6.81 ms |
+| **128** | **750.00 ms** | **5.86 ms** |
+| **256** | **1473.76 ms** | **5.76 ms** |
+
+**The per-row cost is flat at ~5.8 ms from `t=64` upward.** So a prefill costs what its TOKENS
+cost, **not what its PASSES cost.** Batching 16 prompts does not make them cheaper; it only removes
+per-pass overhead, **and there is almost none to remove.**
+
+### This corrects rounds 236 and 237
+
+**Those projected 1.67x from "16 sequential 436 ms passes -> one 436 ms batched pass". The premise
+was wrong: a 944-token pass is not ~436 ms, it is 944 x 5.8 ms = ~5.48 s.** The 16 separate passes
+total **6.98 s**, so true variable-length batching saves **~1.5 s** -- wall **16.13 s -> 14.63 s**,
+endpoint **20.08 -> 26.3 tok/s**.
+
+**That is 1.11x, not 1.67x -- and well short of the 30 tok/s target.** The padded-batch variant is
+worse still: padding to a common length wastes the spread **and cannot beat the per-token floor
+either.**
+
+### So the endpoint target is NOT a scheduling problem after all
+
+**Round 236 was right that decode runs at engine speed and the prefill is serialized; it was wrong
+that serialization is what makes the prefill expensive.** The prefill is expensive because **it
+reads the whole model per prompt token, and 944 prompt tokens is 944 tokens of work at 5.8 ms
+each.**
+
+**Which returns the endpoint target to the same wall as everything else: the per-token prefill cost
+is the GEMM line this session closed ten times over.** The scheduling fix is real, **but small --
+and it is worth doing for 1.11x, not for the target.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
