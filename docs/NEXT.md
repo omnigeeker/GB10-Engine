@@ -1175,6 +1175,42 @@ were each caught by a cheap identity check, and **this one came back clean**:
 facts, and conflating them is what made round 193's alarm feel like a refutation when it was
 only a question.
 
+## THE GEMM DECOMPOSED (round 195) -- and it explains why five proposals failed
+
+**The staging-only ablation finally ran.** Method: disabled the NVFP4 variant's outer-product
+call at `kernels/gemm.cu:402` **by line index** -- the round-193 anchor attempt failed because
+that call appears three times, and the line-index edit is unambiguous (`dirty:1` proves it
+applied). **The gate fails by design here; this is a timing probe and its number must never be
+read as a result.**
+
+**t=64, 3 runs:**
+
+| | ms | share | rate |
+|---|---|---|---|
+| staging only | **213.20 / 213.85 / 215.19 = 214.08** | **49%** | **82.2 GB/s = 36% of the 228 peak** |
+| outer product (by difference) | **221.86** | **51%** | **3.94 TFLOPS (~22% of a ~18 TFLOPS CUDA-core ceiling)** |
+| total | **435.94** | | 40.4 GB/s |
+
+**So the time splits almost exactly in half, and both halves sit 2-3x below their own ceilings.
+Staging alone runs at twice the rate the full kernel achieves, so the layout story was at most
+half the problem -- and the other half is pure FMA on dequantized bf16.**
+
+### This is the answer to "why did five proposals fail"
+
+**There is no single dominant mechanism.** Every proposal from rounds 148-192 targeted one half
+-- occupancy, K splitting, the launch cut, traffic redundancy, the layout -- and **any fix that
+addresses only one half can win at most a fraction of the other half's cost.** That is exactly
+the pattern the measurements showed: 2-3% wins, and three falsifications.
+
+**The only class of fix that addresses both at once is a bigger tile / better data reuse**, so
+each staged byte feeds more FMAs *and* each FMA chain has more independent work.
+
+**But rounds 96-119 already established that exactly one tile shape passes the B/FMA gate at
+`GB10_GEMM_BLOCK = 128`** -- so the honest next question is not "which shape" but **whether the
+block size is the free variable**: with 256 threads the per-thread accumulator budget halves,
+which changes which shapes pass the gate at all. **That is a bounded, gate-checkable experiment
+and it is the only lead this decomposition leaves open.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
