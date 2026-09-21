@@ -337,12 +337,38 @@ accumulator and index state per thread -- 122 registers against 52 -- and pushes
 the tile to one block per SM. The extra loads in flight do not compensate.
 
 So the geometry is boxed in from both sides: `UNITS` cannot grow without `TN`,
-and `TN` cannot grow without register pressure. The remaining headroom is in the
-shared-memory budget, which is what caps occupancy at 2 blocks/SM: `wt` is
-`2*KC*(TN+4)` uint16 and `xt` is `2*KC*(TT+4)` float, 35840 B together. Shrinking
-the `+4` padding, or storing `xt` in bf16, would fit a third block per SM and
-raise the aggregate loads in flight without touching `TN`. That is the next
-experiment.
+and `TN` cannot grow without register pressure.
+
+### Occupancy, tested a second time (round 68)
+
+The remaining hypothesis was the shared-memory budget capping occupancy at 2
+blocks/SM. Dropping the `+4` padding (`WSTRIDE = TN`, `XSTRIDE = TT`, both still
+multiples of 4 so the `float4`/`ushort4` loads stay aligned) fits a third block:
+
+| | t=1 | t=16 | registers | smem | blocks/SM |
+|---|---|---|---|---|---|
+| padded | **271.46** | **292.85** | 52 | 35840 | 2 |
+| unpadded | 271.99 | 294.19 | 104 | 32768 | 3 |
+
+Correct (`generate` 16/16) and **completely neutral** -- and it cost registers,
+52 -> 104, presumably from the different unrolling. Reverted.
+
+This is the second independent test of occupancy on this kernel (the first was
+fp8 going 2 -> 3 blocks/SM in round 56) and both came back flat. Combined with
+the flat response to tile shape and to bytes in flight, the picture is now
+consistent: **the GEMM is not waiting on DRAM, and it is not short of warps.**
+
+That leaves the ~271 ms as internal work: the dequantisation and shared stores
+in the staging passes, the outer product's shared reads, and the non-GEMM ops.
+The round-65 result -- that `stage_xtile`'s 71 ms is stores, and that removing
+the dead zero-fill made things *slower* through divergence -- is the clearest
+clue about what kind of change would help: not deleting work, but removing
+per-lane branching from the shared-memory fill.
+
+Worth noting for perspective: 271 ms for 17.6 GB is 65 GB/s, while the decode
+GEMV reaches 148 GB/s on the same weights. So the ceiling is not the memory
+system; the GEMM path is roughly 2.3x less efficient than the GEMV path at
+identical traffic.
 
 ### A caution learned in round 64
 
