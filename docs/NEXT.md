@@ -61,6 +61,30 @@ shared   : 102,400 / 24,576   = 4 blocks   <- binding
 what makes this a diagnosis rather than a guess -- and it is the first mechanism
 this session that is supported by two independent measurements.
 
+### The occupancy hypothesis, tested and rejected (round 107)
+
+The cleanest test needs no precision change: `KC`=32 -> 16 halves the shared tile.
+
+| `KC` | registers | smem | blocks/SM | TTFT |
+|---|---|---|---|---|
+| 32 | 96 | 24,576 B | 4 | **498-500 ms** |
+| 16 | 78 | 12,288 B | **6** | **582.3 ms (+17%)** |
+
+**Correct (`generate` 16/16) and clearly worse.** So occupancy is not the binding
+constraint either: raising it from 33% to 37.5% costs 17%, because doubling the
+chunk count doubles the barriers and that dominates.
+
+**The 33%/33% agreement was a coincidence, not a diagnosis.** Two numbers matching
+is not evidence unless the mechanism connecting them is itself tested -- which is
+the same lesson as rounds 59, 101 and 104, arriving from the opposite direction:
+there, a counted mechanism was wrong; here, a *correlated* pair of measurements
+was. **Four mechanisms are now ruled out by measurement on this GEMM** (load
+pattern, dequant, shared stores, occupancy), and the prefill still runs at ~35 GB/s
+against the ~58 GB/s the same kernel reaches at t=1 -- **and even that comparison
+may be invalid, because the 58 GB/s figure was taken under the old TT=32/`KC`=64
+configuration.** Re-measuring the t=1 launch under the current configuration is
+the first thing the next session should do, before any further theory.
+
 **The lever is shared memory per block.** The 24,576 B is `xt[2][32][64]` as f32
 (16,384) plus `wt[2][32][64]` as u16 (8,192). Making `xt` bf16 takes it to
 16,384 B total, which allows 6 blocks by shared and 5 by registers -- i.e. **up to
