@@ -176,6 +176,33 @@ n-tile (tied to `GB10_TT`=64 by the tile mapping) or a K split (which needs a re
 across blocks). **Neither is a one-line change**, and both are shape changes of the kind
 round 115's tile work already showed to be the only moves that pay on this engine.
 
+### The n-tile path is closed too -- the K split is the only one left (round 148)
+
+Checked before proposing it: `crates/gb10-cuda/src/ops.rs:57` documents
+`GB10_NR = 64` as **"matches `GB10_TN` in `kernels/gemm.cu`"**. So **grid.x cannot be
+doubled by shrinking `GB10_NR` alone** -- NR and TN move together, and rounds 96-119
+already settled the tile at **TM=8/TNREG=4 with TN=64**, the only combination that ever
+passed the gate (TN=64 with TNREG=4 failed the mapping twice, rounds 90 and 96).
+
+**That leaves exactly one source of prefill parallelism: splitting K across blocks**,
+which needs a cross-block reduction (atomics, or a second pass over the accumulators).
+**A real feature, not a constant** -- and the honest next step, because it is the same
+lesson the tile work already taught: only shape changes pay on this engine, and the
+cheap shapes are exhausted.
+
+**The magnitude is knowable in advance:**
+
+| | now | 2-way K split |
+|---|---|---|
+| blocks | 272 (5.7/SM) | **544 (11.3/SM)** |
+| per-block K work | full | halved |
+| occupancy, if blocks bind (they do: 5.7 offered vs 5.3 cap) | **47%** | up to **~85%** |
+
+**So the ceiling is roughly 2x on the prefill: TTFT 434 -> ~220 ms, and the endpoint
+19.83 -> ~35-40 tok/s.** That is the one remaining path to the endpoint's >= 30 tok/s
+target, and it is a bounded, well-specified feature rather than another constant to
+try.
+
 **Also checkable:** 97 registers and 24,576 B shared have not been varied since round
 115, and the shared limit (4.2 blocks/SM) is *below* the register limit (5.3) -- so if
 shared usage could drop under 20,480 B, the register limit would become the only one.
