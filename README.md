@@ -7,25 +7,42 @@ Targets, and the measured hardware physics behind them, are in
 [`docs/TARGETS.md`](docs/TARGETS.md) and [`docs/PHYSICS.md`](docs/PHYSICS.md).
 
 > **Read `docs/PHYSICS.md` first.** The original request asked for 100 tok/s
-> single-stream. GB10 provides ~200 GB/s of usable read bandwidth and this
-> checkpoint requires 21.0 GB of weight reads per token, so the single-stream
-> ceiling is **9.5 tok/s**. That target is off by 10.5x and no implementation
-> can reach it; the agreed contract in `docs/TARGETS.md` reflects what the
-> hardware can actually do.
+> single-stream. Measured on this machine, GB10 sustains **228 GB/s** of read
+> bandwidth and this checkpoint requires **17.608 GB** of weight traffic per token,
+> so the single-stream roofline is **12.95 tok/s** and the per-step floor is
+> **77.2 ms**. The 100 tok/s target needs ~1.76 TB/s -- **7.7x the measured
+> bandwidth** -- so no implementation can reach it. The agreed contract in
+> `docs/TARGETS.md` reflects what the hardware can actually do.
 
 ## Status
 
 | Milestone | State |
 |---|---|
 | M0 Foundation: config, safetensors, tokenizer, chat template | **done** |
-| M1 CUDA backend + roofline GEMV | in progress |
-| M2 Layer kernels (Gated DeltaNet, attention, MLP, NVFP4/FP8) | pending |
-| M3 Full forward + greedy-decode parity | pending |
-| M4 MTP speculative decoding | pending |
-| M5 Paged KV + continuous batching (16 concurrent) | pending |
-| M6 OpenAI + Anthropic endpoints | pending |
-| M7 Roofline optimization | pending |
-| M8 Ollama head-to-head | pending |
+| M1 CUDA backend + roofline GEMV | **done** |
+| M2 Layer kernels (Gated DeltaNet, attention, MLP, NVFP4/FP8) | **done** |
+| M3 Full forward + greedy-decode parity | **done** (token-exact, 64 layers, 16/16) |
+| M4 MTP speculative decoding | **done** (token-exact; 44/48 acceptance; ~0.32x batched) |
+| M5 Paged KV + continuous batching (16 concurrent) | **done** (47.78 tok/s at B=16) |
+| M6 OpenAI + Anthropic endpoints | **done** (both protocols + streaming) |
+| M7 Roofline optimization | **in progress** -- see below |
+| M8 llama.cpp head-to-head | **done** (otp +11-14%; TTFT rate still 5.9x behind) |
+
+### Where the performance actually stands
+
+| | measured | target | |
+|---|---|---|---|
+| single-stream decode | **9.66 tok/s** | 12.5 (the agreed substitute) | 73% of the 12.95 roofline |
+| engine, 16 concurrent | **47.78 tok/s** | 30 | **met** |
+| endpoint, 16 concurrent | **19.8 tok/s** | 30 | prefill-bound |
+| otp vs llama.cpp | **+11-14%** | better | **met** |
+| TTFT rate vs llama.cpp | 7.36 vs 1.25 ms/token | better | **not met** |
+| single-stream 100 tok/s | -- | 100 | **physically impossible (7.7x)** |
+
+The remaining gap is two kernels, both characterized in `docs/NEXT.md`:
+`nvfp4_gemv_kernel` reaches 190 GB/s against the 272 GB/s its own access pattern
+sustains, and the prefill GEMM runs at **47% occupancy** -- bound by neither
+bandwidth (18% of roofline) nor compute (7.4 TFLOPS).
 
 ## Layout
 
@@ -128,8 +145,17 @@ curl http://127.0.0.1:8080/v1/messages \
 forward pass, collecting them within a 25 ms window. Set `GB10_BATCH_LOG=1` to log
 the group size each step -- 16 parallel requests should log `batch of 16`.
 Measured on one GB10: **256 completion tokens from 16 concurrent requests in
-13.6 s, i.e. 18.8 tok/s aggregate**, with identical prompts returning byte-identical
+12.9 s, i.e. 19.8 tok/s aggregate**, with identical prompts returning byte-identical
 answers.
+
+**Answers are stripped of the model's reasoning block.** `enable_thinking` defaults to
+`true` (matching the checkpoint), so the template puts the opening ` thinking` in the
+prompt and generation returns reasoning followed by `</think>`; the endpoint removes
+everything through that tag, so `content` is the answer itself. **Pass
+`"enable_thinking": false` for a shorter, direct answer with no reasoning generated at
+all** -- in that case the stripper is a no-op and the text passes through untouched.
+**Streaming still passes the reasoning through** -- see `docs/NEXT.md` for the
+designed fix and the truncation trap it has to avoid.
 
 No authentication is implemented and the listener is bound to loopback; add a
 proxy in front of it if it needs to be reachable from elsewhere.
