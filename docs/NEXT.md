@@ -897,11 +897,53 @@ far fewer loads are in flight than the probe sustains. The outer product is only
 ~27% as long as the loads, so it cannot hide them.
 
 **That points at the pipeline shape, which is exactly what round 74 flagged and
-then set aside.** The next experiment is to overlap more: either issue the next
-chunk's loads before the barrier rather than after it, or deepen the k pipeline
-so that two chunks are always in flight. Both are size changes to the existing
-structure, and both can be judged against the 825.6 us launch time rather than
-against a probe.
+then set aside.** The next experiment is to overlap more.
+
+### The pipeline split, and it is slower (round 83)
+
+`stage_wtile` was split into `load_wtile` (issue the global loads into registers)
+and `commit_wtile` (dequantise and store to shared), with the outer product moved
+between them:
+
+```
+load(chunk 0); commit(wt[1]); sync
+for c:
+    load(chunk c+1)          <- issue, do not consume
+    outer(wt[cur])           <- runs while the loads are in flight
+    commit(wt[nxt])          <- consume
+    sync
+```
+
+Correct (`generate` 16/16) and **slower**:
+
+| | t=1 |
+|---|---|
+| baseline | 271.46 ms |
+| load/commit split | 289.39 ms |
+
+Reverted. The likely cause is register pressure: `pk[2]` and `scl[2]` are now live
+across the whole outer product rather than only inside the staging, and this
+kernel is already register-sensitive (round 67 saw 122 registers from a much
+smaller change and lost 12%).
+
+### Where that leaves the concurrency hypothesis
+
+The hypothesis was that the staging's 71 GB/s (against 181 GB/s for the same
+pattern in isolation) is caused by loads being issued in bursts separated by
+barriers. The split pipeline should have fixed exactly that and it did not; it
+made things worse. So either
+
+* the compiler was already hoisting the loads across the outer product, in which
+  case the bursts were never the problem and 71 GB/s has another cause, or
+* the bursts are real but the register cost of fixing them exceeds the gain.
+
+Those are distinguishable: compile both versions with `-Xptxas -v` and compare
+register counts and spills. If the split version spills, the second explanation
+holds and the fix is to reduce the live range -- for instance by keeping only the
+scale in registers and re-loading the packed weights in `commit_wtile`, or by
+splitting only the scale fetch, which is a byte rather than 8.
+
+That check costs one command and should be the first thing done next round.
 
 ### A caution learned in round 64
 
