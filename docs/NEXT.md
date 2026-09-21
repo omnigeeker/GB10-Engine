@@ -45,9 +45,22 @@ line numbers are known:
   gemm.cu:311/317 switch `stage_wtile_fp8` stays, but the compute call must
   become `gemm2d_outer_bf16` (gemm.cu:181) instead of `gemm2d_outer`.
 
-That alone halves fp8's shared from 34816 B to 26112 B, matching nvfp4, and
-drops fp8 from 2 to 3 blocks/SM. Gate: `generate` must still be 16/16 exact --
-if bf16 were not lossless for e4m3, this is where it would show.
+**DONE (round 56).** fp8 shared is now 26112 B, matching nvfp4, and `generate`
+is still **16/16 exact** -- so the e4m3 -> bf16 conversion is confirmed lossless,
+as the mantissa widths predicted.
+
+It did **not** change the forward time:
+
+| t | before | after |
+|---|---|---|
+| 1 | 387.81 | 383.29 |
+| 4 | 388.08 | 393.88 |
+| 16 | 404.08 | 404.82 |
+
+That is a useful negative result: occupancy was not the limiter (fp8 went from 2
+to 3 blocks/SM and gained nothing), which further isolates the cause to the
+per-chunk load latency that `GB10_KC = 32` produces. It also leaves the fp8
+kernel in the shape step 2 needs.
 
 Step 2 then becomes possible:
 

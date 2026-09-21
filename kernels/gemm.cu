@@ -81,7 +81,7 @@ __device__ __forceinline__ void stage_wtile(uint16_t (*wt)[GB10_WSTRIDE],
 }
 
 template <int KC>
-__device__ __forceinline__ void stage_wtile_fp8(float (*wt)[GB10_WSTRIDE],
+__device__ __forceinline__ void stage_wtile_fp8(uint16_t (*wt)[GB10_WSTRIDE],
                                                 const uint8_t* __restrict__ w,
                                                 const float* __restrict__ s1, int K, int nbase,
                                                 int N, int c) {
@@ -98,7 +98,9 @@ __device__ __forceinline__ void stage_wtile_fp8(float (*wt)[GB10_WSTRIDE],
         const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
         const float wscale = __ldg(s1);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) wt[seg * 8 + j][nl] = e4m3_to_float(pb[j]) * wscale;
+        for (int j = 0; j < 8; ++j)
+            wt[seg * 8 + j][nl] =
+                __bfloat16_as_ushort(__float2bfloat16_rn(e4m3_to_float(pb[j]) * wscale));
     }
 }
 
@@ -296,7 +298,7 @@ __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
                                               float* __restrict__ y, int N, int K, int T) {
     // Double buffered: staging chunk c+1 while computing chunk c hides the
     // staging load latency, which is what this kernel is actually bound by.
-    __shared__ float wt[2][GB10_KC][GB10_WSTRIDE];
+    __shared__ uint16_t wt[2][GB10_KC][GB10_WSTRIDE];
     __shared__ float xt[2][GB10_KC][GB10_XSTRIDE];
 
     const int nbase = blockIdx.x * GB10_TN;
@@ -317,7 +319,7 @@ __device__ __forceinline__ void fp8_gemm_body(const uint8_t* __restrict__ w,
             stage_wtile_fp8<GB10_KC>(wt[nxt], w, s1, K, nbase, N, c + 1);
             stage_xtile<GB10_KC>(xt[nxt], x, K, T, t0, c + 1);
         }
-        gemm2d_outer(wt[cur], xt[cur], acc, ty, tx);
+        gemm2d_outer_bf16(wt[cur], xt[cur], acc, ty, tx);
         __syncthreads();
     }
 
