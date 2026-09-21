@@ -332,3 +332,46 @@ data".**
 **Do not re-attempt the memset form.** The next attempt should be the scratch+reduction
 form, and it should still land the kernel change first with `grid.z = 1` and prove both
 gates green before the host ever asks for `nsplit = 2`.
+
+
+---
+
+## CORRECTION (round 163): the "live buffer" explanation is NOT established
+
+The round-162 note above says `memset_zeros(y)` destroys live activations. **Reading the
+call site does not support that as stated.** `crates/gb10-model/src/weights.rs:95-101`:
+
+```rust
+if self.n < 256 || t <= 16 { return self.forward(dev, x, y, t); }
+...
+LinearData::NvFp4 { w, wscale, scale2 } =>
+    kern.nvfp4_gemm(dev, w, wscale, scale2, x, y, self.n, self.k, t)?
+```
+
+**`y` is a caller-supplied OUT parameter of `forward_prefill`.** It is written by the
+GEMM, so zeroing it immediately before the GEMM is not obviously wrong. **The
+"live activation" story was an inference, not a measurement, and it should not be
+repeated as fact.**
+
+**What is still true and still unexplained:** the gate reports `0/0` with the split on and
+16/16 with it off, and `out` is empty, so generation produces no tokens. **The root cause
+is open.**
+
+**The remaining candidate, which fits the evidence better:** `memset_zeros` zeroes the
+**entire slice**, and `y` is very likely a **slice of a larger preallocated activation
+buffer** rather than a `t * n` allocation of its own. If so, the memset clears well past
+the region the GEMM writes -- into neighbouring buffers. That would corrupt the forward
+pass in a way that produces degenerate output, which matches `out` being empty. **This is
+also unverified**; the way to settle it is to compare `y.len()` against `t * n` at the
+call site -- **one print, before any further design work.**
+
+**Why the scratch design is still the right answer regardless:** it never memsets
+anything, so **it does not depend on this question at all.** Whether `y` is live, aliased
+or exactly sized, writing `nsplit` disjoint scratch regions and then summing them into
+`y` once is correct. **The design is chosen because it is indifferent to the cause, not
+because the cause is known.**
+
+**So the next attempt should do the one print first (cheap, settles the mechanism), then
+implement scratch+reduction.** If `y.len() == t * n` the memset theory is dead and the
+bug is in the kernel's chunk arithmetic instead -- and that would be worth knowing before
+writing a new kernel.
