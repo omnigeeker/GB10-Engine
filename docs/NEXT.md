@@ -327,6 +327,42 @@ else {
 
 **Do the same at the Anthropic site** (`main.rs:483`, `event:`/`data:` framing).
 
+### Attempted twice in round 156, reverted twice -- the exact compile error
+
+Both attempts hit the borrow fight the note above predicts, and **both were reverted
+cleanly with `git status` empty and `generate` still 16/16. Nothing about streaming
+landed.**
+
+The error to plan around is **`E0631: type mismatch in closure arguments`** at
+`ThinkGate::new(&mut send)`: `send` is `|v: &Value| -> Result<()>` (line 411) while the
+gate's bound is `F: FnMut(&str) -> Result<()>`. **The gate cannot wrap `send` directly.**
+
+The shape that gets furthest is a separate `&str` adapter per site, *not* a modification
+of `send`:
+
+```rust
+let mut emit_s = |t: &str| -> Result<()> { send(&json!({ ... "content": t ... })) };
+{
+    let mut gate = ThinkGate::new(&mut emit_s);
+    let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| gate.push(piece));
+    gate.flush()?;
+    match res { ... }
+}
+// `emit_s` must be OUT OF SCOPE before the finish chunks call `send` again.
+```
+
+**The scoping is the whole difficulty**, and it is why the second attempt died too: the
+finish chunks after the generation block also call `send`, so `emit_s` and `gate` both
+have to drop before that point, and the `match res` arm has to be closed at the right
+place. **A patch to this region has to move the closing brace, which makes a
+string-match edit fragile** -- the second attempt's anchor failed and wrote nothing,
+leaving the tree mid-patch until it was restored from `/tmp/m155.rs`.
+
+**Next attempt: restructure this function by hand rather than by patch script**, or
+extract the whole streaming body into its own function so the gate's lifetime is a
+function boundary rather than a brace to be moved. **Do not use a sed/python anchor for
+the brace.**
+
 **Acceptance:** `curl ... "stream": true` with the round-152 prompt and
 `max_tokens: 200` must emit `The capital of France is Paris.` and **must not emit any
 reasoning text**; with `max_tokens: 8` it must still deliver *something* rather than an
