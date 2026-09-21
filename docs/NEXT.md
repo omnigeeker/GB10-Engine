@@ -2541,6 +2541,39 @@ Everything else in the objective is reachable and has a concrete path: TTFT
   addressing bug passes.
 * Change one variable and see whether the failure follows it.
 
+## MEASUREMENT RULE, added round 135: the ablation has a ~7-8% run-to-run spread
+
+Identical binaries, three runs each:
+
+| | run 1 | run 2 | run 3 | spread |
+|---|---|---|---|---|
+| `gemv_bw` probe (level 1) | 261.9 | 279.4 | 273.7 | **~7%** |
+| `abl6` level 3 (scale path) | 214.0 | 209.9 | 226.3 | **~8%** |
+
+**Round 131 ran each level once.** Its level-3 value (194.8) is an **outlier below**
+the 209.9-226.3 range. The *level-1 vs level-3 gap* does survive -- level 1 averages
+~266 against level 3's ~215, about **19%** -- so the mechanism claim that the scale
+path costs the most still stands. **But a single run overstated it, and two later
+decisions were made on numbers that cannot support them:**
+
+* **round 132's "-3.3% faster"** and
+* **round 134's "+2.5% worse"**
+
+are **both inside a ~7% noise band**. Neither the widening nor the shared hoist is
+established by the `forward-cost` harness as it was run -- both were single
+measurements. Round 134's conclusion (the hoist is not worth keeping) is *directionally*
+supported by the shared-memory latency argument, but the 2.5% figure itself is noise.
+
+**Rule: any number that becomes a mechanism claim -- or a keep/revert decision -- must
+be run at least 3 times, and the spread reported alongside it.** Rounds 59, 101, 104
+and 106 each established that a counted or correlated measurement can mean nothing;
+this round establishes that a *single* measurement can too, including one this session
+generated and then built three rounds of reasoning on.
+
+**What is still solid:** the probe's pattern ceiling (~266-279 GB/s, mean ~272) against
+the real kernel's 190 GB/s. That gap is **1.43x**, far outside the noise, and it is the
+one number driving this investigation that survives repetition.
+
 ## Shared-memory hoist: tested and rejected -- and it re-reads the ablation (round 134)
 
 Implemented exactly as designed below (nvfp4 template only, `use_smem` guard, static
