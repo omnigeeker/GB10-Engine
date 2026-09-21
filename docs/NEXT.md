@@ -1,5 +1,67 @@
 # SESSION HANDOFF (read this first)
 
+## Where this stands, as of round 140
+
+**One kernel is the entire remaining decode shortfall.** Everything else is measured
+and closed:
+
+| path | bytes/step | time/step | GB/s | its pattern's ceiling | gap |
+|---|---|---|---|---|---|
+| **`nvfp4_gemv_kernel`** | **9.19 GB** | 52.7 ms | **174** | **272** | **1.56x** |
+| `fp8_gemv_kernel` | 8.42 GB | 36.2 ms | **232** | -- | **none (at peak)** |
+| delta-rule + rmsnorm | small | ~15 ms | -- | -- | -- |
+
+`bench/hw/gemv_bw.cu` streams the real NVFP4 layout with the GEMV's **own access
+pattern** and reaches **~272 GB/s** (261.9/279.4/273.7 over 3 runs). So the memory
+system is not the limit: **the 1.56x is inside `nvfp4_gemv_kernel`.**
+
+**T1** (`docs/TARGETS.md`) is single-stream decode >= 12.5 tok/s. Current: **9.66**.
+The original 100 tok/s target was shown physically unreachable before implementation
+began and the owner accepted hardware-feasible targets; the roofline is 12.95 tok/s.
+
+## What has been ruled out on that kernel -- do not retry these
+
+Each was eliminated by measurement, not argument:
+
+1. x traffic (shared staging of x) -- neutral
+2. bytes in flight -- 768 KB against ~78 KB needed, **10x more than required**
+3. DRAM latency
+4. occupancy -- 39 registers, far below the limit
+5. local memory
+6. the weight stream
+7. the load instruction mix -- `ROWS`=2 measured **+3.1% worse at B=1**, extending
+   round 104's B=16 result to both ends of the batch range
+8. the warp reorganisation the analysis called for -- **already implemented**
+   (`e0 = i*kTile + lane*kVec` already puts 256 contiguous bytes under one warp
+   instruction)
+9. per-element ALU work -- ALU at **7.5%** and issue at **8.6%** of capacity
+10. hoisting the scale row into shared memory -- **+2.5% worse**, outside the ~1%
+    `forward-cost` noise
+
+**What survived and is in the tree:** widening the NVFP4 scale load to 8 lanes x
+`uint32` + `__shfl_sync` (round 132). Measured **-2.0%**, three runs per build,
+ranges non-overlapping (105.63 -> 103.48 ms).
+
+## Measurement rules this session paid for
+
+* **A broken kernel reports faster.** Rounds 88, 110 and 119 each produced a "faster"
+  number from a kernel that failed the 16/16 gate. **Run the gate before trusting any
+  number.**
+* **Change a component's size and measure; never disable a component and subtract.**
+* **A counted mechanism can mean nothing** (rounds 59, 101, 104, 106).
+* **A single measurement can mean nothing too** (round 135) -- including one this
+  session produced and then built three rounds of reasoning on.
+* **Any number that becomes a claim or a keep/revert decision: >= 3 runs, report the
+  spread.** `forward-cost` t=1 repeats to **~1%**; the probe/ablation to **~7-8%**.
+* **Cheapest check first.** Two of the last three proposals died to one grep or one
+  `python3 -c` before touching the kernel.
+
+## The gate
+
+`./target/release/gb10-verify generate --n 16` -- 64 layers, token-exact against
+`Qwen3_5ForCausalLM` weights dequantized from NVFP4 to bf16. **16/16 or nothing is
+trusted.** `chunked-prefill` guards the prefill/`start>0` path.
+
 ## T1 is a bandwidth-efficiency target, and it is narrow (round 123)
 
 `docs/TARGETS.md` records the owner's revised, hardware-feasible contract -- the
