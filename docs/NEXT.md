@@ -1108,6 +1108,44 @@ endpoint target is still reachable *in principle* -- 88.9 GB/s is below the 170 
 machine demonstrates elsewhere -- **but no mechanism for it is currently identified.** That is
 the honest state, and it is different from "impossible": it is "not yet found".
 
+## THREE GEMM VARIANTS (round 193): I never checked which one runs
+
+**The staging-only ablation did not run. Its anchor -- `gemm2d_outer_bf16(wt[cur], xt[cur], acc,
+ty, tx);` -- occurs THREE times, at `kernels/gemm.cu:402`, `:436` and `:469`. The assert
+rejected 3 != 1, nothing was written, and `git status` is empty, so the printed
+432.59 / 428.46 / 425.52 ms are the baseline again, not a staging-only result.**
+
+**But the failure surfaced the thing that matters: `gemm.cu` contains three outer-product call
+sites, i.e. at least three GEMM kernel variants -- and I have been reasoning about "the prefill
+GEMM" since round 148 without once establishing which variant `forward_prefill` launches.**
+
+**This is round 176's lesson repeating exactly.** There, `nvfp4_gemv` turned out to dispatch
+between two kernels and I had read the wrong one. Here there are three.
+
+### What this invalidates, and what it does not
+
+| conclusion | status |
+|---|---|
+| **KC=64 is worse** (round 192) | **VALID** -- measured end-to-end through `forward-cost`, so it tested whichever variant actually runs |
+| K split is 2-3% (round 187) | **VALID** -- same reason |
+| no redundant weight traffic (round 191) | valid for the launched variant only |
+| **the 16 B-per-line layout arithmetic** (round 189) | **UNSUPPORTED** -- rests on reading one specific `stage_wtile`, and that function may not belong to the launched variant |
+| **the transpose proposal** (round 190) | **UNSUPPORTED**, same reason |
+
+**End-to-end measurements survive; code-reading conclusions do not, until the variant is
+identified.**
+
+### The first step next round is identification, not another mechanism
+
+**Which of the three outer-product variants does `nvfp4_gemm` launch, and does the `stage_wtile`
+I analysed (`kernels/gemm.cu:65`) belong to it?** One grep of the three call sites' enclosing
+kernel signatures answers it -- and it must be answered before any further layout reasoning.
+
+**This is now the fourth time this session that reading the wrong object -- a kernel, a column, a
+comment, a ruled-out list entry -- produced a confident conclusion that had to be retracted.
+The pattern is stable enough to name: verify the identity of the object before reasoning about
+its properties.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
