@@ -130,6 +130,33 @@ are what is costing.
 **Test with `forward-cost` t=1, >= 3 runs, mean against 103.48 ms** (the round-132
 build), and the gate must stay 16/16.
 
+## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
+
+The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
+**47.78 tok/s** at B=16 in `batch-parity`. The measured split explains it: **7.63 s
+prefill + 5.36 s decode + ~0.6 s = 13.59 s**, against 13.60 s measured.
+
+Reading `run_group` confirms the prefill is **not** batched -- line 669 calls
+`model.prefill_seq(...)` inside the per-sequence loop, so **all 16 requests pay 16
+separate prefill passes.** That looks like an obvious scheduler win. **It is not, and
+the GEMM's tile width is why:**
+
+| | weight passes |
+|---|---|
+| separate: 16 sequences x 1 pass each | **16** |
+| batched: 16 x 59 = 944 tokens / 64 per tile | **15** |
+
+**A 59-token prompt is already within one 64-wide tile, so it already costs exactly one
+weight pass.** Batching 16 of them saves one pass in sixteen -- about 6%, not enough to
+justify a scheduler change, and it would break the per-sequence state handling that
+`prefill_seq` currently owns.
+
+**So the endpoint's 7.63 s of prefill is 16 x 434 ms of weight-bound work that cannot be
+amortised away.** It is the same 32 GB/s prefill GEMM that T1's roofline discussion
+points at, not a scheduling defect. **The endpoint target (>= 30 tok/s at 16 concurrent)
+cannot be reached by scheduling; it needs the prefill GEMM faster, which is the same
+work as the decode gap, in a different kernel.**
+
 ## What has been ruled out on that kernel -- do not retry these
 
 Each was eliminated by measurement, not argument:
