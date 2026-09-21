@@ -83,7 +83,39 @@ register pressure and scheduling.**
 outer structure already holds `pk[ROWS]`, `sc[ROWS]` and the 16-float `XVec xv`. **The
 compiler cannot keep all of that in flight and serialises.**
 
-**The fix to test: fuse the unpack into the FMA loop** -- unpack one element and apply
+### The fused unpack is NEUTRAL -- register pressure is not it either (round 144)
+
+Implemented exactly as below (unpack each nibble inline into its FMA, so `lo[8]`/`hi[8]`
+never become live arrays):
+
+| | round 132 build | fused unpack |
+|---|---|---|
+| registers | 48 | **45** (fell as predicted) |
+| spills | 0 | 0 |
+| `generate` | 16/16 | **16/16** |
+| **t=1 (3 runs)** | 103.29 / 103.03 / 104.11 (**mean 103.48**) | 101.00 / 104.09 / 104.36 (**mean 103.15**) |
+
+**-0.3%, ranges heavily overlapping. Reverted.**
+
+**The register count fell exactly as the hypothesis predicted and the bandwidth still
+did not move -- which is the cleanest possible falsification.** So register pressure is
+not `nvfp4_gemv_tmpl`'s problem either.
+
+**And that closes the last of the three levers derived from the ablation.** Levers 1 and
+2 (shared-memory and `prmt` tables) died to reading the code; lever 3 died to
+measurement.
+
+**The methodological conclusion, which is the real result of rounds 141-144:**
+`bench/hw/gemv_bw.cu` **reproduces the real kernel's bandwidth** (185.8 against 190) but
+**its internal decomposition does not transfer to the real kernel.** Every step-by-step
+explanation the ablation offers -- unpack, scale, FMA, and their super-additive
+combination -- has now been tested *in the real kernel*, and none of them moves it.
+**A synthetic kernel that matches on the endpoint but not on the derivative is not a
+model of the kernel, and its per-level numbers should not be used to choose edits.**
+The one thing it established that survives is the endpoint comparison itself: the
+pattern sustains ~272 GB/s and the kernel reaches 190.
+
+**The original fix note, kept as the record of a tested-and-rejected edit:** -- unpack one element and apply
 its FMA immediately, so `lo[8]`/`hi[8]` never become live arrays. **That trades 16 live
 registers for a shorter dependency chain**, and the level-8-vs-7 gap says the registers
 are what is costing.
