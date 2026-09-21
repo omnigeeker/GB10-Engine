@@ -89,3 +89,47 @@ weights left unquantized.
 Durable state lives in `loop/state.json`; per-round reports in `loop/rounds/`.
 A round that fails a gate is recorded as `FAIL` and does not advance the
 milestone.
+
+## Using the local endpoint
+
+The server speaks both the OpenAI and the Anthropic wire protocols on
+`127.0.0.1:8080`. Start it with the model directory as the argument:
+
+```sh
+cargo build --release
+./target/release/gb10-server --model models/Qwen3.8-27B-NVFP4
+```
+
+It takes about 95 s to load the weights, then it serves:
+
+| route | protocol | notes |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI | supports `stream`, `max_tokens`, `enable_thinking` |
+| `POST /v1/messages` | Anthropic | supports `stream`, `max_tokens` |
+| `GET /v1/models` | both | returns the loaded model id |
+
+**OpenAI client:**
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"m","messages":[{"role":"user","content":"Count from one to five."}],"max_tokens":16}'
+```
+
+**Anthropic client:**
+
+```sh
+curl http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"Count from one to five."}]}'
+```
+
+**Concurrency.** The server batches up to 16 concurrent requests into a single
+forward pass, collecting them within a 25 ms window. Set `GB10_BATCH_LOG=1` to log
+the group size each step -- 16 parallel requests should log `batch of 16`.
+Measured on one GB10: **256 completion tokens from 16 concurrent requests in
+13.6 s, i.e. 18.8 tok/s aggregate**, with identical prompts returning byte-identical
+answers.
+
+No authentication is implemented and the listener is bound to loopback; add a
+proxy in front of it if it needs to be reachable from elsewhere.
