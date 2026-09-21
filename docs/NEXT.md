@@ -1478,6 +1478,53 @@ work is removed, and the difference is a real staging measurement.**
 > **An ablation that removes the *use* of data can also remove the *load* of it. Remove the
 > computation, but keep a dependency on the data.**
 
+## THE ABLATION WAS WRONG -- AND CORRECTING IT CLOSES THE ARITHMETIC (round 203)
+
+**Round 202 predicted the ablation was eliminating dead loads. This confirms it and quantifies it.**
+
+**Method: replace the deleted outer product with a DEPENDENCY-PRESERVING probe -- one read from
+`wt` and one from `xt`, accumulated into `acc[0][0]` -- so the staged data stays live and the
+compiler cannot drop the loads, while the FMA work is still removed.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **probe (loads live, FMA removed)** | **279.62** [277.35-282.32] | **322.33** [319.62-324.18] |
+| deleted-outer-product ablation (round 195) | 178.88 | 213.63 |
+| full kernel | 400.01 | 435.94 |
+
+**The probe measures 100.74 ms (t=32) and 108.70 ms (t=64) MORE than the ablation did. So round
+195's ablation WAS eliminating loads, and its "staging = 214.08 ms" was an underestimate by
+about half.**
+
+### The corrected decomposition at t=64
+
+| phase | ms | share | rate |
+|---|---|---|---|
+| **staging (loads live)** | **322.33** | **74%** | **54.6 GB/s = 24% of the 228 peak** |
+| outer product (by difference) | **113.61** | **26%** | -- |
+| total | 435.94 | | 40.4 GB/s |
+
+**So the real picture is NOT "two co-equal halves". Staging dominates at 74% and runs at 24% of
+peak -- worse than the 36% the flawed measurement suggested. The outer product is not the
+co-bottleneck it appeared to be.**
+
+### And the arithmetic now closes exactly on target
+
+**At peak bandwidth the staging would take `17.608 / 228 = 77.2 ms`, and
+`77.2 + 113.6 = 190.8 ms` against today's 435.94 -- a 2.28x speedup. The endpoint target needs
+2.2x. THE ARITHMETIC CLOSES ON TARGET.**
+
+**So the objective is reachable and the lever is now unambiguous: the staging must move from
+54.6 GB/s toward peak. The layout leads of rounds 189-190 were demoted by a confounded test
+(KC=64) and deserve re-examination now that staging is known to be 74% of the time, not 49%.**
+
+### The rule, paid for twice
+
+> **An ablation that removes the *use* of data can also remove the *load* of it. Remove the
+> computation, but keep a dependency on the data.**
+
+**Round 202 predicted this. Round 203 confirmed it and put a number on it: 108 ms.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
