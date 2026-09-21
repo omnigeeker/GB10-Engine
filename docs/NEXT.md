@@ -2182,6 +2182,28 @@ all, which is worse than not gating."**
 **This is the only unmet target this session that was a DEFECT rather than a hardware limit, and
 it is now fixed.**
 
+## BOTH PROTOCOL STREAMING PATHS VERIFIED INCREMENTAL (round 222)
+
+**The fix landed in `ThinkGate`, and both handlers construct their own gate --
+`handle_chat_completions` at `main.rs:440` and `handle_messages` at `main.rs:576` -- so the single
+change covers both protocols.**
+
+**Verified live, same request on both routes (`max_tokens = 40`):**
+
+| protocol | deltas | true TTFT | total |
+|---|---|---|---|
+| **Anthropic `/v1/messages`** | **40** | **0.530 s** | 14.184 s |
+| **OpenAI `/v1/chat/completions`** | **40** | **0.523 s** | 14.277 s |
+
+**Both went from 2 frames / ~14.4 s TTFT to 40 frames / ~0.53 s TTFT.** The two protocols now
+behave identically, which is what the objective asks for.
+
+**And TTFT is now the number it should be**: ~0.53 s, which is the prefill plus the first decode
+step -- **not the whole generation.** That is the quantity the objective compares against
+llama.cpp, **and it is measurable for the first time.**
+
+**Gate status: `generate` 16/16, `chunked-prefill` OK.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
