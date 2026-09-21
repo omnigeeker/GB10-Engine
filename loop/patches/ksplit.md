@@ -231,3 +231,51 @@ from a compile-time assumption about the launch.
 **Acceptance:** both gates must stay green, then `forward-cost` / TTFT with **>= 3 runs**
 against the 434 ms baseline, **ranges non-overlapping** before calling it a win.
 **Predicted ~2x: TTFT -> ~220 ms, endpoint 19.8 -> ~35-40 tok/s.**
+
+
+---
+
+## HOST HALF ATTEMPTED AND REVERTED (round 161) -- the gate caught three failures
+
+`crates/gb10-cuda/src/ops.rs` was edited at all three NVFP4 prefill launch sites:
+compute `nsplit` from `k / 32`, `memset_zeros(y)` when `nsplit > 1` (cudarc does expose
+`memset_zeros` at `driver/safe/core.rs:1573`), and pass `nsplit` as the third grid dim.
+**It compiled. It failed the gate three ways. It was reverted with `git checkout` and the
+tree is green again at the round-160 commit (`generate` 16/16, `chunked-prefill` OK).**
+
+| store form | `generate` | `chunked-prefill` | `batch-parity` |
+|---|---|---|---|
+| baseline (no split) | **16/16** | **OK** | OK |
+| `if (z == 0) store else atomicAdd` | **0/0** | **FAILED** | OK |
+| all blocks `atomicAdd` | **0/0** | **FAILED** | OK |
+
+**The first form is a race and that part is understood**: block 0's plain store can land
+after another block's `atomicAdd` and clobber the partial sum. **The second form removes
+the race and still fails identically, so the race was not the (only) bug.**
+
+**`0/0` rather than a token mismatch is the important signal.** The same gate reports
+16/16 without the split, so a comparison that examines *zero* tokens points at something
+structural -- an error, an empty output, a shape problem -- not a rounding difference.
+**That is the first thing the next attempt must explain**, before touching the timing.
+
+`batch-parity` passing throughout is consistent and expected: **it does not use the
+prefill GEMM**, so it is not evidence that the split works.
+
+### Cheapest checks for the next attempt, in order
+
+1. **Read what `0/0` means in `gb10-verify`.** If it counts wrong tokens out of tokens
+   compared, zero compared tokens means generation produced nothing -- so look for an
+   error/panic path, not a numerics path. **One grep, before any code change.**
+2. **Print `nsplit` and `kchunks` once** to confirm the split is 2 for the real `k` and
+   that the guard is not silently selecting 2 where `nchunk / 2` is odd.
+3. **Check whether `y` is used more than once per call** in the prefill path. If the
+   same slice is passed for two GEMMs, or read back after the call, zeroing it before the
+   launch is not the benign operation this spec assumes.
+4. **Only then** re-measure TTFT, with `>= 3` runs.
+
+**What survives and is safe:** the kernel half (items 1-4) is committed and verified with
+`grid.z = 1` -- behaviour unchanged, both gates green. **That increment is real and
+vetted; the host half is not.**
+
+**And the rule that held: the gate blocked a faster-and-wrong prefill three times in a
+row. Do not take a timing on this path until it is green.**
