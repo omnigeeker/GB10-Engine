@@ -1,3 +1,100 @@
+# SESSION HANDOFF (read this first)
+
+## Verified state
+
+`generate` 16/16 exact, `chunked-prefill` OK, `batch-parity` OK. t=1 forward
+272.75 ms, t=16 286.93 ms. Tree is clean at the best-known state; every round has
+been pushed to `GB10-Engine`.
+
+The engine is complete and usable: pure Rust, NVFP4 on GB10, OpenAI and Anthropic
+endpoints, concurrency-16 correct, and otp better than llama.cpp. The open items
+are performance only.
+
+## What is actually measured (trust these)
+
+The only sound numbers in this document are the profiler's per-launch figures and
+component tests done by changing a size. Everything derived from disabling a
+component and subtracting has been retracted.
+
+`nsys profile --stats=true` on `forward-cost`:
+
+| kernel | % GPU | avg | min |
+|---|---|---|---|
+| `nvfp4_gemm_kernel` | 32.7 | 825.6 us | 635.9 us |
+| `nvfp4_gemv_kernel` | 24.9 | 301.2 us | 213.9 us |
+| `fp8_gemm_kernel` | 20.1 | 468.3 us | 238.3 us |
+| `fp8_gemv_kernel` | 17.1 | 192.9 us | 26.0 us |
+| all non-GEMM ops | ~5 total | | |
+
+The four GEMM/GEMV kernels are 94.8% of GPU time; non-GEMM work cannot pay more
+than 5%.
+
+Per `nvfp4_gemm_kernel` launch (44.6 MB of weights), by halving components and
+reading the profiler:
+
+| part | per launch | share |
+|---|---|---|
+| weight loads | ~630 us | 76% |
+| outer product | ~170 us | 21% |
+| dequant + shared stores | ~2 us | 0.2% |
+
+**So the loads run at 71 GB/s average (104 at minimum) against 148 GB/s for the
+GEMV path on the same weights.** That gap is the target.
+
+## The next change, with a reference implementation in this repo
+
+`nvfp4_gemv_tmpl` in `kernels/gemv.cu` solved this same problem and its comment
+says how:
+
+> *Issue every row's weight and scale load BEFORE any of the arithmetic. Fusing
+> the loads into the compute loop leaves the compiler free to keep only one load
+> in flight per warp, which starves DRAM; separating them gives ROWS independent
+> loads.*
+
+Its addressing makes **one warp instruction cover 256 contiguous bytes of a
+single row** (`e0 = i*kTile + lane*kVec`, 8-byte loads). The GEMM staging instead
+scatters one instruction across 8 rows at 32 B each, and fuses load with dequant
+and store.
+
+The fix has two halves that must go together:
+
+1. **One row per warp instruction** -- change the staging's thread-to-(row, k)
+   mapping. Rounds 76, 77 and 79 all kept the 8-row scatter and only varied the
+   bytes per row, which is why none of them moved anything.
+2. **Issue all loads before arithmetic** -- round 83 tried this alone and it was
+   *slower*, consistent with the GEMV comment: separating loads only helps when
+   there are genuinely independent loads to separate.
+
+Note the shared-memory constraint: one row per instruction with 8-byte lanes
+means 256 bytes = 512 k-elements, and a 512-deep `wt` tile does not fit
+(`2*512*68*2 = 139264 B`). Resolving that is the design problem for the next
+session -- the likely answer is a row-major shared tile with a different consumer
+loop in `gemm2d_outer_bf16`.
+
+## Methodology rules learned here
+
+* **Probe before optimising** -- this produced every real gain (rounds 60, 62, 63:
+  -28%).
+* **Change a component's size and measure; never disable a component and
+  subtract.** Disable-probes over-attribute badly (round 81).
+* **A probe measures what a pattern can reach, never what the kernel is blocked
+  by** (round 79).
+* **A probe that varies two things at once is as misleading as a guess** and more
+  dangerous, because it looks like evidence (round 75/76).
+* **Profile first.** Three rounds were spent on a misdirected line that one
+  `nsys` run would have avoided (round 77).
+* **Read the codebase.** The answer to the GEMM problem was documented in
+  `gemv.cu` the whole time (round 83).
+* Revert anything whose gain is inside the +-2% run-to-run noise, even when the
+  sign is consistent (round 77).
+
+## Honest target assessment
+
+Single-decoder 100 tok/s is arithmetically unreachable: 17.6 GB/token against
+228 GB/s measured gives a **roofline of ~13 tok/s**. Concurrency-16 at 30 tok/s is
+**already met** (40.75). TTFT better than llama.cpp is still open (452.6 ms vs
+~74 ms), with prefill improved 27-28% so far.
+
 # Handoff: the prefill GEMM is the critical path
 
 ## Where the engine stands
