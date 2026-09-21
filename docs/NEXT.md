@@ -2383,6 +2383,38 @@ staging's current 52.4 GB/s.
 **And the fix does not need to be perfect to pay: landing merely at the GEMV's 170 GB/s captures
 3.2x of the 4.0x available.**
 
+## THE "CHEAPER EXPERIMENT" IS REFUTED BY ARITHMETIC (round 229)
+
+**Round 227's shape 3 was dismissed by citing round 199 -- but round 199 measured the TOKEN
+dimension (`GB10_TT`), not `GB10_TN`. They are different knobs.** That made `GB10_TN` look like an
+untested shortcut to `P = 4`.
+
+**It is not, and the arithmetic says so before any code is written.**
+
+**The thread count is DERIVED from the tile:**
+
+| constant | value | derived |
+|---|---|---|
+| `GB10_TN` | 64 | `ty_groups = GB10_TN / GB10_TM = 8` |
+| `GB10_TT` | 64 | `tx_groups = GB10_TT / GB10_TNREG = 16` |
+| -- | -- | **8 x 16 = 128 threads** |
+
+**Raising `GB10_TN` to 256 raises `ty_groups` to 32, which needs 512 threads -- and then
+`P = UNITS / threads = 512 / 512 = 1` again. The loads per thread do not change.** Raising the
+tile raises the work and the parallelism together, **which is exactly why it does not touch the
+quantity that matters.**
+
+### So shape 1 is the only route
+
+**The multi-k-tile pipeline raises `P` WITHOUT changing `UNITS` or the thread count: the extra
+loads come from k-tiles that have not been consumed yet, not from a wider tile.** That is the
+structural difference, **and it is why every tile-shaped change -- round 199's wider token tile,
+round 225's wider `GB10_KC`, and this round's wider `GB10_TN` -- has failed or would fail.**
+
+**The check cost nothing, and it is the same one that has paid four times this session: identify
+the units and the producing code before reasoning about a number.** Here the producing code is the
+thread-count derivation, **and it was one line away.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
