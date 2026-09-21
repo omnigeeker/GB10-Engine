@@ -379,12 +379,38 @@ become per-kernel template parameters (or per-kernel macros) rather than the
 single set of `#define`s used today, and `gemm2d_ids`/`stage_xtile` need to be
 parameterised with them.
 
-That is the shape of the next change. It is worth doing because the prize is
-large and doubly motivated -- 41 GB/s to 100+ GB/s on both GEMMs moves TTFT and
-unblocks MTP -- but it touches staging, tiling, id mapping and the launch
-configuration together, so it should be done as one deliberate step with the
-GEMM bandwidth as the gate and `generate`/`chunked-prefill` as the correctness
-net, not incrementally by constant.
+### Correction: the retiling above is NOT needed (round 53)
+
+The whole of the previous section assumed 49152 B was the ceiling. It is not --
+that is only the **static** shared-memory limit. The device reports
+`MaxSharedMemoryPerBlockOptin = 101376`, so a kernel that opts in and uses
+dynamic shared memory can address more than twice as much.
+
+That dissolves the constraint the retiling existed to satisfy:
+
+| kernel | KC=64 shared | vs 101376 opt-in |
+|---|---|---|
+| nvfp4 (uint16 `wt`) | 52224 B | fits |
+| fp8 (float `wt`) | 69632 B | fits |
+
+So `GB10_KC` can go to 64 **with the existing TN=64 / TT=64 / block=256
+geometry and no change to `gemm2d_ids` or `stage_xtile` at all**. The change
+reduces to moving the three `__shared__` declarations to `extern __shared__`
+with typed pointers, and setting the dynamic size plus
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` on the three GEMM functions
+at launch time.
+
+**The one thing to watch is occupancy.** At KC=32 the kernel fits three blocks
+per SM; at KC=64 (52224 B against 102400 B per SM) only one does. If the
+per-chunk latency hypothesis is right, more bytes in flight per chunk should
+outweigh that -- but that is exactly the kind of prediction this project has
+been wrong about before (the sharedPerBlock theory in round 35, the delta-rule
+theory in round 36), so it has to be measured, not assumed. The gate is
+`nvfp4_gemm_kernel`'s achieved GB/s (41 today, target 100+), and
+`generate`/`chunked-prefill` guard correctness.
+
+If KC=64 alone does not lift the bandwidth, the next lever is the tile shape --
+and at that point the retiling tables above become the fallback, not the plan.
 
 This is the next thing to do, and it is worth doing carefully: a 3x gain here
 moves TTFT and unblocks MTP at the same time.
