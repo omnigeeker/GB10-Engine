@@ -1447,6 +1447,37 @@ count -- i.e. a shape change -- and every shape change tried so far has been cou
 
 **Reverted; tree clean.**
 
+## THE ABLATION ITSELF IS SUSPECT (round 202)
+
+**Round 201 left a 35 ms staging difference (178.88 at t=32 vs 213.63 at t=64) with no credible
+source. Ruling out the candidates:**
+
+| candidate | size | verdict |
+|---|---|---|
+| x traffic (`stage_xtile`) | 2048 B/k-tile, 320 KB/block, **26.2 MB per GEMM call** | **2.4% of the 1100 MB weight traffic -- cannot produce 35 ms** |
+| the epilogue store | 32 x 64 x 4 = **8 KB per block** | smaller still |
+
+**So the most likely explanation is that the ablation does not measure the same thing at both
+sizes.** With the outer product removed, `wt` and `xt` feed nothing but a zero accumulator, **and
+a compiler is free to eliminate loads it can prove dead -- at one size and not the other,
+depending on how the unrolled code falls.** The `__syncthreads()` guards make this less likely
+but not impossible.
+
+### This puts the round-195 decomposition in question too
+
+**The 49% staging / 51% outer-product split is the ONLY mechanism-level result this session
+produced, and it rests on the same ablation. It is worth one careful re-derivation.**
+
+**The fix is a probe that cannot be optimized away: keep a dependency on the staged data.** Do
+not delete the outer product -- instead, accumulate something derived from `wt`/`xt` into the
+output (e.g. sum a few elements of each into `acc[0][0]`). **Then the loads stay live, the FMA
+work is removed, and the difference is a real staging measurement.**
+
+**And the rule that generalizes, which this session paid for twice:**
+
+> **An ablation that removes the *use* of data can also remove the *load* of it. Remove the
+> computation, but keep a dependency on the data.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
