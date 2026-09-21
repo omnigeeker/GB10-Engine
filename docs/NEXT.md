@@ -1278,6 +1278,38 @@ fails, revert -- do not tune.
 before executing them. The failure mode is a broken gate and the safety net is
 `git checkout -- kernels/gemm.cu crates/gb10-cuda/src/ops.rs`.**
 
+## THE SHAPE EXPERIMENT WAS ATTEMPTED TWICE AND FAILED THE GATE (round 198)
+
+**Both attempts auto-reverted clean (`dirty:0`). The gate is the reason nothing broken was left
+behind.**
+
+**Attempt 1.** The patch asserted out on `a5` -- `block_dim: (128,1,1)` occurs **4** times, not
+the 3 the plan assumed -- so `ops.rs` was never written while `gemm.cu` already was. That
+produced a kernel compiled for 256 threads launched with 128: **gate 0/16**. **This is exactly
+the inconsistency the gate exists to catch, and it caught it.**
+
+**Attempt 2.** With the count corrected to 4, all five edits applied and the build was clean.
+**Gate 0/4.** So the 256-thread / 128-token-tile shape is **not correct as constructed** -- at
+least one more coupling exists that the five-edit list does not name.
+
+### What the round-196 arithmetic got right, and what it got wrong
+
+**Right:** `tx_groups` is tied to the **token** dimension -- `GB10_TT / GB10_TNREG = 128/4 = 32`
+-- **not to N**. So `GB10_NR`, `GB10_WSTRIDE` and `GB10_TN` correctly stay at 64, and the
+round-197 plan was wrong to list them. **The real change set is smaller and lies along T.**
+
+**Wrong:** something else in the kernel assumes a 64-token tile. **Candidates, in the order worth
+checking:** the `xt` shared tile's declared size; any loop bound written as a literal or derived
+from `GB10_TT`; the store indexing that maps `tx` back to token columns. **One grep for
+`GB10_TT` and for `tx` inside `kernels/gemm.cu` names it.**
+
+### Verdict on this lead
+
+**It is still the right class of fix** -- the only one that addresses both halves of the
+round-195 decomposition at once. **But it is not a constant swap: it is a real kernel change,
+and it needs a session that can iterate on it with the gate in the loop.** That session was not
+this one, and stopping here is what kept the tree green.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
