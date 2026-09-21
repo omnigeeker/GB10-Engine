@@ -853,6 +853,64 @@ fn mtp_generate(args: &Args, n_new: usize) -> Result<bool> {
     Ok(same)
 }
 
+/// Prefill the same prompt in one shot and in two chunks, and require the
+/// results to agree.
+///
+/// This is the only test that drives `start > 0` in `attn_prefill`: the second
+/// chunk attends over a cache that already holds the first chunk. Without it
+/// the new parameter is exercised only at `start == 0`, where it is
+/// indistinguishable from the old hardcoded behaviour -- so a green
+/// `batch-parity` would say nothing about it.
+fn chunked_prefill(args: &Args, n_dec: usize) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let model = Model::load_from(&dev, cfg, &args.model)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+
+    let prompt = if args.prompt.is_empty() {
+        "The quick brown fox jumps over the lazy dog. Count from one to ten and \
+         then explain, in two sentences, why the sky appears blue at midday."
+            .to_string()
+    } else {
+        args.prompt.clone()
+    };
+    let ids = tok.encode(&prompt, false)?;
+    if ids.len() < 4 {
+        bail!("prompt too short to split: {} tokens", ids.len());
+    }
+    let split = ids.len() / 2;
+
+    // --- one shot ---
+    let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut one = vec![model.prefill_seq(&dev, &ids, &mut st, &mut sc, 0)?];
+    for _ in 1..n_dec {
+        let t = *one.last().unwrap();
+        one.push(model.step(&dev, t, &mut st, &mut sc)?);
+    }
+
+    // --- two chunks: the second one starts from a non-empty cache ---
+    let mut st2 = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc2 = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut two = vec![model.prefill_seq(&dev, &ids[..split], &mut st2, &mut sc2, 0)?];
+    two[0] = model.prefill_seq(&dev, &ids[split..], &mut st2, &mut sc2, 0)?;
+    for _ in 1..n_dec {
+        let t = *two.last().unwrap();
+        two.push(model.step(&dev, t, &mut st2, &mut sc2)?);
+    }
+
+    println!("== chunked prefill (start > 0) ==");
+    println!("  prompt {} tokens, split {}+{}", ids.len(), split, ids.len() - split);
+    println!("  one shot : {:?}", &one[..one.len().min(8)]);
+    println!("  two chunk: {:?}", &two[..two.len().min(8)]);
+    let same = one == two;
+    println!("  decoded  : {:?}", tok.decode(&one, false)?);
+    println!("  agree: {}", if same { "YES" } else { "NO" });
+    println!();
+    Ok(same)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -876,6 +934,14 @@ fn main() -> Result<()> {
                 bail!("generate gate FAILED");
             }
             println!("\ngenerate: OK");
+            return Ok(());
+        }
+        "chunked-prefill" => {
+            let ok = chunked_prefill(&args, args.n_new.max(1))?;
+            if !ok {
+                bail!("chunked-prefill gate FAILED");
+            }
+            println!("\nchunked-prefill: OK");
             return Ok(());
         }
         "mtp-generate" => {
@@ -906,7 +972,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill)"
         ),
     };
 

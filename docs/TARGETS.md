@@ -165,10 +165,29 @@ batch-parity  : 16/16 sequences exact, 40.75 tok/s @ n_seq=16 OK
 ```
 
 Note the honesty of that evidence: it proves **no regression**, not that the new
-capability works. Nothing exercises `start > 0` yet. The first consumer will be
-the batched MTP verify path, and it should be introduced together with a test
-that actually runs two prefill chunks so `start > 0` is covered rather than
-assumed.
+capability works, because nothing on the existing path exercises `start > 0`.
+
+### ...and is now covered by a test that drives it (round 45)
+
+`gb10-verify chunked-prefill` prefills the same prompt one-shot and in two
+chunks, then compares the generated tokens. The second chunk is the only place
+in the engine where attention runs with a non-empty cache:
+
+```
+prompt 32 tokens, split 16+16
+one shot : [271, 16, 11, 220, 17, 11]
+two chunk: [271, 16, 11, 220, 17, 11]
+decoded  : "\n\n1, 2,"
+agree: YES
+```
+
+The decoded text is a sensible continuation of the prompt, which matters: two
+identical-but-degenerate outputs would satisfy the comparison while proving
+nothing. A `start`-related break can only affect the two-chunk path, so this
+comparison is exactly the discriminator the round-44 change needed.
+
+The non-empty-cache forward is therefore verified, and the batched MTP verify
+path can now be built on it.
 
 ### The head was verified with a control, not just a happy path
 
