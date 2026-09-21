@@ -1605,6 +1605,51 @@ read adds no memory-level parallelism.**
 | **staging alone (loads live, FMA removed)** | **279.62** | **322.33** |
 | full kernel | 400.01 | 435.94 |
 
+## THE DIAGNOSTIC REFUTED THE ALTERNATIVE -- AND THE LAYOUT MATCHES EXACTLY (round 206)
+
+**Round 205 asked for one cheap test before any restructure. It ran, and it settled the question.**
+
+**Method: a second independent GLOBAL load per thread inside `stage_wtile`** (from the next
+k-tile's bytes, accumulated into `pk[p].x` so it cannot be eliminated), **on top of the
+dependency-preserving probe.**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **staging + 2 loads in flight** | **280.90** [279.22-284.15] | **326.03** [322.51-329.76] |
+| staging, 1 load (round 203) | 279.62 | 322.33 |
+
+**No change: +0.5% at t=32 and +1.1% at t=64, both inside noise.** So **memory-level parallelism
+is not the limiter**, the "one load per barrier" diagnosis is **refuted**, and the `nchunk`
+restructure would have been wasted work.
+
+### And that points back at the layout, with an exact match
+
+**A warp of 32 lanes reads 8 B each = 256 B -- but from 16 different rows** (two lanes per row,
+per the `PAIRS` decomposition). **Each row contributes 16 B of a 64-byte line.**
+
+```
+efficiency = 16 rows x 16 B / (16 rows x 64 B) = 25%
+measured staging rate = 54.6 / 228 GB/s  = 24% of peak
+```
+
+**QUANTITATIVE MATCH, not directional.**
+
+**And the `KC=64` test that appeared to falsify this was confounded** -- it changed shared-memory
+size AND halved the outer-product iteration count. **The layout hypothesis was never tested in
+isolation. With the MLP alternative now excluded, it is the leading candidate again.**
+
+### The fix, and its cost
+
+**Transpose the weight layout to `[k][row]`** (rounds 189-190). Then a warp's 32 lanes read **64
+contiguous bytes of one row**, one cache line is fully consumed, and the staging rate should
+approach peak.
+
+**Cost: ~0.154 s once at load** (17.608 GB read + write at 228 GB/s), against a **6.98 s prefill
+per endpoint request.** It pays for itself in the first request.
+
+**The prize is unchanged and now well-founded:** staging **322.33 -> 77.2 ms**, total
+**435.94 -> 190.8 ms**, **2.28x against a 2.2x target.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
