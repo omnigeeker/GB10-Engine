@@ -656,6 +656,30 @@ more `ROWS` (register-capped at 4) or a different blocking -- **not more bandwid
 the GEMM.** The design is already at a deliberate, documented sweet spot, and the
 `ROWS` knob has been searched (rounds 104/127).
 
+### The one concrete fix left for the endpoint (round 178)
+
+**The batched GEMV re-reads `x` from L2 for every row group.** The kernel header names the
+problem ("makes the kernel L2-bound"), `ROWS` is register-capped at 4, and round 127 already
+showed `ROWS=2` is worse. **So the remaining lever is not `ROWS` -- it is where the re-reads
+land.**
+
+**Proposal: stage the block's `x` slab in SHARED memory once per k-tile, so the
+`ROWS x B` reads hit shared instead of L2.** Shared memory is on-SM and roughly an order of
+magnitude faster than L2 for this access pattern, and the slab is small: one `kTile` of `B`
+batch rows is `512 x 16 x 4 B = 32 KB`, against 121 GiB of unified memory and a 256-thread
+block.
+
+**This is a genuine, unexplored mechanism** -- unlike the eleven prefill mechanisms
+eliminated so far, it targets a bottleneck that has now been *located in source* rather than
+inferred from a timing.
+
+**How to measure it honestly, given rounds 174-177:** the change lives in
+`nvfp4_gemv_batch_tmpl`, **so the benchmark must call a path with `t > 16`** -- `weights.rs:95`
+routes `t <= 16` to the batch==1 kernel, and `forward-cost` at t=8/16 therefore cannot see
+this change at all. **`chunked-prefill`, the endpoint, or `forward-cost` at t=32/64 will.**
+Three runs, spread reported, and the gate (`generate --n 16`, `chunked-prefill`) must pass
+before any number is quoted.
+
 ### Next step
 
 **A shape question about the GEMV's batch handling** (`kernels/gemv.cu`, `GB10_BATCH_MAX`,
