@@ -871,6 +871,46 @@ A/B failed this test; round 185 establishes that **the entire `forward-cost` ins
 it for any GEMM change** -- so no `forward-cost` result can ever license a GEMM keep/revert
 decision.
 
+### BREAKTHROUGH (round 186): the GEMM is measured, and the endpoint target is REACHABLE
+
+**Extended the `forward-cost` sweep to `[1, 2, 4, 8, 16, 32, 64]`
+(`gb10-verify/src/main.rs:1008`). `t=32` and `t=64` are outside `weights.rs:95`'s `t <= 16`
+GEMV cut, so the GEMM branch is measured here for the first time.**
+
+| t | `pre_ms` (mean of 3) | path | effective |
+|---|---|---|---|
+| 16 | 314.17 | GEMV | -- |
+| 32 | **400.01** | **GEMM** | 44.0 GB/s |
+| 64 | **435.94** | **GEMM** | **40.4 GB/s** |
+
+**t=32 -> 64 costs only +35.9 ms for 2x the tokens -- NEARLY FLAT.** So the GEMM is not
+per-token-bound: **the weight stream dominates, and it runs at 18% of the 228 GB/s peak.**
+
+**And the endpoint arithmetic finally closes:** ~59-token prompts are one 64-wide chunk each,
+so the prefill is **16 GEMM calls x 435.94 ms = 6.98 s**, against the measured ~7.63 s.
+**The model now predicts the endpoint.**
+
+### Reachability, computed correctly
+
+**My first attempt divided one call's 17.608 GB by the whole 16-call budget. The prefill moves
+16 x 17.608 = 281.7 GB.**
+
+| | |
+|---|---|
+| prefill today | 6.98 s for 281.7 GB = **40.4 GB/s** |
+| 30 tok/s budget | 256/30 = 8.53 s total; decode ~5.36 s, so **prefill must fall to 3.17 s** |
+| required rate | 281.7 / 3.17 = **88.8 GB/s** |
+| that is | **2.2x** the current 40.4 GB/s |
+| the ceiling | the single-row GEMV already sustains **170 GB/s** on this machine, **4.2x away** |
+
+**So the endpoint target is REACHABLE in principle: 2.2x on the GEMM against 4.2x of
+headroom. It is a performance-engineering problem, not a physical one.** The single-decoder
+100 tok/s target remains the only physically impossible one, at 7.7x peak bandwidth.
+
+**And the lever is the K split**: gate-verified (16/16 x3, `chunked-prefill` OK), aimed at
+precisely this kernel, and never validly measured -- because until this round `forward-cost`
+could not see the GEMM at all.
+
 ### The proposal that follows, and how it differs from the rejected one
 
 **Not shared-memory staging** (round 179: measured, rejected, and its ruled-out entry names

@@ -1005,7 +1005,7 @@ fn forward_cost(args: &Args) -> Result<()> {
 
     println!("== cost of a t-row forward vs t single-row steps ==");
     println!("     t   t x step(ms)   one t-row fwd(ms)   ratio   per-row");
-    for t in [1usize, 2, 4, 8, 16] {
+    for t in [1usize, 2, 4, 8, 16, 32, 64] {
         let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
         let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
         let mut next = model.prefill(&dev, &ids, &mut st, &mut sc)?;
