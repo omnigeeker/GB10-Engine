@@ -43,6 +43,33 @@ comes back with 0 spills and room to spare.
    rule below before writing the unrolled body.**
 4. The same `static_assert` update and regenerated bodies as the (8,4) change.
 
+## The body generator, and the operand asymmetry that bit twice (round 118)
+
+`acc`=64 (`TM`=8/`TNREG`=8, 64 threads) was attempted twice and **both attempts failed
+inside the body generator before writing anything**, so the tree is untouched at
+round 115's (8,4) and re-confirms it: `generate` 16/16, TTFT 432.0/434.3 ms.
+
+**The bug was the same both times and it is worth writing down, because it is an
+asymmetry between the two operands:**
+
+```python
+Q = 'xyzw'
+# WEIGHT: the float4 component is selected by the ROW, not the column.
+# wv0 holds the weights for rows 0..3, wv1 for rows 4..7 -- each thread's weight
+# value for row r is a SCALAR, so index by r % 4.
+W = lambda r, c: ('wv0.%s' % Q[r]) if r < 4 else ('wv1.%s' % Q[r-4])
+# ACTIVATION: this one IS selected by the COLUMN -- xv covers columns 0..3.
+X = lambda c:    ('xv.%s'  % Q[c]) if c < 4 else ('xw.%s'  % Q[c-4])
+```
+
+Indexing the weight by `c` (which runs to 7 when `TNREG`=8) raises `IndexError` on
+`Q[4..7]`. `TM`=8/`TNREG`=4 did not catch it because there `c` only ever reached 3.
+
+**Everything else in this file is verified:** the mapping rule below, the
+`GB10_GEMM_BLOCK` 128 -> 64 change *and* the three `LaunchConfig` block dims in
+`crates/gb10-cuda/src/ops.rs`, and the `static_assert` update. With the two lambdas
+above, generating the (8,8) bodies is mechanical.
+
 **Mapping rule** (this is what round 96 got wrong and round 115 verified):
 `ty_groups = 64/TM`, `tx_groups = 64/TNREG`, and `ty_groups * tx_groups` must equal
 `GB10_GEMM_BLOCK`, with `ty = threadIdx.x / tx_groups` and `tx = threadIdx.x % tx_groups`.
