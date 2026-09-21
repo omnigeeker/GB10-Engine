@@ -2728,6 +2728,38 @@ target, with no kernel work.**
 **Acceptance is the usual: `generate` 16/16 and `chunked-prefill` OK, then a live 16-concurrent
 run, 3 runs with spread.**
 
+## THE BATCHED PREFILL IS A REAL FEATURE, NOT A CALL SWAP (round 238)
+
+**Reading the API narrows the fix, and it is more work than round 237 implied.**
+
+**What is already batched**: `prefill_seq` calls
+`layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, seq)`,
+**and the doc comment states that `seq` affects only WHERE state lands, not how the prompt is
+computed.** So the layers already process all `t` tokens of one prompt in a single pass.
+
+**What is not**: **`forward_prefill` takes ONE `seq`.** So 16 concurrent requests cannot become
+one call -- **each needs its own `seq`, and each has its own prompt length.**
+
+**Which means the fix is variable-length sequence batching in the prefill path**: one forward
+carrying 16 sequences of 16 different lengths, writing each to its own slot. **That is a real
+feature, not a call swap.**
+
+### And there is a cheaper intermediate worth measuring first
+
+**Pad the prompts to a common length and prefill them as one `t = 16 x L` pass with per-sequence
+slot writes.** Padding wastes compute on the difference between the longest and the average prompt,
+**but it converts 16 sequential ~436 ms passes into one pass.**
+
+**The numbers to weigh**: the current cost is **6.98 s** for 16 prefills. **One padded pass at
+`t = 16 x L` costs roughly what a single `t ~= 944` prefill costs** -- and `forward-cost` has
+`t = 64` at **435.94 ms with a 64-wide tile**, so **a 944-token pass is a different tile regime and
+its cost is NOT in the record.**
+
+**So the honest next step is a measurement, not an implementation**: run `forward-cost` at `t`
+around 944 **to see what one large prefill actually costs.** If it is near 436 ms, the padded-batch
+fix is worth building; **if it scales linearly with `t`, padding buys nothing and only true
+variable-length batching would.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
