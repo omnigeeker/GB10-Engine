@@ -93,6 +93,53 @@ of weight traffic against the GEMM's own 58 GB/s). **That gap -- prefill at t=59
 running at half the GEMM's measured rate -- is the next thing to explain**, and it
 is a fresh anomaly rather than a continuation of the staging work.
 
+### The prefill anomaly is explained, and the fix is blocked by shared memory (round 88)
+
+`nsys profile` on `generate --n 2` (one 59-token prefill, 16 decode steps):
+
+| kernel | % | launches | avg |
+|---|---|---|---|
+| `nvfp4_gemv_kernel` | 41.1 | 3,089 | 290.6 us |
+| `fp8_gemv_kernel` | 29.1 | 3,328 | 190.9 us |
+| `nvfp4_gemm_kernel` | 14.2 | **192** | **1,619.6 us** |
+| `fp8_gemm_kernel` | 9.1 | **208** | **959.2 us** |
+| `rmsnorm_zero_centered` | 1.3 | 2,737 | 10.6 us |
+| everything else | <1 each | | |
+
+192 = 64 layers x 3 nvfp4 matrices, i.e. **exactly one prefill pass**. Prefill is
+311 + 199.5 = **510.5 ms of 564.5 ms TTFT -- 90%**. The GEMV kernels are the
+decode.
+
+**There is no anomaly.** `nvfp4_gemm_kernel` costs 1,619.6 us at t=59 against
+825.6 us at t=1, and the reason is simply that **T=59 needs ceil(59/32) = 2
+t-tiles, so every weight is read twice**:
+
+```
+192 launches x 44.6 MB x 2 tiles = 17.1 GB in 311 ms = 55 GB/s
+```
+
+which is the GEMM's normal rate. The "31 GB/s" was an artefact of dividing by
+half the real traffic.
+
+**The fix is to raise `GB10_TT` to 64 so T=59 fits in one tile**, halving prefill
+traffic. Attempted this round: it **fails the generate gate** (0/1, diverges at
+index 0) because it overflows shared memory --
+
+| | xt | wt | total | budget 49152 |
+|---|---|---|---|---|
+| TT=32 (current) | 9,216 | 17,408 | 26,624 | ok |
+| TT=64 | 34,816 | 17,408 | **52,224** | **OVER** |
+| TT=64, bf16 `xt` | 17,408 | 17,408 | 34,816 | ok |
+| TT=64, `KC`=32 | 34,816 | 8,704 | 43,520 | ok |
+
+The TTFT reading of 469.2 ms taken during that attempt was **invalid** -- the
+kernel was broken and decoded one token -- and must not be quoted. Reverted;
+baseline re-verified at TTFT 569.1 ms with agreement 16/16.
+
+**So the next change is a tile-shape change, not a load-pattern change:** TT=64
+with either a bf16 `xt` (risk: activation precision) or `KC`=32 (risk: twice the
+barriers). Both fit; both need the generate gate to pass.
+
 ## Verified state
 
 `generate` 16/16 exact, `chunked-prefill` OK, `batch-parity` OK. t=1 forward
