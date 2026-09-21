@@ -730,10 +730,49 @@ K=5120, 272 blocks, 5.7 blocks/SM, ~2.8 waves at 2 blocks/SM):
   128 FP32 lanes/SM shared by two blocks
 * the loads themselves should be ~0.6 us
 
-which leaves roughly 1 us per chunk unaccounted for. That is the next thing to
-measure, and it can be measured per-launch rather than by probe: shrink the
-outer product's k loop and read the launch time, exactly as round 61 did but
-against the profiler's number instead of a probe delta.
+which leaves roughly 1 us per chunk unaccounted for.
+
+### Splitting the GEMM: staging 80%, outer product 20% (round 79)
+
+Quartering `gemm2d_outer_bf16`'s k loop and reading the t=1 forward:
+
+| | t=1 |
+|---|---|
+| baseline | 271.46 ms |
+| outer product k-loop at 1/4 | 231.38 ms |
+
+so the full outer product costs (271.46 - 231.38) / 0.75 = **~53 ms, 20% of the
+forward**. The remaining ~218 ms is the staging, which the profiler puts at
+~58 GB/s.
+
+Putting the two measurements together, the t=1 forward decomposes as:
+
+| part | ms | share | rate |
+|---|---|---|---|
+| weight staging (nvfp4 + fp8 + bf16) | ~218 | 80% | ~58 GB/s |
+| outer product | ~53 | 20% | -- |
+| non-GEMM ops | ~13 | 5% | -- |
+
+**And the GEMV path moves the same weights at ~148 GB/s.**
+
+So the isolated probe was right about the *relative* ordering after all: 32 B/row
+measured 90 GB/s against 206 GB/s contiguous, and the kernel shows 58 GB/s
+against 148. The probe predicted the comparison correctly; what it could not
+predict is that my particular fix would not move it, because the fix changed the
+bytes per row without changing the shape that actually matters.
+
+The shape that matters is how many *different rows* a single load instruction
+touches. The staging's load presents **8 rows x 32 B** to the coalescer; the
+probe's fast pattern presented **4 rows x 64 B**; the GEMV streams one row
+contiguously. My round-77 attempt produced **8 rows x 64 B** -- more bytes, same
+eight-way row scatter, which is why it was neutral.
+
+**The next attempt should reduce the row count per instruction, not raise the
+bytes.** A warp that streams down one or two rows instead of eight is what the
+GEMV path does and what the 4-row probe pattern did. That is a change to the
+staging's thread-to-row mapping and to how the tile is laid out in shared memory,
+since the outer product currently expects `wt[k][n]` with `n` spread across
+threads.
 
 ### A caution learned in round 64
 
