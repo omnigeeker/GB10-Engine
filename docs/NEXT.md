@@ -568,6 +568,40 @@ it touches only the `xt` type and the two stride macros and leaves the tiling
 alone -- at the cost of sitting exactly on the 49152 B limit, which may need a
 little slack.
 
+### A structural point that changes the cost (round 75)
+
+Working out the `KC = 128` variants turned up something worth writing down before
+any code changes, because it moves the problem.
+
+The current tile is already **128 k-rows deep in total**: `wt[2][KC][WSTRIDE]`
+holds two `KC = 64` chunks, 17408 B. A single `wt[128][WSTRIDE]` tile is *also*
+17408 B. So `KC = 128` costs nothing in shared memory **if the double buffer is
+given up** -- the same space simply holds one bigger k-tile instead of two
+alternating ones.
+
+That matters because it means the obstacle is not really shared memory. It is
+that dropping the double buffer **serialises staging against the outer product**.
+With staging projected at ~86 ms (at 177 GB/s) and the outer product at ~56 ms,
+serialised they cost ~142 ms against the ~112 ms they cost overlapped today. The
+cache-line win would be spent, and then some.
+
+So `KC = 128` is only worth doing if the pipeline survives it. The shapes that
+fit with double buffering all force `TT = 16` (and therefore a reworked
+`gemm2d_ids`, plus a second accumulator group per thread at 128 threads), and the
+ones that keep `TT = 32` sit exactly on the 49152 B limit.
+
+The clean resolution is a **three-deep k-pipeline**: keep 128 k-rows of weights
+resident, but stage the *next* 64 k-rows into the half that has just been
+consumed, so the staging read still covers 64 contiguous bytes per row while
+staying overlapped with compute. That needs the outer product to consume the two
+halves in order, which is exactly what the current `cur`/`nxt` structure already
+does -- the change is to stage both halves in one pass at the top and then
+compute both, rather than staging one and computing one.
+
+That is the version to build. It keeps `TN = 64`, `TT = 32`, the float `xt`
+tile, and the 35840 B budget, and it changes only the staging/consumption order
+in the three GEMM bodies.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
