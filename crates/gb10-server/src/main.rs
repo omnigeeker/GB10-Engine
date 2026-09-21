@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 
 /// Prompt tokens the KV cache and recurrent state are sized for.
 const MAX_SEQ: usize = 2048;
+/// Concurrent sequence slots the state is sized for.
+const MAX_CONCURRENT: usize = 16;
 
 struct Args {
     model: PathBuf,
@@ -191,7 +193,12 @@ impl Engine {
         let model = Model::load_from(&dev, cfg, &args.model)?;
         let tok = QwenTokenizer::from_model_dir(&args.model)?;
         let tmpl = ChatTemplate::from_model_dir(&args.model)?;
-        let state = ModelState::new(&dev, &model, MAX_SEQ, 1)?;
+        // Slots for concurrent sequences. The scheduler that uses them is not
+        // wired up yet (the accept loop is still serial), but the state must be
+        // sized for it first. `step_batch` takes its batch size from
+        // `tokens.len()` and requires it to be <= this, so a single request
+        // still runs with n_seq = 1 and costs nothing extra.
+        let state = ModelState::new(&dev, &model, MAX_SEQ, MAX_CONCURRENT)?;
         let sc = Scratch::new(&dev, &text, MAX_SEQ)?;
         Ok(Self { dev, model, tok, tmpl, state, sc, name: args.model_name.clone() })
     }

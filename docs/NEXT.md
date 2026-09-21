@@ -38,6 +38,38 @@ individually correct.**
 That test -- not `batch-parity` -- is what the objective actually asks for, and
 until it passes the concurrency requirement is unverified end to end.
 
+### The endpoint gap, measured end to end (round 92)
+
+The state is now sized for it (`MAX_CONCURRENT = 16`, `ModelState::new(..., 16)`),
+which is safe on its own because `step_batch` takes its batch size from
+`tokens.len()` and requires only `<= state.n_seq`, so a single request still runs
+with `n_seq = 1`. Verified: `GET /health` -> ok, and a single
+`POST /v1/chat/completions` returns 12 tokens normally.
+
+Then the objective's actual test, 16 concurrent clients:
+
+```
+16 parallel curl -> /v1/chat/completions, max_tokens=16
+wall 47.73 s, 256 completion tokens -> 5.36 tok/s aggregate
+```
+
+**Against the 30 tok/s the objective asks for, and against the 40.75 tok/s the
+engine's own batch path already reaches.** The endpoint is 7.6x short, which is
+exactly what `n_seq = 1` plus a serial accept loop predicts: the 16 requests run
+one after another, each at roughly the single-stream rate.
+
+This is the first honest end-to-end number for the concurrency requirement, and it
+is also the test harness for fixing it: **the scheduler is done when this same
+command reports >= 30 tok/s aggregate with each stream individually correct.**
+
+**The key enabler is confirmed:** `step_batch` sizes itself from `tokens.len()`
+(`model.rs:277`), so a group of `k` requests can be prefilled into slots `0..k` and
+stepped with `k` tokens -- no state compaction needed. A single request is just
+`k = 1` and costs nothing extra. The remaining work is the scheduler itself: a
+worker thread owning `Engine`, an `mpsc` queue of pending requests each carrying a
+token channel, a loop that drains up to 16 and calls `step_batch`, and an accept
+loop that spawns a thread per connection.
+
 ## BREAKTHROUGH (round 85): route short prompts to the batched GEMV
 
 The single biggest win of the project. `forward_prefill` was routing everything
