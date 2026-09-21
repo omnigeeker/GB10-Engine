@@ -1146,6 +1146,35 @@ comment, a ruled-out list entry -- produced a confident conclusion that had to b
 The pattern is stable enough to name: verify the identity of the object before reasoning about
 its properties.**
 
+## THE IDENTITY CHECK COMES BACK CLEAN (round 194)
+
+**`kernels/gemm.cu:479/486/492` defines three entry points -- `nvfp4_gemm_kernel`,
+`fp8_gemm_kernel`, `bf16_gemm_kernel` -- and all three call the SAME shared `gemm2d_*` helper
+family.** So the three outer-product call sites at `:402`, `:436` and `:469` are the
+**nvfp4 / fp8 / bf16 variants of one helper**, not three unrelated kernels, and `awk` confirms
+line 402 sits inside a `__device__` helper rather than a `__global__` entry point.
+
+**So the `stage_wtile` analysis of rounds 189-190 WAS about the right code.** The NVFP4 variant
+is the one `nvfp4_gemm_kernel` uses, and NVFP4 carries the bulk of the prefill traffic.
+
+**Which means the transpose proposal is demoted by MEASUREMENT, not by misidentification.**
+Round 192's `KC=64` test doubled exactly the quantity the layout argument blamed and made the
+GEMM **3.5-3.9% slower**. That is a valid end-to-end result, and it -- not the variant question
+-- is what closes the layout lead.
+
+**The round-193 alarm was worth raising and is now answered.** The risk was real: it had already
+cost a retraction at round 176. Checking it took one grep.
+
+**And the distinction is worth keeping.** The four "wrong object" incidents (169, 176, 184, 193)
+were each caught by a cheap identity check, and **this one came back clean**:
+
+> **The check costs one grep. Its failure mode is a retraction; its success mode is a licence to
+> keep reasoning. Run it every time.**
+
+**The object was correctly identified; the hypothesis was still wrong.** Those are independent
+facts, and conflating them is what made round 193's alarm feel like a refutation when it was
+only a question.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
