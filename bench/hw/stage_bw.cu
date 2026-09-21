@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 
 #define TN 64        // rows of N per block, as in kernels/gemm.cu
 #define KC 64        // k-chunk
@@ -86,6 +87,29 @@ __global__ void read_staging64(const uint2* __restrict__ w, int K, int N, int nc
     if (s == 0xdeadbeefULL) *out = s;
 }
 
+// Z: 8 lanes x 4 B per row -- same 32 B/row as the current staging, but the same
+// number of units and loads as the 64 B/row pattern. Comparing Z against B
+// isolates bytes-per-row; comparing Z against the current pattern isolates the
+// load count.
+__global__ void read_staging_z(const char* __restrict__ w, int K, int N, int nchunk,
+                               unsigned long long* out) {
+    const int nbase = blockIdx.x * TN;
+    unsigned long long s = 0;
+    for (int c = 0; c < nchunk; ++c) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int u = threadIdx.x + p * BLOCK;
+            const int nl = u / 8, gr = u % 8;
+            const int n = nbase + nl;
+            if (n < N) {
+                const size_t off = (size_t)n * (K >> 1) + c * 32 + gr * 4;
+                s += __ldg(reinterpret_cast<const uint32_t*>(w + off));
+            }
+        }
+    }
+    if (s == 0xdeadbeefULL) *out = s;
+}
+
 int main(int argc, char** argv) {
     // One layer's NVFP4 weights are ~150 MB; the model streams ~9.63 GB of them
     // across 64 layers, so a 150 MB buffer repeated 64x reproduces both the
@@ -107,14 +131,16 @@ int main(int argc, char** argv) {
     const int gridA = (int)(bytes / 16 / BLOCK);
     const int gridB = (N + TN - 1) / TN;
 
-    for (int which = 0; which < 3; ++which) {
+    for (int which = 0; which < 4; ++which) {
         // warm
         if (which == 0)
             read_contig<<<gridA, BLOCK>>>((const uint4*)buf, bytes / 16, out);
         else if (which == 1)
             read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
-        else
+        else if (which == 2)
             read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
+        else
+            read_staging_z<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk, out);
         check(cudaDeviceSynchronize(), "warmup");
 
         check(cudaEventRecord(a), "record");
@@ -123,8 +149,10 @@ int main(int argc, char** argv) {
                 read_contig<<<gridA, BLOCK>>>((const uint4*)buf, bytes / 16, out);
             else if (which == 1)
                 read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
-            else
+            else if (which == 2)
                 read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
+            else
+                read_staging_z<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk, out);
         }
         check(cudaEventRecord(b), "record");
         check(cudaEventSynchronize(b), "sync");
@@ -136,7 +164,10 @@ int main(int argc, char** argv) {
         const double per_rep = (which == 0) ? (double)bytes : (double)N * (K / 2);
         const double gb = per_rep * reps / 1e9;
         std::printf("%-10s %8.1f ms   %7.1f GB   %7.1f GB/s\n",
-                    which == 0 ? "contig" : (which == 1 ? "staging32" : "staging64"),
+                    which == 0 ? "contig"
+                               : (which == 1 ? "4lane x 8B (32B/row)"
+                                             : (which == 2 ? "8lane x 8B (64B/row)"
+                                                           : "8lane x 4B (32B/row)")),
                     ms, gb, gb / (ms / 1000.0));
     }
 

@@ -637,8 +637,56 @@ the other mechanisms eliminated above.
 
 **The lesson is about the probe, not the kernel.** A probe that changes two
 variables at once is as misleading as a guess, and it is more dangerous because
-it looks like evidence. The next probe must vary bytes-per-row with `UNITS`
-pinned, so that only the cache-line variable moves.
+it looks like evidence.
+
+### The clean 2x2, and why the probe still does not transfer (round 77)
+
+The probe was rebuilt to vary one thing at a time -- three patterns, with the
+load count and the bytes-per-row separated:
+
+| pattern | bytes/row | loads per chunk | GB/s |
+|---|---|---|---|
+| 4 lane x 8 B | 32 | 256 | 90.4 |
+| 8 lane x 8 B | 64 | 512 | 184.9 |
+| 8 lane x 4 B | 32 | 512 | 102.7 |
+
+* 8lane x 4B vs 8lane x 8B (load count fixed, bytes/row varies): 102.7 -> 184.9,
+  **+80%**. Bytes-per-row is the dominant variable.
+* 4lane x 8B vs 8lane x 4B (bytes/row fixed, load count varies): 90.4 -> 102.7,
+  +14%. Load count is minor.
+
+So the cache-line mechanism is real, and round 76's failure is explained: my
+paired staging used **two 8-byte loads** that together covered 64 bytes of a row,
+but the coalescer works per *instruction*, so each load still presented 8 rows x
+32 B. Two requests covering the same line are not one request covering the line.
+
+That was fixed -- a single **16-byte load** per thread, 4 lanes per row, so one
+instruction's warp footprint is 8 rows x 64 contiguous bytes. The result:
+
+| t | baseline | single 16 B load, 64 B/row |
+|---|---|---|
+| 1 | 271.46 | 270.21 |
+| 2 | 284.42 | 271.11 |
+| 4 | 273.77 | 269.78 |
+| 16 | 292.85 | 290.75 |
+
+Correct (`generate` 16/16), better at every point, and **every one of those
+differences is inside the +-2% run-to-run noise measured on this box**. It is not
+a defensible win, so it was reverted rather than kept on the strength of a
+consistent sign.
+
+**The conclusion is that per-warp request shape does not bind in the real
+kernel**, even though it clearly binds in isolation. The likely reason is
+concurrency: the isolated probe runs one warp's pattern against an otherwise idle
+memory system, while the kernel has many warps from two blocks per SM issuing
+interleaved requests, so the memory controller sees a much denser stream than any
+single warp's shape suggests. A pattern that is 2x worse in isolation can be
+indistinguishable when 20 other warps are filling the gaps.
+
+That is worth stating plainly because it bounds what the probe can be used for:
+`bench/hw/stage_bw.cu` is good for **falsifying** a mechanism (if a pattern is
+slow in isolation it will not be fast in the kernel) but not for **predicting a
+gain** from a pattern change.
 
 ### A caution learned in round 64
 
