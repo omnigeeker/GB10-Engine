@@ -84,6 +84,48 @@ error this session has hit repeatedly.
 is measured, the design has verified line anchors, and the main risk is eliminated.
 The remaining work is the four edits and the gate.
 
+## Both traps can be DESIGNED OUT, not worked around (round 158)
+
+Applying the same insight that unblocked the streaming fix in round 157 -- *remove the
+problem the design creates, do not solve it* -- both silent-error traps above have a
+cheap structural answer. **Neither needs the `rel` variable or a second store site.**
+
+### Trap 1 (buffer parity) disappears if `kc_half` is even
+
+`nchunk = 5120 / 32 = 160`, so a 2-way split gives **`kc_half = 80`** and `kc0` is
+**0 or 80 -- both even.** The loop's parity is `cur = (c ^ 1) & 1`, which depends only on
+the parity of `c`; with `c` starting at an even number the expression **stays correct
+unchanged.**
+
+```
+prologue stages chunk kc0, writing buffer 1
+c = kc0 (even) -> cur = (kc0 ^ 1) & 1 = 1  -> reads buffer 1   == what the prologue staged
+```
+
+**So there is no `rel` and no parity edit** -- only the prologue's chunk index changes
+from `0` to `kc0`, which is an index and not a parity. **The guard is a divisibility
+check: split only when `kc_half % 2 == 0`; otherwise launch `grid.z = 1` and take the
+existing path.**
+
+### Trap 2 (per-dtype stores) disappears if the split is scoped to the NVFP4 GEMM
+
+The prefill launches the NVFP4 path (`ops.rs:1191/1206/1221`), and its store lives in
+`gemm2d_store_scaled`. **Launching `grid.z = 2` only from that path leaves the fp8 and
+bf16 bodies -- and their stores -- completely untouched**, so there is no second site to
+convert and no partial-corruption failure mode.
+
+### What is actually left
+
+1. `#define GB10_KSPLIT 2`
+2. `kc0 = blockIdx.z * kc_half`, `kc1 = min(kc0 + kc_half, nchunk)`
+3. prologue stages chunk `kc0` instead of `0`
+4. `atomicAdd` in the **one** NVFP4 store
+5. `grid.z = 2` at the **one** NVFP4 prefill launch, plus a `cudaMemsetAsync` of `y`
+
+**With both traps designed out, the gate is checking arithmetic rather than a lifetime
+(or a parity) that the design got wrong** -- which is exactly the difference between
+round 157 succeeding and rounds 156 failing twice.
+
 ## Acceptance
 
 * **`generate --n 16` must be 16/16.** The gate is the only thing that makes a K split
