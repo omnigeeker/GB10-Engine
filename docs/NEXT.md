@@ -38,6 +38,41 @@ wasting 6 of 64 columns at T=58.
 * one-row-per-warp loads in the GEMM -- impossible at TN=64, needs 65,536 B of
   tile against a 49,152 B budget (round 85).
 
+### The prefill GEMM is occupancy-limited, and it is quantified (round 106)
+
+`ptxas -v` on the current `gemm.cu`:
+
+| kernel | registers | spills | smem |
+|---|---|---|---|
+| `nvfp4_gemm_kernel` | 96 | 0 | 24,576 B |
+| `fp8_gemm_kernel` | 85 | 0 | 24,576 B |
+| `bf16_gemm_kernel` | 104 | 0 | 24,576 B |
+
+Resource limits per SM (GB10: 65,536 registers, 102,400 B shared, 24 blocks):
+
+```
+registers: 65,536 / (96 * 128) = 5 blocks
+shared   : 102,400 / 24,576   = 4 blocks   <- binding
+=> 4 blocks = 512 threads = 16 warps of 48 = 33% occupancy
+```
+
+**33% occupancy, and the prefill measures 33% of FMA peak** (5.7 G FMAs per
+[17408,5120] matrix against a 10.4 T FMA/s ceiling). Those two numbers agreeing is
+what makes this a diagnosis rather than a guess -- and it is the first mechanism
+this session that is supported by two independent measurements.
+
+**The lever is shared memory per block.** The 24,576 B is `xt[2][32][64]` as f32
+(16,384) plus `wt[2][32][64]` as u16 (8,192). Making `xt` bf16 takes it to
+16,384 B total, which allows 6 blocks by shared and 5 by registers -- i.e. **up to
+5 blocks/SM, 640 threads, 20 warps, 42% occupancy**, and it is the same change
+that would free the room for `KC`=64.
+
+Note this is the *third* time bf16 `xt` has come up, but the first time for a
+measured reason: rounds 97-98 rejected it on the strength of a confounded
+`KC`/padding comparison, which round 98 itself overturned. **The gate decides** --
+if bf16 activations do not survive the oracle comparison, the change is out
+regardless of the occupancy arithmetic.
+
 **Three separate times this session a plausible mechanism was counted rather than
 measured and turned out to be wrong** (rounds 59, 101, 104). The rule that works
 is: change one variable, read an absolute per-launch number, and run the gate
