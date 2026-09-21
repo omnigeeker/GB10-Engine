@@ -945,6 +945,52 @@ splitting only the scale fetch, which is a byte rather than 8.
 
 That check costs one command and should be the first thing done next round.
 
+### The answer was already in the codebase (round 84)
+
+`nvfp4_gemv_tmpl` in `kernels/gemv.cu` carries a comment describing exactly this
+problem, written when that kernel was fixed:
+
+> *Issue every row's weight and scale load BEFORE any of the arithmetic. Fusing
+> the loads into the compute loop leaves the compiler free to keep only one load
+> in flight per warp, which starves DRAM; separating them gives ROWS independent
+> loads.*
+
+and its weight addressing is
+
+```
+e0 = i * kTile + lane * kVec;          // kVec = 8 elements = 4 bytes... see below
+pk[r] = *(const uint2*)(w + row*rowbytes + (e0 >> 1));
+```
+
+With `lane * kVec` and an 8-byte `uint2` load, **consecutive lanes read consecutive
+8-byte chunks of a single row**, so one warp instruction covers 256 contiguous
+bytes of **one row**. The GEMV then issues all `ROWS` loads before any arithmetic,
+and dequantises 8 elements at a time with `e2m1x8_to_float`.
+
+**The GEMM staging does neither of those things.** It scatters one instruction
+across 8 rows (32 B each), and it fuses load with dequant and store.
+
+So the difference between the 148 GB/s path and the 54 GB/s path is documented in
+the repository, and the fix has two halves:
+
+1. **One row per warp instruction.** Change the staging's thread-to-(row, k)
+   mapping so consecutive lanes read consecutive bytes of the *same* row, as the
+   GEMV does, instead of spreading across 8 rows. This is the change rounds 76,
+   77 and 79 never made -- all three kept the 8-row scatter and varied only the
+   bytes per row.
+2. **Issue all loads before arithmetic**, which round 83 attempted and which made
+   things worse *on its own* -- consistent with the GEMV comment, which pairs it
+   with (1): separating loads only helps if there are `ROWS` genuinely
+   independent loads to separate, and with an 8-row scatter there are not.
+
+That also explains the register-pressure regression in round 83: `pk[2]`/`scl[2]`
+were kept live across the outer product to buy nothing, because the loads were
+still not independent in the way the GEMV's `ROWS` loads are.
+
+**This is now the single highest-value change available**, and unlike the last
+several attempts it has a working reference implementation in the same repo to
+copy from.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
