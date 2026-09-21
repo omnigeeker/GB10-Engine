@@ -1,5 +1,68 @@
 # SESSION HANDOFF (read this first)
 
+## Final state of this session
+
+Everything below is measured, and every claim is backed by a gate or a number in
+this file. The engine is complete and usable; what remains is performance.
+
+**Delivered and verified**
+
+| item | evidence |
+|---|---|
+| Pure-Rust inference engine | builds with 0 errors, aarch64 |
+| Qwen3.8-27B **NVFP4** on GB10 | `generate` 16/16 exact vs the bf16 oracle |
+| MTP | `mtp-probe` OK, acceptance 44/48, token-exact |
+| OpenAI protocol endpoint | `POST /v1/chat/completions` |
+| Anthropic protocol endpoint | `POST /v1/messages` |
+| Concurrency 16 (engine) | `batch-parity` 16/16 exact |
+| Concurrency 16 (endpoint) | 16 concurrent requests, 17.37 tok/s |
+| otp vs llama.cpp | 8.48-8.62 vs llama.cpp, better |
+| Loop project, push per round | rounds 36-99, all PASS and pushed |
+
+**Performance achieved this session**
+
+| | before | after |
+|---|---|---|
+| t=1 forward | 271.46 ms | **118.40 ms (-56%)** |
+| TTFT | 566.3 ms | **498.2-508.3 ms (-12%)** |
+| endpoint, 16 concurrent | 5.36 tok/s (serial server) | **17.37 tok/s (3.24x)** |
+
+The three changes that did it: **round 85** (route short prompts to the batched
+GEMV -- one `if`, worth -56% on its own), **rounds 94-95** (a batching scheduler
+plus a 25 ms batching window in the server), **rounds 96-98** (a 64-wide prompt
+tile, then removing the tile padding).
+
+**Not achieved, with reasons**
+
+* **Single-decoder 100 tok/s -- arithmetically impossible on this hardware.**
+  17.6 GB of weights per token against 228 GB/s measured gives a roofline of
+  **~13 tok/s**; 100 would need ~1.76 TB/s. No implementation can reach it. The
+  engine runs at 8.48 tok/s, ~65% of the roofline.
+* **TTFT better than llama.cpp**: 498-508 ms against ~74 ms, ~6.9x off.
+* **30 tok/s at 16 concurrent**: 17.37 measured, 1.7x short.
+
+Both open items reduce to the same thing -- **making the GEMM and GEMV paths reach
+their bandwidth bounds**. The bounds and the shortfalls per path are in the
+round-99 notes; the batch decode is 3.3x off its bound, and the prefill GEMM is
+1.8x off, and those two numbers are the whole of the remaining gap.
+
+## What worked, methodologically
+
+* **Probe before optimising.** Every real gain came from a measurement, and the
+  single largest came from reading the code rather than measuring.
+* **Change one variable.** Round 97 changed `KC` and the padding together and
+  reached a conclusion that round 98's clean experiment reversed -- it would have
+  sent the next session into a risky bf16 change that was pointless.
+* **Never disable a component and subtract** (round 81). Change its size and read
+  the profiler's absolute per-launch number instead.
+* **Re-measure quoted numbers.** The TTFT figure repeated for dozens of rounds was
+  from round 27 and 24% stale (round 86).
+* **Run the gate before believing the number.** A broken TT=64 kernel reported a
+  -17% TTFT that was pure artefact (round 88).
+* **Read the codebase.** The answer to the GEMM problem was written in `gemv.cu`
+  the whole time (round 83), and the biggest win of the session was an `if` in
+  `weights.rs` (round 85).
+
 ## Where the endpoint's 14.74 s goes, and both remaining gaps (round 99)
 
 All gates green at `959557b`: `generate` 16/16 (100%), TTFT 508.3 ms, decode
