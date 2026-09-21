@@ -257,22 +257,30 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
 extern "C" __global__ void attn_prefill_kernel(
     const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    float scale) {
+    float scale, int start, int kv_base) {
     const int h = blockIdx.x;
     const int t = blockIdx.y;
     const int d = threadIdx.x;
     const int group = n_q_heads / n_kv_heads;
     const int kh = h / group;
 
-    extern __shared__ float scores[];  // n_tokens entries
+    // `scores` holds one entry per *key*, and the key window is
+    // `0..=start+t`: `start` is how many keys were already in the cache before
+    // these tokens. Row `t` of `q`/`out` is the `t`-th *new* token, while `k`/`v`
+    // are the whole cache for this sequence, offset by `kv_base`.
+    extern __shared__ float scores[];  // start + n_tokens entries
+
+    // Absolute position of this query row.
+    const int win = start + t;
 
     const bool active = d < head_dim;
     const float qv = active ? q[((size_t)t * n_q_heads + h) * head_dim + d] : 0.0f;
 
     // One block reduction per key. O(T) reductions per query: correct and
     // simple, but quadratic in T. Replaced by a tiled kernel in M6.
-    for (int s = 0; s <= t; ++s) {
-        const float kv_ = active ? k[((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
+    for (int s = 0; s <= win; ++s) {
+        const float kv_ = active
+            ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kv_) * scale;
         if (d == 0) scores[s] = dot;
         __syncthreads();
@@ -281,16 +289,16 @@ extern "C" __global__ void attn_prefill_kernel(
     // Every thread redundantly recomputes the softmax (T is small here), which
     // avoids further synchronisation.
     float mx = -INFINITY;
-    for (int s = 0; s <= t; ++s) mx = fmaxf(mx, scores[s]);
+    for (int s = 0; s <= win; ++s) mx = fmaxf(mx, scores[s]);
     float sum = 0.0f;
-    for (int s = 0; s <= t; ++s) sum += __expf(scores[s] - mx);
+    for (int s = 0; s <= win; ++s) sum += __expf(scores[s] - mx);
     const float inv = 1.0f / sum;
 
     if (active) {
         float acc = 0.0f;
-        for (int s = 0; s <= t; ++s) {
+        for (int s = 0; s <= win; ++s) {
             const float p = __expf(scores[s] - mx) * inv;
-            acc = fmaf(p, v[((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
+            acc = fmaf(p, v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
         }
         out[((size_t)t * n_q_heads + h) * head_dim + d] = acc;
     }

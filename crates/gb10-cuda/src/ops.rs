@@ -987,16 +987,21 @@ impl Ops {
         n_kv_heads: usize,
         head_dim: usize,
         scale: f32,
+        start: usize,
+        kv_base: usize,
     ) -> Result<()> {
         need(
             q.len() >= n_tokens * n_q_heads * head_dim
-                && k.len() >= n_tokens * n_kv_heads * head_dim
-                && v.len() >= n_tokens * n_kv_heads * head_dim
+                // `kv_base` is already in floats; only the key rows scale by
+                // the head count.
+                && k.len() >= kv_base + (start + n_tokens) * n_kv_heads * head_dim
+                && v.len() >= kv_base + (start + n_tokens) * n_kv_heads * head_dim
                 && out.len() >= n_tokens * n_q_heads * head_dim,
             "attn_prefill",
         )?;
         let (t, nq, nk, hd) =
             (n_tokens as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
+        let (st, kb) = (start as i32, kv_base as i32);
         unsafe {
             dev.stream()
                 .launch_builder(&self.attn_prefill)
@@ -1009,10 +1014,12 @@ impl Ops {
                 .arg(&nk)
                 .arg(&hd)
                 .arg(&scale)
+                .arg(&st)
+                .arg(&kb)
                 .launch(LaunchConfig {
                     grid_dim: (n_q_heads as u32, n_tokens as u32, 1),
                     block_dim: (block_for(head_dim, 256), 1, 1),
-                    shared_mem_bytes: (n_tokens * 4) as u32,
+                    shared_mem_bytes: ((start + n_tokens) * 4) as u32,
                 })?;
         }
         Ok(())

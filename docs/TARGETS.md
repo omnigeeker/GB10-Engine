@@ -142,6 +142,34 @@ extra drafted token adds only 0.85 GB, so the marginal drafted token is 21x
 cheaper than a decoder step. Realizing it is gated on the batched-verify path,
 not on the head.
 
+### The non-empty-cache prerequisite is now in place (round 44)
+
+`attn_prefill_kernel` was querying the *new tokens'* k/v with the query count set
+to `pos + t`, and its causal window was hardcoded to `0..=t`. That only works
+when `pos == 0` -- with a non-empty cache the query rows ran off the end of the
+buffer and every row attended to the wrong key range.
+
+It now takes `start` (keys already in the cache) and `kv_base` (this sequence's
+slice), queries the **cache** rather than the scratch k/v, and windows each
+query row over `0..=start+t`. The single call site in `forward_prefill` passes
+`t` queries, the cache, and `pos`. The dynamic `scores[]` allocation is sized
+`start + n_tokens`.
+
+This is behaviour-preserving on the path that exists today -- prefill from an
+empty cache, where the cache slice just written equals the old scratch k/v -- and
+both gates confirm it:
+
+```
+generate      : oracle agreement 16/16, exact match          OK
+batch-parity  : 16/16 sequences exact, 40.75 tok/s @ n_seq=16 OK
+```
+
+Note the honesty of that evidence: it proves **no regression**, not that the new
+capability works. Nothing exercises `start > 0` yet. The first consumer will be
+the batched MTP verify path, and it should be introduced together with a test
+that actually runs two prefill chunks so `start > 0` is covered rather than
+assumed.
+
 ### The head was verified with a control, not just a happy path
 
 The two candidate hidden inputs (post-final-norm vs pre-norm residual) produced

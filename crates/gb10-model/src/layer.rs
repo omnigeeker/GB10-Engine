@@ -456,20 +456,24 @@ impl FullAttnLayer {
         state.n_keys[seq] = pos + t;
 
         let scale = 1.0 / (hd as f32).sqrt();
-        // The kernel hardcodes the causal window as 0..=t and indexes k/v from
-        // row 0, so it must be handed *this sequence's* projected k/v, not the
-        // shared cache: the cache would make every sequence attend to slot 0.
+        // Attend over the whole cache: queries are the `t` new rows of `sc.q`,
+        // and `k`/`v` are this sequence's slice of the cache (offset by
+        // `kv_base`), with `pos` keys already in it. Reading the cache rather
+        // than `sc.kb_ln`/`sc.vb` is what makes this valid from a non-empty
+        // cache, which chunked prefill and MTP verification both need.
         ops.attn_prefill(
             dev,
             &sc.q,
-            &sc.kb_ln,
-            &sc.vb,
+            &state.k_cache,
+            &state.v_cache,
             &mut sc.attn,
-            state.n_keys[seq],
+            t,
             nh,
             nkv,
             hd,
             scale,
+            pos,
+            kv_base,
         )?;
 
         ops.sigmoid_mul(dev, &mut sc.attn, &sc.gate, t * nh * hd)?;
