@@ -1824,6 +1824,45 @@ layout a block's 64 rows are contiguous within each k, so the stride disappears.
 tested coalescing WITHIN a warp and found only 13%; it did not test the stride ACROSS rows, which
 is what this round identifies.**
 
+## THE ROW-STRIDE HYPOTHESIS IS REFUTED (round 212)
+
+**One token in the probe: the row stride from `K/2 = 2560 B` to `16 B`**, making each block's 64
+rows contiguous.
+
+| | t=32 | t=64 |
+|---|---|---|
+| stride 16 B | **203.32** [201.33-205.04] | **250.18** [248.87-252.35] |
+| stride 2560 B (round 211) | 208.50 | 251.12 |
+| change | -2.5% | **-0.4% (noise)** |
+
+**So the stride is not the limiter, and the row-buffer-locality story -- the first candidate to
+survive every previous exclusion -- does not survive its own test either. A transposed layout
+would not have helped for this reason.**
+
+### Seven candidates excluded
+
+| # | candidate | how excluded |
+|---|---|---|
+| 1 | memory-level parallelism | measured (round 206, +/-0.5%) |
+| 2 | coalescing within a warp | measured (round 208, 13%) |
+| 3 | instruction count | arithmetic (0.17 ms) |
+| 4 | address arithmetic | arithmetic (7.64 ms) |
+| 5 | in-flight bytes | arithmetic + measurement |
+| 6 | shared store + barrier | **measured, a real 16%** (round 211) -- excluded as the dominant cause |
+| 7 | **row stride / DRAM locality** | **measured (this round, -0.4%)** |
+
+### Where that leaves it
+
+**The global read of 17.608 GB runs at 70.1 GB/s = 30.8% of peak with no shared store, no FMA,
+perfect coalescing, a contiguous stride, negligible instruction cost and adequate bytes in
+flight. Every in-kernel explanation is now excluded.**
+
+**The one measurement that would settle it is OUTSIDE the kernel.** The machine's 228 GB/s peak
+came from a benchmark, and the single-row GEMV reached 170 GB/s. **If a plain 17.6 GB read of the
+actual weight tensor, from a trivial standalone kernel, also lands near 70 GB/s, then the limit
+is the memory system or the tensor's placement -- not this kernel.** That is a small,
+self-contained test and it is the right next step.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
