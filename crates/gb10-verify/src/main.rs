@@ -900,11 +900,23 @@ fn chunked_prefill(args: &Args, n_dec: usize) -> Result<bool> {
         two.push(model.step(&dev, t, &mut st2, &mut sc2)?);
     }
 
+    // `all_logits` scores every row; the row `prefill_seq` scored on its own
+    // must agree with it, or the verify path is reading different hidden states
+    // than the decode path.
+    let mut st3 = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc3 = Scratch::new(&dev, &text, args.max_seq)?;
+    let last = model.prefill_seq(&dev, &ids, &mut st3, &mut sc3, 0)?;
+    model.all_logits(&dev, &mut st3, ids.len())?;
+    let rows = dev.stream().clone_dtoh(&st3.idx_all)?;
+    let row_last = rows[ids.len() - 1] as u32;
+    let rows_ok = row_last == last;
+    println!("  all_logits row {} = {}, prefill_seq = {}", ids.len() - 1, row_last, last);
+
     println!("== chunked prefill (start > 0) ==");
     println!("  prompt {} tokens, split {}+{}", ids.len(), split, ids.len() - split);
     println!("  one shot : {:?}", &one[..one.len().min(8)]);
     println!("  two chunk: {:?}", &two[..two.len().min(8)]);
-    let same = one == two;
+    let same = one == two && rows_ok;
     println!("  decoded  : {:?}", tok.decode(&one, false)?);
     println!("  agree: {}", if same { "YES" } else { "NO" });
     println!();

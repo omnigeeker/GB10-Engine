@@ -66,6 +66,22 @@ impl Model {
         })
     }
 
+    /// Scoring for the MTP verify path: `lm_head` over *every* row of
+    /// `state.normed`, argmaxed into `state.idx_all`.
+    ///
+    /// `prefill_seq` scores only the last row on purpose -- over a full prompt
+    /// that is 715 MB of weights per token. Verification is the opposite case:
+    /// a handful of rows, each of which reuses a weight read the single-row
+    /// path would have had to repeat.
+    pub fn all_logits(&self, dev: &Device, state: &mut ModelState, t: usize) -> Result<()> {
+        anyhow::ensure!(t >= 1 && t <= VERIFY_MAX, "all_logits rows {t}");
+        self.lm_head
+            .forward(dev, &state.normed, &mut state.logits_all, t)?;
+        dev.ops()
+            .argmax_multi(dev, &state.logits_all, &mut state.idx_all, self.vocab_size(), t)?;
+        Ok(())
+    }
+
     pub fn text(&self) -> &gb10_core::config::TextConfig {
         &self.cfg.text_config
     }
@@ -93,6 +109,13 @@ pub struct ModelState {
     pub normed: CudaSlice<f32>,
     /// Final-norm row of the last prompt token, consumed by `lm_head`.
     pub last: CudaSlice<f32>,
+    /// Per-row logits for the MTP verify path, which needs the prediction of
+    /// *every* drafted row rather than just the last one. Sized for
+    /// `VERIFY_MAX` rows: at 248320 vocab a `max_seq`-sized buffer would be
+    /// 2 GB, and verification never covers more than a handful of tokens.
+    pub logits_all: CudaSlice<f32>,
+    /// Argmax of each of those rows.
+    pub idx_all: CudaSlice<i32>,
     /// Token ids staged on the device for a batched decode step.
     pub tokens_dev: CudaSlice<i32>,
     /// Number of sequences this state is sliced into.
@@ -108,6 +131,7 @@ impl ModelState {
             layers.push(LayerState::new(dev, text, l, max_seq, n_seq)?);
         }
         let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
+        let vocab_hint = model.vocab_size();
         Ok(Self {
             layers,
             logits: z(model.vocab_size() * n_seq)?,
@@ -118,6 +142,8 @@ impl ModelState {
             b: z(text.hidden_size * max_seq)?,
             normed: z(text.hidden_size * max_seq)?,
             last: z(text.hidden_size)?,
+            logits_all: z(vocab_hint * VERIFY_MAX)?,
+            idx_all: dev.stream().alloc_zeros::<i32>(VERIFY_MAX)?,
             tokens_dev: dev.stream().alloc_zeros::<i32>(n_seq)?,
             n_seq,
             n_tokens: 0,
@@ -293,6 +319,11 @@ impl Model {
         Ok(v[0] as u32)
     }
 }
+
+/// Rows the MTP verify path can score at once. Each extra verified row is one
+/// more drafted token, bought for the ~0.85 GB the head costs to draft it
+/// instead of the 17.6 GB a decoder step costs.
+pub const VERIFY_MAX: usize = 64;
 
 /// Per-phase wall time for one decode step, in milliseconds.
 ///

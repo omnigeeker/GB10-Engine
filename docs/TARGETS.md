@@ -189,6 +189,26 @@ comparison is exactly the discriminator the round-44 change needed.
 The non-empty-cache forward is therefore verified, and the batched MTP verify
 path can now be built on it.
 
+### ...and the second prerequisite, per-row scoring (round 46)
+
+Verifying `K` drafted tokens in one forward needs the decoder's prediction at
+*every* drafted row, but `prefill_seq` scores only the last row -- deliberately,
+since over a full prompt that would re-read 715 MB of weights per token.
+`Model::all_logits` adds the multi-row case for the verify path only, sized to
+`VERIFY_MAX = 64` rows (63 MB of logits buffers, negligible against 121 GB).
+
+It is checked against the path it parallels, not left to trust:
+
+```
+all_logits row 31 = 271, prefill_seq = 271
+chunked-prefill: OK
+```
+
+Both prerequisites for the batched MTP verify now exist and are individually
+verified. What remains is to compose them into the draft/verify/accept loop and
+measure whether the composed path actually beats 1.0x -- the naive per-token
+loop measured 0.95x, and only batching the verification changes that.
+
 ### The head was verified with a control, not just a happy path
 
 The two candidate hidden inputs (post-final-norm vs pre-norm residual) produced
