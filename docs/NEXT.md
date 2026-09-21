@@ -717,6 +717,43 @@ dispatches to it), so the extra points need the sweep list in the harness extend
 harness edit with no correctness risk, which is exactly why it should be done before any
 kernel rewrite.**
 
+### THE FULL CURVE (round 181) -- and it was already being printed
+
+`crates/gb10-verify/src/main.rs:1008`: `for t in [1usize, 2, 4, 8, 16]`. **The harness has
+always swept five batch sizes. Rounds 168-180 only ever read t=8 and t=16 because a `grep`
+filter (`'^ +8 |^ +16 '`) hid the other three. No edit was needed.**
+
+**Full sweep, mean of 3 runs** (effective = 17.608 GB / time):
+
+| t | `pre_ms` | effective | scaling |
+|---|---|---|---|
+| 1 | **103.64** | **169.9 GB/s** | -- |
+| 2 | **133.66** | 131.7 GB/s | x1.29 for 2x |
+| 4 | **142.60** | 123.5 GB/s | **x1.07 for 2x** |
+| 8 | **179.61** | 98.0 GB/s | x1.26 for 2x |
+| 16 | **312.23** | 56.4 GB/s | **x1.74 for 2x** |
+
+**Two regimes, with the boundary between t=4 and t=8:**
+
+* **t=1 -> 4: +38% for 4x the batch -- nearly flat. The weight stream dominates.**
+* **t=8 -> 16: +74% for 2x the batch -- nearly linear. Per-token work dominates.**
+
+**So "latency or traffic" is answered "both, at different sizes". The high end is genuinely
+linear in batch, which means the target is the marginal per-token cost -- 16.6 ms/token --
+not a fixed stall. At 16 concurrent that term is 16 x 16.6 = 265 ms against a ~104 ms fixed
+weight cost, so 72% of the endpoint's prefill time is per-token work.**
+
+**t=1 achieves 169.9 GB/s = 75% of the 228 GB/s peak, matching the known single-row figure.
+The batch kernel falls 132 -> 56 GB/s as batch goes 2 -> 16.**
+
+**This is the first complete quantified profile of the endpoint's prefill cost. It says the
+target is the batched kernel's per-token marginal cost (the activation re-read / dependency
+chain of rounds 177/179), NOT the weight stream -- which is already at 75% of peak.**
+
+**Methodological note worth keeping: three rounds reasoned about this curve before anyone
+read the whole table, and the harness had been printing all five points the entire time.
+The measurement was already taken; a filter hid it.**
+
 ### Superseded: the round-178 proposal
 
 **The batched GEMV re-reads `x` from L2 for every row group.** The kernel header names the
