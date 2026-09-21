@@ -636,3 +636,35 @@ such.**
 decisive instruments were a `y.len()` print, a memset-on/split-off run, a `gridDim.z`
 print, and finally a three-run A/B. **The prints were each worth more than the rounds of
 reasoning that preceded them.**
+
+
+---
+
+## CORRECTION (round 174): THE A/B NEVER EXERCISED THE SPLIT
+
+**`forward-cost` measures `pre_ms` at `t = 8` and `t = 16`. `weights.rs:95` routes
+`t <= 16` to the batched GEMV, not to the GEMM.** The K split lives in the GEMM only.
+
+**So the round-168 A/B -- 176.77 -> 176.07 at t=8, and 298.27 -> 307.81 at t=16 -- measured
+the GEMV path, which the split does not touch. The "+3.2% worse" was noise in a kernel the
+patch could not affect.**
+
+| claim from round 168 | status |
+|---|---|
+| the split is correct (16/16 x3, `chunked-prefill` OK) | **stands** -- `generate`/`chunked-prefill` do exercise the GEMM |
+| the split is **not faster** | **UNFOUNDED -- never measured** |
+| therefore the occupancy hypothesis is falsified | **also unfounded** -- the split that was supposed to test it was never run under load |
+
+**The patch was reverted on the strength of a measurement that could not have detected it.
+The split is untested, not rejected.**
+
+### What a valid test requires
+
+**Measure a path that actually calls `forward_prefill` -- i.e. `t > 16`.** `chunked-prefill`
+and the endpoint both do. **`forward-cost` at t=32 or t=64 would too; at t<=16 it cannot.**
+
+**This is the third time this session that a verdict rested on a quantity that did not
+contain the effect**: round 144 (an endpoint match read as a derivative match), round 169
+(a column's meaning inferred from its value), and now round 174. **The rule that keeps
+being re-learned: before trusting a keep/revert decision, confirm the measured path
+contains the changed code.**
