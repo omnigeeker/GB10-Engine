@@ -19,6 +19,44 @@ system is not the limit: **the 1.56x is inside `nvfp4_gemv_kernel`.**
 The original 100 tok/s target was shown physically unreachable before implementation
 began and the owner accepted hardware-feasible targets; the roofline is 12.95 tok/s.
 
+## THE GAP IS THE DEQUANT PATH -- ablation closed in round 141
+
+`bench/hw/gemv_bw.cu`'s `LEVEL` ablation, extended to call the kernel's **own**
+`e2m1x8_to_float` and `e4m3_to_float` (included straight from
+`kernels/gemv_common.cuh`) instead of hand-written placeholders:
+
+| level | work | GB/s |
+|---|---|---|
+| 6 | scale multiply, **no scale load** | **262.8** |
+| **7** | **the real dequant path** | **171.0 / 207.5 / 178.9 -> mean 186** |
+| -- | the real `nvfp4_gemv_kernel` | **190** |
+
+**The synthetic reproduction now lands on the real kernel (186 against 190), so the
+ablation accounts for the entire gap and closes.** And it isolates the cause in one
+step: **the dequant path costs ~29%**, against 262.8 GB/s when the multiply is kept
+but the unpack is removed.
+
+**So the shortfall is `e2m1x8_to_float` + `e4m3_to_float` and nothing else** -- not the
+access pattern (272 GB/s measured), not the x loads, not occupancy, not the scale
+*load* (level 6 proves the multiply alone is nearly free).
+
+**This also corrects round 130's first-order check.** That check assumed ~33 ops per
+8 bytes and concluded ALU sat at 7.5% of capacity -- but `e2m1x8_to_float` is a
+per-element bit-manipulation chain, not 8 ops per call. **The cost is the dequant's
+*dependency chain*, and throughput arithmetic cannot see a dependency chain.** That is
+why a count-based check passed while the measurement says 29% -- the same failure mode
+as rounds 59/101/104/106, now for the fourth time.
+
+**The lever is to make the unpack cheaper or less serial:**
+
+* a shared-memory lookup table (16 entries, 64 B) replacing per-element bit
+  manipulation with one shared load;
+* a two-element `prmt`-based table (256 entries);
+* restructuring so the 16-element chain is independent across its two halves.
+
+**Test with `forward-cost` t=1, >= 3 runs, mean against 103.48 ms** (the round-132
+build), and the gate must stay 16/16.
+
 ## What has been ruled out on that kernel -- do not retry these
 
 Each was eliminated by measurement, not argument:
