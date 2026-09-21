@@ -119,12 +119,29 @@ __device__ __forceinline__ void nvfp4_gemv_tmpl(
         for (int i = 0; i < full_tiles; ++i) {
             const int e0 = i * kTile + lane * kVec;
             const XVec xv = load_x(xb, e0);
-            const int so = i * kWarp + lane;
+            const int sbyte = i * kWarp;  // 32 scales per k-tile
 
             // Issue every row's weight and scale load BEFORE any of the
             // arithmetic. Fusing the loads into the compute loop leaves the
             // compiler free to keep only one load in flight per warp, which
             // starves DRAM; separating them gives ROWS independent loads.
+            //
+            // The scale row is 32 consecutive bytes per k-tile. Reading one byte
+            // per lane costs 32 B per warp instruction against the weight load's
+            // 256 B -- 8x less efficient, and the round-131 ablation measured that
+            // single step as the whole gap between this kernel's 190 GB/s and the
+            // 271 GB/s its own access pattern sustains. So lanes 0..7 load one
+            // uint32 each (a 128 B instruction) and broadcast the byte each lane
+            // needs. scalerow is K/16 and K is a multiple of 128, so the +sbyte
+            // offset is always 4-byte aligned.
+            uint32_t sw[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                const uint32_t* __restrict__ sp = reinterpret_cast<const uint32_t*>(
+                    wscale + (size_t)row * scalerow + sbyte);
+                sw[r] = (row < N && lane < 8) ? __ldg(sp + (lane & 7)) : 0u;
+            }
             uint2 pk[ROWS];
             float sc[ROWS];
 #pragma unroll
@@ -133,7 +150,14 @@ __device__ __forceinline__ void nvfp4_gemv_tmpl(
                 if (row < N) {
                     const uint8_t* __restrict__ wr = w + (size_t)row * rowbytes;
                     pk[r] = *reinterpret_cast<const uint2*>(wr + (e0 >> 1));
-                    sc[r] = e4m3_to_float(wscale[(size_t)row * scalerow + so]);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const int row = rbase + r;
+                if (row < N) {
+                    const uint32_t s4 = __shfl_sync(0xffffffffu, sw[r], lane >> 2);
+                    sc[r] = e4m3_to_float((uint8_t)((s4 >> ((lane & 3) << 3)) & 0xFFu));
                 }
             }
 

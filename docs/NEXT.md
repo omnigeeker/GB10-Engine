@@ -266,7 +266,31 @@ the memory system has to interleave with the weights. The scale row is only
 111's observation that the NVFP4 dequant path carries the LOP3/SHF, while ALU
 utilisation stays at 7.5%: the instructions are there, the *loads* are what cost.
 
-**The fix is specific and testable:** each warp's k-tile needs 32 *consecutive* scale
+### The widening was implemented, and it recovers only a third of the prediction (round 132)
+
+Lanes 0..7 now load one `uint32` each (128 B per warp instruction) and broadcast the
+byte each lane needs with `__shfl_sync`, replacing one byte per lane (32 B per
+instruction):
+
+| | reference | with wide scale load |
+|---|---|---|
+| `generate` | 16/16 | **16/16** |
+| registers / spills | 39 / 0 | 48 / 0 |
+| **t=1 one-row forward** | **104.2 ms** | **100.79 ms (-3.3%)** |
+
+**Kept: it is correct and it is a real gain -- the first this session since round
+115.** But the ablation predicted ~20% and reality gave 3.3%, and the gap is
+informative: **the cost is the second stream's *existence*, not its instruction
+width.** Steps 4 and 5 of the ablation *raised* bandwidth (210.5, 212.5) -- adding
+more work per k-tile hid the extra load's latency, which is the same signature as a
+latency/occupancy cost rather than a bandwidth cost.
+
+**So the remaining ~26% needs the stream removed, not widened** -- hoist the scale row
+(320 B for K=5120) into shared memory once per row, or restructure so the scale is not
+a per-k-tile load at all. Widening was the cheap experiment and it answered the
+question; the next one has to remove the load.
+
+**The original fix note, kept for the record:** each warp's k-tile needs 32 *consecutive* scale
 bytes. Load them as 8 lanes x `uint32` (128 B per instruction) or 2 lanes x `uint4`
 and broadcast with `__shfl_sync`, or hoist the whole 320-byte scale row into registers
 or shared once per row. **Any of those turns a 32 B/instruction stream into a 128 B
