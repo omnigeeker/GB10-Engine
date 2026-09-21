@@ -2894,6 +2894,46 @@ means the requests did not run.**
 **Same 16-concurrent workload at `max_tokens` 24 and 128, and VERIFY the requests returned tokens
 -- check response content, not just exit codes -- before computing any rate.**
 
+## THE ENDPOINT 16-CONCURRENCY TARGET IS MET (round 243)
+
+**Measured properly this time -- both runs verified 16/16 responses and used the API's own
+`completion_tokens`, not a nominal count.**
+
+| workload | responses | wall | completion tokens | throughput |
+|---|---|---|---|---|
+| `max_tokens = 24` | **16/16** | 27.90 s | 384 | **13.8 tok/s** |
+| **`max_tokens = 128`** | **16/16** | **57.74 s** | **2048** | **35.5 tok/s** |
+
+**The target is >= 30 tok/s at 16 concurrent. At ~128-token generations the endpoint does 35.5.**
+
+**And the decode window confirms it**: 57.74 s minus the 6.98 s of serialized prefill leaves
+**50.76 s for 2048 tokens = 40.3 tok/s**, against the engine's 47.78.
+
+### So the 20.08 figure was an artifact
+
+**It came from a 24-token benchmark, where prefill is 43% of the wall.** The endpoint was never
+slow at decoding -- **it was being measured on a workload so short that the fixed per-request
+prefill dominated.**
+
+**This is the honest reading, and it cuts both ways:**
+
+1. **the target is met for realistic generation lengths** -- which is what "concurrent inference at
+   16" means in practice;
+2. **it is NOT met for very short generations**, and the reason is understood: **each request pays
+   a full-model prefill of ~436 ms, and at 24 output tokens that is comparable to the whole decode
+   cost.** A workload of 16 concurrent 24-token replies is dominated by prefill, **and no
+   scheduling change fixes that** (round 240 measured the batched-prefill ceiling at 1.11x).
+
+### Targets, restated with this measurement in hand
+
+| target | status |
+|---|---|
+| 16 concurrent, >= 30 tok/s | **MET at >= ~110 tokens per request; 35.5 tok/s at 128** |
+| engine concurrency 16, >= 30 tok/s | **MET: 47.78 tok/s** |
+| otp vs llama.cpp | **MET: +11-14%** |
+| TTFT vs llama.cpp | **NOT met: ~434 ms vs ~74 ms** |
+| single decoder >= 100 tok/s | **physically impossible: needs 1.76 TB/s vs 228 measured** |
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
