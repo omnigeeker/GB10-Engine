@@ -279,6 +279,59 @@ suppress emitted pieces until the boundary is seen, which **changes
 time-to-first-visible-token and must be measured as its own change rather than
 smuggled into this one.**
 
+### The streaming fix, designed (round 154) -- not implemented
+
+`crates/gb10-server/src/main.rs:378` sends each piece from the generator callback:
+
+```rust
+let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
+    send(&json!({ ... "choices": [{"index": 0,
+        "delta": {"content": piece}, "finish_reason": null}], }))
+});
+```
+
+**A per-piece string match will not work**: `piece` is `tok.decode(&[next], true)`, and
+`</think>` is several tokens, so the tag arrives split across pieces. The callback needs
+to buffer until the boundary is *complete*:
+
+```rust
+let mut held = String::new();
+let mut opened = false;          // has </think> been seen?
+// inside the callback, per piece:
+if opened { emit(piece) }
+else {
+    held.push_str(piece);
+    if let Some(i) = held.find("</think") {
+        if let Some(j) = held[i..].find('>') {
+            opened = true;
+            let rest = held[i + j + 1..].trim_start().to_string();
+            held.clear();
+            if !rest.is_empty() { emit(&rest) }
+        }
+    }
+}
+```
+
+**Two things to get right:**
+
+* **Borrow checker.** `send` is already a closure capturing `stream` mutably, and this
+  state machine wants to be captured by the generator callback too. **The clean shape is
+  to make the state machine a small struct with an `emit(&mut self, piece)` method and
+  pass `send` into it, rather than nesting three closures.** Expect a fight if it is
+  written inline.
+* **An empty-answer fallback.** If the model never emits `</think>` (truncated mid
+  reasoning), `held` is never flushed and **the stream delivers nothing at all** --
+  strictly worse than the current behaviour. **On `finish`, flush `held` through
+  `visible()`**, so a truncated run still shows its reasoning the way the
+  non-streaming path does.
+
+**Do the same at the Anthropic site** (`main.rs:483`, `event:`/`data:` framing).
+
+**Acceptance:** `curl ... "stream": true` with the round-152 prompt and
+`max_tokens: 200` must emit `The capital of France is Paris.` and **must not emit any
+reasoning text**; with `max_tokens: 8` it must still deliver *something* rather than an
+empty stream; `generate --n 16` stays 16/16.
+
 **The original analysis and fix options, kept for the record:**
 
 * **strip** everything up to and including `</think>` from `content` before returning;
