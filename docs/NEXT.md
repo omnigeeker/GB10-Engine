@@ -129,6 +129,46 @@ GEMV's shape is `ROWS`=1, one warp per row, one 8-byte weight load per instructi
 per thread. **A shape change, not a resource, is the only kind of move that has
 worked on this engine.**
 
+### ...but there is no shape change to make here (round 128)
+
+Round 127 proposed reorganising the warp so that one 32-lane instruction covers 256
+contiguous bytes of one row. **Reading the kernel shows that is already what it
+does:**
+
+```cuda
+const int e0 = i * kTile + lane * kVec;   // kVec = 16
+const XVec xv = load_x(xb, e0);
+uint2 pk[ROWS];
+```
+
+`lane * kVec` puts lane L at elements `[16L, 16L+16)`, i.e. bytes `[8L, 8L+8)` of the
+packed 4-bit row -- so **the 32 lanes of one warp already cover 256 contiguous bytes
+of a single row in one instruction**. The comment above the load block already
+documents separating the loads from the arithmetic so that `ROWS` independent loads
+stay in flight, which is exactly what round 126 measured as 10x more than needed.
+**The GEMV is already organised the way the analysis says it should be, so round
+127's proposal was redundant.**
+
+### The question that actually remains (round 128)
+
+If nothing counted explains the missing 17%, the honest possibility is that **83% of
+the probe figure is what this access pattern can do** -- the 228 GB/s in
+`bench/hw/bw4.cu` is measured with a *different* pattern, and T1's 12.5 tok/s was
+derived from a roofline that assumes 95% of it.
+
+**Settle it by measurement, not argument:** write a probe that streams the real NVFP4
+weight layout the way the GEMV does -- one row per warp, 256 B per instruction -- and
+measure the ceiling of *that* pattern. `bench/hw/bw4.cu` and `bench/hw/stage_bw.cu`
+are the existing templates.
+
+| probe result | conclusion |
+|---|---|
+| ~190 GB/s | **T1 as written is not a kernel problem**; 190 is the pattern's ceiling and the contract's T1 needs restating from a measured pattern ceiling, the same way the 100 tok/s target was |
+| ~228 GB/s | the kernel has 17% to find and the resource counting should resume |
+
+**That is one cheap probe that ends the argument either way**, and it is the same
+move that resolved the round-59 DRAM question -- measure the pattern, not the kernel.
+
 **That is the thing to look at next**: not bandwidth, not latency, not occupancy --
 the *load instruction mix*. `ROWS`=2 would halve the x-load count per unit of
 weight, and round 104 already measured its cost at B=16 (12% worse) but never
