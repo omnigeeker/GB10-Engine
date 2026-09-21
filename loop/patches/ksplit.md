@@ -375,3 +375,61 @@ because the cause is known.**
 implement scratch+reduction.** If `y.len() == t * n` the memset theory is dead and the
 bug is in the kernel's chunk arithmetic instead -- and that would be worth knowing before
 writing a new kernel.
+
+
+---
+
+## MEASURED (round 164): y is 16x too big -- and that was NOT the root cause
+
+A debug print at the GEMM call site (`weights.rs`, one `eprintln!` of `y.len()` vs
+`t * self.n`, removed afterwards) settled in **one run** what two rounds of inference had
+not. Seven distinct layer shapes, and the ratio is **exactly 16 every time**:
+
+| `y.len()` | `t * n` | ratio |
+|---|---|---|
+| 8,912,896 | 557,056 | **16.0** |
+| 5,242,880 | 327,680 | **16.0** |
+| 2,621,440 | 163,840 | **16.0** |
+| 3,145,728 | 196,608 | **16.0** |
+
+**So `y` is a slice of an activation buffer sized for 16 sequences, and
+`memset_zeros(y)` on the whole slice cleared fifteen neighbours' worth of it.** The
+round-163 correction called this unverified; **it is now verified.**
+
+### And fixing it did not fix the gate
+
+With `memset_zeros(&mut y.slice_mut(..t * n))` -- the correctly scoped zero -- **and** all
+blocks accumulating:
+
+| gate | result |
+|---|---|
+| `generate --n 16` | **0/0** |
+| `chunked-prefill --n 6` | **FAILED** |
+| `batch-parity` | OK |
+| `mtp-probe` | OK |
+
+**Reverted with `git checkout`; tree green at the round-163 commit (16/16,
+`chunked-prefill` OK).**
+
+**The memset overshoot was a genuine defect in the design, but it is not the root
+cause.** The bug is in the split itself, which leaves two candidates: **the chunk-range
+arithmetic** or **the double-buffer parity**.
+
+### The next diagnostic splits that space in half
+
+**Run with `nsplit = 2` but force `kc0 = 0` and `kc1 = nchunk / 2` for BOTH blocks** --
+block 1 redundantly recomputes block 0's half, so the two blocks write identical partial
+sums into the same region.
+
+* **If the gate passes**, the store and atomic path are correct and the bug is the range
+  or the parity.
+* **If it still fails**, the store path is wrong.
+
+**One flag, one run, and it halves the search space** rather than guessing at the parity.
+
+### The technique worth naming
+
+**A print of a size relationship at the call site answered in one run what two rounds of
+reasoning could not** -- `y.len()` vs `t * n` is one line and it is decisive. The
+correction in round 163 was right to say "one print, before any further design work",
+**and acting on it immediately was worth more than the design work it replaced.**
