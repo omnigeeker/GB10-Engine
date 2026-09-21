@@ -1927,6 +1927,43 @@ done on the wrong object -- **one matrix compared against all matrices.** This s
 caught that class of error five times (rounds 169, 176, 184, 193, and here), **and this is the
 first time the check and the correction happened in the same round.**
 
+## THE ENDPOINT MODEL WAS WRONG: THIS IS A DECODE PROBLEM (round 215)
+
+**Following the round-214 reconciliation one step further exposes a second, larger error.**
+
+**If 435.94 ms were ONE GEMM call on ONE 5120x5120 matrix, the whole model -- ~1344 such
+matrices -- would take `1344 x 435.94 ms = 586 s` per prefill. ABSURD.**
+
+**So 435.94 ms is the WHOLE MODEL**, which is consistent: `17.608 GB / 435.94 ms = 40.4 GB/s`.
+**And it matches what the instrument does**: `forward-cost`'s `pre_ms` timer wraps
+`model.prefill_seq(&dev, &feed, &mut st2, &mut sc2, 0)` over `t` fresh tokens -- **a full forward
+pass, not one GEMM.**
+
+### What this falsifies
+
+**The round-186 endpoint model -- "prefill = 16 GEMM calls x 435.94 ms = 6.98 s" -- is wrong.
+There are not 16 calls of 435.94 ms. There is ONE full-model prefill of ~436 ms.**
+
+**Consequences, stated carefully:**
+
+1. **the endpoint's ~12.9 s wall is NOT dominated by a 6.98 s prefill -- it is dominated by
+   decode, at roughly 12.4 s;**
+2. **the "prefill must fall to 3.17 s for 30 tok/s" arithmetic is void**, because the prefill was
+   never 6.98 s;
+3. **the 2.28x "if staging reached peak" figure still stands as a statement about the GEMM** --
+   but it is **2.28x on ~436 ms of a ~12.9 s wall, about 3.4%**, not the lever the endpoint
+   target needs.
+
+### And that reframes the endpoint target completely
+
+**If prefill is ~436 ms of ~12.9 s, the endpoint target is a DECODE problem, not a prefill
+problem.** The GEMV path -- characterized in rounds 173-185 and set aside from round 186 onward
+as "the wrong branch" -- **is where the endpoint's time actually goes.**
+
+**This is the fifth "wrong object" error this session and the second in two rounds.** It was
+caught only by following the round-214 reconciliation one step further, **rather than stopping
+when the first check passed.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
