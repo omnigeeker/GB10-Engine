@@ -1650,6 +1650,39 @@ per endpoint request.** It pays for itself in the first request.
 **The prize is unchanged and now well-founded:** staging **322.33 -> 77.2 ms**, total
 **435.94 -> 190.8 ms**, **2.28x against a 2.2x target.**
 
+## THE LANE REORDER IS IMPOSSIBLE -- THE TRANSPOSE IS THE ONLY FIX (round 207)
+
+**With the layout now the confirmed cause (round 206: 25% predicted, 24% measured), it is worth
+stating once and for all why the obvious fix does not work, so it is not retried.**
+
+**A row contributes `KC x 0.5 B = 16` contiguous bytes per k-tile. 64 contiguous bytes of ONE row
+would require 4 consecutive k-tiles.**
+
+**So there are exactly two ways to consume a full 64-byte line:**
+
+| option | cost |
+|---|---|
+| **1. widen `KC` 32 -> 128** (4 k-tiles at once) | **quadruples the `wt` shared tile (8 KB -> 32 KB)**, and `KC` 32 -> 64 was already shown harmful |
+| **2. TRANSPOSE to `[k][row]`** | **none of the above** -- a row's 16 B for one k become adjacent to the next row's, so 32 lanes cover 64 contiguous bytes across 4 rows for a single k |
+
+**Option 2 pays no shared-memory or iteration-count penalty -- which is exactly why the confounded
+`KC=64` test could not have settled it, and why it remains the only viable fix.**
+
+### The change is bounded
+
+- **Transpose is a one-time pass at load (~0.154 s).**
+- **Kernel-side, only `stage_wtile` changes.** The shared tile `wt` keeps its current shape and
+  **the outer product is untouched.**
+- **The group-scale factors transpose with the weights** (they are per 16 elements along k).
+- **Any code assuming `row * (K/2)` addressing -- including the loader -- must move together.**
+
+### Acceptance
+
+**Gate first (`generate --n 16`, `chunked-prefill --n 6`), then the round-203 probe to measure
+staging alone (baseline **322.33 ms** at t=64), then the full kernel at t=32/64 (baseline
+**400.01 / 435.94 ms**).** The target is staging toward **77.2 ms**, total toward **190.8 ms**
+-- **2.28x.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
