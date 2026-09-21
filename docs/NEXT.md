@@ -2624,6 +2624,29 @@ scale path -- so the same treatment is the obvious next move: extend the `LEVEL`
 ablation in `bench/hw/gemv_bw.cu` to fp8's layout (one `uint8` weight byte per lane per
 k-tile plus a per-channel float scale) and see which step costs the bandwidth.
 
+### The fp8 ablation is unnecessary -- the gap is entirely NVFP4 (round 138)
+
+Checked with arithmetic before spending a round on it. Bytes per step are derivable
+from the model's shapes, and both times were already measured in round 124:
+
+| path | bytes/step | measured time | GB/s | its pattern's ceiling | gap |
+|---|---|---|---|---|---|
+| **NVFP4** (64 x 3 MLP + `lm_head`, /2 for 4-bit) | **9.19 GB** | 52.7 ms | **174** | 272 | **1.56x** |
+| **fp8** (the remaining 17.608 - 9.19) | **8.42 GB** | 36.2 ms | **232** | -- | **none** |
+
+**`fp8_gemv_kernel` is running at 232 GB/s -- at or above the measured 228 GB/s peak.
+There is no gap there, and round 137's proposed fp8 ablation would have been wasted.**
+
+**This also corrects the number to chase.** The NVFP4 path is at **174 GB/s**, not the
+190 I derived earlier from nsys' average across mixed matrix sizes. Against its own
+pattern's **272 GB/s** that is a **1.56x gap in one kernel on one code path** -- the
+most precisely scoped target this session has had.
+
+**Method note:** this cost one `python3 -c` and no GPU time. **Two of the last three
+rounds' proposals died to arithmetic or a single grep before touching the kernel** --
+the fp8 widening (nothing to widen) and this one (nothing to gain). Cheapest check
+first is what round 135's measurement rule is really enforcing.
+
 ## Shared-memory hoist: tested and rejected -- and it re-reads the ablation (round 134)
 
 Implemented exactly as designed below (nvfp4 template only, `use_smem` guard, static
