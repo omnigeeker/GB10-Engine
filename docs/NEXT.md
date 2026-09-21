@@ -462,8 +462,28 @@ cannot both be true, so one input is wrong:
 3. **`prefill_seq` reads more than one copy of the weights** (e.g. the MTP layer, or a
    second pass).
 
-**That is now the single highest-value question, and it is answerable by reading
-`gemm2d_outer_bf16` and counting -- no GPU time required.** It also fits the standing
+### Counted in the source (round 171): the B/FMA term is fine
+
+`kernels/gemm.cu:262` `gemm2d_outer_bf16`, per thread per `k` (32 iterations):
+
+| | |
+|---|---|
+| loads | one `uint4` (16 B = 8 bf16 weights) + one `float4` (16 B = 4 activations) = **32 B** |
+| arithmetic | 8 rows x 4 cols = **32 `fmaf`** + 4 `__bfloat1622float2` |
+| ratio | **~1.0 B/FMA per thread** |
+
+**The closed form assumed 0.75 and the code says ~1.0 -- close. The ~9x discrepancy is
+therefore NOT in the B/FMA term**, and hypothesis 1 above is eliminated without any GPU
+time. **It is in (a) the FLOP/param count, or (b) what `prefill_seq` actually moves.**
+
+**One real amplification the model missed:** with `ty = threadIdx.x >> 4`, the 32 lanes of a
+warp span **two** `ty` values, so the same `uint4` is fetched for two row groups per warp
+per `k` instead of being broadcast. **That is a genuine 2x traffic factor -- and it is a
+concrete, fixable inefficiency** (a mapping with one `ty` per warp would halve the weight
+fetches), **though on its own it does not close the 9x.**
+
+**So the prefill now has two independent, code-identified leads rather than a mystery:
+the warp-level weight refetch, and the unresolved factor of ~9 in the accounting.** It also fits the standing
 observation that the prefill sits at 18% of the bandwidth roofline and a small fraction of
 the FMA roofline: **a 9x accounting error would explain exactly that shape.**
 
