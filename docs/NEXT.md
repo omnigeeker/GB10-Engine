@@ -62,6 +62,62 @@ This is the first honest end-to-end number for the concurrency requirement, and 
 is also the test harness for fixing it: **the scheduler is done when this same
 command reports >= 30 tok/s aggregate with each stream individually correct.**
 
+### The exact shape of the scheduler (round 93)
+
+Verified this round: tree clean at `91bbd0d`, 0 build errors, `generate` 16/16
+(100%), `batch-parity` OK, `chunked-prefill` OK. The server change from round 92
+is committed and pushed.
+
+Both halves are required -- **batching alone changes nothing while the accept loop
+is serial, because there is never more than one pending request**:
+
+1. **Concurrent accept.** `for conn in listener.incoming()` becomes a
+   `std::thread::spawn` per connection. The `Engine` must move out of `main` into
+   the scheduler thread, so `handle`/`handle_chat_completions`/`handle_messages`
+   stop taking `&mut Engine` and take a `Sender<Job>` instead.
+2. **The scheduler thread** owns `Engine` and runs:
+
+```rust
+struct Job { messages: Vec<ChatMessage>, max_tokens: usize,
+             enable_thinking: bool, out: mpsc::Sender<Msg> }
+enum Msg { Token(String), Done(GenResult) }
+```
+
+```
+loop {
+    let first = rx.recv()?;                    // block for at least one
+    let mut group = vec![first];
+    while group.len() < MAX_CONCURRENT {       // drain whatever else is waiting
+        match rx.try_recv() { Ok(j) => group.push(j), Err(_) => break }
+    }
+    let k = group.len();
+    let mut next = Vec::new();
+    for (s, job) in group.iter().enumerate() {
+        next.push(model.prefill_seq(dev, &encode(job), &mut state, &mut sc, s)?);
+    }
+    // step all k together; a finished slot keeps being stepped with its last
+    // token so the slot indices stay put and no state has to be moved.
+    loop {
+        let mut live = 0;
+        for s in 0..k { emit(group[s], next[s]); if !finished(s) { live += 1 } }
+        if live == 0 { break }
+        next = model.step_batch(dev, &next, &mut state, &mut sc)?;
+    }
+}
+```
+
+3. **`handle_*` changes are mechanical**: each currently calls
+   `eng.generate(messages, max_tokens, thinking, on_token)`. Introduce a
+   `generate_remote(&tx, ...)` with the *same signature and return type* that
+   sends the `Job`, then forwards `Msg::Token` into `on_token` and returns the
+   `GenResult` from `Msg::Done`. The response-writing code below it does not
+   change at all.
+
+The one correctness trap: a finished slot must keep contributing a token to
+`next` (its own last token is fine) so `k` stays constant for the group; the
+alternative, compacting slots, would require moving per-slot recurrent state and
+KV cache and is not needed.
+
 **The key enabler is confirmed:** `step_batch` sizes itself from `tokens.len()`
 (`model.rs:277`), so a group of `k` requests can be prefilled into slots `0..k` and
 stepped with `k` tokens -- no state compaction needed. A single request is just
