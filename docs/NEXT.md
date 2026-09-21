@@ -2003,6 +2003,45 @@ caused by misreading a number's SCOPE rather than its value.**
 > **When a model's terms disagree, check whether each is per-request, per-layer, per-matrix or
 > per-forward before concluding the model is wrong.**
 
+## STOP DOING ARITHMETIC ON REMEMBERED NUMBERS (round 217)
+
+**Three self-retractions this session -- rounds 195, 200 and 215 -- and every one of them came
+from combining remembered figures rather than measuring the quantity directly.** Round 216's
+retraction was the clearest: the endpoint model was judged wrong, then judged right again, **using
+only numbers already in the notes.**
+
+**The fix is one measurement, and it is the user's actual workload.**
+
+### The measurement to run
+
+**Start the server and send 16 concurrent chat requests, timing each one's FIRST TOKEN and its
+LAST TOKEN separately.** That separates prefill from decode empirically:
+
+| what it settles | how |
+|---|---|
+| is the wall prefill-dominated or decode-dominated? | **TTFT x 16 (serialized) vs (total - TTFT)** -- measured, not modelled |
+| what is the real prefill cost? | the TTFT distribution across the 16 requests |
+| does the 25 ms batching window help or hurt? | compare against a run with it disabled |
+| is the 47.78 tok/s figure the right decode rate for this mix? | tokens after the first, divided by the decode window |
+
+**Concretely: `curl` 16 requests in parallel with `-w` writing `time_starttransfer` and
+`time_total`, or add a `GB10_TIMING=1` line to the server that logs per-request TTFT.** Either
+way it is a handful of lines and it needs no kernel work.
+
+**This must come before any further optimisation of either the GEMM or the GEMV**, because
+rounds 186-216 spent their effort deciding which of those two matters, **and the answer is
+available by measurement rather than by argument.**
+
+### And the recorded baselines it should be checked against
+
+| measurement | value |
+|---|---|
+| endpoint, 16 concurrent | **12.909 s wall, 20.08 tok/s** |
+| engine B=16 (batch-parity) | **47.78 tok/s** |
+| single stream | **9.66 tok/s** |
+| full-model prefill at t=64 | **435.94 ms** |
+| staging / global read / outer product | **322.33 / 251.12 / 113.61 ms** |
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
