@@ -224,6 +224,46 @@ bottleneck, the split loses**, and the fallback is a second reduction kernel.
 **Acceptance is the gate plus >= 3 runs**, and if TTFT does not move the result is to be
 recorded as the tenth prefill mechanism eliminated -- not quietly dropped.
 
+## USER-VISIBLE ENDPOINT ISSUE: the reasoning block is returned as `content` (round 152)
+
+Found by actually calling the endpoint rather than trusting its JSON shape. A 200-token
+generation returns:
+
+```
+'User asks: "What is the capital of France? Answer in one short sentence." Need answer
+one short sentence. Final: "The capital of France is Paris."\n</think>\n\nThe capital
+of France is Paris.'
+finish_reason: stop, 43 completion tokens
+```
+
+**The answer is correct** -- "The capital of France is Paris." -- so the engine and the
+weights are fine. **But `content` is the raw reasoning block plus the answer, ending a
+bare `</think>`.** The chat template evidently puts the opening ` thinking` into the
+prompt, so the model's output legitimately starts mid-reasoning and closes the tag
+itself, and the endpoint passes that through verbatim.
+
+**Consequence: at low `max_tokens` the user sees only reasoning and never the answer.**
+That is exactly what the earlier 16-token smoke test showed ("We need to respond to
+user: ..."), and **the first assessment of it as "just truncation, not a defect" was too
+generous** -- the truncation is real, but it is a defect *because* the reasoning block
+occupies the visible `content` field.
+
+**This is a presentation issue, not a numerics one**, and it is user-visible on the one
+deliverable the objective names explicitly. **It is also entirely in Rust, so it carries
+none of the kernel-change risk that `loop/patches/ksplit.md` does** -- which makes it the
+better next task while the K split waits.
+
+**Two fixes, both cheap:**
+
+* **strip** everything up to and including `</think>` from `content` before returning;
+* or **expose it separately** -- OpenAI's `reasoning_content`, Anthropic's `thinking`
+  content block -- so the reasoning and the answer both survive and neither protocol's
+  schema is violated.
+
+**Acceptance:** the 200-token generation above must return `The capital of France is
+Paris.` (or that plus a separate reasoning field), and `generate --n 16` must stay 16/16
+-- the tokenizer path must not change, only the response assembly.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
