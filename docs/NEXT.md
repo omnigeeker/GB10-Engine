@@ -688,6 +688,53 @@ That is worth stating plainly because it bounds what the probe can be used for:
 slow in isolation it will not be fast in the kernel) but not for **predicting a
 gain** from a pattern change.
 
+### The kernel-level breakdown, which should have come first (round 78)
+
+Every share quoted above came from probe deltas, which the last three rounds have
+shown are unreliable in both directions. `nsys profile --stats=true` on
+`forward-cost` gives the actual distribution instead:
+
+| kernel | % GPU time | launches | avg | min |
+|---|---|---|---|---|
+| `nvfp4_gemm_kernel` | 32.7 | 2880 | 825.6 us | 635.9 us |
+| `nvfp4_gemv_kernel` | 24.9 | 5998 | 301.2 us | 213.9 us |
+| `fp8_gemm_kernel` | 20.1 | 3120 | 468.3 us | 238.3 us |
+| `fp8_gemv_kernel` | 17.1 | 6448 | 192.9 us | 26.0 us |
+| `rmsnorm_zero_centered` | 1.1 | 7406 | 11.0 us | 1.3 us |
+| `bf16_gemv_batch` | 0.9 | 1344 | 46.8 us | 12.1 us |
+| `gated_delta_rule_chunk` | 0.9 | 720 | 86.9 us | 34.8 us |
+| `gated_delta_rule_step` | 0.7 | 1488 | 36.2 us | 26.5 us |
+| everything else | <1% each | | | |
+
+**The four GEMM/GEMV kernels are 94.8% of GPU time. Every non-GEMM op together
+is ~5%.** The round-61/64 probes said the "remainder" was 35-38% and that
+non-GEMM work was a plausible target; the profiler says it is not. Optimising
+`rmsnorm`, `swiglu`, `rope` or the delta rule cannot pay more than ~5%.
+
+**The number that matters is this.** `nvfp4_gemm_kernel` moves 9.2 GB per forward
+across 15 forwards in 2.38 s, so the GEMM path runs at **~58 GB/s** (70 GB/s at
+its minimum). `fp8_gemm_kernel` independently lands at the same ~58 GB/s. The
+GEMV path, on the same weights, reaches ~148 GB/s.
+
+So the finding is not about staging, cache lines, or shared stores: **the GEMM
+path as a whole is 2.5x less efficient than the GEMV path at identical traffic,
+and it is 94.8% of the time.** That is the thing to explain, and the profiler
+gives a per-launch number to optimise rather than a probe delta.
+
+A first estimate of where a launch's 825 us goes, for the MLP gate (N=17408,
+K=5120, 272 blocks, 5.7 blocks/SM, ~2.8 waves at 2 blocks/SM):
+
+* 164 KB of weights per block, 80 chunks of 2 KB each
+* ~2.8 us per chunk measured
+* the outer product is 1024 FMA per thread per chunk -- ~1.2 us per chunk at
+  128 FP32 lanes/SM shared by two blocks
+* the loads themselves should be ~0.6 us
+
+which leaves roughly 1 us per chunk unaccounted for. That is the next thing to
+measure, and it can be measured per-launch rather than by probe: shrink the
+outer product's k loop and read the launch time, exactly as round 61 did but
+against the profiler's number instead of a probe delta.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
