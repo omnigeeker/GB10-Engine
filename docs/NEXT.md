@@ -181,6 +181,35 @@ and nvfp4's moves 9.63 GB in ~85 ms = 113 GB/s. Both roughly doubled from the
 but both are still around half of the 228 GB/s roofline, so the same MLP
 question should be asked of them again with a larger `P`.
 
+### Wider loads: 16 elements per thread (round 62)
+
+Acting on that last sentence. `stage_wtile` now has each thread own 16
+consecutive NVFP4 elements rather than 8, fetched as a single `uint2` and
+covered by one group scale. That halves both the staging iterations and the
+number of load instructions for the same bytes.
+
+| t | round 60 | round 62 | |
+|---|---|---|---|
+| 1 | 312.27 | **287.58** | -8% |
+| 2 | 312.22 | 284.42 | -9% |
+| 4 | 319.96 | 288.52 | -10% |
+| 8 | 323.73 | 295.93 | -9% |
+| 16 | 341.81 | **312.19** | -9% |
+
+`generate` still **16/16 exact**.
+
+Cumulative against the round-59 baseline, both changes together:
+
+| t | baseline | now | |
+|---|---|---|---|
+| 1 | 377.31 | **287.58** | **-24%** |
+| 16 | 401.48 | **312.19** | **-22%** |
+
+The same widening is the obvious next thing for `stage_wtile_fp8`, which still
+loads 8 bytes per thread, and for `stage_xtile`, which still loads 16 bytes per
+thread but only from the handful of lanes where `t < T` -- so at small `t` almost
+all of its work is writing zeros into shared rather than loading.
+
 ### Two real bugs found on the way (round 58)
 
 Worth keeping because both produced misleading failures:
