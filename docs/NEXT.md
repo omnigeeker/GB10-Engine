@@ -61,6 +61,33 @@ The 256-entry `prmt` variant has the same distribution problem with 8x the footp
 be dependency structure -- the 16 elements are independent, so the ILP exists and the
 question is whether the compiler is extracting it.
 
+**The ILP test closes it (round 143), and the answer is register pressure.**
+
+Measured in the same ablation, three runs each:
+
+| level | work | GB/s |
+|---|---|---|
+| 6 | scale multiply + FMA, **no unpack** | **262.8** |
+| 9 | unpack **one half** only | ~234 |
+| 8 | unpack **both halves**, no scale/FMA | ~231 |
+| **7** | **unpack + scale + FMA** | **~184** |
+
+**The unpack is not the bottleneck** -- halving it (level 9, ~234) changes nothing
+against doing it fully (level 8, ~231). **But the costs are super-additive:** unpack
+alone ~231, scale+FMA alone 262.8, and **together 184 -- worse than either part
+alone.** That is not a throughput limit in any single step; **it is the signature of
+register pressure and scheduling.**
+
+**The mechanism is visible in the source:** `e2m1x8_to_float(packed.x, lo)` and
+`(packed.y, hi)` **keep 16 floats live** before the 16 FMAs consume them, while the
+outer structure already holds `pk[ROWS]`, `sc[ROWS]` and the 16-float `XVec xv`. **The
+compiler cannot keep all of that in flight and serialises.**
+
+**The fix to test: fuse the unpack into the FMA loop** -- unpack one element and apply
+its FMA immediately, so `lo[8]`/`hi[8]` never become live arrays. **That trades 16 live
+registers for a shorter dependency chain**, and the level-8-vs-7 gap says the registers
+are what is costing.
+
 **The remaining lever, if any:**
 
 * a shared-memory lookup table (16 entries, 64 B) replacing per-element bit
