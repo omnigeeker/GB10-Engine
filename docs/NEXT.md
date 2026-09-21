@@ -148,6 +148,39 @@ what ruled out occupancy and tile shape, leaving memory-level parallelism as the
 only remaining explanation -- and that one was then confirmed by a probe before
 being acted on.
 
+### Decomposing what is left (round 61)
+
+Same method: disable one stage at a time and read the delta off the t=1 forward.
+Each probe is timing-only and was reverted immediately; the tree is at the
+round-60 state, `generate` 16/16 exact.
+
+| stage disabled | t=1 forward | implied cost | share |
+|---|---|---|---|
+| (none) | 312.27 ms | -- | -- |
+| nvfp4 weight staging | 227.30 ms | ~85 ms | 27% |
+| fp8 weight staging | 256.65 ms | ~56 ms | 18% |
+| outer product, 3/4 of k | 263.91 ms | ~64 ms | 20% |
+| **remainder** | | **~107 ms** | **35%** |
+
+The probes overlap (removing a stage also removes the compute that consumes it),
+so these are upper bounds and the shares do not sum cleanly. What they do say is
+that **no single stage dominates any more**: the two stagings are 45% between
+them, the outer product 20%, and the largest single bucket is now the
+"everything else" remainder at ~35%.
+
+That remainder is `stage_xtile`, the bf16 GEMM, `gemm2d_store`, and the
+non-GEMM ops (rmsnorm, rope, and the rest). **The next probe should attack it
+directly** -- disable `stage_xtile` and the bf16 path in turn -- because at 107 ms
+it is now bigger than any individual stage, and the round-60 result showed the
+method works: a probe that isolates one stage is what turns a flat response
+surface into a fix.
+
+Also worth noting for scale: fp8's staging moves 5.59 GB in ~56 ms = 100 GB/s,
+and nvfp4's moves 9.63 GB in ~85 ms = 113 GB/s. Both roughly doubled from the
+64 GB/s that prompted the round-60 fix, so the two-pass load is doing its job --
+but both are still around half of the 228 GB/s roofline, so the same MLP
+question should be asked of them again with a larger `P`.
+
 ### Two real bugs found on the way (round 58)
 
 Worth keeping because both produced misleading failures:
