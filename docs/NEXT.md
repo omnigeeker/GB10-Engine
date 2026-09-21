@@ -1,5 +1,41 @@
 # SESSION HANDOFF (read this first)
 
+## The tile shape WAS the cause: TM=8/TNREG=4 (round 115)
+
+After six resource hypotheses failed (rounds 102-111), round 111 concluded the 36%
+FMA efficiency came from the tile *shape*. **It did.** The change in
+`loop/patches/tm8-tnreg4.md` was applied verbatim:
+
+| | TM=4/TNREG=8 | **TM=8/TNREG=4** |
+|---|---|---|
+| shared per 32 FMA | 40 B (`wv` 8 + `xv` 16 + `xw` 16) | **32 B (`wv` 16 + `xv` 16)** |
+| loads per k | 3 | **2** |
+| ptxas registers | 96 | 97 |
+| ptxas smem | 24,576 B | **24,576 B** (predicted unchanged) |
+| **`generate`** | 16/16 | **16/16 (100%)** |
+| **TTFT** | 462.4 ms | **434.0 ms (-6.1%)** |
+| **endpoint 16 concurrent** | 18.82 tok/s | **19.83 tok/s (+5.4%)** |
+
+`chunked-prefill`, `batch-parity` and `mtp-probe` all still OK, and 16 concurrent
+requests still log `batch of 16` and return **1 distinct output** for 256 tokens.
+
+**This is the first change since round 98 that is both correct and faster.** Two
+things are worth carrying forward from it:
+
+* **The patch spec worked because it named the trap.** Round 96 failed on exactly
+  this change by pairing `TNREG`=4 with a `tx = threadIdx.x & 7` mapping that
+  covered 32 of 64 columns. Writing the mapping table down as a step meant the
+  re-application hit 16/16 on the first try.
+* **Six failed attempts to find a resource were the useful result.** Each one was
+  cheap and each one eliminated a real candidate; the shape was found by
+  elimination, not by insight.
+
+**The prefill GEMM now runs at** 44.6 MB / (434 ms x 1,379.5/413 us scaling) --
+re-measure; the 32.3 GB/s figure is from the previous shape. The next increment is
+the same trick again: `TM`=16 would need `acc[16][2]` and 16 columns per `tx`
+group, which may or may not tile 64x64 with 128 threads -- **check the mapping
+before writing the body, exactly as above.**
+
 ## The endpoint's batching is verified correct, and its gap is now arithmetic (round 112)
 
 First time this was actually checked rather than assumed: `GB10_BATCH_LOG=1` on 16
