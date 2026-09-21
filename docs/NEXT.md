@@ -433,6 +433,52 @@ move, it is the shared stores and the fix is the tile layout.
 This is the same method that produced every gain so far: isolate one thing,
 measure, then act.
 
+### Both candidates tested, both ruled out (rounds 71-72)
+
+**Dequantisation ALU.** The 16 `e2m1_to_float` calls per 8-byte load were
+replaced with a cheap value derived from the same register (keeping the loads
+alive, timing only):
+
+| | t=1 |
+|---|---|
+| baseline | 271.46 ms |
+| dequant ALU removed | 280.85 ms |
+
+No gain. **The ALU is not the limit.**
+
+**Bank conflicts in the `wt` stores.** `WSTRIDE = TN+4 = 68` uint16 = 136 B =
+34 banks, so rows land 2 banks apart and a warp's four rows overlap; padding to
+`TN+16 = 80` puts rows 8 banks apart and makes the pattern conflict-free:
+
+| | t=1 | t=16 |
+|---|---|---|
+| WSTRIDE = 68 | **271.46** | 292.85 |
+| WSTRIDE = 80 | 272.26 | 290.42 |
+
+Neutral. **Bank conflicts are not the limit either.**
+
+### What that leaves
+
+Every explanation on the list has now been tested and come back flat: DRAM
+bandwidth, occupancy (twice), bytes in flight, load count, tile shape, load
+width, dequant ALU, shared-store bank conflicts, and per-chunk latency (which
+arithmetic rules out by three orders of magnitude -- 0.14 ms predicted against
+71 ms measured).
+
+The staging moves 9.63 GB in ~71 ms, which is 136 GB/s against a 228 GB/s
+roofline. Since none of the mechanisms above explain the gap, the next thing to
+question is **the roofline number itself**. 228 GB/s came from `bench/hw/bw4.cu`,
+an incompressible random-access probe. The staging's pattern is different in two
+ways that probe does not capture: a warp reads 8 rows that are 2560 B apart
+rather than one contiguous run, and the working set is 44.6 MB of weights
+streamed through a 25 MB L2. Either could hold the achievable rate below 228.
+
+**The cheap next step is therefore to measure the achievable rate for this
+exact pattern** -- a standalone probe that reads the real weight layout with the
+real warp access pattern and nothing else. If that comes back at ~136 GB/s, the
+staging is already at the hardware limit for this pattern and the remaining work
+belongs in the outer product and the non-GEMM ops instead.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
