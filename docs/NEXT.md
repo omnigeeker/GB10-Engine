@@ -2541,7 +2541,41 @@ Everything else in the objective is reachable and has a concrete path: TTFT
   addressing bug passes.
 * Change one variable and see whether the failure follows it.
 
-## Ready-to-apply: hoist the scale row into shared memory (for round 133+)
+## Shared-memory hoist: tested and rejected -- and it re-reads the ablation (round 134)
+
+Implemented exactly as designed below (nvfp4 template only, `use_smem` guard, static
+4096 B buffer, cooperative load + `__syncwarp()`):
+
+| | round 132 | shared hoist |
+|---|---|---|
+| `generate` | 16/16 | **16/16** |
+| **t=1 one-row forward** | **100.79 ms** | **103.35 ms (+2.5% WORSE)** |
+
+Reverted.
+
+**A negative that clarifies everything:** removing **9 of the 10** global scale loads
+made the kernel *slower*. The only way that is possible is that **those loads were
+already being served from L2** -- the scale row is 320 bytes per row and a warp reuses
+it 10 times, so it is tiny and hot. The `__syncwarp()` and the shared traffic were
+pure addition.
+
+**So the scale stream is not a DRAM-bandwidth cost, and round 131's step-3 drop of
+54 GB/s is not traffic -- it is the load's presence in the dependency chain, i.e. L2
+latency.** That single re-reading explains all three measurements at once:
+
+* **widening the load (round 132) helped only 3.3%** -- fewer load instructions, but
+  the same latency to L2;
+* **ablation steps 4 and 5 *raised* bandwidth** (210.5, 212.5) -- adding work per
+  k-tile gave the scheduler something to overlap the L2 latency with;
+* **shared memory did not help** -- shared has its own latency, plus a `__syncwarp()`.
+
+**The fix is therefore to break the dependency, not to move the data:**
+software-pipeline the scale load one k-tile ahead, so tile `i`'s scale fetch overlaps
+tile `i-1`'s FMAs. The ablation's own shape predicts this is the mechanism -- two
+separate steps each added work and each *raised* bandwidth, which is exactly the
+signature of latency hiding.
+
+## Original design note (kept: implemented and rejected in round 134)
 
 Round 132 widened the scale load (8 lanes x `uint32` + `__shfl_sync`) and kept it:
 correct 16/16, t=1 **104.2 -> 100.79 ms (-3.3%)**. That is a real gain but only a third
