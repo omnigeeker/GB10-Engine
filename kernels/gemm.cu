@@ -37,10 +37,10 @@
 using namespace gb10;
 
 #define GB10_TN 64    // rows of N per block
-#define GB10_TT 32    // prompt tokens per block
-#define GB10_KC 64    // k values per chunk
+#define GB10_TT 64    // prompt tokens per block
+#define GB10_KC 32    // k values per chunk
 #define GB10_TM 4     // rows of N owned by one thread
-#define GB10_TNREG 4  // tokens owned by one thread
+#define GB10_TNREG 8  // tokens owned by one thread
 #define GB10_GEMM_BLOCK 128
 
 // Padded strides. The pad must keep each row 16-byte aligned (a multiple of 4
@@ -205,28 +205,45 @@ __device__ __forceinline__ void stage_xtile(float (*xt)[GB10_XSTRIDE],
 __device__ __forceinline__ void gemm2d_outer(const float (*wt)[GB10_WSTRIDE],
                                              const float (*xt)[GB10_XSTRIDE],
                                              float (&acc)[GB10_TM][GB10_TNREG], int ty, int tx) {
-    static_assert(GB10_TM == 4 && GB10_TNREG == 4, "float4 path assumes 4x4 tiles");
+    static_assert(GB10_TM == 4 && GB10_TNREG == 8, "float4 path assumes 4x8 tiles");
 #pragma unroll
     for (int k = 0; k < GB10_KC; ++k) {
         // One 16-byte load per operand per k instead of four 4-byte ones.
         const float4 wv = *reinterpret_cast<const float4*>(&wt[k][ty * GB10_TM]);
         const float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        const float4 xw = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG + 4]);
         acc[0][0] = fmaf(wv.x, xv.x, acc[0][0]);
         acc[0][1] = fmaf(wv.x, xv.y, acc[0][1]);
         acc[0][2] = fmaf(wv.x, xv.z, acc[0][2]);
         acc[0][3] = fmaf(wv.x, xv.w, acc[0][3]);
+        acc[0][4] = fmaf(wv.x, xw.x, acc[0][4]);
+        acc[0][5] = fmaf(wv.x, xw.y, acc[0][5]);
+        acc[0][6] = fmaf(wv.x, xw.z, acc[0][6]);
+        acc[0][7] = fmaf(wv.x, xw.w, acc[0][7]);
         acc[1][0] = fmaf(wv.y, xv.x, acc[1][0]);
         acc[1][1] = fmaf(wv.y, xv.y, acc[1][1]);
         acc[1][2] = fmaf(wv.y, xv.z, acc[1][2]);
         acc[1][3] = fmaf(wv.y, xv.w, acc[1][3]);
+        acc[1][4] = fmaf(wv.y, xw.x, acc[1][4]);
+        acc[1][5] = fmaf(wv.y, xw.y, acc[1][5]);
+        acc[1][6] = fmaf(wv.y, xw.z, acc[1][6]);
+        acc[1][7] = fmaf(wv.y, xw.w, acc[1][7]);
         acc[2][0] = fmaf(wv.z, xv.x, acc[2][0]);
         acc[2][1] = fmaf(wv.z, xv.y, acc[2][1]);
         acc[2][2] = fmaf(wv.z, xv.z, acc[2][2]);
         acc[2][3] = fmaf(wv.z, xv.w, acc[2][3]);
+        acc[2][4] = fmaf(wv.z, xw.x, acc[2][4]);
+        acc[2][5] = fmaf(wv.z, xw.y, acc[2][5]);
+        acc[2][6] = fmaf(wv.z, xw.z, acc[2][6]);
+        acc[2][7] = fmaf(wv.z, xw.w, acc[2][7]);
         acc[3][0] = fmaf(wv.w, xv.x, acc[3][0]);
         acc[3][1] = fmaf(wv.w, xv.y, acc[3][1]);
         acc[3][2] = fmaf(wv.w, xv.z, acc[3][2]);
         acc[3][3] = fmaf(wv.w, xv.w, acc[3][3]);
+        acc[3][4] = fmaf(wv.w, xw.x, acc[3][4]);
+        acc[3][5] = fmaf(wv.w, xw.y, acc[3][5]);
+        acc[3][6] = fmaf(wv.w, xw.z, acc[3][6]);
+        acc[3][7] = fmaf(wv.w, xw.w, acc[3][7]);
     }
 }
 
@@ -235,7 +252,7 @@ __device__ __forceinline__ void gemm2d_outer_bf16(const uint16_t (*wt)[GB10_WSTR
                                                   const float (*xt)[GB10_XSTRIDE],
                                                   float (&acc)[GB10_TM][GB10_TNREG], int ty,
                                                   int tx) {
-    static_assert(GB10_TM == 4 && GB10_TNREG == 4, "bf16 path assumes 4x4 tiles");
+    static_assert(GB10_TM == 4 && GB10_TNREG == 8, "bf16 path assumes 4x8 tiles");
 #pragma unroll
     for (int k = 0; k < GB10_KC; ++k) {
         const uint2 wq = *reinterpret_cast<const uint2*>(&wt[k][ty * GB10_TM]);
@@ -244,22 +261,39 @@ __device__ __forceinline__ void gemm2d_outer_bf16(const uint16_t (*wt)[GB10_WSTR
         const float w2 = bf16_to_float((uint16_t)(wq.y & 0xFFFF));
         const float w3 = bf16_to_float((uint16_t)(wq.y >> 16));
         const float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        const float4 xw = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG + 4]);
         acc[0][0] = fmaf(w0, xv.x, acc[0][0]);
         acc[0][1] = fmaf(w0, xv.y, acc[0][1]);
         acc[0][2] = fmaf(w0, xv.z, acc[0][2]);
         acc[0][3] = fmaf(w0, xv.w, acc[0][3]);
+        acc[0][4] = fmaf(w0, xw.x, acc[0][4]);
+        acc[0][5] = fmaf(w0, xw.y, acc[0][5]);
+        acc[0][6] = fmaf(w0, xw.z, acc[0][6]);
+        acc[0][7] = fmaf(w0, xw.w, acc[0][7]);
         acc[1][0] = fmaf(w1, xv.x, acc[1][0]);
         acc[1][1] = fmaf(w1, xv.y, acc[1][1]);
         acc[1][2] = fmaf(w1, xv.z, acc[1][2]);
         acc[1][3] = fmaf(w1, xv.w, acc[1][3]);
+        acc[1][4] = fmaf(w1, xw.x, acc[1][4]);
+        acc[1][5] = fmaf(w1, xw.y, acc[1][5]);
+        acc[1][6] = fmaf(w1, xw.z, acc[1][6]);
+        acc[1][7] = fmaf(w1, xw.w, acc[1][7]);
         acc[2][0] = fmaf(w2, xv.x, acc[2][0]);
         acc[2][1] = fmaf(w2, xv.y, acc[2][1]);
         acc[2][2] = fmaf(w2, xv.z, acc[2][2]);
         acc[2][3] = fmaf(w2, xv.w, acc[2][3]);
+        acc[2][4] = fmaf(w2, xw.x, acc[2][4]);
+        acc[2][5] = fmaf(w2, xw.y, acc[2][5]);
+        acc[2][6] = fmaf(w2, xw.z, acc[2][6]);
+        acc[2][7] = fmaf(w2, xw.w, acc[2][7]);
         acc[3][0] = fmaf(w3, xv.x, acc[3][0]);
         acc[3][1] = fmaf(w3, xv.y, acc[3][1]);
         acc[3][2] = fmaf(w3, xv.z, acc[3][2]);
         acc[3][3] = fmaf(w3, xv.w, acc[3][3]);
+        acc[3][4] = fmaf(w3, xw.x, acc[3][4]);
+        acc[3][5] = fmaf(w3, xw.y, acc[3][5]);
+        acc[3][6] = fmaf(w3, xw.z, acc[3][6]);
+        acc[3][7] = fmaf(w3, xw.w, acc[3][7]);
     }
 }
 

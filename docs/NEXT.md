@@ -1,5 +1,38 @@
 # SESSION HANDOFF (read this first)
 
+## TT=64 is landed, with a measured tradeoff (round 96)
+
+The 64x64 tile from round 90 is reinstated together with a wider GEMV cut, and it
+is correct: `generate` 16/16 (100%), `batch-parity` OK. `GB10_TT` 64, `GB10_KC`
+32, `GB10_TNREG` 8, `GB10_TILE_T` 64, and `forward_prefill` routes to the batched
+GEMV for `t <= 16`.
+
+| | before | after |
+|---|---|---|
+| TTFT (58-token prompt) | 566.3 ms | **518.2 ms (-8.5%)** |
+| endpoint, 16 concurrent, 256 tokens | 15.73 s | **15.06 s (17.0 tok/s)** |
+| t=1 | 116.56 | 117.33 |
+| t=2 | 145.98 | 142.35 |
+| t=4 | 156.80 | 153.86 |
+| t=8 | 193.36 | 189.21 |
+| **t=16** | **292.10** | **343.21 (+17.5%)** |
+
+**Kept**, because the wins are on stated objectives (TTFT, endpoint concurrency)
+and the loss is on an intermediate grid point that no objective names. Correctness
+re-verified end to end: 16 identical concurrent prompts still give exactly one
+distinct output.
+
+**But the gain is far below the ~2x the traffic argument predicts**, and the reason
+matters for whoever picks this up: TT=64 halves the weight passes (58 tokens fits
+one 64-wide tile instead of two 32-wide ones) but `KC`=32 doubles the chunk count
+and therefore the barriers, which cancels most of it. **`KC`=64 with TT=64 needs
+52,224 B of shared memory against a 49,152 B budget** -- over by 3,072 -- so
+getting the full 2x means shrinking `xt` (bf16, or single-buffered) or the padding.
+That is the concrete next step, and it is worth ~2x on prefill, which is the
+majority of both TTFT and the endpoint's 16-concurrent time.
+
+Remaining gap to the objective's 30 tok/s at 16 concurrent: 17.0 measured.
+
 ## THE DELIVERED ENDPOINT DOES NOT SERVE CONCURRENT REQUESTS (round 91)
 
 This is an objective-level gap and it outranks TTFT. The objective asks for

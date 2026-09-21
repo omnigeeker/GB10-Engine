@@ -53,7 +53,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
 /// Gated DeltaNet key/value head geometry (fixed by the checkpoint).
 /// Prompt tokens covered by one prefill GEMM block; must match `GB10_TILE_T`
 /// in `kernels/gemm.cu`.
-pub const GB10_TILE_T: usize = 32;
+pub const GB10_TILE_T: usize = 64;
 /// Rows of N per prefill GEMM block; matches `GB10_TN` in `kernels/gemm.cu`.
 pub const GB10_NR: usize = 64;
 

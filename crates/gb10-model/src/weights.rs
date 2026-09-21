@@ -92,7 +92,7 @@ impl Linear {
         // GEMV then re-reads every weight once per token, which outweighs its
         // better load pattern. The 8..16 range is unmeasured, so 8 is the
         // conservative cut.
-        if self.n < 256 || t <= 8 {
+        if self.n < 256 || t <= 16 {
             return self.forward(dev, x, y, t);
         }
         let kern = dev.ops();
