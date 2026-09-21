@@ -589,3 +589,50 @@ an empty range and contributes exactly zero.** That is the finding.
 2. **If `gridDim.z` is correct**, look at what else `blockIdx.z` touches in
    `gemm2d_store_scaled` and the staging helpers -- a second block changes nothing about
    block 0, so a failure means the kernel is reading z somewhere it should not.
+
+
+---
+
+## FINAL: THE K SPLIT IS IMPLEMENTED, GATE-CLEAN, AND DOES NOT HELP (round 168)
+
+**The earlier failures were all in the diagnostics, not the design. Done properly, the
+split works:**
+
+* kernel: `nsplit = gridDim.z`, `kc0 = blockIdx.z * kc_half`, `kc1 = min(kc0 + kc_half, nchunk)`
+* host: `memset_zeros(&mut y.slice_mut(..t*n))` then `grid.z = 2`
+
+**The kernel prints confirmed `gridDim=(272,1,2)`, `blockIdx.z` 0 and 1, `nsplit=2`,
+`nchunk=160` -- the third dimension does reach the kernel.** (My round-167 hypothesis that
+it might not was wrong, and the print settled it in one run.)
+
+**The gate passes 16/16, three consecutive runs, plus `chunked-prefill --n 6` OK.** So the
+split is *correct*.
+
+### And it is not faster
+
+`forward-cost`, 3 runs each, same build otherwise:
+
+| rows | no split (mean) | split (mean) | |
+|---|---|---|---|
+| 8 | 177.61 / 178.05 / 174.65 = **176.77** | 177.50 / 174.38 / 176.34 = **176.07** | **-0.4%, neutral** |
+| 16 | 302.20 / 297.84 / 294.78 = **298.27** | 313.41 / 305.17 / 304.86 = **307.81** | **+3.2% WORSE** |
+
+**Reverted. The split is not in the tree.**
+
+### What this falsifies
+
+**The occupancy hypothesis.** The prefill GEMM really is at 47% occupancy with the
+register budget (5.3 blocks/SM) and the grid (5.7) binding at once -- those were measured
+in round 148 and are still true. **But doubling the block count to 544 does not buy
+throughput**, which means **occupancy was not the limiter**, or the `atomicAdd` store path
+cost more than the extra blocks won. The rounds-148 diagnosis was correct about the
+*numbers* and wrong about the *consequence*.
+
+**That is the eleventh prefill mechanism eliminated**, and like the others it was
+eliminated by measurement rather than by argument. **`docs/NEXT.md` should record it as
+such.**
+
+**Note the cost of the path here:** this took rounds 148-168 -- twenty rounds -- and the
+decisive instruments were a `y.len()` print, a memset-on/split-off run, a `gridDim.z`
+print, and finally a three-run A/B. **The prints were each worth more than the rounds of
+reasoning that preceded them.**
