@@ -47,8 +47,8 @@ using namespace gb10;
 // floats) so the inner loop can read a whole 4-wide sub-tile with one LDS.128
 // instead of four LDS.32; the extra float beyond that keeps consecutive `k`
 // slices off the same shared bank.
-#define GB10_WSTRIDE (GB10_TN + 4)
-#define GB10_XSTRIDE (GB10_TT + 4)
+#define GB10_WSTRIDE GB10_TN
+#define GB10_XSTRIDE GB10_TT
 
 // Stage the [TILE_N, KC] weight chunk, decoded to fp32, as `wt[k][n]`.
 template <int KC>

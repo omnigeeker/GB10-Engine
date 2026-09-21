@@ -56,6 +56,35 @@ xt[2][64][66] + wt[2][64][64] = 50,176 B
 Reverted; **TT=64 with `KC`=32 and padding stays the best configuration found** at
 TTFT 518.2 ms and 17.0 tok/s at 16 concurrent.
 
+### The padding was the confound, and removing it wins (round 98)
+
+Round 97 changed two things at once, so it could not say whether `KC`=64 was worse
+or the missing padding was. Isolated:
+
+| configuration | shared | TTFT |
+|---|---|---|
+| `KC`=32, padded (68) | 26,112 B | 518.2 ms |
+| `KC`=32, **no padding** (64) | **24,576 B** | **498.2 ms** |
+| `KC`=64, no padding (64) | 49,152 B | 537.7 ms |
+
+**Removing the padding is a win, not a loss** (-3.8%), and `KC`=32 is genuinely
+better than `KC`=64 -- so the round-97 conclusion that the padding "was worth more
+than halving the barriers" was wrong, and the bf16 `xt` lever it recommended is
+**not needed**. That is the value of isolating one variable: two rounds of
+reasoning from a confounded pair of numbers pointed at a risky change that the
+clean experiment shows is pointless.
+
+Landed: `GB10_WSTRIDE = GB10_TN`, `GB10_XSTRIDE = GB10_TT`, `KC`=32, TT=64.
+
+| | baseline | now |
+|---|---|---|
+| TTFT | 566.3 ms | **498.2 ms (-12%)** |
+| endpoint, 16 concurrent, 256 tokens | 47.73 s (serial) | **14.74 s = 17.37 tok/s (3.24x)** |
+| shared memory used | 26,112 B | 24,576 B |
+
+Correctness: `generate` 16/16 (100%), `batch-parity` OK, and 16 identical
+concurrent prompts still give exactly one distinct output.
+
 **So the prefill gain is capped here unless `xt` stops being f32.** Making `xt`
 bf16 would free 17,408 B, which is exactly what `KC`=64 with padding needs
 (34,816 + 17,408 = 52,224 - 17,408 = 34,816). That is the one remaining lever, and
