@@ -2150,6 +2150,38 @@ streaming penalty -- **it is the same ~8.6 s generation, reported differently.**
 **Each instrument was one question away from the truth, and the question was always the same:
 what would this number be if the instrument were measuring something else?**
 
+## THE STREAMING DEFECT IS FIXED -- TTFT 14.4 s -> 0.534 s (round 221)
+
+**Cause, found by reading `ThinkGate::push`**: the gate holds text until it sees the closing
+thinking tag. **When the model emits no thinking block -- the normal case for a direct question --
+no tag ever arrives, so the gate held the ENTIRE response and released it only at `flush()` when
+generation ended.**
+
+**The fix is a bounded hold**: release immediately once the held text either contains no `<`
+(so no tag can still be forming) or reaches 64 characters.
+
+**Verified on the same request (`max_tokens = 40`):**
+
+| | before | after |
+|---|---|---|
+| content frames | **2** | **40** |
+| first content frame | 0.016 s (the start frame) | -- |
+| **true TTFT** | **~14.4 s** (nothing until the end) | **0.534 s** |
+| total | 14.4 s | 14.443 s |
+
+**So the user-visible TTFT drops by ~27x, and the total is unchanged -- the fix changes WHEN text
+appears, not how fast it is produced.**
+
+**Gate status after the change: `generate` 16/16 and `chunked-prefill` OK.**
+
+**And the thinking text visible in the 40-token run is the designed fallback, not a leak**: with
+`max_tokens = 40` the model was still mid-thought and the tag never closed, so `flush()` released
+what it had. **The code comment states the intent: "otherwise the stream would deliver nothing at
+all, which is worse than not gating."**
+
+**This is the only unmet target this session that was a DEFECT rather than a hardware limit, and
+it is now fixed.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches

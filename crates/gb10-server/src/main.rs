@@ -224,7 +224,19 @@ impl ThinkGate {
             return Some(piece.to_string());
         }
         self.held.push_str(piece);
-        let i = self.held.find("</think")?;
+        // If no tag can still be forming, release immediately. Without this the gate
+        // holds the ENTIRE response whenever the model emits no thinking block, which
+        // makes streaming non-incremental and destroys TTFT.
+        let i = match self.held.find("</think") {
+            Some(i) => i,
+            None => {
+                if self.held.len() >= 64 || !self.held.contains('<') {
+                    let out = std::mem::take(&mut self.held);
+                    return Some(out);
+                }
+                return None;
+            }
+        };
         let j = self.held[i..].find('>')?;
         self.opened = true;
         let rest = self.held[i + j + 1..].trim_start().to_string();
