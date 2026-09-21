@@ -537,3 +537,55 @@ zero and block 0 writes plainly, so nothing needs zeroing at all:
 
 **Note: the scripted removal of the memset failed on a stale anchor -- the fifth
 patch-script failure of this session. Use the `edit` tool, not a heredoc.**
+
+
+---
+
+## DECISIVE (round 167): the memset is exonerated -- it is the `grid.z = 2` launch
+
+A one-edit test, `ops.rs` only, **no kernel change at all** (applied with the `edit`
+tool):
+
+```rust
+let want = t * n;
+dev.stream().memset_zeros(&mut y.slice_mut(..want))?;   // memset ON
+// grid_dim stays (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 1)   -- split OFF
+```
+
+**With the split off, the kernel runs its original full range and block 0 stores plainly,
+overwriting whatever was zeroed -- so this isolates the memset and nothing else.**
+
+| | result |
+|---|---|
+| `generate --n 16` | **16/16** |
+| `chunked-prefill --n 6` | **OK** |
+
+**So `memset_zeros(&mut y.slice_mut(..t*n))` is harmless: it honours the view's byte
+offset and does not touch the 15 neighbouring sequences.** The round-166 hypothesis that
+it might be base-relative is **falsified by measurement.**
+
+### The search space is now ONE candidate
+
+| candidate | verdict |
+|---|---|
+| `kc0`/`kc1` arithmetic | **out** -- round 166 used literal constants |
+| uninitialised accumulator in block 1 | **out** -- `gemm2d_begin` zeroes it (`gemm2d.cu:345-350`) |
+| the region-scoped memset | **out** -- 16/16 above |
+| **the `grid.z = 2` launch itself** | **the only one left** |
+
+**A `grid.z = 2` launch of the prefill GEMM breaks it, even when the second block is given
+an empty range and contributes exactly zero.** That is the finding.
+
+### Next hypothesis, cheapest first
+
+1. **Check that the third grid dimension actually reaches the kernel.** `LaunchConfig`'s
+   `grid_dim` is a 3-tuple; **if `grid.z` is silently dropped or reordered by the launch
+   path, `gridDim.z` inside the kernel is not 2**, and `nsplit` -- which the kernel derives
+   from `gridDim.z` -- would be wrong. `nsplit == 1` with host `nsplit == 2` means the
+   kernel covers the full range in **both** blocks while the host zeroes and expects
+   accumulation: **every element written twice, once by plain store and once by
+   atomicAdd, in an unspecified order.** That produces exactly the empty generation the
+   gate reports. **Print `gridDim.z` from the kernel once to settle it.**
+2. **If `gridDim.z` is correct**, look at what else `blockIdx.z` touches in
+   `gemm2d_store_scaled` and the staging helpers -- a second block changes nothing about
+   block 0, so a failure means the kernel is reading z somewhere it should not.
