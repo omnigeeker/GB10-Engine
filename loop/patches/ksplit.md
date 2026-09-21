@@ -487,3 +487,53 @@ attempt 1's assertion was wrong: it assumed code that had already been supersede
   place to look.
 
 **Do not take a TTFT measurement before this returns green.**
+
+
+---
+
+## THE DIAGNOSTIC RAN (round 166) -- and it eliminates two candidates
+
+The `edit` tool applied the kernel change; the script applied `ops.rs`. **The diagnostic
+executed and FAILED: `generate --n 16` 0/0, `chunked-prefill` FAILED.** Reverted after.
+
+The build under test: **block 0 covers all of K, block 1 takes an EMPTY range**, with the
+`grid.z = 2` launch and the region-scoped `memset_zeros(&mut y.slice_mut(..t*n))`. The
+result should have been numerically identical to the working build. **It was not.**
+
+**That eliminates two candidates outright:**
+
+| candidate | why it is out |
+|---|---|
+| the `kc0`/`kc1` arithmetic | **this run did not use it** -- both blocks got literal constants |
+| an uninitialised accumulator in the empty block 1 | `gemm2d_begin` sets every element to `0.0f` (`kernels/gemm.cu:345-350`, verified), so block 1 adds exactly zero |
+
+**And the store path was not the failure either**: the committed kernel stores with
+`if (blockIdx.z == 0) y[...] = acc[...] else atomicAdd(...)`, so in this run block 0 did
+a **plain store**. The store path was not exercised.
+
+**So two candidates remain:**
+
+1. **the `grid.z = 2` launch itself**, or
+2. **the region-scoped memset.**
+
+### The mechanism to test first
+
+**`memset_zeros` on a `slice_mut(..want)` view may not honour the view's byte offset.**
+If the driver memset starts at the allocation base rather than at the view, it zeroes the
+wrong region -- **the same class of error as round 164's measured 16x overshoot, which was
+real.** `y` is a slice of a 16-sequence buffer, so a base-relative memset would clear a
+neighbouring sequence's activations and produce exactly the empty generation the gate
+reports.
+
+### The test that separates the two
+
+**Run the same diagnostic with the memset removed entirely.** Block 1 contributes exactly
+zero and block 0 writes plainly, so nothing needs zeroing at all:
+
+* **gate passes** -> the memset is the culprit; use a fill kernel over `y`'s own region, or
+  write every element instead of accumulating.
+* **gate fails** -> the `grid.z = 2` launch is the culprit, and the next question is what
+  about a second block breaks the prefill.
+
+**Note: the scripted removal of the memset failed on a stale anchor -- the fifth
+patch-script failure of this session. Use the `edit` tool, not a heredoc.**
