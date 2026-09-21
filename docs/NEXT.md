@@ -2352,6 +2352,37 @@ prefill 2.2x.** The gate (`generate` 16/16 plus `chunked-prefill`) decides wheth
 layout, **so a failure would mean the staging loop is not actually issuing the loads
 concurrently -- itself diagnosable by counting the loads in the generated PTX.**
 
+## INDEPENDENT CONFIRMATION FROM THE GEMV PATH (round 228)
+
+**The round-226 mechanism says the staging is limited by having ONE 8 B load in flight per thread,
+not by the memory system. There is already a measurement in the record that tests this
+independently, and it agrees.**
+
+**The GEMV path reads THE SAME WEIGHT TENSOR, and it is written with many elements per thread in
+a grid-stride loop.**
+
+| kernel | elements per thread | rate on this weight layout |
+|---|---|---|
+| **GEMM staging (probe)** | **1** | **52.4 GB/s** |
+| **GEMV** | **many (grid-stride)** | **170 GB/s** |
+| machine peak | -- | 228 GB/s |
+
+**Same tensor, same memory system, same machine -- 3.2x apart, and the only difference is the
+per-thread element count.** That is the round-226 finding **confirmed by a kernel that was already
+written and measured before the hypothesis existed.**
+
+### And it bounds the fix's ceiling honestly
+
+**The GEMV reaches 170 GB/s, the 4-element probe reaches 208 GB/s, peak is 228. So a staging
+rewrite should land in 170-208 GB/s, not at peak** -- and that is still a **3.2-4.0x** on the
+staging's current 52.4 GB/s.
+
+**Which keeps the projection honest: staging 322.33 ms -> ~80-100 ms, full kernel 435.94 ms ->
+~195-215 ms, prefill 2.0-2.2x. Rounds 226 and 227 stand.**
+
+**And the fix does not need to be perfect to pay: landing merely at the GEMV's 170 GB/s captures
+3.2x of the 4.0x available.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
