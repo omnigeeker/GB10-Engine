@@ -1570,6 +1570,41 @@ the unroll.**
 **The prize, unchanged and now well-founded:** staging 322.33 ms -> 77.2 ms at peak, total
 435.94 -> 190.8 ms, **2.28x against a 2.2x target.**
 
+## THE UNROLL IS NOT A ONE-CONSTANT CHANGE (round 205) -- and the cheaper test comes first
+
+**The staging load has NO spare width.** 128 threads x 8 B (`uint2`) = **1024 B** per k-tile, and
+the k-tile is exactly 64 rows x 16 B = **1024 B**. **Exact match -- coverage is complete.**
+
+**So `P` cannot be raised by widening.** Raising `PAIRS` alone would read past the k-tile into
+the next one's bytes -- **wrong data, not a faster load.**
+
+**The unroll therefore requires restructuring the `nchunk` loop**: stage into both `wt[0]`/`wt[1]`
+before one barrier, then run two outer-product passes. **That touches the K-split prologue
+(`kc0`) and the `xt` staging in the same breath, so it is not a one-constant experiment.**
+
+### The cheaper diagnostic, which comes first
+
+**Keep the loop structure and add ONE extra independent global load per thread** -- from the next
+k-tile's `wt` bytes into a scratch slot -- **purely to put a second request in flight.**
+
+**It must be a GLOBAL load, so it belongs inside `stage_wtile`.** The probe line at the
+outer-product site cannot do it: `wt`/`xt` there are already shared memory, **and a second shared
+read adds no memory-level parallelism.**
+
+**Read the result this way:**
+
+- **staging speeds up materially -> the barrier-drain diagnosis is confirmed, and the restructure
+  is worth its cost;**
+- **staging does not speed up -> the 24% has a different cause, and the restructure would have
+  been wasted work.**
+
+### Baselines to beat (both from the trustworthy round-203 probe)
+
+| measurement | t=32 | t=64 |
+|---|---|---|
+| **staging alone (loads live, FMA removed)** | **279.62** | **322.33** |
+| full kernel | 400.01 | 435.94 |
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
