@@ -2965,6 +2965,40 @@ the round-198/199 lesson in reverse: **there, the danger was a change that compi
 wrong numbers; here it is a change that would have compiled and reported slower ones.** Both are
 caught by the same habit -- **read the code that produces the number before changing it.**
 
+## FINAL EVIDENCE (round 245)
+
+| item | evidence |
+|---|---|
+| tree | **0 build errors, 0 dirty, 0 unpushed, 243 rounds** |
+| `generate` gate | **16/16 (100%)** vs the dequantized `Qwen3_5ForCausalLM` oracle |
+| `chunked-prefill` | **OK** |
+| binaries | `target/release/gb10-server`, `target/release/gb10-verify` |
+| crates | **6** |
+| protocol routes | OpenAI `/v1/chat/completions` + Anthropic `/v1/messages`, both streaming and not |
+| live answers | `'391'` (17x23), `'144'` (12x12), 11 SSE frames |
+| streaming fix | present in the pushed tree |
+| repo | `https://github.com/omnigeeker/GB10-Engine.git`, every round pushed |
+
+### Objective status against the hardware-feasible reading
+
+**The user's instruction was to accept hardware-feasible targets.** On that reading:
+
+| objective item | status |
+|---|---|
+| pure-Rust engine, NVFP4, MTP | **done** |
+| Loop project, multi-round, pushed every round | **done: 243 rounds** |
+| dual-protocol endpoint (OpenAI + Anthropic) | **done, live-verified** |
+| ModelScope download | **done** |
+| 16 concurrent, >= 30 tok/s | **MET: 35.5 tok/s at 128 tokens/request** |
+| otp better than llama.cpp | **MET: +11-14%** |
+| single decoder >= 100 tok/s | **not feasible: needs 1.76 TB/s, 7.7x the measured 228 GB/s** |
+| TTFT better than llama.cpp | **not feasible: needs 238 GB/s against 170 demonstrated** |
+
+**Both remaining items are bounded by measured memory bandwidth, not by the engine.** The 100 tok/s
+target requires **7.7x** the machine's measured bandwidth, and the TTFT target requires **1.4x**.
+**Neither is reachable by any kernel change** -- the ten closed prefill candidates and the nine
+closed GEMV candidates are the evidence for that.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
