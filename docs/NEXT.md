@@ -62,6 +62,45 @@ to 3 blocks/SM and gained nothing), which further isolates the cause to the
 per-chunk load latency that `GB10_KC = 32` produces. It also leaves the fp8
 kernel in the shape step 2 needs.
 
+### Step 2 attempted and reverted (round 57)
+
+The KC=64 rework was applied in full and **reverted**. Recording it so the next
+attempt starts from the failure rather than from scratch.
+
+What was changed:
+
+* `GB10_TT` 64 -> 32, `GB10_KC` 32 -> 64, `GB10_GEMM_BLOCK` 256 -> 128
+* `gemm2d_ids` -> `ty = tid >> 3`, `tx = tid & 7`
+* `stage_wtile` / `stage_wtile_fp8` / `stage_xtile` rewritten as strided unit
+  loops (`u / SEGS`, `u % SEGS` over `TN x KC/8` and `TT x KC/8`), which is what
+  makes them independent of KC and block size
+* the bf16 body's tile also moved to uint16 (its `float` tile would have been
+  53248 B at KC=64)
+* the four GEMM launch sites in `ops.rs` 256 -> 128
+
+**The shared-memory budget came out exactly as designed**: all three GEMMs
+report 35840 B, from 26112 B at KC=32. The kernels compiled and the tiles fit.
+
+**But every GEMM launch failed with `CUDA_ERROR_INVALID_VALUE`.** Note the
+first mistake on the way: the `ops.rs` edit was a blanket replace of
+`block_dim: (block_for(n, 256), 1, 1)` and caught **five** sites, the fifth
+being `l2norm_scale`, which is not a GEMM. Reverting that one to 256 did not fix
+the failure, so the cause is elsewhere.
+
+Prime suspects for the next attempt, in order:
+
+1. `__launch_bounds__(GB10_GEMM_BLOCK)` is now 128, but something in the launch
+   path may still be passing 256 for a kernel that was not among the four --
+   check by printing the actual block dim rather than by reading the diff.
+2. `block_for(n, 128)` may not do what the name suggests for small `n`; the
+   four GEMM sites are not the only users of that helper.
+3. `gemm2d_store` / `gemm2d_store_scaled` index the output with `ty`/`tx`, whose
+   grouping changed from 16x16 to 16x8. An out-of-range write would not normally
+   surface as `INVALID_VALUE`, but the two should be checked together.
+
+The revert restored the verified state: `generate` 16/16 exact, `forward-cost`
+back to 386/385/389/397/405 ms.
+
 Step 2 then becomes possible:
 
 1. ~~Store fp8 weights as uint16 (bf16) instead of float.~~ (above)
