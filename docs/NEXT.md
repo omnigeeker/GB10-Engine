@@ -2540,3 +2540,33 @@ Everything else in the objective is reachable and has a concrete path: TTFT
 * `batch-parity` must use prompts of different lengths, or a per-sequence
   addressing bug passes.
 * Change one variable and see whether the failure follows it.
+
+## Ready-to-apply: hoist the scale row into shared memory (for round 133+)
+
+Round 132 widened the scale load (8 lanes x `uint32` + `__shfl_sync`) and kept it:
+correct 16/16, t=1 **104.2 -> 100.79 ms (-3.3%)**. That is a real gain but only a third
+of the ablation's ~20% prediction, and the ablation's own shape explains why: **steps 4
+and 5 *raised* bandwidth (210.5, 212.5), so adding work per k-tile hid the extra load's
+latency.** The cost is the second stream's existence, not its width -- so it has to be
+*removed*, not widened.
+
+**The design, with the constraints that make it a one-pass change:**
+
+* The scale row is `scalerow = K/16` bytes -- **320 B for K=5120**, and K is a multiple
+  of 128, so `scalerow` is a multiple of 8 and every 4-byte group is aligned.
+* A warp reads the *same* row for all `full_tiles = K/512 = 10` k-tiles, so the row is
+  currently fetched **10 times** when it need only be fetched once.
+* Static shared, no launch-config change: `__shared__ uint8_t ssc[4096];` indexed
+  `ssc + (warp * ROWS + r) * scalerow`. Needs `nwarps * ROWS * scalerow <= 4096`:
+  at the current launch (128 threads = 4 warps, ROWS=1, scalerow=320) that is
+  **1280 B**, well inside. **Guard it:** `if (scalerow <= 512)` uses shared, else fall
+  back to the round-132 path -- do not silently overflow.
+* Cooperative load at the top of the row loop: lanes `0..(scalerow/4-1)` each load one
+  `uint32` (that is 80 lanes' worth at K=5120, so loop it), then `__syncwarp()`.
+  Keep the loads 4-byte aligned and the loop unrolled.
+* The k loop then reads `ssc[... + i*kWarp + lane]` -- a shared load, no global traffic.
+
+**Expected signals:** `generate` **must be 16/16**; t=1 must fall below **100.79 ms**.
+If the `__syncwarp()` and shared traffic eat the gain, revert and record -- the
+ablation is still the only thing that has located this, and a negative here would mean
+the 26% is not addressable from the scale path at all.
