@@ -1211,6 +1211,43 @@ block size is the free variable**: with 256 threads the per-thread accumulator b
 which changes which shapes pass the gate at all. **That is a bounded, gate-checkable experiment
 and it is the only lead this decomposition leaves open.**
 
+## BLOCK SIZE IS NOT FREE -- BUT A BIGGER TILE AT 256 THREADS IS (round 196)
+
+**Worked the round-195 lead before spending a build. It closes, and it opens a better one.**
+
+**The accumulator identity checks out against the code:** 128 threads with the
+`static_assert`'d `GB10_TM = 8, GB10_TNREG = 4` gives a block tile of 64n x 64t = 4096
+outputs, and 4096/128 = 32 = TM*TNREG. **So `threads x acc = 4096`, i.e. `acc = 4096/threads`.**
+
+**And the B/FMA closed form is confirmed by the counted source:** for TM=8/TNREG=4,
+`2/TNREG + 4/TM = 0.5 + 0.5 = 1.0` -- **exactly the ~1.0 B/FMA counted in `gemm2d_outer_bf16`
+in round 171.** Formula and code agree.
+
+**Raising `GB10_GEMM_BLOCK` to 256 at the SAME tile forces `acc = 16`:**
+
+| shape | acc | B/FMA |
+|---|---|---|
+| TM=4 / TNREG=4 | 16 | **1.5** |
+| TM=8 / TNREG=2 | 16 | **1.5** |
+| today: TM=8 / TNREG=4 at 128 threads | 32 | **1.0** |
+
+**So at a constant tile, more threads is strictly worse. Block size is not the free variable.**
+
+### What is free: enlarge the tile at 256 threads
+
+**A 64x128 or 128x64 block tile carries 8192 outputs, so `acc = 32` at 256 threads and B/FMA
+stays at 1.0 -- while each staged byte feeds twice as many FMAs.** That is precisely the
+"bigger tile / better reuse" fix the round-195 decomposition pointed at, now with a concrete
+shape and a stated reason to expect it to pass the gate.
+
+**Coupled constants:** `GB10_TN` in `kernels/gemm.cu` and `GB10_NR` in `crates/gb10-cuda/src/ops.rs`
+must move together, `GB10_WSTRIDE` follows `GB10_TN`, and the launch `block_dim` goes to 256.
+**This is a shape change of the kind rounds 96-119 searched -- but at a block size they never
+tried, which is what makes it new rather than a repeat.**
+
+**Acceptance test, unchanged: the gate first, then 3 runs at t=32/64 against the recorded
+baseline of 400.01 / 435.94 ms.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
