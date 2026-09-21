@@ -856,6 +856,53 @@ The profiler numbers stand on their own and remain the target:
 launch -- 54 GB/s average, 70 GB/s at best, against 148 GB/s for the GEMV path on
 the same weights.
 
+### A valid component test, and the gap located (round 82)
+
+Following the new rule -- change a component's *size*, read the profiler's
+absolute per-launch number -- the outer product's k loop was halved:
+
+| `nvfp4_gemm_kernel` | avg | min |
+|---|---|---|
+| baseline | 825.6 us | 635.9 us |
+| outer product k at 1/2 | 740.6 us | 532.2 us |
+| **outer product, doubled back** | **~170 us** | **~207 us** |
+
+That is 21-25% of the launch, and it agrees with the t=1 estimate (53 ms of 271,
+20%) that came from the same kind of test. **The two independent methods agree,
+which is what a valid measurement looks like.**
+
+Combining with round 81 (dequant + shared stores: a 4x reduction moved the whole
+forward by 4.6 ms, i.e. ~2 us per launch -- negligible), the launch decomposes as:
+
+| part | per launch | share |
+|---|---|---|
+| weight loads | **~630 us** | ~76% |
+| outer product | ~170 us | ~21% |
+| dequant + shared stores | ~2 us | ~0.2% |
+
+**So the loads move 44.6 MB in 630 us = 71 GB/s average, 104 GB/s at the
+minimum -- while the pattern probe says this exact access pattern can reach
+181 GB/s.**
+
+That is the gap, now located precisely and by a sound method: **the kernel's
+weight loads run at 39% of what their own access pattern is capable of.** It is
+not the pattern (181 GB/s is achievable), not the dequant, not the stores, and
+not the outer product.
+
+What differs between the probe and the kernel is **concurrency**. The probe runs
+272 blocks of pure loads against an idle memory system. The kernel's blocks stage
+one chunk, `__syncthreads()`, run the outer product, `__syncthreads()`, stage the
+next -- so loads are issued in bursts separated by a barrier, and at any instant
+far fewer loads are in flight than the probe sustains. The outer product is only
+~27% as long as the loads, so it cannot hide them.
+
+**That points at the pipeline shape, which is exactly what round 74 flagged and
+then set aside.** The next experiment is to overlap more: either issue the next
+chunk's loads before the barrier rather than after it, or deepen the k pipeline
+so that two chunks are always in flight. Both are size changes to the existing
+structure, and both can be judged against the 825.6 us launch time rather than
+against a probe.
+
 ### A caution learned in round 64
 
 The probes were scripted with a `cp` restore from a scratch copy that predated
