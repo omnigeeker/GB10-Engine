@@ -743,6 +743,116 @@ fn mtp_probe(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Speculative decoding with the MTP head, gated on reproducing *exactly* the
+/// tokens plain greedy decoding produces.
+///
+/// Greedy accept/reject cannot change the output -- a rejected draft is thrown
+/// away and the decoder's own token is emitted instead -- so the sequence is
+/// identical by construction. The gate checks that rather than trusting it,
+/// because an off-by-one in the draft/verify handshake still yields fluent
+/// text and a plausible-looking acceptance rate.
+fn mtp_generate(args: &Args, n_new: usize) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let model = Model::load_from(&dev, cfg, &args.model)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+    let store = Store::open(&args.model, "")?;
+    let mtp = Mtp::load(&store, &dev, &text)?;
+
+    let prompt = if args.prompt.is_empty() {
+        "What is the capital of France?".to_string()
+    } else {
+        args.prompt.clone()
+    };
+    let ids = tok.encode(&prompt, false)?;
+
+    // --- reference: plain greedy ---
+    let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut next = model.prefill(&dev, &ids, &mut st, &mut sc)?;
+    let t0 = std::time::Instant::now();
+    let mut want = Vec::new();
+    for _ in 0..n_new {
+        if tok.is_eos(next) {
+            break;
+        }
+        want.push(next);
+        next = model.step(&dev, next, &mut st, &mut sc)?;
+    }
+    let dt_ref = t0.elapsed().as_secs_f64();
+
+    // --- speculative: draft with the head, verify with a decoder step ---
+    // Invariant at the top of each round: `st.normed` is h_t and `cur` is
+    // x_{t+1}. The head guesses x_{t+2} from exactly those two; the decoder
+    // step on x_{t+1} then produces h_{t+1} and the true x_{t+2}.
+    let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+    let mut ms = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
+    let mut idx: gb10_cuda::CudaSlice<i32> = dev.stream().alloc_zeros::<i32>(1)?;
+    let mut cur = model.prefill(&dev, &ids, &mut st, &mut sc)?;
+    let t1 = std::time::Instant::now();
+    let mut got: Vec<u32> = Vec::new();
+    let (mut hits, mut steps) = (0usize, 0usize);
+    // On acceptance `cur` becomes a token that was *just* emitted, so the naive
+    // "emit cur, then emit actual" loop pushes it a second time on the next
+    // round. Tracking whether `cur` is already in `got` is what keeps the
+    // emitted sequence equal to greedy. It also makes the accounting legible:
+    // each round runs exactly one decoder step and emits `1 + accepted` tokens,
+    // so the long-run rate is `1 + acceptance` tokens per step.
+    let mut emitted = false;
+    while got.len() < n_new && steps < n_new * 4 {
+        if !emitted {
+            if tok.is_eos(cur) {
+                break;
+            }
+            got.push(cur);
+        }
+        mtp.forward(&dev, &text, &st.normed, cur, &model.embed, &model.lm_head, &mut ms)?;
+        dev.ops().argmax(&dev, &ms.logits, &mut idx, model.vocab_size())?;
+        let draft = dev.stream().memcpy_dtov(&idx)?[0] as u32;
+
+        let actual = model.step(&dev, cur, &mut st, &mut sc)?;
+        steps += 1;
+        if draft == actual {
+            hits += 1;
+            if got.len() < n_new {
+                got.push(actual);
+                emitted = true;
+            } else {
+                emitted = true;
+            }
+        } else {
+            emitted = false;
+        }
+        cur = actual;
+    }
+    let dt_spec = t1.elapsed().as_secs_f64();
+
+    let rps = want.len() as f64 / dt_ref;
+    let sps = got.len() as f64 / dt_spec;
+    println!("== MTP speculative decoding ==");
+    println!("  prompt: {prompt:?}");
+    println!("  greedy reference : {:>3} tokens in {:.3}s -> {:.2} tok/s", want.len(), dt_ref, rps);
+    println!("  MTP speculative  : {:>3} tokens in {:.3}s -> {:.2} tok/s", got.len(), dt_spec, sps);
+    println!("  draft acceptance : {hits}/{steps} = {:.1}%", 100.0 * hits as f64 / steps as f64);
+    println!("  speedup          : {:.2}x", sps / rps);
+
+    let same = got == want;
+    println!("  token-exact vs greedy: {}", if same { "YES" } else { "NO" });
+    if !same {
+        let d = want.iter().zip(&got).position(|(a, b)| a != b);
+        println!(
+            "  first difference at {:?}: want {:?} got {:?}",
+            d,
+            d.map(|i| want[i]),
+            d.map(|i| got[i])
+        );
+    }
+    println!();
+    Ok(same)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -768,6 +878,14 @@ fn main() -> Result<()> {
             println!("\ngenerate: OK");
             return Ok(());
         }
+        "mtp-generate" => {
+            let ok = mtp_generate(&args, args.n_new)?;
+            if !ok {
+                bail!("mtp-generate gate FAILED");
+            }
+            println!("\nmtp-generate: OK");
+            return Ok(());
+        }
         "mtp-probe" => {
             mtp_probe(&args)?;
             return Ok(());
@@ -788,7 +906,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate)"
         ),
     };
 

@@ -101,10 +101,46 @@ steps, four unrelated prompts:
 | "List the planets in order, then describe each one in a sentence." | 89.6% |
 
 Average ~90%, and the spread across unrelated subjects is what rules out
-repetition inflating the number. At 90% acceptance the economics above give
-`18.45 / 1.90 = 9.71 GB/token`, a **1.81x** speedup -- 42.44 tok/s becomes
-roughly **77 tok/s at n_seq=16**, past the "50+ at concurrency 16" target, and
-8.69 becomes ~15.7 tok/s single-stream.
+repetition inflating the number.
+
+### The 1.81x table above was WRONG -- drafting does not replace a decoder step
+
+A naive per-token speculative loop (draft with the head, verify with one
+`Model::step`, accept/reject) was implemented and measured:
+
+```
+greedy reference :  48 tokens in 5.492s -> 8.74 tok/s
+MTP speculative  :  48 tokens in 5.809s -> 8.26 tok/s
+draft acceptance : 43/47 = 91.5%
+speedup          : 0.95x
+token-exact vs greedy: YES
+```
+
+Token-exact and 91.5% acceptance, but **no speedup at all**. The reasoning error
+in the table above was treating the draft as a *replacement* for a decoder step.
+It is not. The decoder step on `x_{t+1}` is what produces `h_{t+1}` and the true
+`x_{t+2}`; the draft only tells you what that step will say, and the step still
+has to run to move the state forward. Since every emitted token needs one
+17.6 GB weight read either way, the loop is exactly break-even -- the algebra
+confirms it: a round emits `1 + accepted` tokens but only when the previous
+round was rejected, so the long-run rate is `P(reject) * (1 + a) + P(accept) * a
+= 1` token per step, independent of acceptance.
+
+### Where the speedup actually has to come from
+
+The head is only cheap because it reuses the decoder's hidden state. To turn
+that into throughput, **several drafted tokens must be verified in one decoder
+forward** -- a `K+1`-token batched forward reads the weights once, so `K+1`
+tokens cost `17.6 + K * 0.85` GB instead of `(K+1) * 17.6`. That is the real
+1.9x, and it needs the one thing the engine does not have yet: a multi-token
+forward that works from a **non-empty** KV cache. `attn_prefill_kernel`
+hardcodes the causal window as `0..=t` rather than `0..=start+t`, which is
+exactly why `forward_prefill` is documented as valid only on an empty cache.
+
+So the cost of the verify step grows with `K` while its benefit also grows: each
+extra drafted token adds only 0.85 GB, so the marginal drafted token is 21x
+cheaper than a decoder step. Realizing it is gated on the batched-verify path,
+not on the head.
 
 ### The head was verified with a control, not just a happy path
 
