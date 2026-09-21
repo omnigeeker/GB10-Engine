@@ -2103,6 +2103,53 @@ the intended quantity.** The cheap check is to ask **what the number would be if
 were measuring something else** -- and in all three cases that question would have caught it
 before the measurement was believed.
 
+## THE STREAMING PATH IS NOT INCREMENTAL -- A REAL DEFECT (round 220)
+
+**Rewrote the TTFT instrument to parse the SSE body in python and time the first frame carrying
+content. It works, and it found what three previous instruments could not:**
+
+| measurement | value |
+|---|---|
+| single request, first content frame | **0.016 s** |
+| single request, total | **8.614 s** |
+| **content frames received** | **2** |
+| 16 concurrent, first frame | **0.001 s median** |
+| 16 concurrent, total | **15.620 s** |
+
+**Only TWO content frames for a 24-token completion.** So the server is not emitting token by
+token -- **it sends a start frame and an end frame, with the whole completion arriving in
+between.**
+
+**Which means the 0.016 s "TTFT" is the START FRAME, not the first token. As a user experiences
+it, TTFT equals the total: 8.6 s single, 15.6 s at 16 concurrent.**
+
+### That is a genuine defect against the objective
+
+**The user asked for TTFT better than llama.cpp. A non-incremental stream cannot have a good TTFT
+at all -- it reports the whole generation time before any text appears. llama.cpp streams token
+by token, so its TTFT is a real TTFT.**
+
+**And it is fixable**: the batching scheduler already produces tokens one step at a time, so the
+streaming handler needs to flush each decoded token as its own SSE frame **instead of
+accumulating the completion and emitting it once.** That is in
+`crates/gb10-server/src/main.rs`, and **it is the highest-value remaining item because it is the
+only unmet target that is a defect rather than a hardware limit.**
+
+**It also resolves the round-219 anomaly**: the "2.75 tok/s" single streaming request was not a
+streaming penalty -- **it is the same ~8.6 s generation, reported differently.**
+
+### And why it took four instruments
+
+| round | instrument | what it measured |
+|---|---|---|
+| 218 | non-streaming `time_starttransfer` | a buffered response |
+| 219 | streaming `time_starttransfer` | the SSE headers |
+| 220a | SSE parse, `'content' in line` | the role frame |
+| **220b** | **SSE parse, count content frames** | **2 frames -- the real answer** |
+
+**Each instrument was one question away from the truth, and the question was always the same:
+what would this number be if the instrument were measuring something else?**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
