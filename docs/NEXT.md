@@ -1356,6 +1356,55 @@ pointed at simply does not apply at the token counts that matter. Reverted.**
 
 **The GEMM stays at 40.4 GB/s. No mechanism for the remaining 2.2x is currently identified.**
 
+## THE TWO PHASES SUM EXACTLY -- THEY DO NOT OVERLAP (round 200)
+
+**This is the finding the whole session was missing.**
+
+```
+staging 214.08 + outer product 221.86 = 435.94
+measured total                          435.94
+sum - total = 0.00 ms
+```
+
+**The two phases ADD. They do not overlap at all.**
+
+**If they overlapped, the total would be `max(214, 222) = 222 ms` -- a 1.96x win. The endpoint
+target needs 2.2x. THE PRIZE IS THE SAME ORDER AS THE TARGET.**
+
+### This reframes the entire search
+
+**Six mechanisms were closed by asking "how do we make staging faster, or the FMA denser".**
+**The measurement says the direct question is "why do the two phases serialize" -- and the prize
+for answering it is essentially the whole remaining target, not the 2-3% every previous lever
+delivered.**
+
+**And the code already intends overlap**: `xt[2]`/`wt[2]` double buffers, and
+`stage_xtile(xt[nxt], ..., c + 1)` is issued before `gemm2d_outer(wt[cur], xt[cur])`.
+**So the structure says "pipeline" and the measurement says "serial".**
+
+### Why they might serialize, in the order worth checking
+
+1. **A `__syncthreads()` between staging and compute forces every thread to wait for the slowest
+   load, instead of letting compute consume the *other* buffer.**
+2. **The buffers may be consumed in the same order they are produced**, making a dependency chain
+   rather than a pipeline.
+3. **If `cur`/`nxt` swap at a point that puts a barrier between issue and use, the load latency is
+   exposed on the next iteration instead of hidden.**
+
+**One check decides it: does the loop issue the loads for `k+1` and then compute on `k` *without
+an intervening barrier that both phases must pass together*? A single read of the `nchunk` loop
+body answers it.**
+
+### And a measurement that would confirm the diagnosis before any rewrite
+
+**Reduce the outer-product work (e.g. `GB10_TNREG` 4 -> 2) and see whether the total falls by the
+FULL amount of the removed FMA time or by less.**
+
+- **falls by the full amount -> the phases are serialized, and overlap is the prize;**
+- **falls by less -> they already overlap, and the exact sum is a coincidence.**
+
+**That is a one-constant experiment with a recorded baseline, and it is the next thing to run.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
