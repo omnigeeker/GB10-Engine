@@ -97,11 +97,49 @@ Step cost against the 77 ms weight floor, which holds at every batch size:
 way) and points at something that scales with the number of sequences. The compute
 bound at B=16 is only ~41 ms, so it is not raw FMA throughput either.
 
-**Next step: a dedicated sweep of the batch GEMV's time against B** (1, 2, 4, 8, 16)
-on one matrix, so the per-sequence and fixed components can be separated. The
-endpoint and `batch-parity` disagree about B, and that has been quietly confusing
-several rounds of reasoning -- fix the measurement before theorising about the
-cause.
+### The B sweep, and what it says about the endpoint (round 104)
+
+`batch-parity --n-seq N` gives a clean curve. The weight floor is 77 ms/step at
+every batch size:
+
+| B | ms/step | vs floor | aggregate tok/s |
+|---|---|---|---|
+| 1 | 104.2 | 1.35x | 9.59 |
+| 2 | 135.0 | 1.75x | 14.82 |
+| 4 | 148.3 | 1.93x | 26.97 |
+| 8 | 190.4 | 2.47x | 42.01 |
+| **16** | **334.9** | **4.35x** | **47.78** |
+
+**The engine already reaches 47.78 tok/s aggregate at B=16, well above the 30 the
+objective asks for.** So the endpoint's 17.37 tok/s is the actual gap, and the
+sweep says where it is: the endpoint's 14.74 s is ~8.2 s of **prefill** and ~6.5 s
+of decode, and 6.5 s / 16 steps = 406 ms/step against the engine's own 335 -- so
+**the decode is roughly at parity and the prefill is the whole difference.**
+
+Bound check: prefill is 16 weight passes at 58 GB/s = 4.85 s, decode is 16 passes
+at 148 GB/s = 1.9 s, total 6.75 s = **38 tok/s achievable** against 17.37 measured.
+Batching prefill would save only ~6% (a 928-token concatenation is 15 tile-passes
+against 16), so **the prefill win has to come from the prefill GEMM itself**, which
+runs 58 tokens in ~500 ms against its own 303 ms pass.
+
+### The local-memory hypothesis, tested and rejected (round 104)
+
+`nvfp4_gemv_batch_kernel` compiles to 128 registers **with a 256-byte stack
+frame**, i.e. `lo[ROWS][8]` and `hi[ROWS][8]` are partly in local memory and get
+read back 16 times each in the inner loop -- a plausible cause of the batch gap.
+
+Tested by dropping `ROWS` from 4 to 2, which frees registers exactly as expected
+(80 registers, 128-byte stack):
+
+| | B=4 | B=16 |
+|---|---|---|
+| ROWS=4 | 148.3 ms | **334.9 ms** |
+| ROWS=2 | 147.0 ms | **374.1 ms (+12%)** |
+
+**Worse at B=16**, because halving `ROWS` doubles the x re-reads per row group.
+Reverted. So local memory is not the dominant cost either -- that is now three
+mechanisms ruled out by measurement on this kernel (x traffic, local memory, and
+by the sweep's shape the weight stream itself).
 
 ## Final state of this session
 
