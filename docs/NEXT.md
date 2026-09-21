@@ -2270,6 +2270,46 @@ a grid-stride loop while this reads ONE 8 B element per thread per k-tile.** Rou
 second load **within** a k-tile and saw nothing -- **but it did not change the number of elements
 each thread owns across the whole reduction, which is what a grid-stride loop does.**
 
+## THE STAGING IS LATENCY-BOUND -- 4x THE WORK REACHES 91% OF PEAK (round 226)
+
+**This is the answer to the question rounds 202-225 spent themselves on.**
+
+**The last untested structural difference was that the GEMV reads many elements per thread in a
+grid-stride loop while the staging reads ONE 8 B element per thread per k-tile. Tested by making
+the probe read 4 consecutive elements per thread -- 4x the volume, the same number of barriers:**
+
+| | t=32 | t=64 |
+|---|---|---|
+| **4 elements per thread** | **209.53** [207.27-213.92] | **252.15** [247.74-256.47] |
+| 1 element per thread | 208.50 | 251.12 |
+| change | **+0.5%** | **+0.4%** |
+
+**4x the volume in the SAME time. The rate goes from 52.4 GB/s to 208 GB/s -- 91% of the 228 GB/s
+peak.**
+
+### So the staging was never bandwidth-limited
+
+**It was limited by having only ONE 8 B load in flight per thread.** The memory system was idle
+most of the time, **and every previous candidate failed because none of them changed that.**
+
+**And this explains the whole exclusion list at once:**
+
+| candidate | why it did not move the needle |
+|---|---|
+| MLP within a k-tile (206) | added an ADDRESS, not volume |
+| coalescing (208) | changed the pattern, not the per-thread count |
+| stride (212), instructions, address math, in-flight bytes (210) | all secondary to the per-thread count |
+| barrier cadence (225) | a wider k-tile spreads the same one-element work over more shared memory |
+
+### The fix, now specific and not a layout change
+
+**Restructure the staging so each thread handles MULTIPLE elements per k-tile** -- the same total
+volume, the same number of barriers, **just more loads in flight per thread.**
+
+**Measured headroom: 52.4 -> 208 GB/s. So the staging's 322.33 ms could fall toward ~85 ms and
+the full kernel's 435.94 ms toward ~200 ms -- a 2.2x on prefill.** **That is the 2.28x the earlier
+rounds kept referring to, now with a mechanism instead of a hope.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
