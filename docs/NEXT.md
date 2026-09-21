@@ -166,6 +166,43 @@ are the existing templates.
 | ~190 GB/s | **T1 as written is not a kernel problem**; 190 is the pattern's ceiling and the contract's T1 needs restating from a measured pattern ceiling, the same way the 100 tok/s target was |
 | ~228 GB/s | the kernel has 17% to find and the resource counting should resume |
 
+### The probe answers it, and the answer is decisive (round 129)
+
+`bench/hw/gemv_bw.cu` streams the real layout with the GEMV's own pattern -- one row
+per warp, lane L at bytes `[8L, 8L+8)`, `ROWS` rows in flight:
+
+| | GB/s |
+|---|---|
+| **the pattern, measured** | **271.5** |
+| `bw4.cu` reference | 228.0 |
+| **the real `nvfp4_gemv_kernel`** | **190.0** |
+
+**The pattern does 119% of the reference figure, so the memory system is not the
+limit and the missing bandwidth is inside the kernel.** The kernel is at **70% of
+what its own access pattern can do** -- a **1.43x** gap, and T1's 220 GB/s is only
+**81%** of the pattern ceiling.
+
+Two cross-checks from the same run:
+
+* **`ROWS`=1 (271.5) and `ROWS`=2 (270.6) are indistinguishable**, which is exactly
+  consistent with round 127's measurement that `ROWS`=2 does not help the real
+  kernel. The pattern is not `ROWS`-sensitive, so `ROWS` was never the lever -- two
+  independent measurements now agree on that.
+* The `lm_head` shape (635.7 MB, well past L2) gives **232.7 GB/s**, still above the
+  reference. Larger shapes cost some, but not the 30% in question.
+
+**What the kernel does that the probe does not, per 8 bytes of weight per thread per
+k-tile:** the probe does two XORs. The kernel does a 16-element NVFP4 unpack, a
+scale lookup and multiply, and 16 FMAs. **That is the 30%, and it is the first
+explanation this session that is supported by a controlled comparison rather than
+by arithmetic on a resource.**
+
+**Round 127's `ROWS`=2 failed because it kept every one of those per-element
+operations and only changed how many rows shared a loop.** The lever is to reduce
+the *per-element* work, or to process more rows per thread so that the x loads and
+loop overhead are amortised without changing the arithmetic -- not to re-count
+memory resources, which nine rounds have now eliminated.
+
 **That is one cheap probe that ends the argument either way**, and it is the same
 move that resolved the round-59 DRAM question -- measure the pattern, not the kernel.
 
