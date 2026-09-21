@@ -2536,6 +2536,42 @@ more elements of the SAME k-tile into registers and staging them from registers,
 registers rather than shared. **That is the one shape not yet tried, and it is now the only one
 consistent with both measurements.**
 
+## THE ONE SHAPE LEFT, AND WHY IT ESCAPES THE CIRCULARITY (round 233)
+
+### The circularity that killed the ring
+
+**`P > 1` needs `UNITS > 128`, and `UNITS = GB10_TN * PAIRS` -- so raising it means a wider tile,
+and a wider tile needs more shared.** The ring tried to break this by staging 4 k-tiles at once,
+**and it paid in shared (2 -> 4 buffers) and lost 4.5%.**
+
+### The way out: separate where the loads LAND from where they are STAGED
+
+**Registers are the only other place:**
+
+1. **At the top of the loop, issue FOUR global loads into registers** -- one for each of k-tiles
+   `c`, `c+1`, `c+2`, `c+3`. **That is four loads in flight per thread, the measured round-226
+   condition.**
+2. **Then stage them one at a time into the SAME two shared buffers the kernel already has.**
+3. **Register cost: 4 x 8 B = 32 B per thread**, against the ring's **8 KB of extra shared.**
+   **Occupancy is set by shared here, so this shape does not pay the cost that killed the ring.**
+
+### Why it is not free, stated honestly
+
+**The four loads must be issued before the first is consumed, so the loop has to load-ahead by 4
+while computing behind by 4. That is more restructuring than the ring, not less** -- and the ring
+was already the largest change this session attempted. **Register pressure may also lower
+occupancy directly, which is the same failure mode in a different currency.**
+
+**So the honest state: the mechanism is real and measured, the ring failed for a now-understood
+reason, and this shape is the only one left that does not repeat that reason. It is a genuine
+candidate, not a certainty** -- and the round-232 result is exactly why that distinction is worth
+stating rather than promising a number.
+
+### What is NOT left
+
+**Any tile-shaped change** (rounds 199, 225, 229), **any layout change** (round 212), **any
+coalescing change** (round 208), **or any deeper ring** (round 232).
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
