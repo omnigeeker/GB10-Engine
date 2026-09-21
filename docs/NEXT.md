@@ -36,11 +36,37 @@ ROWS=4, and ROWS=8 would be 128. That is why the kernel is shaped this way.
 block per k-tile instead of once per row group -- removing the 1.43 GB entirely.
 The cost is one `__syncthreads()` per k-tile, i.e. `K/kTile = 10` barriers.
 
-**Expected: the decode becomes weight-bound at 17.6 GB / 148 GB/s = 119 ms/step
-against 392 now, up to 3.3x.** The endpoint's 16-concurrent figure would go from
-17.37 tok/s to roughly 35+, **crossing the 30 tok/s the objective asks for**. That
-makes this the single highest-value change remaining, and unlike the earlier
-GEMM work the bound and the shortfall are both measured rather than inferred.
+### Implemented, and the diagnosis was wrong (round 102)
+
+The shared staging was built exactly as described (`__shared__ float
+xs[BMAX][kTile]`, cooperative stage per k-tile, two barriers) and is **correct**:
+`generate` 16/16 (100%), `batch-parity` OK.
+
+It is also **neutral**, and the step cost got slightly *worse*:
+
+| max_tokens | before | with shared x |
+|---|---|---|
+| 1 | 8.58 s | 7.96 s |
+| 16 | 14.74 s | **14.61 s** |
+| implied step cost | 419 ms | **443 ms** |
+| aggregate | 17.37 tok/s | 17.52 tok/s |
+
+Reverted -- the rule is to revert anything inside the +-2% noise band, and this is
++0.9% on the primary metric while adding two barriers per k-tile.
+
+**So the x-traffic analysis above is wrong.** The arithmetic is right (1.43 GB of
+x reads against 44.6 MB of weights) but the conclusion drawn from it is not: x is
+327 KB and the L2 is 25 MB, so those re-reads were already being served from L2,
+and L2 bandwidth was never the limit. Counting bytes is not the same as finding
+the bottleneck -- **the same mistake the round-59 DRAM probe made**, in a new
+place. The batch decode's 3.3x gap is still unexplained, and the next attempt
+should start from a profile of the kernel rather than from a traffic count.
+
+What *is* now established is the shape of the problem: 392 ms/step for 16
+sequences against a 119 ms weight bound, with the weights demonstrably read once.
+The remaining candidates are the FMA issue rate (16 FMAs per weight element per
+batch element is a lot of arithmetic per byte) and the accumulator register
+pressure that forces `ROWS = 4`.
 
 ## Final state of this session
 
