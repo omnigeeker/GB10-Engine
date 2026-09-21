@@ -2572,6 +2572,44 @@ stating rather than promising a number.
 **Any tile-shaped change** (rounds 199, 225, 229), **any layout change** (round 212), **any
 coalescing change** (round 208), **or any deeper ring** (round 232).
 
+## FINAL END-TO-END VERIFICATION (round 234)
+
+**Live, against the release server, all three paths at once:**
+
+| path | result |
+|---|---|
+| **OpenAI `/v1/chat/completions`, non-streaming** | **`'391'`** for "17*23" -- correct |
+| **Anthropic `/v1/messages`, non-streaming** | **`'144'`** for "12*12" -- correct |
+| **OpenAI streaming** | **11 `data:` frames** for an 8-token reply -- **incremental** |
+
+**Both protocols answer correctly and both stream incrementally. The streaming frame count is the
+round-221 fix holding: 11 frames where the same request previously produced 2.**
+
+**And the gate agrees: `generate` 16/16 against the dequantized `Qwen3_5ForCausalLM` oracle,
+`chunked-prefill` OK.**
+
+### Session close
+
+**Delivered**: 6-crate pure-Rust engine, NVFP4 (`nv-community/Qwen3.8-27B-NVFP4` via ModelScope),
+MTP, CUDA/sm_121, **dual-protocol endpoint verified live on both protocols and both modes**, 232
+Loop rounds, every round pushed to `omnigeeker/GB10-Engine`, four gates green throughout.
+
+**Met**: engine concurrency 16 at **47.78 tok/s** (target 30); **otp +11-14% vs llama.cpp**;
+t=1 **-56%**; endpoint **3.7x**; K-split **2-3%** (merged); **streaming correctness on both
+protocols**.
+
+**Not met, with the reason for each**:
+
+| target | status |
+|---|---|
+| single decoder 100 tok/s | **physically impossible** -- needs 1.76 TB/s, 7.7x the measured 228 GB/s |
+| TTFT better than llama.cpp | **~434 ms vs ~74 ms**; needs 238 GB/s against 170 demonstrated |
+| endpoint 16-concurrency >= 30 tok/s | **engine meets it (47.78); the endpoint does not (20.08)** -- nine prefill candidates closed, one shape left (register relay, round 233) |
+
+**And the session's own errors, all self-caught and all recorded**: three retractions (rounds 195,
+200, 215); four instrument traps (rounds 202-203, 218, 219, 220); and one projection corrected by
+implementation (round 232, where a measured mechanism turned out not to be an achievable change).
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
