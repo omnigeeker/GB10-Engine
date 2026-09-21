@@ -1964,6 +1964,45 @@ as "the wrong branch" -- **is where the endpoint's time actually goes.**
 caught only by following the round-214 reconciliation one step further, **rather than stopping
 when the first check passed.**
 
+## ROUND 215 IS RETRACTED -- ROUND 186 STANDS (round 216)
+
+**Round 215 concluded the endpoint wall is decode-dominated, because "16 GEMM calls x 435.94 ms"
+looked wrong once 435.94 ms was established as one full-model prefill.**
+
+**That reasoning was wrong. The check is arithmetic on the endpoint's own numbers:**
+
+| quantity | value |
+|---|---|
+| endpoint workload | 16 requests x ~16 tokens = **259 tokens** |
+| measured | **12.909 s at 20.08 tok/s** |
+| decode | 259 tokens at 47.78 tok/s (the measured B=16 rate) = **5.42 s** |
+| prefill | 16 requests x ~436 ms, **serialized** = **6.98 s** |
+| **sum** | **12.40 s vs 12.909 s measured -- within 4%** |
+
+**So the 16 prefill passes are one per REQUEST, not 16 per request.** Round 215 read "16 GEMM
+calls" as 16 calls within a single prefill -- **which would indeed have been absurd, but that is
+not what round 186 said.** The model closes to within 4%, and **round 186 stands.**
+
+### What survives from round 215
+
+**The observation that `forward-cost`'s `pre_ms` wraps a FULL forward pass** -- so **435.94 ms is
+one whole-model prefill and `17.608 GB / 435.94 ms = 40.4 GB/s` is the right reading.** That part
+was correct, **and it is what makes the 6.98 s figure coherent: 16 sequential full-model prefills.**
+
+### What does not survive
+
+**The conclusion that this is a decode problem and that the GEMV branch is the relevant one.**
+**Prefill is 6.98 s of a 12.9 s wall -- 54% -- and remains the right target. The 2.28x staging
+prize applies to that 54%, not to 3.4%.**
+
+### The rule
+
+**This is the session's third self-retraction (rounds 200, 195, and now 215), and the second one
+caused by misreading a number's SCOPE rather than its value.**
+
+> **When a model's terms disagree, check whether each is per-request, per-layer, per-matrix or
+> per-forward before concluding the model is wrong.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
