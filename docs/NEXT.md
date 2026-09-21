@@ -29,6 +29,41 @@ Two things make this the right next target rather than more prefill work:
   it to +64%.** The objective asks for otp to beat llama.cpp, and this is the path
   that does it rather than the path that defends a lead.
 
+### The B=1 step, decomposed for the first time (round 124)
+
+`nsys` on `forward-cost`, using the non-batch kernels (the `t <= 16` cut, so the
+small-`t` points exercise the same code the single stream uses):
+
+| kernel | launches/step | avg | total/step |
+|---|---|---|---|
+| `nvfp4_gemv_kernel` | 192 | **274.3 us** | **52.7 ms** |
+| `fp8_gemv_kernel` | 208 | **174.2 us** | **36.2 ms** |
+| **GEMV total** | 400 | | **88.9 ms = 85% of the 104.2 ms step** |
+
+The launch counts are exactly the model's matrix counts (64 layers x 3 NVFP4,
+64 x 3.25 FP8), so this is the whole decode and nothing else. The remaining ~15 ms
+is `gated_delta_rule_{chunk,step}_kernel` and `rmsnorm_zero_centered_kernel`.
+
+**The interesting number is the gap between the average and the median:**
+
+| | per launch, on 44.6 MB | GB/s | % of 228 peak |
+|---|---|---|---|
+| median | 234.6 us | **190.0** | **83%** |
+| average | 274.3 us | **162.6** | **71%** |
+
+So **the typical launch is already at 83% of peak** and the tail is what costs the
+difference -- stddev 302 us against a 234.6 us median, with a **maximum of
+4,858 us, 20x the median**. There are 6,190 launches in the profile and the tail is
+expensive enough to move the mean by 12 percentage points of bandwidth.
+
+**That tail is the new, unexamined thing.** Rounds 102-111 spent six rounds testing
+mechanisms on the *prefill* GEMM; the single-stream GEMV has never been decomposed
+before this round, and the first decomposition says the win is not in the typical
+launch but in the outliers. **Find out what the slow launches have in common before
+changing any kernel** -- the obvious candidates are L2-cold first touches, the
+`lm_head`'s different shape, and the prefill/decode boundary, and each is checkable
+by correlating launch index with duration in the nsys trace.
+
 **Where to start:** the B sweep in round 104 gives `nvfp4_gemv_kernel` ~271 us avg
 at B=1 across 23,940 launches, but nothing has decomposed that 104.2 ms/step by
 kernel. **Profile one decode step at B=1 first** -- exactly the step that was
