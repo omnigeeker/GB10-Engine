@@ -57,6 +57,33 @@ atomic per output element, sustained across 192 matrices per prefill. **If the a
 throughput is the new bottleneck the split will lose**, and the fallback is a second
 reduction kernel (two full-tile writes plus one add) rather than atomics.
 
+## The atomic risk is MEASURED AND ELIMINATED (round 150)
+
+The section above says to measure the atomics before implementing. Done, with a
+standalone kernel at the prefill's own launch shape (272 blocks x 128 threads) writing
+into an output of the prefill's own size (59 x 17408 floats):
+
+| | |
+|---|---|
+| atomic load, 2-way split of one prefill | 192 matrices x 2.2 M = **422 M atomics** |
+| **measured bursts** | 422 M in **4.0 / 4.0 / 5.0 ms** |
+| that rate | **~105 G atomics/s** |
+| needed to stay inside a 434 ms prefill | ~972 M atomics/s |
+| **margin / cost** | **~108x -> ~1% of the prefill** |
+
+**So the atomics are not a reason to avoid the split, and the fallback (a second
+reduction pass) is unnecessary.**
+
+One note on how this was read: the benchmark's printed *verdict* line said "0 M/s"
+because of an extra `/1e6` in the format expression. **The reliable output was the
+*time* -- 4.0, 4.0 and 5.0 ms -- and the rate is arithmetic on it.** Worth recording,
+because a broken derived number next to a good raw number is exactly the shape of
+error this session has hit repeatedly.
+
+**Nothing in this spec is now blocked:** the mechanism (47% occupancy, blocks-bound)
+is measured, the design has verified line anchors, and the main risk is eliminated.
+The remaining work is the four edits and the gate.
+
 ## Acceptance
 
 * **`generate --n 16` must be 16/16.** The gate is the only thing that makes a K split
