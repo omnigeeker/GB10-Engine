@@ -1310,6 +1310,52 @@ round-195 decomposition at once. **But it is not a constant swap: it is a real k
 and it needs a session that can iterate on it with the gate in the loop.** That session was not
 this one, and stopping here is what kept the tree green.
 
+## THE BIGGER-TILE LEVER IS CLOSED (round 199) -- gate green, 50% slower
+
+**The round-198 failure had one cause and it was found: the 4th `block_dim: (128,1,1)` belongs to
+an ATTENTION kernel at `crates/gb10-cuda/src/ops.rs:1120` (`grid_dim: (n_v_heads, 1, 1)`) that
+must stay at 128. Changing all four handed it 256 threads and produced garbage.**
+
+**Targeting only the three GEMM launches at `:1195`, `:1210`, `:1225` -- with `GB10_TT` 64->128,
+`GB10_GEMM_BLOCK` 128->256, `gemm2d_ids` to `>>5`/`&31`, and `GB10_TILE_T` 64->128 -- PASSED the
+gate 16/16 and `chunked-prefill`. The shape is CORRECT.**
+
+**And it is 50% slower:**
+
+| t | baseline | 256-thread / 128-token tile | |
+|---|---|---|---|
+| 32 | 400.01 | **600.43** [597.36-602.84] | **+50%** |
+| 64 | 435.94 | **658.00** [654.66-661.31] | **+51%** |
+
+### The reason is arithmetic, and it is fatal for this objective
+
+| t | tile columns useful | wasted |
+|---|---|---|
+| 32 | 32 of 128 | **75%** |
+| 64 | 64 of 128 | **50%** |
+| 128 | 128 of 128 | 0% |
+
+**The endpoint's prefill is ~59 tokens**, so the tile would be **46% empty** while the y-dimension
+block count **halves**. **The tile only pays for itself at t >= 128, which this workload never
+reaches** -- and `GB10_TILE_T = 64` was chosen to match exactly those ~59 tokens.
+
+**So the "bigger tile" lever is closed too, and closed by measurement with the gate green. The
+round-195 decomposition still stands (49% staging / 51% outer product); the specific fix it
+pointed at simply does not apply at the token counts that matter. Reverted.**
+
+### Six mechanisms closed, every one of them by measurement
+
+| # | mechanism | result |
+|---|---|---|
+| 1 | occupancy / K split | real, **2-3%** (merged) |
+| 2 | batched GEMV path | wrong branch |
+| 3 | dispatch cut | correct as-is |
+| 4 | redundant weight traffic | ruled out |
+| 5 | weight-layout contiguity | **falsified** (KC=64) |
+| 6 | **bigger tile at 256 threads** | **correct but 50% slower** (this round) |
+
+**The GEMM stays at 40.4 GB/s. No mechanism for the remaining 2.2x is currently identified.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
