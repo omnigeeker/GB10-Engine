@@ -416,7 +416,58 @@ empty stream; `generate --n 16` stays 16/16.
 Paris.` (or that plus a separate reasoning field), and `generate --n 16` must stay 16/16
 -- the tokenizer path must not change, only the response assembly.
 
-## CORRECTION (round 169): identify the units before reasoning about the numbers
+## CORRECTION TO THE CORRECTION (round 170): `pre_ms` DOES move the 17.608 GB
+
+**Round 169 retracted the round-168 conclusion. That retraction was wrong, and reading the
+harness is what shows it.**
+
+`crates/gb10-verify/src/main.rs:1019-1028`:
+
+```rust
+let mut st2 = ModelState::new(&dev, &model, args.max_seq, 1)?;
+let _ = model.prefill(&dev, &ids, &mut st2, &mut sc2)?;      // warm-up on `ids`
+let feed: Vec<u32> = vec![next; t];                          // t fresh tokens
+let t1 = std::time::Instant::now();
+let _ = model.prefill_seq(&dev, &feed, &mut st2, &mut sc2, 0)?;
+let pre_ms = t1.elapsed().as_secs_f64() * 1e3;
+```
+
+**`pre_ms` times `prefill_seq` over `t` tokens -- a real forward through all 64 layers,
+reading every weight once, inside a single 64-wide tile for both `t = 8` and `t = 16`.**
+So the traffic is **17.608 GB in both cases**, exactly as round 168 assumed:
+
+| t | `pre_ms` (mean of 3) | weight traffic | effective |
+|---|---|---|---|
+| 8 | **176.77 ms** | 17.608 GB | **99.6 GB/s** |
+| 16 | **298.27 ms** | 17.608 GB | **59.0 GB/s** |
+
+**Identical traffic, 1.69x the time. The prefill is therefore NOT weight-bandwidth-bound --
+it is bound by per-token work.** That conclusion stands, and the round-169 note is void.
+
+**And how it was broken is the lesson.** I inferred what a column meant from its *value*
+instead of from *the code that produced it*, then used that inference to retract a correct
+result. **That is the same error class as rounds 152 and 155 -- and this time I committed it
+while explicitly recording that error class.** One `sed -n` on the harness was all that was
+needed, before either conclusion.
+
+## The open question, now sharpened
+
+With the traffic attribution restored: the prefill moves 17.608 GB in 176.77 ms
+(**99.6 GB/s**) while doing 0.437 TFLOP (**2.47 TFLOPS**). **The closed form says a
+0.75 B/FMA tile at 99.6 GB/s can only sustain 0.27 TFLOPS -- a ~9x disagreement.** These
+cannot both be true, so one input is wrong:
+
+1. **`B/FMA` is not 0.75 for this kernel**, or
+2. **the FLOP/param count is low by ~9x**, or
+3. **`prefill_seq` reads more than one copy of the weights** (e.g. the MTP layer, or a
+   second pass).
+
+**That is now the single highest-value question, and it is answerable by reading
+`gemm2d_outer_bf16` and counting -- no GPU time required.** It also fits the standing
+observation that the prefill sits at 18% of the bandwidth roofline and a small fraction of
+the FMA roofline: **a 9x accounting error would explain exactly that shape.**
+
+## Superseded: the round-169 note (kept because the error is instructive)
 
 `forward-cost` prints `t | step_ms | pre_ms | ratio | ms/row`
 (`crates/gb10-verify/src/main.rs:1030`). At t=8 that is **step 831.62 ms, pre 177.50 ms**.
