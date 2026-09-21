@@ -2070,6 +2070,39 @@ here. **A true TTFT needs the streaming path** -- `/v1/chat/completions` with `s
 the Anthropic `/v1/messages` SSE form -- **and that is the right instrument for any future TTFT
 work.**
 
+## THE TTFT INSTRUMENT FAILS TOO (round 219)
+
+**Measured the streaming path with `curl -w '%{time_starttransfer}'`, expecting the first SSE
+chunk. Got `ttft = 0.000395 s` for a single request and `0.00` for all 16 concurrent.**
+
+**That is not a fast TTFT -- it is the wrong quantity.** `time_starttransfer` measures the first
+HTTP byte, **and the server flushes SSE headers immediately, before generating anything.** The
+instrument sees the response headers and reports ~0.
+
+**A true TTFT needs to parse the SSE body and time the first `data:` chunk that carries content.**
+`curl` cannot do that with `-w`; it needs either a small reader (python streaming, or a shell loop
+over `curl -N`) **or a server-side `GB10_TIMING=1` log line.**
+
+### And one anomaly, recorded as an anomaly
+
+**A single streaming request with `max_tokens = 24` took 8.73 s total, i.e. 2.75 tok/s** -- well
+below the recorded **9.66 tok/s** single-stream figure. **That is either a streaming-path penalty
+or a different prompt length, and it is UNVERIFIED.** It is recorded to be checked, not as a
+result.
+
+### The third instrument-level trap this session
+
+| round | instrument | what it actually measured |
+|---|---|---|
+| 202-203 | dead-load ablation | the compiler had removed the loads |
+| 218 | non-streaming `time_starttransfer` | a buffered response, so TTFT == TOTAL |
+| **219** | **streaming `time_starttransfer`** | **the SSE headers, not the first token** |
+
+**The pattern: an instrument that reports a number is not the same as an instrument that measures
+the intended quantity.** The cheap check is to ask **what the number would be if the instrument
+were measuring something else** -- and in all three cases that question would have caught it
+before the measurement was believed.
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
