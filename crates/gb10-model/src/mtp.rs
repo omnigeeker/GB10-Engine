@@ -29,7 +29,8 @@ pub struct MtpState {
     fc_in: CudaSlice<f32>,
     /// `fc` output, the attention layer's output, and the final norm.
     x: CudaSlice<f32>,
-    out: CudaSlice<f32>,
+    /// Layer output; the draft chain feeds this back as the next hidden.
+    pub out: CudaSlice<f32>,
     normed: CudaSlice<f32>,
     pub logits: CudaSlice<f32>,
     /// The head keeps its own KV cache; it must not share the decoder's.

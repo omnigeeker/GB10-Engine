@@ -130,6 +130,9 @@ pub struct ModelState {
     pub conv_snapshot: Vec<CudaSlice<f32>>,
     /// `n_keys` before the verification pass, per sequence.
     pub n_keys_snapshot: Vec<Vec<usize>>,
+    /// Token count before the verification pass. `prefill_seq` advances it, so
+    /// leaving it un-restored makes every later round read a stale row.
+    pub n_tokens_snapshot: usize,
     /// Token ids staged on the device for a batched decode step.
     pub tokens_dev: CudaSlice<i32>,
     /// Number of sequences this state is sliced into.
@@ -175,6 +178,7 @@ impl ModelState {
             tokens_dev: dev.stream().alloc_zeros::<i32>(n_seq)?,
             n_seq,
             n_tokens: 0,
+            n_tokens_snapshot: 0,
         })
     }
 
@@ -186,6 +190,7 @@ impl ModelState {
             dev.stream().memcpy_dtod(&l.conv_hist, &mut self.conv_snapshot[i])?;
             self.n_keys_snapshot[i].copy_from_slice(&l.n_keys);
         }
+        self.n_tokens_snapshot = self.n_tokens;
         Ok(())
     }
 
@@ -198,6 +203,7 @@ impl ModelState {
             l.n_keys.copy_from_slice(&self.n_keys_snapshot[i]);
             l.sync_positions(dev)?;
         }
+        self.n_tokens = self.n_tokens_snapshot;
         Ok(())
     }
 

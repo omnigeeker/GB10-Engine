@@ -751,7 +751,26 @@ fn mtp_probe(args: &Args) -> Result<()> {
 /// identical by construction. The gate checks that rather than trusting it,
 /// because an off-by-one in the draft/verify handshake still yields fluent
 /// text and a plausible-looking acceptance rate.
+/// Batched MTP speculative decoding, gated on reproducing plain greedy output.
+///
+/// This is where the three verified prerequisites are composed:
+///
+///   1. a forward from a non-empty KV cache (`attn_prefill` `start`/`kv_base`),
+///   2. per-row scoring (`Model::all_logits`),
+///   3. a reversible round (`snapshot_recurrent` / `restore_recurrent`).
+///
+/// The naive per-token loop measured 0.95x because every emitted token still
+/// needed its own 17.6 GB weight read. Batching is what changes that: one
+/// forward over `K` drafted tokens reads the weights **once**, so a round costs
+/// two weight reads (verify + commit) and emits `accepted + 2` tokens.
+/// Sequential decoding would need `accepted + 2` reads for the same tokens.
 fn mtp_generate(args: &Args, n_new: usize) -> Result<bool> {
+    use gb10_cuda::CudaSlice;
+
+    // Drafts verified per round. Every extra draft adds ~0.85 GB of head work
+    // against the 17.6 GB the verify forward costs anyway.
+    const K: usize = 4;
+
     let cfg = load_config(&args.model)?;
     let text = cfg.text_config.clone();
     let dev = Device::new(0)?;
@@ -782,60 +801,96 @@ fn mtp_generate(args: &Args, n_new: usize) -> Result<bool> {
     }
     let dt_ref = t0.elapsed().as_secs_f64();
 
-    // --- speculative: draft with the head, verify with a decoder step ---
-    // Invariant at the top of each round: `st.normed` is h_t and `cur` is
-    // x_{t+1}. The head guesses x_{t+2} from exactly those two; the decoder
-    // step on x_{t+1} then produces h_{t+1} and the true x_{t+2}.
+    // --- speculative ---
     let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
     let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
     let mut ms = MtpState::new(&dev, &text, args.max_seq, model.vocab_size())?;
-    let mut idx: gb10_cuda::CudaSlice<i32> = dev.stream().alloc_zeros::<i32>(1)?;
+    let h = text.hidden_size;
+    // Invariant at the top of a round: `chain[..h]` is the hidden at position P
+    // and `cur` is the token at P+1, predicted but not yet emitted.
+    let mut chain: CudaSlice<f32> = dev.stream().alloc_zeros::<f32>(h)?;
     let mut cur = model.prefill(&dev, &ids, &mut st, &mut sc)?;
+
     let t1 = std::time::Instant::now();
     let mut got: Vec<u32> = Vec::new();
-    let (mut hits, mut steps) = (0usize, 0usize);
-    // On acceptance `cur` becomes a token that was *just* emitted, so the naive
-    // "emit cur, then emit actual" loop pushes it a second time on the next
-    // round. Tracking whether `cur` is already in `got` is what keeps the
-    // emitted sequence equal to greedy. It also makes the accounting legible:
-    // each round runs exactly one decoder step and emits `1 + accepted` tokens,
-    // so the long-run rate is `1 + acceptance` tokens per step.
-    let mut emitted = false;
-    while got.len() < n_new && steps < n_new * 4 {
-        if !emitted {
-            if tok.is_eos(cur) {
-                break;
-            }
-            got.push(cur);
+    let (mut drafted, mut accepted, mut rounds) = (0usize, 0usize, 0usize);
+    while got.len() < n_new && rounds < n_new * 4 {
+        if tok.is_eos(cur) {
+            break;
         }
-        mtp.forward(&dev, &text, &st.normed, cur, &model.embed, &model.lm_head, &mut ms)?;
-        dev.ops().argmax(&dev, &ms.logits, &mut idx, model.vocab_size())?;
-        let draft = dev.stream().memcpy_dtov(&idx)?[0] as u32;
+        // Hidden at position P is the last row the decoder wrote. The row count
+        // has to come from the state, not the prompt length: after the first
+        // round the context has grown past `ids.len()`, and a stale count reads
+        // a row from the middle of the sequence -- which still yields fluent
+        // drafts, just wrong ones.
+        dev.ops()
+            .copy_last_row(&dev, &st.normed, &mut chain, st.n_tokens, h)?;
 
-        let actual = model.step(&dev, cur, &mut st, &mut sc)?;
-        steps += 1;
-        if draft == actual {
-            hits += 1;
-            if got.len() < n_new {
-                got.push(actual);
-                emitted = true;
-            } else {
-                emitted = true;
-            }
-        } else {
-            emitted = false;
+        // 1. Draft K tokens, chaining each draft's own hidden into the next.
+        let mut drafts: Vec<u32> = Vec::with_capacity(K);
+        let mut t = cur;
+        for _ in 0..K {
+            mtp.forward(&dev, &text, &chain, t, &model.embed, &model.lm_head, &mut ms)?;
+            let d = dev.stream().clone_dtoh(&ms.logits)?;
+            let d = d
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u32;
+            drafts.push(d);
+            dev.stream().memcpy_dtod(&ms.out, &mut chain)?;
+            t = d;
         }
-        cur = actual;
+
+        // 2. Verify: feed the known token plus K-1 drafts, score every row.
+        st.snapshot_recurrent(&dev)?;
+        let mut feed: Vec<u32> = Vec::with_capacity(K);
+        feed.push(cur);
+        feed.extend_from_slice(&drafts[..K - 1]);
+        model.prefill_seq(&dev, &feed, &mut st, &mut sc, 0)?;
+        model.all_logits(&dev, &mut st, K)?;
+        let pred = dev.stream().clone_dtoh(&st.idx_all)?;
+
+        // 3. Accept the longest matching prefix.
+        let mut acc = 0usize;
+        while acc < K - 1 && pred[acc] as u32 == drafts[acc] {
+            acc += 1;
+        }
+        let next_true = pred[acc] as u32;
+        drafted += K - 1;
+        accepted += acc;
+
+        // 4. Rewind, then commit only what survived. The Gated DeltaNet
+        //    recurrence cannot be unwound, so the rejected drafts must never
+        //    reach the real state -- hence the snapshot and this replay.
+        st.restore_recurrent(&dev)?;
+        let mut commit: Vec<u32> = Vec::with_capacity(acc + 2);
+        commit.push(cur);
+        commit.extend_from_slice(&drafts[..acc]);
+        commit.push(next_true);
+        got.push(cur);
+        for d in &drafts[..acc] {
+            got.push(*d);
+        }
+        got.push(next_true);
+        cur = model.prefill_seq(&dev, &commit, &mut st, &mut sc, 0)?;
+        rounds += 1;
     }
     let dt_spec = t1.elapsed().as_secs_f64();
+    // A round emits `accepted + 2` tokens at once, so it can overshoot.
+    got.truncate(n_new);
 
     let rps = want.len() as f64 / dt_ref;
     let sps = got.len() as f64 / dt_spec;
-    println!("== MTP speculative decoding ==");
+    println!("== MTP speculative decoding (batched verify, K={K}) ==");
     println!("  prompt: {prompt:?}");
     println!("  greedy reference : {:>3} tokens in {:.3}s -> {:.2} tok/s", want.len(), dt_ref, rps);
     println!("  MTP speculative  : {:>3} tokens in {:.3}s -> {:.2} tok/s", got.len(), dt_spec, sps);
-    println!("  draft acceptance : {hits}/{steps} = {:.1}%", 100.0 * hits as f64 / steps as f64);
+    println!(
+        "  draft acceptance : {accepted}/{drafted} = {:.1}%  over {rounds} rounds",
+        100.0 * accepted as f64 / drafted.max(1) as f64
+    );
     println!("  speedup          : {:.2}x", sps / rps);
 
     let same = got == want;

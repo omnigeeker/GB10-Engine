@@ -231,9 +231,45 @@ all_logits row 31 = 271, prefill_seq = 271
 
 All three prerequisites for the batched MTP verify now exist and are
 individually verified: a forward from a non-empty cache, per-row scoring, and a
-reversible round. What remains is to compose them into the draft/verify/accept
-loop and measure whether the composed path beats 1.0x -- the naive per-token
-loop measured 0.95x, and only batching the verification changes that.
+reversible round.
+
+### The composed loop is correct but 3x SLOWER (round 48)
+
+`mtp-generate` now runs the full batched scheme: draft `K=4` tokens by chaining
+the head's own hidden, snapshot, verify all 4 in one forward, accept the longest
+matching prefix, restore, then replay only the accepted tokens to commit.
+
+```
+greedy reference :  48 tokens in 5.527s -> 8.68 tok/s
+MTP speculative  :  48 tokens in 17.381s -> 2.76 tok/s
+draft acceptance : 7/63 = 11.1%  over 21 rounds
+speedup          : 0.32x
+token-exact vs greedy: YES
+```
+
+Correct output, but far slower than even the naive 0.95x version. Two distinct
+faults, and they need separating:
+
+1. **Acceptance collapsed to 11.1%** from 91.5% for a single draft. The first
+   draft does not depend on the chain, so something in the new plumbing is
+   wrong, not the head. Suspects, in order: the chained `ms.out` fed back as the
+   next hidden (a bug there would hurt drafts 2-4 but not the 11.1% figure),
+   `snapshot`/`restore` completeness, and the row index passed to
+   `copy_last_row`.
+2. **Each verify/commit forward is far more expensive than a decode step.**
+   Both read all 17.6 GB, but at 4-5 rows the prefill GEMM runs at a small
+   fraction of the bandwidth a 1-row GEMV manages -- the same small-token GEMM
+   inefficiency as M7. So "two weight reads per round" is not two *decode-step*
+   costs; the replay roughly triples the round.
+
+Finding (2) is the more fundamental one: it means the batched-verify idea has a
+much smaller budget than the round-40 arithmetic assumed. Before investing
+further, it needs a direct measurement of a `t`-row `prefill_seq` forward versus
+`t` single-row steps -- if a 4-row forward already costs more than 1 decode
+step, the whole scheme cannot pay off on this engine regardless of the head.
+
+Neither the naive nor the batched loop is wired into the server; both are
+diagnostics.
 
 ### The head was verified with a control, not just a happy path
 
