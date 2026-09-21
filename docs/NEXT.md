@@ -1,5 +1,43 @@
 # SESSION HANDOFF (read this first)
 
+## THE DELIVERED ENDPOINT DOES NOT SERVE CONCURRENT REQUESTS (round 91)
+
+This is an objective-level gap and it outranks TTFT. The objective asks for
+concurrent inference up to 16 at >= 30 tok/s aggregate *and* a usable local
+endpoint. The **engine** does that -- `batch-parity` is 16/16 exact at 40.75 tok/s
+-- but the **server does not use it**:
+
+```rust
+// crates/gb10-server/src/main.rs
+let state = ModelState::new(&dev, &model, MAX_SEQ, 1)?;   // n_seq = 1
+...
+for conn in listener.incoming() {                          // one connection at a time
+```
+
+`n_seq = 1` and a serial accept loop mean the endpoint handles **one request at a
+time**. Sixteen concurrent clients would queue, and the aggregate throughput would
+be 16x *worse* than the single-stream number, not 40.75 tok/s. So
+`batch-parity`'s result is not reachable through the endpoint the user was
+promised.
+
+**Fix, and it is bounded:**
+
+1. a worker thread that owns `Model`/`ModelState`/`Scratch`;
+2. an `mpsc` queue of pending requests, each carrying its own token stream
+   channel back to its connection thread;
+3. a batching loop that drains the queue (up to 16) and calls the existing
+   `step_batch`, emitting each sequence's token to its own channel;
+4. the accept loop spawns a thread per connection, which enqueues and then
+   forwards tokens as SSE.
+
+Every piece except the scheduler already exists and is verified
+(`step_batch`, `batch-parity`, the SSE writers). **Success test: 16 concurrent
+`curl` requests to `/v1/chat/completions`, aggregate >= 30 tok/s, and each stream
+individually correct.**
+
+That test -- not `batch-parity` -- is what the objective actually asks for, and
+until it passes the concurrency requirement is unverified end to end.
+
 ## BREAKTHROUGH (round 85): route short prompts to the batched GEMV
 
 The single biggest win of the project. `forward_prefill` was routing everything
