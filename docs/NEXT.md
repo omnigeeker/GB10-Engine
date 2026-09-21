@@ -688,6 +688,35 @@ iteration -- the same shape as the scale load.** If that is the real mechanism, 
 round, not after.** That is the first time in this session a rejected mechanism was caught
 in advance rather than by re-measuring it.
 
+### The latency hypothesis is testable from data already in hand (round 180)
+
+**If the batched GEMV is latency/dependency-bound, time is SUB-LINEAR in batch; if it is
+traffic-bound, time is LINEAR.** The two points already measured:
+
+| batch | `pre_ms` (mean of 3) |
+|---|---|
+| 8 | **176.77 ms** |
+| 16 | **298.27 ms** |
+
+**Ratio 1.687 for 2x the batch -- clearly sub-linear.** Fitting `T(B) = a + bB`:
+**b = 15.19 ms per batch row, a = 55.27 ms** -- **31% of the t=8 time does not depend on
+batch at all.**
+
+**So the prediction is supported: there is a large fixed component, which is what a
+dependency-chain stall looks like.**
+
+**But the fit is not yet trustworthy, and the reason is decisive:** if the 17.608 GB of
+weights stream once, then `a = 55.27 ms` implies **319 GB/s -- 40% above the measured
+228 GB/s peak, which is impossible.** So one of three things is wrong: the linear model, the
+17.608 GB traffic figure, or the mapping from batch size to the weight set.
+
+**Next step -- NO kernel change required.** Sweep `pre_ms` at five or more batch sizes and
+fit. **A curve that flattens is latency; a straight line through the origin is traffic.**
+`forward_cost` reports only t=8 and t=16 today (`crates/gb10-verify/src/main.rs:1068`
+dispatches to it), so the extra points need the sweep list in the harness extended -- **a
+harness edit with no correctness risk, which is exactly why it should be done before any
+kernel rewrite.**
+
 ### Superseded: the round-178 proposal
 
 **The batched GEMV re-reads `x` from L2 for every row group.** The kernel header names the
