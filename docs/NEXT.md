@@ -1405,6 +1405,48 @@ FULL amount of the removed FMA time or by less.**
 
 **That is a one-constant experiment with a recorded baseline, and it is the next thing to run.**
 
+## ROUND 200 IS NOT REPRODUCED AT A SECOND POINT (round 201)
+
+**The staging-only ablation, run at two token counts, 3 runs each:**
+
+| t | staging-only | full | difference |
+|---|---|---|---|
+| 32 | **178.88** [177.26-180.06] | 400.01 | **221.13** |
+| 64 | **213.63** [211.38-216.88] | 435.94 | **222.31** |
+
+**The pattern is INVERTED from what the serialization model requires.** Staging is the weight
+stream and should be **t-independent** -- yet it moves **178.88 -> 213.63 (+19%)** when t doubles.
+The outer product should **scale with t** -- yet the difference is **221.13 vs 222.31, essentially
+constant.**
+
+**Both have innocent explanations individually:** the tile is 64 tokens wide, so at t=32 half the
+columns are computed as zeros and the FMA count is the *same* as at t=64 -- **which explains the
+constant difference exactly**; and `stage_xtile` masks its loads by t, so staging legitimately
+varies.
+
+**But together they mean the round-200 "they add, they do not overlap" reading is NOT
+established.** The exact sum `214.08 + 221.86 = 435.94` was real arithmetic on real
+measurements -- **but it was ONE point, and a second point does not reproduce the same
+decomposition. A model that fits one point is not a model.**
+
+**This is the session's own rule applied to the session's own best finding:** *"a synthetic model
+matching on the endpoint but not the derivative is not a model of the kernel."* Round 200 matched
+the endpoint. Round 201 shows it does not match the derivative.
+
+### Status of each claim
+
+| claim | status |
+|---|---|
+| staging is 179-214 ms; outer product is ~221 ms; both large, neither dominates | **STANDS** (round 195) |
+| the two phases add exactly, so they do not overlap | **DOWNGRADED to unconfirmed** |
+| overlap is worth 1.96x | **unconfirmed** -- it depends on the claim above |
+
+**And t=32 is not an independent test**: with a 64-wide tile its FMA count equals t=64's, so it
+cannot probe FMA scaling. **A valid second point needs a change that actually alters the FMA
+count -- i.e. a shape change -- and every shape change tried so far has been coupled or a loss.**
+
+**Reverted; tree clean.**
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
