@@ -988,6 +988,58 @@ fn chunked_prefill(args: &Args, n_dec: usize) -> Result<bool> {
     Ok(same)
 }
 
+/// The measurement that decides whether batched MTP verification can ever pay.
+///
+/// Both paths read the same 17.6 GB of weights; the question is how the cost
+/// scales with rows. If one `t`-row `prefill_seq` costs about the same as one
+/// single-row `step`, then verifying `t` drafts in one forward is a real `t`x
+/// saving. If it costs close to `t` steps, the scheme cannot pay off here no
+/// matter how cheap the head is.
+fn forward_cost(args: &Args) -> Result<()> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let model = Model::load_from(&dev, cfg, &args.model)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+    let ids = tok.encode("The quick brown fox jumps over the lazy dog.", false)?;
+
+    println!("== cost of a t-row forward vs t single-row steps ==");
+    println!("     t   t x step(ms)   one t-row fwd(ms)   ratio   per-row");
+    for t in [1usize, 2, 4, 8, 16] {
+        let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+        let mut sc = Scratch::new(&dev, &text, args.max_seq)?;
+        let mut next = model.prefill(&dev, &ids, &mut st, &mut sc)?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..t {
+            next = model.step(&dev, next, &mut st, &mut sc)?;
+        }
+        dev.synchronize()?;
+        let step_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let mut st2 = ModelState::new(&dev, &model, args.max_seq, 1)?;
+        let mut sc2 = Scratch::new(&dev, &text, args.max_seq)?;
+        let _ = model.prefill(&dev, &ids, &mut st2, &mut sc2)?;
+        let feed: Vec<u32> = vec![next; t];
+        dev.synchronize()?;
+        let t1 = std::time::Instant::now();
+        let _ = model.prefill_seq(&dev, &feed, &mut st2, &mut sc2, 0)?;
+        dev.synchronize()?;
+        let pre_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        println!(
+            "  {t:>4}   {step_ms:>12.2}   {pre_ms:>16.2}   {:>5.2}   {:>7.2} ms/row",
+            pre_ms / step_ms,
+            pre_ms / t as f64
+        );
+    }
+    println!();
+    println!("ratio ~1.0 means rows are nearly free and batched verify can pay;");
+    println!("ratio ~t means a t-row forward costs t steps and it cannot.");
+    println!();
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1011,6 +1063,10 @@ fn main() -> Result<()> {
                 bail!("generate gate FAILED");
             }
             println!("\ngenerate: OK");
+            return Ok(());
+        }
+        "forward-cost" => {
+            forward_cost(&args)?;
             return Ok(());
         }
         "chunked-prefill" => {
@@ -1049,7 +1105,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill|forward-cost)"
         ),
     };
 

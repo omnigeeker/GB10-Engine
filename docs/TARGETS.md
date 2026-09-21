@@ -262,13 +262,41 @@ faults, and they need separating:
    inefficiency as M7. So "two weight reads per round" is not two *decode-step*
    costs; the replay roughly triples the round.
 
-Finding (2) is the more fundamental one: it means the batched-verify idea has a
-much smaller budget than the round-40 arithmetic assumed. Before investing
-further, it needs a direct measurement of a `t`-row `prefill_seq` forward versus
-`t` single-row steps -- if a 4-row forward already costs more than 1 decode
-step, the whole scheme cannot pay off on this engine regardless of the head.
+### The decisive measurement: rows are nearly free, but the prefill path is 3x off (round 49)
 
-Neither the naive nor the batched loop is wired into the server; both are
+`gb10-verify forward-cost` compares one `t`-row `prefill_seq` forward against `t`
+single-row `step`s:
+
+| t | t x step | one t-row forward | ratio | per row |
+|---|---|---|---|---|
+| 1 | 119.30 ms | 387.81 ms | 3.25 | 387.81 ms |
+| 2 | 235.22 ms | 385.18 ms | 1.64 | 192.59 ms |
+| 4 | 454.94 ms | 388.08 ms | 0.85 | 97.02 ms |
+| 8 | 930.59 ms | 396.03 ms | 0.43 | 49.50 ms |
+| 16 | 1844.14 ms | 404.08 ms | 0.22 | 25.25 ms |
+
+Two conclusions, and they point the same way:
+
+**1. Marginal rows are essentially free.** The forward costs ~390 ms whether it
+processes 1 row or 16. So batched verification *can* pay -- the round-40
+arithmetic was not wrong about that. The fault is the commit replay: two ~390 ms
+forwards per round is worse than `accepted + 2` decode steps at 119 ms each. One
+forward that could be used directly would emit up to 5 tokens for 390 ms, i.e.
+78 ms/token against 119 ms/token -- roughly **1.5x**.
+
+**2. The prefill path runs at 45 GB/s, 20% of the 228 GB/s roofline**, against
+the decode GEMV's 148 GB/s (65%). At `t=1` a prefill-style forward is 3.25x
+*slower* than a decode step that reads exactly the same 17.6 GB. That is a
+kernel-efficiency defect, not a fundamental limit, and it is the same defect
+behind the TTFT gap (452.6 ms vs llama.cpp's ~74 ms).
+
+So the highest-value target is now the prefill/GEMM path, and it is doubly
+motivated: it is the TTFT number the objective asks for, and it is the
+prerequisite for the MTP scheme to pay off at all. Continuing to patch the MTP
+pipeline while its verify forward is 3x off would be optimizing the wrong
+thing.
+
+Neither the naive nor the batched MTP loop is wired into the server; both are
 diagnostics.
 
 ### The head was verified with a control, not just a happy path
