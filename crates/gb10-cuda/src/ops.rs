@@ -1185,10 +1185,14 @@ impl Ops {
         x: &CudaSlice<f32>, y: &mut CudaSlice<f32>, n: usize, k: usize, t: usize,
     ) -> Result<()> {
         let (nn, kk, tt) = (n as i32, k as i32, t as i32);
+        // K-SPLIT host half (round 187): split K across grid.z, zero y first because
+        // block>0 accumulates. The kernel half (nsplit = gridDim.z) is already in.
+        let want = t * n;
+        dev.stream().memset_zeros(&mut y.slice_mut(..want))?;
         unsafe {
             dev.stream().launch_builder(&self.nvfp4_gemm)
                 .arg(w).arg(wscale).arg(scale2).arg(x).arg(y).arg(&nn).arg(&kk).arg(&tt)
-                .launch(LaunchConfig { grid_dim: (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
+                .launch(LaunchConfig { grid_dim: (cdiv(n,GB10_NR), cdiv(t,GB10_TILE_T), 2), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }

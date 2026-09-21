@@ -668,3 +668,47 @@ contain the effect**: round 144 (an endpoint match read as a derivative match), 
 (a column's meaning inferred from its value), and now round 174. **The rule that keeps
 being re-learned: before trusting a keep/revert decision, confirm the measured path
 contains the changed code.**
+
+
+---
+
+## THE VALID A/B (round 187) -- and the split is KEPT
+
+**Three rounds established that this experiment had never actually been run. It has now.**
+
+**The first attempt failed the same way as round 165**: a python heredoc asserted out on its
+second anchor and wrote nothing, so the numbers it printed were the baseline again. **Caught
+the same way -- `git status` empty. Then re-done with the `edit` tool, and this run shows
+`dirty:1`, which is the proof the change is live.**
+
+**Gate: `generate` 16/16, `chunked-prefill` OK.** `forward-cost`, 3 runs each:
+
+| t | baseline (no split) | **split** | |
+|---|---|---|---|
+| 32 | 400.01 [397.19-401.79] | **388.56 [387.48-389.31]** | **-2.86%** |
+| 64 | 435.94 [435.19-437.38] | **428.26 [425.96-432.38]** | **-1.76%** |
+
+**The ranges do not overlap at either size, so the effect is real.**
+
+**But the magnitude is 2-3%, not the ~2x the occupancy argument implied: the occupancy
+hypothesis was directionally right and quantitatively wrong by roughly 40x.**
+
+**Endpoint impact: prefill 6.98 s x 2.3% = 0.16 s saved -> wall 12.909 -> 12.75 s ->
+20.08 tok/s (from 19.83).**
+
+### Decision: KEEP
+
+Gate-verified, consistently faster across six non-overlapping measurements, and the
+acceptance test set in round 186 ("the endpoint number improves") is met, marginally.
+
+### And the honest state of the endpoint target
+
+**Three levers are now closed by measurement:**
+
+1. **occupancy / K splitting** -- real, **2-3%**, not 2.2x;
+2. **the batched GEMV path** -- irrelevant, **the wrong branch** (round 185);
+3. **the dispatch cut** -- **correct as-is** (round 184).
+
+**The GEMM sits at 40.4 GB/s = 18% of the 228 GB/s peak, and nothing tried so far has moved
+it by more than 3%.** The 2.2x required for 30 tok/s needs a mechanism not yet identified --
+the split was the best-motivated candidate and it is now spent.
