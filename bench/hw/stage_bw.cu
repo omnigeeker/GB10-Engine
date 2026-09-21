@@ -110,6 +110,30 @@ __global__ void read_staging_z(const char* __restrict__ w, int K, int N, int nch
     if (s == 0xdeadbeefULL) *out = s;
 }
 
+// D: 4 lanes x 16 B -- a SINGLE 16-byte load per thread, so one instruction's
+// warp footprint is 8 rows x 64 B. This is exactly what round 77 built into the
+// kernel, and it was neutral. Comparing it against B (4 rows x 64 B) isolates
+// the row count with bytes-per-row held fixed.
+__global__ void read_staging_8r64b(const char* __restrict__ w, int K, int N, int nchunk,
+                                   unsigned long long* out) {
+    const int nbase = blockIdx.x * TN;
+    unsigned long long s = 0;
+    for (int c = 0; c < nchunk; ++c) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int u = threadIdx.x + p * BLOCK;
+            const int nl = u / 4, pr = u % 4;
+            const int n = nbase + nl;
+            if (n < N) {
+                const size_t off = (size_t)n * (K >> 1) + c * 64 + pr * 16;
+                const uint4 v = __ldg(reinterpret_cast<const uint4*>(w + off));
+                s += v.x + v.y + v.z + v.w;
+            }
+        }
+    }
+    if (s == 0xdeadbeefULL) *out = s;
+}
+
 int main(int argc, char** argv) {
     // One layer's NVFP4 weights are ~150 MB; the model streams ~9.63 GB of them
     // across 64 layers, so a 150 MB buffer repeated 64x reproduces both the
@@ -131,7 +155,7 @@ int main(int argc, char** argv) {
     const int gridA = (int)(bytes / 16 / BLOCK);
     const int gridB = (N + TN - 1) / TN;
 
-    for (int which = 0; which < 4; ++which) {
+    for (int which = 0; which < 5; ++which) {
         // warm
         if (which == 0)
             read_contig<<<gridA, BLOCK>>>((const uint4*)buf, bytes / 16, out);
@@ -139,8 +163,10 @@ int main(int argc, char** argv) {
             read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
         else if (which == 2)
             read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
-        else
+        else if (which == 3)
             read_staging_z<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk, out);
+        else
+            read_staging_8r64b<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk64, out);
         check(cudaDeviceSynchronize(), "warmup");
 
         check(cudaEventRecord(a), "record");
@@ -151,8 +177,10 @@ int main(int argc, char** argv) {
                 read_staging<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk, out);
             else if (which == 2)
                 read_staging64<<<gridB, BLOCK>>>((const uint2*)buf, K, N, nchunk64, out);
-            else
+            else if (which == 3)
                 read_staging_z<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk, out);
+            else
+                read_staging_8r64b<<<gridB, BLOCK>>>((const char*)buf, K, N, nchunk64, out);
         }
         check(cudaEventRecord(b), "record");
         check(cudaEventSynchronize(b), "sync");
@@ -167,7 +195,8 @@ int main(int argc, char** argv) {
                     which == 0 ? "contig"
                                : (which == 1 ? "4lane x 8B (32B/row)"
                                              : (which == 2 ? "8lane x 8B (64B/row)"
-                                                           : "8lane x 4B (32B/row)")),
+                                                           : (which == 3 ? "4row x 32B/row"
+                                                                         : "8row x 64B/row"))),
                     ms, gb, gb / (ms / 1000.0));
     }
 

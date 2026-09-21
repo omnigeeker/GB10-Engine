@@ -767,12 +767,43 @@ probe's fast pattern presented **4 rows x 64 B**; the GEMV streams one row
 contiguously. My round-77 attempt produced **8 rows x 64 B** -- more bytes, same
 eight-way row scatter, which is why it was neutral.
 
-**The next attempt should reduce the row count per instruction, not raise the
-bytes.** A warp that streams down one or two rows instead of eight is what the
-GEMV path does and what the 4-row probe pattern did. That is a change to the
-staging's thread-to-row mapping and to how the tile is laid out in shared memory,
-since the outer product currently expects `wt[k][n]` with `n` spread across
-threads.
+### Rows per instruction is not the variable either (round 80)
+
+The 4-row hypothesis was tested by adding a fourth pattern that reproduces
+**exactly** what round 77 built into the kernel -- a single 16-byte load per
+thread, 4 lanes per row, so one instruction's footprint is 8 rows x 64 B:
+
+| pattern | rows per instruction | bytes/row | GB/s |
+|---|---|---|---|
+| 4 lane x 8 B | 8 | 32 | 89.8 |
+| 8 lane x 8 B | 4 | 64 | 176.9 |
+| 8 lane x 4 B | 4 | 32 | 101.8 |
+| **4 lane x 16 B (round 77's fix)** | **8** | **64** | **181.0** |
+
+**8 rows x 64 B is just as fast as 4 rows x 64 B.** Rows per instruction is not
+the variable; bytes per row is (32 B -> ~90-102, 64 B -> ~177-181).
+
+**Which makes round 77's null result conclusive rather than puzzling.** The
+kernel change did produce the 8-row x 64 B pattern, and that pattern measures
+181 GB/s in isolation -- yet it was neutral in the kernel. So the staging is
+**not limited by its DRAM access pattern at all**. Changing a 90 GB/s pattern
+into a 181 GB/s pattern bought nothing.
+
+This closes the DRAM line for good. Three independent attempts have now been made
+to exploit the pattern (rounds 60, 76, 77) and the profiler's 58 GB/s has
+survived all of them.
+
+**What is left for the staging is the work that is not the load**: the 16
+`e2m1_to_float` dequantisations and 32 shared stores per thread per unit, and the
+shared traffic the outer product then reads back. Round 71 removed the
+dequantisation ALU from the *old* staging and saw nothing, but that was before the
+pattern was known to be irrelevant; it should be repeated, and the shared stores
+tested the same way, now that the load side is ruled out.
+
+Note also what this says about the probe: it correctly ranked the patterns, and
+it correctly showed the round-77 pattern was fast. It simply cannot tell you
+whether a fast pattern is what the kernel is waiting on. **A probe measures what
+a pattern can reach, never what the kernel is blocked by.**
 
 ### A caution learned in round 64
 
