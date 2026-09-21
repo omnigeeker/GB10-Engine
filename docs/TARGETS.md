@@ -296,6 +296,40 @@ prerequisite for the MTP scheme to pay off at all. Continuing to patch the MTP
 pipeline while its verify forward is 3x off would be optimizing the wrong
 thing.
 
+### Where the prefill time goes, and why (round 50)
+
+`nsys` on `forward-cost`, per prefill:
+
+| kernel | ms per forward | bytes read | GB/s |
+|---|---|---|---|
+| `nvfp4_gemm_kernel` | 233 | 9.63 GB (mlp) | **41** |
+| `fp8_gemm_kernel` | 133 | 5.59 GB | **42** |
+| (decode GEMV, for contrast) | | | **148** |
+
+Both GEMMs sit at **~18% of the 228 GB/s roofline**, against the GEMV's 65%.
+Resource use is not the cause: `nvfp4_gemm_kernel` needs 54 registers and 26112 B
+of shared, so three blocks fit per SM.
+
+The tile geometry is the suspect. `GB10_KC` is 32 k-values per chunk, and the
+weight tile per block per chunk is `GB10_TN x GB10_KC` = 64x32 = 2048 uint16,
+i.e. **16 bytes of weight load per thread per chunk**. That is one 16-byte load
+per thread per chunk, so each chunk is a latency serialisation point rather than
+a bandwidth streaming one: 160 chunks per K=5120 projection, each with two
+`__syncthreads()`, and too little in flight to hide the ~600 ns DRAM latency.
+The same tile is loaded and dequantised identically at `t=1` and `t=16`, which
+is consistent with the measured flat ~390 ms.
+
+The fix is to raise `GB10_KC` so each chunk carries enough bytes per thread to
+cover latency. That is a shared-memory budgeting exercise, not a rewrite:
+`xt[2][KC][GB10_TT+4]` floats plus `wt[2][KC][GB10_TN+4]` are already 26112 B at
+KC=32, and the 48 KB static limit blocks a naive doubling. Tightening the
+strides (`+4` padding to `+1`) buys KC=64 at roughly 50 KB, still marginal, so
+this needs a real look at the padding and the `xt` dtype rather than a constant
+flip.
+
+This is the next thing to do, and it is worth doing carefully: a 3x gain here
+moves TTFT and unblocks MTP at the same time.
+
 Neither the naive nor the batched MTP loop is wired into the server; both are
 diagnostics.
 
