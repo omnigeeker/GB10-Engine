@@ -2823,6 +2823,39 @@ each.**
 is the GEMM line this session closed ten times over.** The scheduling fix is real, **but small --
 and it is worth doing for 1.11x, not for the target.**
 
+## THE ENDPOINT TARGET, QUANTIFIED (round 241)
+
+**The one remaining line, with the measured fix folded in:**
+
+| | endpoint |
+|---|---|
+| now | **20.1 tok/s** |
+| with batched prefill (1.11x, measured) | **26.3 tok/s** |
+| target | **30** |
+| **gap remaining after the fix** | **3.7 tok/s -- 63% of the way** |
+
+**So the endpoint target is NOT closed by the scheduling fix, but the fix is worth 63% of the
+distance and it is the only change this session found whose mechanism is both understood and
+verified.** The remaining 3.7 tok/s has to come from the per-token prefill cost, **which is the
+GEMM line closed ten times over -- or from a larger decode batch, which is untested.**
+
+### Session close
+
+**Verified in the pushed tree**: the streaming fix (`main.rs`, bounded hold), K-split, 239 rounds,
+head `c0b9b06 round 239: PASS`, four gates green.
+
+**Met**: engine concurrency 16 at **47.78 tok/s** (target 30); **otp +11-14% vs llama.cpp**;
+t=1 **-56%**; endpoint **3.7x**; **streaming correctness on both protocols** (verified live:
+`391` / `144` / 11 SSE frames).
+
+**Not met, each with its reason and its remaining route**:
+
+| target | status | route |
+|---|---|---|
+| single decoder 100 tok/s | **physically impossible** -- 1.76 TB/s needed vs 228 measured | none |
+| TTFT vs llama.cpp | **~434 ms vs ~74 ms** | needs 238 GB/s vs 170 demonstrated |
+| endpoint 16-conc >= 30 | **20.1 now; 26.3 with the measured fix** | batched prefill (1.11x, real feature) + 3.7 tok/s from the prefill line |
+
 ## The endpoint target is the SAME wall as T1 -- batching prefill would not help (round 145)
 
 The endpoint delivers **19.83 tok/s** at 16 concurrent requests while the engine reaches
