@@ -591,6 +591,30 @@ independent of `b`. **What is not:** how many times the weights are actually fet
 `gridDim` and `blockIdx.y` from the GEMV, or read the host launch site's `grid_dim`.**
 **Do that before any further reasoning about this kernel's bandwidth.**
 
+### RESOLVED (round 176): there are TWO GEMV kernels, and batch>1 uses the other one
+
+`crates/gb10-cuda/src/kernels.rs`:
+
+| line | |
+|---|---|
+| 9 / 12 | `"nvfp4_gemv_kernel"`, `"nvfp4_gemv_batch_kernel"` |
+| 33 / 34 | `nvfp4_gemv: CudaFunction`, `nvfp4_gemv_batch: CudaFunction` |
+| 88 | `.launch_builder(&self.nvfp4_gemv_batch)` -- the **batch > 1** path |
+| 96 | `let f = &self.nvfp4_gemv;` -- the **batch == 1** path |
+
+**`nvfp4_gemv(...)` dispatches on batch size, and batch > 1 goes to a DIFFERENT kernel.**
+`nvfp4_gemv_tmpl` -- the body I read in round 175 -- is the batch == 1 family, and its
+`blockIdx.y`-as-batch structure is not the batched kernel's structure.
+
+**So every bandwidth number I derived for "the batched GEMV" (99.6 GB/s at t=8, 59.0 GB/s at
+t=16, and the 190 -> 59 decline) belongs to a kernel whose source has not been read.** It
+also dissolves the round-175 arithmetic tension: the per-batch weight re-read I inferred
+from `xb = x + b*K` was inferred from the *wrong kernel's* template.
+
+**Next step, precisely: read `nvfp4_gemv_batch_kernel`'s body and its launch `grid_dim`.**
+**That is where the endpoint's prefill cost actually lives, and no bandwidth claim about
+the batched path is usable until it has been read.**
+
 ### Next step
 
 **A shape question about the GEMV's batch handling** (`kernels/gemv.cu`, `GB10_BATCH_MAX`,
