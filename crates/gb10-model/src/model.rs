@@ -253,6 +253,7 @@ impl Model {
 
         state.n_tokens += 1;
         let v = dev.stream().memcpy_dtov(&state.idx)?;
+        dev.check_err()?;
         Ok(v[0] as u32)
     }
 
@@ -309,6 +310,7 @@ impl Model {
 
         state.n_tokens += 1;
         let v = dev.stream().memcpy_dtov(&state.idx)?;
+        dev.check_err()?;
         Ok(v.iter().map(|&x| x as u32).collect())
     }
 
@@ -337,12 +339,50 @@ impl Model {
         seq: usize,
     ) -> Result<u32> {
         let t = tokens.len();
+        self.forward_normed(dev, tokens, state, sc, seq)?;
+
+        // Only the final prompt row needs logits; running lm_head over all `t`
+        // rows would re-read 715 MB of weights per prompt token.
+        let hidden = self.text().hidden_size;
+        dev.ops()
+            .copy_last_row(dev, &state.normed, &mut state.last, t, hidden)?;
+        self.lm_head.forward(dev, &state.last, &mut state.logits, 1)?;
+        dev.ops()
+            .argmax(dev, &state.logits, &mut state.idx, self.vocab_size())?;
+        let v = dev.stream().memcpy_dtov(&state.idx)?;
+        dev.check_err()?;
+        Ok(v[0] as u32)
+    }
+
+    /// Run `tokens` through the whole stack and leave the final-norm rows of
+    /// *every* position in `state.normed` (`[t, hidden]`), with no `lm_head`.
+    ///
+    /// This is the shared body of `prefill_seq`, which then scores only the
+    /// last row, and of the perplexity path, which has to score a whole window
+    /// of rows and therefore drives `lm_head` itself.
+    ///
+    /// `seq` selects which sequence slot of a multi-sequence state the conv
+    /// history, recurrence and KV cache land in. The residual buffers are
+    /// transient, so it does not change how the prompt is computed.
+    pub fn forward_normed(
+        &self,
+        dev: &Device,
+        tokens: &[u32],
+        state: &mut ModelState,
+        sc: &mut Scratch,
+        seq: usize,
+    ) -> Result<()> {
+        let t = tokens.len();
         if t == 0 {
-            anyhow::bail!("prefill: empty prompt");
+            anyhow::bail!("forward_normed: empty prompt");
         }
         let text = self.text();
         let hidden = text.hidden_size;
-        let eps = text.rms_norm_eps as f32;
+        anyhow::ensure!(
+            t <= state.normed.len() / hidden,
+            "forward_normed: {t} rows exceeds the state's max_seq of {}",
+            state.normed.len() / hidden
+        );
 
         let ids: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
         let ids_dev = dev.stream().clone_htod(&ids)?;
@@ -354,8 +394,6 @@ impl Model {
             std::mem::swap(&mut state.a, &mut state.b);
         }
 
-        // Only the final prompt row needs logits; running lm_head over all `t`
-        // rows would re-read 715 MB of weights per prompt token.
         dev.ops().rmsnorm_zero_centered(
             dev,
             &state.a,
@@ -363,16 +401,15 @@ impl Model {
             &mut state.normed,
             t,
             hidden,
-            eps,
+            text.rms_norm_eps as f32,
         )?;
-        dev.ops()
-            .copy_last_row(dev, &state.normed, &mut state.last, t, hidden)?;
-        self.lm_head.forward(dev, &state.last, &mut state.logits, 1)?;
-        dev.ops()
-            .argmax(dev, &state.logits, &mut state.idx, self.vocab_size())?;
         state.n_tokens += t;
-        let v = dev.stream().memcpy_dtov(&state.idx)?;
-        Ok(v[0] as u32)
+        // The temporary `ids_dev` above is dropped at the end of this function,
+        // and `CudaSlice::drop` synchronises the stream and swallows whatever
+        // that sync reports. Surface it here, before the caller scores these
+        // rows, so an aborted kernel cannot become a quiet wrong answer.
+        dev.check_err()?;
+        Ok(())
     }
 }
 
@@ -467,6 +504,7 @@ impl Model {
 
         state.n_tokens += 1;
         let v = dev.stream().memcpy_dtov(&state.idx)?;
+        dev.check_err()?;
         Ok((v[0] as u32, pt))
     }
 }

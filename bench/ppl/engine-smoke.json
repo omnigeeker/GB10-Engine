@@ -1,0 +1,15 @@
+{
+  "first": 256,
+  "kind": "gb10-engine-ppl",
+  "mean_nll": 1.8169219096027904,
+  "model": "models/Qwen3.8-27B-NVFP4",
+  "n_ctx": 512,
+  "ppl": 6.152890119749954,
+  "ppl_stderr_window": 0.19281626844963246,
+  "predictions": 765,
+  "preds_per_window": 255,
+  "quant": "nvfp4-fp8-mixed (modelopt)",
+  "tokens_file": "bench/ppl/wiki.tokens.txt",
+  "wall_s": 20.933682031,
+  "windows": 3
+}

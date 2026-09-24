@@ -101,6 +101,22 @@ impl Device {
         Ok(())
     }
 
+    /// Raise any CUDA error the driver recorded and cudarc swallowed.
+    ///
+    /// `CudaSlice::drop` synchronises the stream and hands the result to
+    /// `CudaContext::record_err`, which stores it in an atomic rather than
+    /// raising it. An asynchronous failure -- an illegal access, a launch
+    /// abort, a watchdog kill under contention -- therefore sets a sticky
+    /// error that nothing reports, and the engine carries on reading whatever
+    /// the failed kernel left in its output buffer. On the argmax that is a
+    /// wrong token that still decodes to fluent text, so it is invisible.
+    ///
+    /// Calling this before a result is trusted turns that into a hard failure.
+    /// It is an atomic swap on the host, with no device work.
+    pub fn check_err(&self) -> Result<()> {
+        Ok(self.ctx.check_err()?)
+    }
+
     /// Device name, e.g. `NVIDIA GB10`.
     pub fn name(&self) -> Result<String> {
         Ok(self.ctx.name()?)

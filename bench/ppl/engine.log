@@ -1,0 +1,68 @@
+perplexity: 297054 tokens
+  n_ctx=512 first=256 preds/window=255 windows=580 (max 580)
+  model loaded in 75.6s
+  [0] ppl=4.5006  4.42s/window  eta 42.7 min
+  [10] ppl=7.5017  9.12s/window  eta 86.5 min
+  [20] ppl=6.8307  6.93s/window  eta 64.6 min
+  [30] ppl=5.7000  6.21s/window  eta 56.8 min
+  [40] ppl=6.1063  5.92s/window  eta 53.2 min
+  [50] ppl=6.2927  5.73s/window  eta 50.5 min
+  [60] ppl=6.5437  5.56s/window  eta 48.1 min
+  [70] ppl=6.9565  5.32s/window  eta 45.1 min
+  [80] ppl=6.8289  5.12s/window  eta 42.6 min
+  [90] ppl=6.8250  4.96s/window  eta 40.4 min
+  [100] ppl=6.8378  4.85s/window  eta 38.7 min
+  [110] ppl=7.0219  4.73s/window  eta 37.0 min
+  [120] ppl=7.0769  4.65s/window  eta 35.6 min
+  [130] ppl=6.8720  4.58s/window  eta 34.3 min
+  [140] ppl=6.8486  4.51s/window  eta 33.0 min
+  [150] ppl=6.7084  4.46s/window  eta 31.9 min
+  [160] ppl=6.5419  4.41s/window  eta 30.8 min
+  [170] ppl=6.6290  4.37s/window  eta 29.8 min
+  [180] ppl=6.8332  4.33s/window  eta 28.8 min
+  [190] ppl=6.8970  4.30s/window  eta 27.9 min
+  [200] ppl=6.9438  4.27s/window  eta 27.0 min
+  [210] ppl=6.9966  4.24s/window  eta 26.1 min
+  [220] ppl=6.8948  4.22s/window  eta 25.2 min
+  [230] ppl=6.7800  4.20s/window  eta 24.5 min
+  [240] ppl=6.7169  4.18s/window  eta 23.6 min
+  [250] ppl=6.8037  4.16s/window  eta 22.8 min
+  [260] ppl=6.8008  4.15s/window  eta 22.0 min
+  [270] ppl=6.7955  4.13s/window  eta 21.3 min
+  [280] ppl=6.7719  4.11s/window  eta 20.5 min
+  [290] ppl=6.7921  4.09s/window  eta 19.7 min
+  [300] ppl=6.8111  4.08s/window  eta 19.0 min
+  [310] ppl=6.8122  4.08s/window  eta 18.3 min
+  [320] ppl=6.8270  4.06s/window  eta 17.5 min
+  [330] ppl=6.8309  4.05s/window  eta 16.8 min
+  [340] ppl=6.8187  4.04s/window  eta 16.1 min
+  [350] ppl=6.8176  4.03s/window  eta 15.4 min
+  [360] ppl=6.8240  4.02s/window  eta 14.7 min
+  [370] ppl=6.9583  4.02s/window  eta 14.0 min
+  [380] ppl=7.0551  4.01s/window  eta 13.3 min
+  [390] ppl=7.1121  4.00s/window  eta 12.6 min
+  [400] ppl=7.1069  3.99s/window  eta 11.9 min
+  [410] ppl=7.0979  3.99s/window  eta 11.2 min
+  [420] ppl=7.0910  3.98s/window  eta 10.5 min
+  [430] ppl=7.1070  3.98s/window  eta 9.9 min
+  [440] ppl=7.1210  3.97s/window  eta 9.2 min
+  [450] ppl=7.0866  3.97s/window  eta 8.5 min
+  [460] ppl=7.1181  3.96s/window  eta 7.9 min
+  [470] ppl=7.1236  3.95s/window  eta 7.2 min
+  [480] ppl=7.1424  3.95s/window  eta 6.5 min
+  [490] ppl=7.1087  3.94s/window  eta 5.8 min
+  [500] ppl=7.1291  3.94s/window  eta 5.2 min
+  [510] ppl=7.1317  3.93s/window  eta 4.5 min
+  [520] ppl=7.1173  3.93s/window  eta 3.9 min
+  [530] ppl=7.1179  3.92s/window  eta 3.2 min
+  [540] ppl=7.1230  3.92s/window  eta 2.5 min
+  [550] ppl=7.0557  3.92s/window  eta 1.9 min
+  [560] ppl=7.0974  3.91s/window  eta 1.2 min
+  [570] ppl=7.0903  3.91s/window  eta 0.6 min
+  [579] ppl=7.0988  3.91s/window  eta 0.0 min
+
+Final estimate: PPL = 7.0988
+  predictions   147900
+  mean nll      1.959924
+  wall          2265.8s
+wrote bench/ppl/engine.json

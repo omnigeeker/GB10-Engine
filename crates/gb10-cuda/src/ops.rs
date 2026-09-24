@@ -44,6 +44,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "deinterleave_heads_batched_kernel",
     "embed_gather_batched_kernel",
     "copy_last_row_kernel",
+    "copy_rows_kernel",
     "concat2_kernel",
     "nvfp4_gemm_kernel",
     "fp8_gemm_kernel",
@@ -91,6 +92,7 @@ pub struct Ops {
     deinterleave_heads_batched: CudaFunction,
     embed_gather_batched: CudaFunction,
     copy_last_row: CudaFunction,
+    copy_rows: CudaFunction,
     concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
     fp8_gemm: CudaFunction,
@@ -148,6 +150,7 @@ impl Ops {
             deinterleave_heads_batched: take(map, "deinterleave_heads_batched_kernel")?,
             embed_gather_batched: take(map, "embed_gather_batched_kernel")?,
             copy_last_row: take(map, "copy_last_row_kernel")?,
+            copy_rows: take(map, "copy_rows_kernel")?,
             concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
@@ -1159,6 +1162,25 @@ impl Ops {
             dev.stream().launch_builder(&self.copy_last_row)
                 .arg(src).arg(dst).arg(&tt).arg(&nn)
                 .launch(LaunchConfig { grid_dim: (cdiv(n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
+        }
+        Ok(())
+    }
+
+    /// Gather `rows` rows starting at `row0` of `src` (`[row0+rows, n]`) into a
+    /// dense `dst` (`[rows, n]`).
+    pub fn copy_rows(
+        &self, dev: &Device, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>,
+        row0: usize, rows: usize, n: usize,
+    ) -> Result<()> {
+        need(rows > 0, "copy_rows rows")?;
+        need(n > 0, "copy_rows n")?;
+        need(src.len() >= (row0 + rows) * n, "copy_rows src")?;
+        need(dst.len() >= rows * n, "copy_rows dst")?;
+        let (r0, rr, nn) = (row0 as i32, rows as i32, n as i32);
+        unsafe {
+            dev.stream().launch_builder(&self.copy_rows)
+                .arg(src).arg(dst).arg(&r0).arg(&rr).arg(&nn)
+                .launch(LaunchConfig { grid_dim: (cdiv(rows*n,256), 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }

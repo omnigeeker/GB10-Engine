@@ -667,6 +667,21 @@ extern "C" __global__ void copy_last_row_kernel(const float* __restrict__ src,
     dst[i] = src[(size_t)(t - 1) * n + i];
 }
 
+// Gather `rows` rows starting at `row0` of an `[row0+rows, n]` buffer into a
+// dense `[rows, n]` one. The perplexity path has to score a window's rows with
+// the GEMM, which takes a whole buffer rather than a row offset.
+extern "C" __global__ void copy_rows_kernel(const float* __restrict__ src,
+                                            float* __restrict__ dst,
+                                            int row0, int rows, int n) {
+    const int total = rows * n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += gridDim.x * blockDim.x) {
+        const int r = i / n;
+        const int c = i - r * n;
+        dst[i] = src[(size_t)(row0 + r) * n + c];
+    }
+}
+
 // Concatenate two `n`-vectors into `dst`: dst[0..n] = a, dst[n..2n] = b.
 //
 // The MTP head feeds `mtp.fc` with `concat(norm(embed(t+1)), norm(h_t))`, and

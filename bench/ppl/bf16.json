@@ -1,0 +1,14 @@
+{
+  "kind": "bf16-reference-ppl",
+  "model": "/home/wayne/KimiCode/Deploy_QWen3.8-27B/models/Qwen3.8-27B-BF16",
+  "dtype": "bfloat16",
+  "n_ctx": 512,
+  "first": 256,
+  "preds_per_chunk": 255,
+  "chunks": 580,
+  "tokens": 297054,
+  "predictions": 147900,
+  "mean_nll": 1.9531067418310593,
+  "ppl": 7.050557853368303,
+  "ppl_stderr_chunk": 0.016460155007027397
+}

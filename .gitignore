@@ -25,6 +25,10 @@
 # Loop scratch
 /loop/logs
 
+# Perplexity eval: the ModelScope parquet is a download step; the derived raw
+# text and the shared token stream are committed (see docs/ACCURACY.md)
+/bench/ppl/ms-wt
+
 # Editor / OS
 .DS_Store
 *.swp

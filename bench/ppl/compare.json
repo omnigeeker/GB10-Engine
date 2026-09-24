@@ -1,0 +1,22 @@
+{
+  "rows": [
+    {
+      "impl": "llama.cpp",
+      "weights": "NVFP4 (same GGUF)",
+      "ppl": 7.2088,
+      "stderr": 0.04712
+    },
+    {
+      "impl": "gb10-engine",
+      "weights": "NVFP4 (checkpoint)",
+      "ppl": 7.098790200903311,
+      "stderr": 0.016447982273655536
+    },
+    {
+      "impl": "transformers",
+      "weights": "BF16 (base model)",
+      "ppl": 7.050557853368303,
+      "stderr": 0.016460155007027397
+    }
+  ]
+}

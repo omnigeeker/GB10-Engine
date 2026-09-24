@@ -555,6 +555,17 @@ struct Args {
     /// The oracle is bf16-rounded, so bit-exactness is not expected; see
     /// docs/TARGETS.md T7.
     min_agree: f64,
+    /// `perplexity`: file of token ids (llama-tokenize `--ids` format).
+    tokens: Option<PathBuf>,
+    /// `perplexity`: raw text to tokenize with the engine's own tokenizer, used
+    /// to cross-check the token stream against the one llama.cpp produced.
+    text: Option<PathBuf>,
+    /// `perplexity`: window length. llama-perplexity hardcodes 512.
+    ctx: usize,
+    /// `perplexity`: number of windows to score, -1 for all.
+    chunks: i64,
+    /// `perplexity`: where to write the JSON result.
+    out: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<(String, Args)> {
@@ -580,6 +591,11 @@ fn parse_args() -> Result<(String, Args)> {
         n_seq: 4,
         min_agree: 0.85,
         profile: false,
+        tokens: None,
+        text: None,
+        ctx: 512,
+        chunks: -1,
+        out: None,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -641,6 +657,26 @@ fn parse_args() -> Result<(String, Args)> {
             }
             "--min-agree" => {
                 a.min_agree = val()?.parse()?;
+                i += 2;
+            }
+            "--tokens" => {
+                a.tokens = Some(PathBuf::from(val()?));
+                i += 2;
+            }
+            "--text" => {
+                a.text = Some(PathBuf::from(val()?));
+                i += 2;
+            }
+            "--ctx" => {
+                a.ctx = val()?.parse()?;
+                i += 2;
+            }
+            "--chunks" => {
+                a.chunks = val()?.parse()?;
+                i += 2;
+            }
+            "--out" => {
+                a.out = Some(PathBuf::from(val()?));
                 i += 2;
             }
             other => bail!("unknown flag {other}"),
@@ -1040,6 +1076,236 @@ fn forward_cost(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Number of window rows scored per `lm_head` call. The GEMM tiles `T` in
+/// blocks of `GB10_TILE_T` (64), so this reads `lm_head` exactly once per tile.
+/// It does not have to match that tile -- any `t` is legal -- but matching it
+/// means every launch is a single tile pass with no partially idle block.
+#[allow(dead_code)]
+const PPL_TILE: usize = 64;
+
+/// `-log p(target)` for one row of logits, i.e. `logsumexp(row) - row[target]`.
+///
+/// Accumulated in f64: the sum runs over 248320 terms and a f32 accumulator
+/// loses enough of them to move the fourth decimal of the perplexity.
+fn row_nll(logits: &[f32], vocab: usize, r: usize, target: u32) -> f64 {
+    let row = &logits[r * vocab..(r + 1) * vocab];
+    let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+    let s: f64 = row.iter().map(|&v| (v as f64 - m).exp()).sum();
+    (m + s.ln()) - row[target as usize] as f64
+}
+
+/// Sum of `row_nll` over `rows` rows, spread across cores.
+///
+/// This is 255 x 248320 `exp` calls per window, which single-threaded would
+/// cost more than the GPU work it is measuring.
+fn tile_nll(logits: &[f32], vocab: usize, rows: usize, targets: &[u32]) -> f64 {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let nthreads = cores.min(rows).max(1);
+    if nthreads <= 1 {
+        return (0..rows).map(|r| row_nll(logits, vocab, r, targets[r])).sum();
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|tid| {
+                s.spawn(move || {
+                    let mut acc = 0.0f64;
+                    let mut r = tid;
+                    while r < rows {
+                        acc += row_nll(logits, vocab, r, targets[r]);
+                        r += nthreads;
+                    }
+                    acc
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    })
+}
+
+/// Reads `llama-tokenize --ids` output: a python list, optionally followed by a
+/// `Total number of tokens: N` line.
+fn load_token_ids(path: &Path) -> Result<Vec<u32>> {
+    let s = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let body = match (s.find('['), s.find(']')) {
+        (Some(a), Some(b)) if b > a => &s[a + 1..b],
+        _ => s.as_str(),
+    };
+    let mut ids = Vec::new();
+    for tok in body.split(|c: char| c == ',' || c.is_whitespace()) {
+        if tok.is_empty() {
+            continue;
+        }
+        ids.push(
+            tok.parse::<u32>()
+                .with_context(|| format!("token id {tok:?} in {}", path.display()))?,
+        );
+    }
+    Ok(ids)
+}
+
+/// Perplexity of a token stream over non-overlapping 512-token windows.
+///
+/// Replicates `tools/llama.cpp/tools/perplexity` with its default
+/// `--ppl-stride 0` (`llama_perplexity` hardcodes `n_ctx = 512`):
+///
+/// * whole, non-overlapping windows of `n_ctx` tokens, state cleared per window
+/// * `first = n_ctx/2 = 256`
+/// * each window contributes `n_ctx - first - 1 = 255` predictions, from rows
+///   `first .. first+254` (positions 256..510) against the token that follows
+///   each row (`window[257 .. 511]`)
+/// * `ppl = exp(mean(nll))` over all of them
+///
+/// `add_bos` is false for this checkpoint's vocab (verified: `llama-tokenize`
+/// emits no 248044 for the same file), so windows are used verbatim.
+///
+/// Matching the protocol exactly is the point: the same token ids go to
+/// llama.cpp and to the bf16 reference, so the weights are the only difference
+/// between the three numbers.
+fn perplexity(args: &Args) -> Result<()> {
+    let tokens_path = args
+        .tokens
+        .as_ref()
+        .context("perplexity needs --tokens FILE (llama-tokenize --ids output)")?;
+    let ids = load_token_ids(tokens_path)?;
+
+    // Cross-check the engine's own tokenizer against the llama.cpp stream. If
+    // these disagree, a perplexity difference would be a tokenizer artefact and
+    // not a weight difference, so it is reported rather than assumed.
+    if let Some(tf) = &args.text {
+        let raw = std::fs::read_to_string(tf)
+            .with_context(|| format!("reading {}", tf.display()))?;
+        let tok = QwenTokenizer::from_model_dir(&args.model)?;
+        let mine = tok.encode(&raw, false)?;
+        let n = mine.len().min(ids.len());
+        let first_bad = (0..n).find(|&i| mine[i] != ids[i]);
+        let bad = (0..n).filter(|&i| mine[i] != ids[i]).count();
+        println!("token stream cross-check");
+        println!("  engine tokenizer   {} tokens", mine.len());
+        println!("  llama-tokenize     {} tokens", ids.len());
+        println!("  first divergence   {first_bad:?}");
+        println!("  mismatches         {bad} / {n}");
+        println!();
+    }
+
+    let n_ctx = args.ctx;
+    anyhow::ensure!(n_ctx >= 4, "--ctx must be at least 4");
+    let first = n_ctx / 2;
+    let per_chunk = n_ctx - 1 - first;
+    let n_chunk_max = ids.len() / n_ctx;
+    anyhow::ensure!(n_chunk_max > 0, "not enough tokens for one {n_ctx}-token window");
+    let n_chunk = if args.chunks < 0 {
+        n_chunk_max
+    } else {
+        (args.chunks as usize).min(n_chunk_max)
+    };
+
+    println!("perplexity: {} tokens", ids.len());
+    println!(
+        "  n_ctx={n_ctx} first={first} preds/window={per_chunk} windows={n_chunk} (max {n_chunk_max})"
+    );
+
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let t0 = std::time::Instant::now();
+    let model = Model::load_from(&dev, cfg.clone(), &args.model)?;
+    println!("  model loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let vocab = model.vocab_size();
+    let hidden = text.hidden_size;
+    let mut state = ModelState::new(&dev, &model, n_ctx, 1)?;
+    let mut sc = Scratch::new(&dev, &text, n_ctx)?;
+    let mut tile_x = dev.stream().alloc_zeros::<f32>(hidden * PPL_TILE)?;
+    let mut tile_logits = dev.stream().alloc_zeros::<f32>(vocab * PPL_TILE)?;
+
+    let mut nll = 0.0f64;
+    let mut count = 0usize;
+    let mut trace: Vec<f64> = Vec::with_capacity(n_chunk);
+    let mut targets = vec![0u32; PPL_TILE];
+    let started = std::time::Instant::now();
+
+    for i in 0..n_chunk {
+        let start = i * n_ctx;
+        let window = &ids[start..start + n_ctx];
+
+        // llama.cpp clears its memory before every window, which for this
+        // hybrid model means the conv history and the Gated DeltaNet
+        // recurrence as well as the KV cache. Both are order-dependent, so a
+        // window that inherited them would not be the window llama.cpp scored.
+        state.reset(&dev)?;
+        model.forward_normed(&dev, window, &mut state, &mut sc, 0)?;
+
+        let mut window_nll = 0.0f64;
+        let mut off = first;
+        while off < first + per_chunk {
+            let rows = (first + per_chunk - off).min(PPL_TILE);
+            for r in 0..rows {
+                targets[r] = window[off + r + 1];
+            }
+            dev.ops()
+                .copy_rows(&dev, &state.normed, &mut tile_x, off, rows, hidden)?;
+            model
+                .lm_head
+                .forward_prefill(&dev, &tile_x, &mut tile_logits, rows)?;
+            let host = dev.stream().memcpy_dtov(&tile_logits)?;
+            dev.check_err()?;
+            window_nll += tile_nll(&host, vocab, rows, &targets[..rows]);
+            off += rows;
+        }
+
+        nll += window_nll;
+        count += per_chunk;
+        trace.push(window_nll / per_chunk as f64);
+
+        if i % 10 == 0 || i == n_chunk - 1 {
+            let el = started.elapsed().as_secs_f64();
+            let ppl = (nll / count as f64).exp();
+            println!(
+                "  [{i}] ppl={ppl:.4}  {:.2}s/window  eta {:.1} min",
+                el / (i + 1) as f64,
+                el / (i + 1) as f64 * (n_chunk - i - 1) as f64 / 60.0
+            );
+        }
+    }
+
+    let mean_nll = nll / count as f64;
+    let ppl = mean_nll.exp();
+    let var = if trace.len() > 1 {
+        let m = trace.iter().sum::<f64>() / trace.len() as f64;
+        trace.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (trace.len() - 1) as f64
+    } else {
+        0.0
+    };
+    println!();
+    println!("Final estimate: PPL = {ppl:.4}");
+    println!("  predictions   {count}");
+    println!("  mean nll      {mean_nll:.6}");
+    println!("  wall          {:.1}s", started.elapsed().as_secs_f64());
+
+    let result = serde_json::json!({
+        "kind": "gb10-engine-ppl",
+        "model": args.model.display().to_string(),
+        "quant": "nvfp4-fp8-mixed (modelopt)",
+        "tokens_file": tokens_path.display().to_string(),
+        "n_ctx": n_ctx,
+        "first": first,
+        "preds_per_window": per_chunk,
+        "windows": n_chunk,
+        "predictions": count,
+        "mean_nll": mean_nll,
+        "ppl": ppl,
+        "ppl_stderr_window": (var / trace.len() as f64).sqrt(),
+        "wall_s": started.elapsed().as_secs_f64(),
+    });
+    if let Some(out) = &args.out {
+        std::fs::write(out, serde_json::to_string_pretty(&result)?)
+            .with_context(|| format!("writing {}", out.display()))?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1089,6 +1355,10 @@ fn main() -> Result<()> {
             mtp_probe(&args)?;
             return Ok(());
         }
+        "perplexity" => {
+            perplexity(&args)?;
+            return Ok(());
+        }
         "batch-parity" => {
             let ok = batch_parity(&args, args.n_seq, args.n_new)?;
             if !ok {
@@ -1105,7 +1375,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill|forward-cost)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill|forward-cost|perplexity)"
         ),
     };
 
@@ -1125,6 +1395,11 @@ fn main() -> Result<()> {
             n_seq: args.n_seq,
             min_agree: args.min_agree,
             profile: args.profile,
+            tokens: args.tokens.clone(),
+            text: args.text.clone(),
+            ctx: args.ctx,
+            chunks: args.chunks,
+            out: args.out.clone(),
         };
         all_ok &= layer_parity(&a)?;
     }
