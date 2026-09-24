@@ -1,5 +1,40 @@
 # SESSION HANDOFF (read this first)
 
+## Accuracy evaluation — round 245, full write-up in `docs/ACCURACY.md`
+
+wikitext-2, `n_ctx=512`, identical token ids for all three runs (297,054 tokens,
+147,900 predictions each):
+
+| implementation | weights | PPL | vs BF16 |
+|---|---|---|---|
+| llama.cpp | NVFP4 (GGUF of this checkpoint) | 7.2088 ± 0.0471 | +2.244 % |
+| **gb10-engine** | NVFP4 (the checkpoint) | **7.0988** ± 0.0164 | **+0.684 %** |
+| `transformers` | BF16 (base model) | 7.0506 ± 0.0165 | — |
+
+**No accuracy drop.** Reproduce with `python3 bench/ppl/compare.py`.
+
+`gb10-verify perplexity --tokens <llama-tokenize --ids output> [--text <raw>]
+[--ctx 512] [--chunks N] [--out f.json]` is the new path. `--text` runs the
+tokenizer cross-check and is how the "0 mismatches / 297,054" claim is made; a
+mismatch is a hard error, not a warning.
+
+### Open, and the cheapest next experiments
+
+1. **One `generate` run diverged under load** — `[760, ...]` instead of
+   `[1421, ...]`, with no error printed, while llama.cpp's perplexity job held
+   the GPU. **7 further runs passed**, 3 under BF16 load and 4 under a concurrent
+   engine perplexity run, so it is unreproduced. `Device::check_err` now makes
+   such a failure loud (it used to be swallowed by `CudaSlice::drop` ->
+   `record_err`), but the root cause is unknown. The one load not yet retried is
+   llama.cpp specifically. Do not run two 50 GB-class CUDA jobs at once: that
+   OOM-killed the BF16 job once already.
+2. **Coverage is one dataset and one prompt.** A multi-prompt, long-generation
+   token-exactness run against the BF16 reference would say much more about rare
+   failures than perplexity can.
+3. **The 1.53 % disagreement with llama.cpp is characterised, not explained.**
+   No GPU needed to go further: compare one tensor's dequantized values
+   elementwise against the GGUF's NVFP4.
+
 ## Where this stands, as of round 140
 
 **One kernel is the entire remaining decode shortfall.** Everything else is measured
