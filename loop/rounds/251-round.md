@@ -125,6 +125,23 @@ Gated-DeltaNet layers stay linear.
 | 128 K | 10,784 s | measured |
 | 256 K | ~11.6 h | extrapolated |
 
+## Known issues left in place
+
+Two things were found while working on this and deliberately *not* changed, so
+that the validated binary is the committed one. Both are follow-ups.
+
+* **`Engine::generate` and `Engine::prefill_chunked` are dead code.**
+  `gb10-server` has two prefill paths; the live one is `run_group`, and
+  `generate` has no call sites at all. This is a trap rather than a tidiness
+  problem: instrumentation added to `generate` did nothing, and a `max_tokens`
+  clamp put there had no effect, because the request never reaches it. The
+  duplication should be collapsed before it misleads anyone else.
+* **`ModelState` still holds context-sized residual buffers.** `a`, `b` and
+  `normed` are each `hidden * ctx * 4` bytes — 16 GB together at 256K — though
+  a prefill chunk only ever touches `PREFILL_CHUNK` rows. The KV cache is the
+  structure that legitimately scales with the window; these do not, and sizing
+  them to the chunk would free ~16 GB at 256K.
+
 ## Gates
 
 | gate | result |
