@@ -1,5 +1,42 @@
 # Round 249 — 20260926T091657Z
 
+**Milestone: the endpoint is deployed, and deploying it found two real bugs.**
+No model behaviour changed. Both fixes are in `gb10-server`, and a usage guide
+now exists at `docs/USAGE.md`.
+
+## Two bugs found by actually using the service
+
+1. **Every response reported `"model": ""`.** `MODEL_NAME` was a `thread_local!`
+   — written once on the main thread at startup and read from every connection
+   thread, each of which got its own empty copy. The comment above it said
+   "published once so the request handlers do not need the `Engine`", which is
+   what a `thread_local!` cannot do. Replaced with a process-wide `OnceLock`.
+   `/v1/models` and every completion now report `Qwen3.8-27B-NVFP4`.
+
+2. **`POST /v1/completions` returned `{"error":{"message":"not found"}}`.** The
+   route was documented in `README.md` and required by **T8**, but had never been
+   implemented. Added: legacy shape (`object: "text_completion"`, bare `text` per
+   choice, `logprobs: null`, streaming uses `text` not `delta`). A batch `prompt`
+   array is refused with a clear error rather than silently answered with only
+   its first element.
+
+Both were invisible to the gates, which test the engine and not the HTTP
+surface. Deploying the thing is what found them.
+
+## Verified live
+
+| check | result |
+|---|---|
+| `GET /v1/models` | `Qwen3.8-27B-NVFP4` |
+| `POST /v1/chat/completions` | `"1, 2, 3, 4, 5"` |
+| `POST /v1/chat/completions` streaming | SSE deltas, model id populated |
+| `POST /v1/completions` | legacy shape, `"The capital of France is **Paris**."` |
+| `POST /v1/completions` streaming | `text` chunks |
+| `POST /v1/messages` | Anthropic shape, `stop_reason: end_turn`, `"Paris"` |
+| `enable_thinking: true` (default) | 56 tokens generated, `</think>` block stripped, content `391` |
+| 16 concurrent requests | all 16 correct and distinct in 7.7 s |
+| startup | port open after ~45 s |
+
 ## Gates
 
 | gate | result |
