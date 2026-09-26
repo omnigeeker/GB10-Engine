@@ -233,7 +233,7 @@ Set `GB10_BATCH_LOG=1` to log the group size per step.
   exactly one sequence; requests beyond the slot count wait for the batcher
   rather than being refused.
 * `ModelState` also holds context-sized residual buffers (`a`, `b`, `normed`),
-  ～16 GB at 256K. They only ever need a prefill chunk's worth of rows, so this
+  ~16 GB at 256K. They only ever need a prefill chunk's worth of rows, so this
   is slack rather than a requirement.
 
 ## Stopping it
