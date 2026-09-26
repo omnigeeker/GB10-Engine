@@ -127,6 +127,21 @@ It takes about 95 s to load the weights, then it serves:
 | `GET /v1/models` | both | returns the loaded model id |
 | `GET /health` | — | liveness; use this to wait for startup |
 
+The context window is `--ctx` (default 32768) up to the checkpoint's **262144**
+positions, and `--concurrency` sets how many sequences the KV cache is sized
+for. Concurrency defaults to whatever a 40 GB KV budget covers, capped at 16,
+so a long context lowers it automatically:
+
+```sh
+./target/release/gb10-server --model models/Qwen3.8-27B-NVFP4 --ctx 262144
+# context 262144 tokens, 1 concurrent sequence(s), KV cache 34.4 GB
+```
+
+Prefill cost grows quadratically with prompt length, because the 16
+full-attention layers attend over the whole prefix while the 48 Gated-DeltaNet
+layers stay linear: roughly 16 min at 32 K, 3 h at 128 K and 12 h at 256 K on
+this machine. Short prompts are unaffected.
+
 A full usage guide — Python and streaming examples, the parameter table, and the
 decoding limits — is in **[`docs/USAGE.md`](docs/USAGE.md)**.
 

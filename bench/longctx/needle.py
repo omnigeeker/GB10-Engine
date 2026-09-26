@@ -8,6 +8,7 @@ prompt_tokens, how many prefill chunks that implies, and the wall time, because
 the interesting question at long context is not just "is the answer right" but
 "how long did it cost".
 """
+import os
 import sys
 import time
 
@@ -22,8 +23,10 @@ FILLER = (
 CHUNK = 2048
 
 # Depths as a fraction of the document, so a pass is not an artefact of the
-# needle sitting at the very end where recency alone could carry it.
-DEPTHS = [0.1, 0.5, 0.9]
+# needle sitting at the very end where recency alone could carry it. Override
+# with `DEPTHS`: a 256K prompt costs hours, so three depths there is not
+# affordable, while the cheap sizes still get all three.
+DEPTHS = [float(x) for x in os.environ.get("DEPTHS", "0.1,0.5,0.9").split(",")]
 
 
 def ask(prompt, max_tokens=24, timeout=20000):

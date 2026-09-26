@@ -21,6 +21,25 @@ cargo build --release
 | `--host HOST` | `127.0.0.1` | listen address |
 | `--port PORT` | `8080` | listen port |
 | `--name NAME` | `Qwen3.8-27B-NVFP4` | id reported by `/v1/models` and in responses |
+| `--ctx N` | `32768` | context window in tokens (prompt + generation), max `262144` |
+| `--concurrency N` | auto | sequence slots to size the KV cache for, max `16` |
+
+`--ctx` above `262144` is refused: that is the checkpoint's
+`max_position_embeddings`, and past it the model is extrapolating outside its
+RoPE range.
+
+`--concurrency` defaults to the largest count that fits a 40 GB KV budget,
+capped at 16, so a long context automatically reduces concurrency rather than
+failing to allocate. Passing it explicitly is honoured but refused if it does
+not fit. The startup line reports the decision:
+
+```
+context 262144 tokens, 1 concurrent sequence(s), KV cache 34.4 GB (34360 MB per sequence)
+```
+
+The KV cache is the only structure that scales with the context window: 16
+full-attention layers hold K and V for 4 KV heads of 256 f32 dimensions, which
+is **128 KB per token**, so 34.4 GB at 256K for a single sequence.
 
 The weights take **~40–95 s** to load, during which the port is not yet open.
 There is no `--help`; unknown arguments are a hard error.
@@ -179,8 +198,28 @@ Set `GB10_BATCH_LOG=1` to log the group size per step.
 
 ## Limits and caveats
 
-* **Context is 2048 tokens** (`MAX_SEQ`), prompt **plus** generation. A longer
-  prompt is an error, not a truncation.
+* **Context is `--ctx` tokens** (default 32768, max the checkpoint's 262144),
+  prompt **plus** generation. A longer prompt is an error, not a truncation,
+  and generation is clamped so the two together stay inside the window.
+* **Prefill cost grows quadratically with the prompt.** The 48 Gated-DeltaNet
+  layers are linear, but the 16 full-attention layers attend over the whole
+  prefix, so a long prompt is priced by that term. Measured on this box
+  (prompts of repeated filler, needle recovered at 10/50/90% depth):
+
+  | prompt | prefill |
+  |---|---|
+  | 5 K | ~50 s |
+  | 12 K | ~170 s |
+  | 24 K | ~9 min |
+  | 32 K | ~16 min |
+  | 128 K | ~3 h |
+  | 256 K | ~12 h |
+
+  Fitting those gives `≈ 8.8 ms·T + 6.0e-7·T²` seconds. The quadratic term is
+  the attention kernel's key range and is inherent to dense attention at this
+  scale, not an artefact of chunking; chunking only bounds *memory*, not time.
+  Short and medium prompts are unaffected — the quadratic term is under 10% of
+  the total below ~16 K tokens.
 * **Greedy only** — no sampling controls, no `n`/`best_of`, no tool calling, no
   JSON mode, no vision.
 * **No authentication**, bound to loopback. Put a proxy in front if it needs to
@@ -190,6 +229,12 @@ Set `GB10_BATCH_LOG=1` to log the group size per step.
   stream and do not want reasoning.
 * Multi-turn works by sending the full `messages` array; there is no
   server-side session state.
+* **Concurrency 1 at 256K.** The KV budget means a 256K window leaves room for
+  exactly one sequence; requests beyond the slot count wait for the batcher
+  rather than being refused.
+* `ModelState` also holds context-sized residual buffers (`a`, `b`, `normed`),
+  ～16 GB at 256K. They only ever need a prefill chunk's worth of rows, so this
+  is slack rather than a requirement.
 
 ## Stopping it
 
