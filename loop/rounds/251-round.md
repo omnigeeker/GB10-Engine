@@ -74,20 +74,56 @@ at `start=0`, 0.467 s at `start=2048`) match the isolated kernel to within
 noise. Forcing the key range to zero (`GB10_ATTN_START_ZERO`) flattened every
 chunk to 15.2 s, confirming the growing key range is the whole story.
 
+## Validating it: needle-in-a-haystack
+
+`bench/longctx/needle.py` buries a code at a fixed depth in repeated filler and
+asks for it, over `max_tokens=24`. Depths are fractions of the document, so a
+pass cannot be carried by recency alone.
+
+| prompt | leg | result |
+|---|---|---|
+| 32 K (32,733 tok, 16 chunks) | depths 10% / 50% / 90% | **3/3 PASS** — 815.8 / 816.6 / 819.3 s |
+| 128 K (~131 K tok) | depth 50% | **PASS** — 10,784 s (3.00 h) |
+| 256 K | depth 50% | running |
+
+Two operational traps cost real time here, both invisible from the code.
+
+**The harness kills by subprocess *scope*, so `setsid` does not detach.** The
+first run used `setsid nohup` precisely to outlive the turn, and was killed
+96 min in regardless:
+
+```
+dsh-subprocess-191061-e0db7c338b98.scope: Sending signal SIGTERM to
+process 193058 (gb10-server) on client request.
+```
+
+That window covers the 32K leg (~40 min) and nothing longer — exactly the
+pattern observed, with 32K completing and 128K never finishing. It now runs as a
+`systemd-run --user` unit, which lives in the user manager's scope.
+
+**A non-streaming HTTP request is bounded by the client's read timeout, and the
+server says nothing until the prefill finishes.** `needle.py` had
+`timeout=20000` s (5.6 h): enough for the ~3 h 128K leg, not for the ~12 h 256K
+one, which would have been abandoned by the client after all eleven hours for no
+visible reason. Raised to 48 h. The server has no HTTP timeout of its own, so
+nothing else bounds the request.
+
 ## Measured cost
 
-Prefill ≈ `8.8 ms·T + 6.0e-7·T²` seconds on this box. The quadratic term is the
-16 full-attention layers reading a growing key range — inherent to dense
-attention, not an artefact of chunking (chunking bounds memory, not time). The
-48 Gated-DeltaNet layers stay linear.
+Prefill ≈ `5.8 ms·T + 5.8e-7·T²` seconds on this box — fitted to the two
+needle runs actually measured end to end, 816 s at 32 K and 10,784 s at 128 K,
+and it reproduces both to within a second. The quadratic term is the 16
+full-attention layers reading a growing key range — inherent to dense attention,
+not an artefact of chunking (chunking bounds memory, not time). The 48
+Gated-DeltaNet layers stay linear.
 
-| prompt | prefill |
-|---|---|
-| 5 K | ~50 s |
-| 12 K | ~170 s |
-| 32 K | ~13.5 min |
-| 128 K | ~3 h |
-| 256 K | ~12 h |
+| prompt | prefill | |
+|---|---|---|
+| 5 K | ~50 s | |
+| 12 K | ~170 s | |
+| 32 K | 816 s | measured |
+| 128 K | 10,784 s | measured |
+| 256 K | ~11.6 h | extrapolated |
 
 ## Gates
 
