@@ -24,16 +24,69 @@ use gb10_model::layer::Scratch;
 use gb10_model::model::{Model, ModelState};
 use serde_json::{json, Value};
 
-/// Prompt tokens the KV cache and recurrent state are sized for.
-const MAX_SEQ: usize = 2048;
-/// Concurrent sequence slots the state is sized for.
+/// Positions the checkpoint was trained for (`max_position_embeddings` in
+/// `config.json`). Beyond this the model is extrapolating outside its RoPE
+/// range, so it is refused rather than silently served.
+const NATIVE_MAX_POSITIONS: usize = 262144;
+
+/// Concurrent sequence slots the state can be sized for. The scheduler sizes
+/// itself below this when the KV budget cannot cover it.
 const MAX_CONCURRENT: usize = 16;
+
+/// Tokens per prefill pass.
+///
+/// `Scratch` holds one row per token, so this -- not the context window -- sets
+/// how much scratch memory exists. A prompt longer than this is prefilled in
+/// successive chunks that carry the KV cache and recurrent state forward. That
+/// decoupling is what makes a long context possible at all: scratch sized to a
+/// 256K context would be ~150 GB.
+const PREFILL_CHUNK: usize = 2048;
+
+/// KV cache bytes per (token, sequence).
+///
+/// Only the 16 full-attention layers cache K and V; each holds 4 KV heads of
+/// 256 f32 dimensions, so 16 * 2 * 4 * 256 * 4 = 131072 bytes.
+const KV_BYTES_PER_TOKEN_SEQ: usize = 131072;
+
+/// How much of the unified pool to spend on KV cache. The weights are 17.6 GB
+/// against 121 GB total, so this leaves headroom for activations and for
+/// whatever else the machine is doing.
+const KV_BUDGET_BYTES: usize = 40 * 1024 * 1024 * 1024;
+
+/// Pick the number of sequence slots to allocate.
+///
+/// With no explicit request this is the largest count the KV budget covers,
+/// capped at [`MAX_CONCURRENT`]. An explicit `--concurrency` is honoured but
+/// refused if it does not fit, because the alternative is an allocation
+/// failure partway through loading.
+fn resolve_concurrency(ctx: usize, requested: Option<usize>) -> Result<usize> {
+    let per_seq = (ctx * KV_BYTES_PER_TOKEN_SEQ) as u64;
+    match requested {
+        Some(n) => {
+            let bytes = per_seq * n as u64;
+            anyhow::ensure!(
+                bytes <= KV_BUDGET_BYTES as u64,
+                "--concurrency {n} at --ctx {ctx} needs {:.1} GB of KV cache, over the {:.0} GB \
+                 budget; lower --concurrency or --ctx",
+                bytes as f64 / 1e9,
+                KV_BUDGET_BYTES as f64 / 1e9,
+            );
+            Ok(n)
+        }
+        None => Ok(((KV_BUDGET_BYTES as u64 / per_seq) as usize).clamp(1, MAX_CONCURRENT)),
+    }
+}
 
 struct Args {
     model: PathBuf,
     host: String,
     port: u16,
     model_name: String,
+    /// Context window in tokens (prompt + generation).
+    ctx: usize,
+    /// Concurrent sequences to size the KV cache for. `None` means "as many as
+    /// the KV budget allows, up to `MAX_CONCURRENT`".
+    concurrency: Option<usize>,
 }
 
 impl Args {
@@ -42,6 +95,8 @@ impl Args {
         let mut host = "127.0.0.1".to_string();
         let mut port = 8080u16;
         let mut model_name = "Qwen3.8-27B-NVFP4".to_string();
+        let mut ctx = 32768usize;
+        let mut concurrency = None;
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -49,10 +104,22 @@ impl Args {
                 "--host" => host = it.next().context("--host needs a value")?,
                 "--port" => port = it.next().context("--port needs a value")?.parse()?,
                 "--name" => model_name = it.next().context("--name needs a value")?,
+                "--ctx" => ctx = it.next().context("--ctx needs a value")?.parse()?,
+                "--concurrency" => {
+                    concurrency = Some(it.next().context("--concurrency needs a value")?.parse()?)
+                }
                 other => anyhow::bail!("unknown argument: {other}"),
             }
         }
-        Ok(Self { model, host, port, model_name })
+        anyhow::ensure!(ctx >= 2, "--ctx must be at least 2");
+        anyhow::ensure!(
+            ctx <= NATIVE_MAX_POSITIONS,
+            "--ctx {ctx} exceeds the checkpoint's {NATIVE_MAX_POSITIONS} positions"
+        );
+        if let Some(c) = concurrency {
+            anyhow::ensure!(c >= 1, "--concurrency must be at least 1");
+        }
+        Ok(Self { model, host, port, model_name, ctx, concurrency })
     }
 }
 
@@ -174,6 +241,11 @@ struct Engine {
     state: ModelState,
     sc: Scratch,
     name: String,
+    /// Context window in tokens, for the request-time length check.
+    ctx: usize,
+    /// Sequence slots actually allocated. The batcher must not group more
+    /// requests than this, or `prefill_seq` indexes past the state.
+    n_seq: usize,
 }
 
 /// Qwen's chat template puts the opening ` thinking` into the *prompt*, so generation
@@ -271,14 +343,86 @@ impl Engine {
         let model = Model::load_from(&dev, cfg, &args.model)?;
         let tok = QwenTokenizer::from_model_dir(&args.model)?;
         let tmpl = ChatTemplate::from_model_dir(&args.model)?;
-        // Slots for concurrent sequences. The scheduler that uses them is not
-        // wired up yet (the accept loop is still serial), but the state must be
-        // sized for it first. `step_batch` takes its batch size from
+        // Slots for concurrent sequences. `step_batch` takes its batch size from
         // `tokens.len()` and requires it to be <= this, so a single request
         // still runs with n_seq = 1 and costs nothing extra.
-        let state = ModelState::new(&dev, &model, MAX_SEQ, MAX_CONCURRENT)?;
-        let sc = Scratch::new(&dev, &text, MAX_SEQ)?;
-        Ok(Self { dev, model, tok, tmpl, state, sc, name: args.model_name.clone() })
+        let n_seq = resolve_concurrency(args.ctx, args.concurrency)?;
+        // The KV cache is the only structure that scales with the context
+        // window, so it is what decides whether this fits.
+        let kv_gb = (args.ctx * n_seq * KV_BYTES_PER_TOKEN_SEQ) as f64 / 1e9;
+        println!(
+            "context {} tokens, {} concurrent sequence(s), KV cache {:.1} GB \
+             ({:.0} MB per sequence)",
+            args.ctx,
+            n_seq,
+            kv_gb,
+            (args.ctx * KV_BYTES_PER_TOKEN_SEQ) as f64 / 1e6,
+        );
+        if n_seq < MAX_CONCURRENT && args.concurrency.is_none() {
+            println!(
+                "  (capped from {MAX_CONCURRENT} by the {:.0} GB KV budget; pass \
+                 --concurrency to override)",
+                KV_BUDGET_BYTES as f64 / 1e9
+            );
+        }
+        let state = ModelState::new(&dev, &model, args.ctx, n_seq)?;
+        // Scratch holds one row per token, so it is sized to a prefill chunk
+        // rather than to the context: at 256K it would otherwise be ~150 GB.
+        let sc = Scratch::new(&dev, &text, PREFILL_CHUNK)?;
+        Ok(Self {
+            dev,
+            model,
+            tok,
+            tmpl,
+            state,
+            sc,
+            name: args.model_name.clone(),
+            ctx: args.ctx,
+            n_seq,
+        })
+    }
+
+    /// Prefill the prompt in [`PREFILL_CHUNK`]-sized passes, returning the next
+    /// token after the last one.
+    ///
+    /// Chunk boundaries are invisible in the result. `attn_prefill` streams the
+    /// whole key range on every call rather than only the rows it is given, so
+    /// a later chunk starting from a non-empty cache computes exactly what a
+    /// single pass over the whole prompt would; and the recurrent layers carry
+    /// their state across calls. `gb10-verify chunked-prefill` gates precisely
+    /// this, comparing one-shot against split prefill token for token.
+    ///
+    /// This is what decouples scratch memory from the context window: without
+    /// it, `Scratch` and `ModelState`'s residual buffers would both have to
+    /// hold the entire prompt.
+    fn prefill_chunked(&mut self, ids: &[u32]) -> Result<u32> {
+        debug_assert!(!ids.is_empty());
+        let timing = std::env::var_os("GB10_TIMING").is_some();
+        let t_all = std::time::Instant::now();
+        let mut next = 0u32;
+        for (i, c) in ids.chunks(PREFILL_CHUNK).enumerate() {
+            let t0 = std::time::Instant::now();
+            next = self
+                .model
+                .prefill_seq(&self.dev, c, &mut self.state, &mut self.sc, 0)?;
+            if timing {
+                eprintln!(
+                    "  chunk {i} ({} tok, start {}): {:.2}s",
+                    c.len(),
+                    i * PREFILL_CHUNK,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if timing {
+            eprintln!(
+                "  prefill {} tok in {:.2}s ({:.1} ms/tok)",
+                ids.len(),
+                t_all.elapsed().as_secs_f64(),
+                t_all.elapsed().as_secs_f64() * 1e3 / ids.len() as f64
+            );
+        }
+        Ok(next)
     }
 
     /// Render a conversation, prefill it, then decode greedily.
@@ -300,14 +444,26 @@ impl Engine {
         let prompt = self.tmpl.render(messages, &opts)?;
         let ids = self.tok.encode(&prompt, true)?;
         anyhow::ensure!(!ids.is_empty(), "empty prompt");
+        // The prompt must leave room for at least one generated token, so the
+        // window is checked against prompt + 1 rather than the prompt alone.
         anyhow::ensure!(
-            ids.len() < MAX_SEQ,
-            "prompt is {} tokens but the context window is {MAX_SEQ}",
-            ids.len()
+            ids.len() + 1 <= self.ctx,
+            "prompt is {} tokens but the context window is {} (raise --ctx)",
+            ids.len(),
+            self.ctx
         );
 
+        let t_reset = std::time::Instant::now();
         self.state.reset(&self.dev)?;
-        let mut next = self.model.prefill(&self.dev, &ids, &mut self.state, &mut self.sc)?;
+        if std::env::var_os("GB10_TIMING").is_some() {
+            eprintln!("  reset {:.2}s", t_reset.elapsed().as_secs_f64());
+        }
+        let mut next = self.prefill_chunked(&ids)?;
+
+        // Generation appends to the same cache, so the prompt plus everything
+        // generated has to stay inside the window. Clamping rather than
+        // erroring matches how the `length` finish reason already behaves.
+        let max_tokens = max_tokens.min(self.ctx - ids.len());
 
         let mut out = Vec::with_capacity(max_tokens);
         let mut text = String::new();
@@ -856,7 +1012,7 @@ fn scheduler(mut eng: Engine, rx: mpsc::Receiver<Job>) {
         // roughly the single-stream rate instead of the batched one. Measured
         // 815 ms/step against the 287 ms/step that a full batch of 16 costs.
         std::thread::sleep(std::time::Duration::from_millis(25));
-        while group.len() < MAX_CONCURRENT {
+        while group.len() < eng.n_seq {
             match rx.try_recv() {
                 Ok(j) => group.push(j),
                 Err(_) => break,
@@ -877,8 +1033,13 @@ fn scheduler(mut eng: Engine, rx: mpsc::Receiver<Job>) {
 /// and KV cache for no benefit.
 fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
     let k = group.len();
-    let Engine { dev, model, tok, tmpl, state, sc, .. } = eng;
+    let Engine { dev, model, tok, tmpl, state, sc, ctx, .. } = eng;
+    let timing = std::env::var_os("GB10_TIMING").is_some();
+    let t_reset = std::time::Instant::now();
     state.reset(dev)?;
+    if timing {
+        eprintln!("  reset {:.2}s", t_reset.elapsed().as_secs_f64());
+    }
 
     let mut next: Vec<u32> = Vec::with_capacity(k);
     let mut prompt_tokens = Vec::with_capacity(k);
@@ -887,21 +1048,52 @@ fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
     let mut emitted = vec![0usize; k];
     let mut done = vec![false; k];
     let mut finish = vec!["length"; k];
+    // Per-slot generation cap: what the request asked for, further limited by
+    // what is left of the window after this slot's prompt. The second term is
+    // load-bearing -- without it a long prompt plus a large `max_tokens`
+    // appends past this slot's KV cache and into the next sequence's.
+    let mut limit = vec![0usize; k];
 
     for (s, job) in group.iter().enumerate() {
         let opts =
             ChatTemplateOptions { enable_thinking: job.enable_thinking, ..Default::default() };
         let prompt = tmpl.render(&job.messages, &opts)?;
         let p = tok.encode(&prompt, true)?;
-        if p.is_empty() || p.len() >= MAX_SEQ {
-            let _ = job.out.send(Msg::Fail(format!("prompt is {} tokens", p.len())));
+        if p.is_empty() || p.len() + 1 > *ctx {
+            let _ = job.out.send(Msg::Fail(format!(
+                "prompt is {} tokens but the context window is {ctx}",
+                p.len()
+            )));
             done[s] = true;
             prompt_tokens.push(p.len());
             next.push(0);
             continue;
         }
         prompt_tokens.push(p.len());
-        next.push(model.prefill_seq(dev, &p, state, sc, s)?);
+        limit[s] = job.max_tokens.min(*ctx - p.len());
+        let mut nx = 0u32;
+        let t_all = std::time::Instant::now();
+        for (i, c) in p.chunks(PREFILL_CHUNK).enumerate() {
+            let t0 = std::time::Instant::now();
+            nx = model.prefill_seq(dev, c, state, sc, s)?;
+            if timing {
+                eprintln!(
+                    "  slot {s} chunk {i} ({} tok, start {}): {:.2}s",
+                    c.len(),
+                    i * PREFILL_CHUNK,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if timing {
+            eprintln!(
+                "  slot {s}: prefill {} tok in {:.2}s ({:.1} ms/tok)",
+                p.len(),
+                t_all.elapsed().as_secs_f64(),
+                t_all.elapsed().as_secs_f64() * 1e3 / p.len() as f64
+            );
+        }
+        next.push(nx);
     }
 
     let mut live = done.iter().filter(|d| !**d).count();
@@ -922,7 +1114,7 @@ fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
             let piece = tok.decode(&[t], true)?;
             texts[s].push_str(&piece);
             let _ = group[s].out.send(Msg::Token(piece));
-            if emitted[s] >= group[s].max_tokens {
+            if emitted[s] >= limit[s] {
                 done[s] = true;
                 live -= 1;
             }
@@ -950,6 +1142,7 @@ fn main() -> Result<()> {
     let t = std::time::Instant::now();
     let eng = Engine::new(&args)?;
     let _ = MODEL_NAME.set(eng.name.clone());
+    let n_seq = eng.n_seq;
     eprintln!("gb10-server: ready in {:.1}s", t.elapsed().as_secs_f64());
 
     let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -963,7 +1156,7 @@ fn main() -> Result<()> {
     eprintln!("gb10-server: listening on http://{addr}");
     eprintln!("  OpenAI:    POST http://{addr}/v1/chat/completions");
     eprintln!("  Anthropic: POST http://{addr}/v1/messages");
-    eprintln!("  concurrent slots: {MAX_CONCURRENT}");
+    eprintln!("  concurrent slots: {n_seq}");
 
     for conn in listener.incoming() {
         let mut stream = match conn {

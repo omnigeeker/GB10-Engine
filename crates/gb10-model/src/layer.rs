@@ -461,6 +461,11 @@ impl FullAttnLayer {
         // `kv_base`), with `pos` keys already in it. Reading the cache rather
         // than `sc.kb_ln`/`sc.vb` is what makes this valid from a non-empty
         // cache, which chunked prefill and MTP verification both need.
+        // Diagnostic only: `GB10_ATTN_START_ZERO` makes the attention ignore the
+        // cached prefix, so a chunked prefill produces wrong output but does the
+        // same attention work in every chunk. It exists to answer whether the
+        // per-chunk cost that grows with `pos` is the attention's key range at
+        // all -- the isolated kernel says it should not be.
         ops.attn_prefill(
             dev,
             &sc.q,

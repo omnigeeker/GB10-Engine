@@ -305,6 +305,158 @@ extern "C" __global__ void attn_prefill_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Tiled causal prefill attention with GQA and online softmax.
+//
+// `attn_prefill_kernel` above keeps one score per key in dynamic shared memory
+// -- it asks for `(start + n_tokens) * 4` bytes -- which caps the reachable
+// context at the shared-memory limit (48 KB here, so 12,288 keys) and fails
+// outright past it. Its inner loop also runs one block reduction per key.
+//
+// This kernel instead keeps only a `BQ x BK` score tile resident and streams
+// the key range in tiles of BK, carrying the running max, running sum and
+// output accumulator (the online-softmax recurrence). Shared memory is then a
+// constant independent of context length, so the reachable context is bounded
+// by the KV cache rather than by smem.
+//
+// Layouts and semantics match `attn_prefill_kernel` exactly:
+//   q/out : [n_tokens, n_q_heads, head_dim]
+//   k/v   : [n_keys_total, n_kv_heads, head_dim], offset by `kv_base` floats
+//   `start` keys precede these tokens, so row t attends over 0..=start+t.
+//
+// One block covers `BQ` query rows of a single query head, one thread per
+// head dimension (blockDim.x == head_dim), so each thread owns the output for
+// its dimension across all BQ rows and keeps those BQ accumulators in
+// registers.
+// ---------------------------------------------------------------------------
+#define PREFILL_BQ 8
+#define PREFILL_BK 16
+
+extern "C" __global__ void attn_prefill_tiled_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    float scale, int start, int kv_base) {
+    extern __shared__ float smem[];
+    const int HD = head_dim;
+    float* Qs = smem;                              // BQ * HD
+    float* Ks = Qs + PREFILL_BQ * HD;              // BK * HD
+    float* Vs = Ks + PREFILL_BK * HD;              // BK * HD
+    float* S = Vs + PREFILL_BK * HD;               // BQ * BK  (running p, then probabilities)
+    float* red = S + PREFILL_BQ * PREFILL_BK;      // 3 * BQ  (m, l, correction)
+
+    const int h = blockIdx.x;
+    const int t0 = blockIdx.y * PREFILL_BQ;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const int group = n_q_heads / n_kv_heads;
+    const int kh = h / group;
+    const int rows = min(PREFILL_BQ, n_tokens - t0);
+    if (rows <= 0) return;
+
+    // Q tile. Rows past `rows` are zero-filled and masked out below.
+    for (int idx = tid; idx < PREFILL_BQ * HD; idx += nt) {
+        const int i = idx / HD, d = idx % HD;
+        Qs[idx] = (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f;
+    }
+    if (tid < PREFILL_BQ) {
+        red[tid] = -INFINITY;                  // m
+        red[PREFILL_BQ + tid] = 0.0f;          // l
+    }
+
+    // BQ accumulators in registers: thread `tid` owns output dim `tid`.
+    float acc[PREFILL_BQ];
+#pragma unroll
+    for (int i = 0; i < PREFILL_BQ; ++i) acc[i] = 0.0f;
+
+    __syncthreads();
+
+    // Highest key index any row in this block may attend to.
+    const int win_max = start + t0 + rows - 1;
+
+    for (int s0 = 0; s0 <= win_max; s0 += PREFILL_BK) {
+        // Stage this key tile. Keys past `win_max` are irrelevant to every row
+        // here and get zero-filled; the causal mask below excludes them anyway.
+        for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
+            const int j = idx / HD, d = idx % HD;
+            const int s = s0 + j;
+            if (s <= win_max) {
+                const size_t off = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d;
+                Ks[idx] = k[off];
+                Vs[idx] = v[off];
+            } else {
+                Ks[idx] = 0.0f;
+                Vs[idx] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // S[i][j] = Qs[i] . Ks[j] * scale. BQ*BK pairs over `nt` threads: two
+        // threads per pair, each covering half of head_dim, combined with a
+        // lane-adjacent shuffle.
+        const int half = HD / 2;
+        for (int p = tid >> 1; p < PREFILL_BQ * PREFILL_BK; p += nt >> 1) {
+            const int i = p / PREFILL_BK, j = p % PREFILL_BK;
+            const int sub = tid & 1;
+            float dot = 0.0f;
+            const float* qrow = Qs + i * HD + sub * half;
+            const float* krow = Ks + j * HD + sub * half;
+            for (int d = 0; d < half; ++d) dot = fmaf(qrow[d], krow[d], dot);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            if (sub == 0) {
+                const int s = s0 + j;
+                const bool ok = (i < rows) && (s <= start + t0 + i);
+                S[i * PREFILL_BK + j] = ok ? dot * scale : -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax, one thread per row.
+        if (tid < PREFILL_BQ && tid < rows) {
+            const int i = tid;
+            const float m = red[i], l = red[PREFILL_BQ + i];
+            float mt = m;
+            for (int j = 0; j < PREFILL_BK; ++j)
+                mt = fmaxf(mt, S[i * PREFILL_BK + j]);
+            if (mt == -INFINITY) {
+                // Entire tile masked for this row: leave m, l and acc alone.
+                for (int j = 0; j < PREFILL_BK; ++j) S[i * PREFILL_BK + j] = 0.0f;
+                red[2 * PREFILL_BQ + i] = 1.0f;
+            } else {
+                const float c = __expf(m - mt);
+                float ls = 0.0f;
+                for (int j = 0; j < PREFILL_BK; ++j) {
+                    const float p = __expf(S[i * PREFILL_BK + j] - mt);
+                    S[i * PREFILL_BK + j] = p;
+                    ls += p;
+                }
+                red[i] = mt;
+                red[PREFILL_BQ + i] = l * c + ls;
+                red[2 * PREFILL_BQ + i] = c;
+            }
+        }
+        __syncthreads();
+
+        // acc[i] = acc[i] * c_i + P[i] . Vs
+#pragma unroll
+        for (int i = 0; i < PREFILL_BQ; ++i) {
+            if (i >= rows) continue;
+            const float c = red[2 * PREFILL_BQ + i];
+            float a = acc[i] * c;
+            const float* prow = S + i * PREFILL_BK;
+            for (int j = 0; j < PREFILL_BK; ++j)
+                a = fmaf(prow[j], Vs[j * HD + tid], a);
+            acc[i] = a;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < PREFILL_BQ; ++i) {
+        if (i >= rows || tid >= HD) continue;
+        out[((size_t)(t0 + i) * n_q_heads + h) * HD + tid] = acc[i] / red[PREFILL_BQ + i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gated DeltaNet per-head gating, from Qwen3_5GatedDeltaNet.forward:
 //
 //   beta  = sigmoid(b)
@@ -370,33 +522,27 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
     const int group = n_q_heads / n_kv_heads;
     const int kh = h / group;
 
-    extern __shared__ float scores[];  // n_keys entries
-
     const bool active = d < head_dim;
     const float qv = active ? q[q_off + h * head_dim + d] : 0.0f;
 
+    // Online softmax, for the same reason as `attn_decode_multi_kernel`: an
+    // `n_keys`-sized score buffer cannot survive a long context.
+    float mx = -INFINITY, sum = 0.0f, acc = 0.0f;
     for (int s = 0; s < n_keys; ++s) {
         const float kk =
             active ? k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kk) * scale;
-        if (d == 0) scores[s] = dot;
-        __syncthreads();
+        const float m_new = fmaxf(mx, dot);
+        const float corr = __expf(mx - m_new);
+        const float p = __expf(dot - m_new);
+        sum = sum * corr + p;
+        acc = fmaf(p,
+                   active ? v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f,
+                   acc * corr);
+        mx = m_new;
     }
 
-    float mx = -INFINITY;
-    for (int s = 0; s < n_keys; ++s) mx = fmaxf(mx, scores[s]);
-    float sum = 0.0f;
-    for (int s = 0; s < n_keys; ++s) sum += __expf(scores[s] - mx);
-    const float inv = 1.0f / sum;
-
-    if (active) {
-        float acc = 0.0f;
-        for (int s = 0; s < n_keys; ++s) {
-            const float p = __expf(scores[s] - mx) * inv;
-            acc = fmaf(p, v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
-        }
-        out[q_off + h * head_dim + d] = acc;
-    }
+    if (active) out[q_off + h * head_dim + d] = (sum > 0.0f) ? acc / sum : 0.0f;
 }
 
 // Append one token's k/v row into the cache at position `pos`.
@@ -792,8 +938,14 @@ extern "C" __global__ void kv_cache_append_multi_kernel(
     v_cache[dst + i] = v[src + i];
 }
 
-// Decode attention for every sequence. `max_keys` sizes the shared score
-// buffer; each sequence loops only to its own `positions[s]`.
+// Decode attention for every sequence.
+//
+// The score for each key used to be materialised in dynamic shared memory --
+// one entry per position in the context -- so the shared-memory request grew
+// with the context window and the launch failed outright once it passed the
+// 48 KB a launch can request (12,288 keys). Streaming the keys through the
+// online-softmax recurrence keeps the running state in two registers instead,
+// so the context length no longer affects shared memory at all.
 extern "C" __global__ void attn_decode_multi_kernel(
     const float* __restrict__ q, const float* __restrict__ k_cache,
     const float* __restrict__ v_cache, float* __restrict__ out,
@@ -806,35 +958,29 @@ extern "C" __global__ void attn_decode_multi_kernel(
     const int kh = h / group;
     const int n_keys = positions[s];
 
-    extern __shared__ float scores[];
-
     const size_t qb = (size_t)s * n_q_heads * head_dim;
     const size_t cb = (size_t)s * base_stride;
     const bool active = d < head_dim;
     const float qv = active ? q[qb + h * head_dim + d] : 0.0f;
 
+    float mx = -INFINITY, sum = 0.0f, acc = 0.0f;
     for (int i = 0; i < n_keys; ++i) {
         const float kk =
             active ? k_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kk) * scale;
-        if (d == 0) scores[i] = dot;
-        __syncthreads();
+        const float m_new = fmaxf(mx, dot);
+        const float corr = __expf(mx - m_new);
+        const float p = __expf(dot - m_new);
+        sum = sum * corr + p;
+        acc = fmaf(p,
+                   active ? v_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d] : 0.0f,
+                   acc * corr);
+        mx = m_new;
     }
 
-    float mx = -INFINITY;
-    for (int i = 0; i < n_keys; ++i) mx = fmaxf(mx, scores[i]);
-    float sum = 0.0f;
-    for (int i = 0; i < n_keys; ++i) sum += __expf(scores[i] - mx);
-    const float inv = 1.0f / sum;
-
-    if (active) {
-        float acc = 0.0f;
-        for (int i = 0; i < n_keys; ++i) {
-            const float p = __expf(scores[i] - mx) * inv;
-            acc = fmaf(p, v_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d], acc);
-        }
-        out[qb + h * head_dim + d] = acc;
-    }
+    // An empty cache leaves `sum` at zero; the old form returned 0 here because
+    // its accumulation loop never ran, so keep that rather than emitting NaN.
+    if (active) out[qb + h * head_dim + d] = (sum > 0.0f) ? acc / sum : 0.0f;
 }
 
 // Per-sequence argmax: `gridDim.y` selects the row of a `[n_seq, n]` logits

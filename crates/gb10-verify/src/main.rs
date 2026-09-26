@@ -208,6 +208,301 @@ fn batch_parity(args: &Args, n_seq: usize, n_new: usize) -> Result<bool> {
     Ok(all_ok)
 }
 
+/// Time chunked prefill inside the model, with no server in the way.
+///
+/// The server's per-chunk times grow by ~5 s per chunk, which no single op in
+/// the layer forward accounts for and which the attention kernel does not
+/// reproduce in isolation (1.8 s for the same shape). This reproduces the
+/// server's geometry -- same context, same slot count, same chunk size -- so
+/// the growth can be bisected without HTTP or the scheduler in between.
+fn prefill_shape(args: &Args) -> Result<()> {
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let model = Model::load_from(&dev, cfg, &args.model)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+
+    // Matches the server's PREFILL_CHUNK, which is the shape under test.
+    let chunk = 2048usize;
+    let total = args.limit.max(1) as usize;
+    let ctx = args.max_seq;
+    let n_seq = 10usize;
+
+    // A real, in-distribution sequence rather than random ids.
+    let seed_text = "The archive room contains many boxes of old records. Each box \
+                     is labelled with a number and a date, and the shelves are dusted. ";
+    let mut ids: Vec<u32> = Vec::new();
+    while ids.len() < total {
+        ids.extend(tok.encode(seed_text, false)?);
+    }
+    ids.truncate(total);
+
+    println!("chunk size {chunk}, total {} tokens, ctx {ctx}, n_seq {n_seq}", ids.len());
+    let mut state = ModelState::new(&dev, &model, ctx, n_seq)?;
+    let mut sc = Scratch::new(&dev, &text, chunk)?;
+    state.reset(&dev)?;
+
+    let t_all = std::time::Instant::now();
+    for (i, c) in ids.chunks(chunk).enumerate() {
+        let t0 = std::time::Instant::now();
+        model.prefill_seq(&dev, c, &mut state, &mut sc, 0)?;
+        println!(
+            "  chunk {i:>2} ({:>5} tok, start {:>6}): {:>7.2}s",
+            c.len(),
+            i * chunk,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    println!("  total {:.2}s", t_all.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Deterministic pseudo-random value in [-0.5, 0.5), so a failure here is
+/// reproducible without checking in a blob.
+fn lcg(seed: &mut u64) -> f32 {
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (((*seed >> 33) as u32) as f32 / (1u32 << 31) as f32) - 0.5
+}
+
+/// Tiled prefill attention against the legacy kernel, on random inputs.
+///
+/// The legacy kernel is the reference *here* because it materialises every
+/// score and softmaxes them in one shot -- it is the implementation that is
+/// obviously right. The tiled kernel reaches the same answer through the
+/// online-softmax recurrence, which sums in a different order and so agrees
+/// only up to f32 rounding; this therefore checks a tolerance, not bit
+/// equality.
+///
+/// What it is actually looking for is a *tiling* bug, and those are not
+/// subtle: a dropped key tile, a causal edge masked one key too tight, or the
+/// running-max correction applied to the wrong rows all produce O(1) errors.
+/// A tolerance of 1e-4 relative is loose enough to accept reordering and far
+/// too tight to accept any of them.
+fn attn_tile(args: &Args) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let t = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let ops = dev.ops();
+
+    let (nh, nkv, hd) = (t.num_attention_heads, t.num_key_value_heads, t.head_dim);
+    println!("q heads {nh}, kv heads {nkv}, head_dim {hd}");
+    println!(
+        "  {:>5} {:>5}  {:>10}  {:>10}",
+        "start", "ntok", "max|abs|", "rms rel"
+    );
+
+    // `n_tokens` straddles the BQ/BK tile edges (8/16) and the `rows < BQ`
+    // tail; `start` straddles a BK edge and lands mid-tile.
+    let shapes = [
+        (0usize, 1usize),
+        (0, 7),
+        (0, 8),
+        (0, 9),
+        (0, 16),
+        (0, 17),
+        (0, 64),
+        (0, 129),
+        (37, 16),
+        (100, 33),
+        (511, 128),
+        (2047, 64),
+        (1000, 200),
+    ];
+
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut seed = 12345u64;
+    let mut ok = true;
+
+    for &(start, nt) in &shapes {
+        let keys = start + nt;
+        let qh: Vec<f32> = (0..nt * nh * hd).map(|_| lcg(&mut seed)).collect();
+        let kh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+        let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+
+        let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+        let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+        dev.stream().memcpy_htod(&qh, &mut qd)?;
+        dev.stream().memcpy_htod(&kh, &mut kd)?;
+        dev.stream().memcpy_htod(&vh, &mut vd)?;
+        let mut a = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+        let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+
+        let kv_base = 0usize;
+        ops.attn_prefill_legacy(
+            &dev, &qd, &kd, &vd, &mut a, nt, nh, nkv, hd, scale, start, kv_base,
+        )?;
+        ops.attn_prefill_tiled(
+            &dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, kv_base,
+        )?;
+        dev.check_err()?;
+
+        let av = dev.stream().memcpy_dtov(&a)?;
+        let bv = dev.stream().memcpy_dtov(&b)?;
+        // Relative error must be taken against the *scale of the tensor*, not
+        // against each element's own magnitude. Attention outputs are weighted
+        // averages of zero-mean values, so individual elements land near zero
+        // by cancellation; dividing by them reports 1% "error" for an absolute
+        // difference of 1e-7, which is just f32 rounding.
+        let mut max_abs = 0f32;
+        let mut rms_ref = 0f64;
+        let mut rms_diff = 0f64;
+        for i in 0..av.len() {
+            let d = (av[i] - bv[i]).abs();
+            max_abs = max_abs.max(d);
+            rms_ref += (av[i] as f64) * (av[i] as f64);
+            rms_diff += (d as f64) * (d as f64);
+        }
+        let rms_ref = (rms_ref / av.len() as f64).sqrt();
+        let rms_diff = (rms_diff / av.len() as f64).sqrt();
+        let rel = (rms_diff / rms_ref.max(1e-30)) as f32;
+        let pass = rel < 1e-4;
+        ok &= pass;
+        println!(
+            "  {start:>5} {nt:>5}  {max_abs:>10.3e}  {rel:>10.3e}  rms|ref| {rms_ref:.3e}  {}",
+            if pass { "ok" } else { "MISMATCH" }
+        );
+    }
+
+    // `attn_prefill` is what the model calls and now always dispatches to the
+    // tiled kernel, so these compare the *production* path against the legacy
+    // kernel rather than against a second call to the tiled one. The sizes stop
+    // where the legacy kernel stops being launchable.
+    if ok {
+        println!("\n  production path vs legacy kernel:");
+        // The list stops at 12,224 keys on purpose: the legacy kernel asks for
+        // one score per key in dynamic shared memory, and 12,256 is the most it
+        // can launch (48 KB minus the 128 B its reduction helper claims
+        // statically). Asking for more here would test the launch limit rather
+        // than the two kernels' agreement.
+        for &(start, nt) in &[
+            (0usize, 2048usize),
+            (8192, 2048),
+            (9000, 1024),
+            (11000, 1024),
+            (11200, 1024),
+        ] {
+            let keys = start + nt;
+            let qh: Vec<f32> = (0..nt * nh * hd).map(|_| lcg(&mut seed)).collect();
+            let kh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+            let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+            let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            dev.stream().memcpy_htod(&qh, &mut qd)?;
+            dev.stream().memcpy_htod(&kh, &mut kd)?;
+            dev.stream().memcpy_htod(&vh, &mut vd)?;
+            let mut a = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            ops.attn_prefill(&dev, &qd, &kd, &vd, &mut a, nt, nh, nkv, hd, scale, start, 0)?;
+            ops.attn_prefill_legacy(&dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0)?;
+            dev.check_err()?;
+            let av = dev.stream().memcpy_dtov(&a)?;
+            let bv = dev.stream().memcpy_dtov(&b)?;
+            let mut max_abs = 0f32;
+            let mut rr = 0f64;
+            let mut rd = 0f64;
+            for i in 0..av.len() {
+                let d = (av[i] - bv[i]).abs();
+                max_abs = max_abs.max(d);
+                rr += (av[i] as f64) * (av[i] as f64);
+                rd += (d as f64) * (d as f64);
+            }
+            let rel = (rd / rr.max(1e-30)).sqrt() as f32;
+            let pass = rel < 1e-4;
+            ok &= pass;
+            println!(
+                "  start {start:>6} ntok {nt:>5}  keys {keys:>6}  max|abs| {max_abs:.2e}  rms rel {rel:.2e}  {}",
+                if pass { "ok" } else { "MISMATCH" }
+            );
+        }
+    }
+
+    // Spans the legacy kernel cannot launch at all. There is no second
+    // implementation to compare against out here, so this checks the two
+    // failure modes that a broken tile produces: non-finite output, or output
+    // that collapsed to zero because the mask swallowed every key.
+    if ok {
+        println!("\n  long spans (legacy kernel cannot run these):");
+        for &(start, nt) in &[
+            (0usize, 4096usize),
+            (0, 16384),
+            (12288, 1024),
+            // The exact shape the server feeds the kernel for one prefill
+            // chunk, so its isolated cost can be compared against the chunk
+            // time the server reports.
+            (0, 2048),
+            (10240, 2048),
+            (20480, 2048),
+            (0, 65536),
+        ] {
+            let keys = start + nt;
+            let qh: Vec<f32> = (0..nt * nh * hd).map(|_| lcg(&mut seed)).collect();
+            let kh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+            let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
+            let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            dev.stream().memcpy_htod(&qh, &mut qd)?;
+            dev.stream().memcpy_htod(&kh, &mut kd)?;
+            dev.stream().memcpy_htod(&vh, &mut vd)?;
+            let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let t0 = std::time::Instant::now();
+            ops.attn_prefill_tiled(
+                &dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0,
+            )?;
+            dev.check_err()?;
+            // The launch is asynchronous, so the timer has to be stopped after
+            // something that actually waits for the kernel. The D2H copy below
+            // does; timing before it measures the launch and reports ~0 s.
+            let bv = dev.stream().memcpy_dtov(&b)?;
+            let el = t0.elapsed().as_secs_f64();
+            let nan = bv.iter().filter(|v| !v.is_finite()).count();
+            let nonzero = bv.iter().filter(|v| v.abs() > 1e-9).count();
+            let pass = nan == 0 && nonzero > bv.len() / 2;
+            ok &= pass;
+            println!(
+                "  start {start:>6} ntok {nt:>6}  {el:>7.2} s  non-finite {nan:>6}  nonzero {nonzero:>7}/{:<7}  {}",
+                bv.len(),
+                if pass { "ok" } else { "BAD" }
+            );
+        }
+    }
+
+    // Does the *size* of the cache buffer change the kernel's speed?
+    //
+    // Every call above passes k/v sized exactly to the keys it reads. The model
+    // passes a cache sized for the whole context and every sequence slot, of
+    // which only a prefix is live. The server's per-chunk times grow with
+    // `start` far faster than the numbers above predict, and this is the one
+    // difference between the two, so it is worth isolating before looking for
+    // the cost anywhere else.
+    if ok {
+        println!("\n  same shape, cache sized for the real context:");
+        let max_seq = 32768usize;
+        let n_seq = 10usize;
+        let stride = max_seq * nkv * hd;
+        let mut kd = dev.stream().alloc_zeros::<f32>(stride * n_seq)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(stride * n_seq)?;
+        for &(start, nt) in &[(0usize, 2048usize), (10240, 2048), (20480, 2048)] {
+            let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            let t0 = std::time::Instant::now();
+            ops.attn_prefill_tiled(&dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0)?;
+            dev.check_err()?;
+            let _ = dev.stream().memcpy_dtov(&b)?;
+            let el = t0.elapsed().as_secs_f64();
+            println!(
+                "  start {start:>6} ntok {nt:>5}  cache {:.2} GB  {el:>7.2} s",
+                (2 * stride * n_seq * 4) as f64 / 1e9
+            );
+        }
+    }
+    Ok(ok)
+}
+
 fn load_config(model_dir: &Path) -> Result<ModelConfig> {
     let p = model_dir.join("config.json");
     let raw = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -1592,6 +1887,18 @@ fn main() -> Result<()> {
         }
         "forward-cost" => {
             forward_cost(&args)?;
+            return Ok(());
+        }
+        "prefill-shape" => {
+            prefill_shape(&args)?;
+            return Ok(());
+        }
+        "attn-tile" => {
+            let ok = attn_tile(&args)?;
+            if !ok {
+                bail!("attn-tile gate FAILED");
+            }
+            println!("\nattn-tile: OK");
             return Ok(());
         }
         "chunked-prefill" => {
