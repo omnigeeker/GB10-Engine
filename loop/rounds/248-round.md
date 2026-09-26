@@ -1,5 +1,39 @@
 # Round 248 — 20260926T083832Z
 
+**Milestone: task accuracy measured, and the engine does not drop points.**
+No model behaviour changed. `gb10-verify` gained a `choice` subcommand that
+scores multiple-choice questions by answer-letter log-probability, and the engine
+was measured against three references on 3,240 MMLU questions.
+
+## MMLU: 3,240 questions, 14 subjects, zero-shot
+
+| implementation | weights | accuracy | vs BF16 | McNemar p |
+|---|---|---|---|---|
+| `transformers` | BF16 base | **80.74 %** | — | — |
+| `transformers` | NVFP4 dequantized — *the engine's own weights* | 80.46 % | −0.28 % | 0.45 |
+| **gb10-engine** | NVFP4 | **80.34 %** | **−0.40 %** | **0.25** |
+| llama.cpp | NVFP4 GGUF | 79.88 % | −0.86 % | 0.011 |
+
+* Against a reference holding **exactly the same weights**, the engine agrees on
+  **3216/3240 = 99.26 %** of questions (net −0.12 %, p = 0.48). The engine's own
+  arithmetic costs essentially nothing.
+* The 0.40-point gap to BF16 is 13 questions in 3,240 and is **not significant**.
+  The dequantized reference pays a similar −0.28 %, so what gap exists is the
+  price of 4-bit weights.
+* llama.cpp's NVFP4 path is again the outlier, and the only significant gap —
+  the same ordering the perplexity result found, on a task metric.
+* Prompt is defined once (`bench/mmlu/render.py`, mirrored in the engine) and
+  both `transformers` references report **0 prompt-token mismatches / 3,240**.
+
+Two traps caught by assertions rather than assumed away: llama.cpp's server
+returns OpenAI-style `logprob`/`top_logprobs` keys (not `prob`/`probs`), and its
+candidate list at `n_probs = 100` omitted an answer letter on 130 questions.
+Sorting the letter ids would have silently permuted A/B/C/D — the engine's order
+is 357/417/351/414, not sorted. Re-running at `n_probs = 1000` reduced omissions
+to 3 and changed **0 of 3,240 picks**, so the number was already correct.
+
+Full write-up in `docs/ACCURACY.md` → "Task accuracy: MMLU".
+
 ## Gates
 
 | gate | result |

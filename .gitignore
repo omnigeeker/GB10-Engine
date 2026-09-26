@@ -39,3 +39,4 @@ tools/llama.cpp/
 # Python bytecode
 __pycache__/
 *.pyc
+/bench/mmlu/data/
