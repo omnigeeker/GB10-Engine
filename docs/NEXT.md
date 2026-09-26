@@ -1,6 +1,6 @@
 # SESSION HANDOFF (read this first)
 
-## Accuracy evaluation — round 245, full write-up in `docs/ACCURACY.md`
+## Accuracy evaluation — full write-up in `docs/ACCURACY.md`
 
 wikitext-2, `n_ctx=512`, identical token ids for all three runs (297,054 tokens,
 147,900 predictions each):
@@ -18,22 +18,42 @@ wikitext-2, `n_ctx=512`, identical token ids for all three runs (297,054 tokens,
 tokenizer cross-check and is how the "0 mismatches / 297,054" claim is made; a
 mismatch is a hard error, not a warning.
 
+### Token level: 8 prompts x 64 tokens, 409/477 = 85.74 %, 3/8 exact
+
+T7 asks for exact top-1 match over **>= 32** greedy tokens; the committed gate
+only checked 16. Extended, the engine is exact on p01-capital/p05-prime/p07-proof
+and diverges at steps 11/55/57/61/61 elsewhere. **Every attributable divergence is
+an exact tie or one bf16 ulp in the reference's logits**, and on 4 of 5 prompts
+the reference's own KV-cache decode leaves its recompute path at the same step or
+earlier. The reference emits *bf16 logits* (0.125 grid at `|logit|~23`), so 2.2 %
+of its greedy decisions are exact ties and "the" greedy token is not defined
+there. Details, tables and the trap that this investigation fell into first are
+in `docs/ACCURACY.md` -> "T7 extended".
+
+Reproduce: `python3 bench/ppl/multi_prompt_check.py --n 64` then
+`python3 bench/ppl/divergence_analysis.py`.
+
 ### Open, and the cheapest next experiments
 
-1. **One `generate` run diverged under load** — `[760, ...]` instead of
-   `[1421, ...]`, with no error printed, while llama.cpp's perplexity job held
-   the GPU. **7 further runs passed**, 3 under BF16 load and 4 under a concurrent
-   engine perplexity run, so it is unreproduced. `Device::check_err` now makes
-   such a failure loud (it used to be swallowed by `CudaSlice::drop` ->
-   `record_err`), but the root cause is unknown. The one load not yet retried is
-   llama.cpp specifically. Do not run two 50 GB-class CUDA jobs at once: that
-   OOM-killed the BF16 job once already.
-2. **Coverage is one dataset and one prompt.** A multi-prompt, long-generation
-   token-exactness run against the BF16 reference would say much more about rare
-   failures than perplexity can.
+1. **No engine logits have ever been compared to reference logits.** All
+   token-level conclusions are inferred from token identity plus the
+   *reference's* margins. A per-step top-k comparison would measure the engine's
+   error directly instead of bounding it by the reference's resolution. This is
+   the single most valuable missing measurement.
+2. **One `generate` run diverged under load** — `[760, ...]` instead of
+   `[1421, ...]`, no error printed, while llama.cpp's perplexity job held the
+   GPU. **15 further runs have passed** (8 clean, 3 under BF16 load, 4 under a
+   concurrent engine perplexity run). `Device::check_err` now makes such a
+   failure loud (it used to be swallowed by `CudaSlice::drop` -> `record_err`),
+   but the root cause is unknown. The one load not yet retried is llama.cpp
+   specifically. Do not run two 50 GB-class CUDA jobs at once: that OOM-killed
+   the BF16 job once already.
 3. **The 1.53 % disagreement with llama.cpp is characterised, not explained.**
    No GPU needed to go further: compare one tensor's dequantized values
    elementwise against the GGUF's NVFP4.
+4. **The bit-exactness gate cannot be tightened to 32+ tokens on this
+   reference.** If T7 is to be met literally, the reference has to change (logits
+   in f32, or a defined tie-break), not the engine.
 
 ## Where this stands, as of round 140
 

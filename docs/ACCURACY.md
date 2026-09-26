@@ -6,6 +6,13 @@
 the unquantized BF16 model**, against **2.24 %** for llama.cpp's NVFP4 path on the
 same weights. The engine is the closer of the two to the reference.
 
+At the token level, extended from 1 prompt x 16 tokens to **8 prompts x 64 tokens**
+(including a 367-token prefill), the engine agrees on **409/477 = 85.74 %** of
+tokens and is exact on 3 of 8 prompts. Every attributable divergence is at an
+**exact tie or one bf16 ulp** in the reference's own logits, and the reference
+disagrees with *itself* across equivalent decode strategies at the same or earlier
+steps. Details in **T7 extended** below.
+
 ## The three numbers
 
 wikitext-2 test (`wiki.test.raw`, 297,054 tokens), `n_ctx = 512`, non-overlapping
@@ -85,6 +92,101 @@ Independently of perplexity, the 64-layer greedy gate still agrees **16/16
 dequantizing this same NVFP4 checkpoint to bf16. That gate compares tokens, not
 aggregates, and it is what rules out a systematic logit shift.
 
+## T7 extended: 8 prompts x 64 tokens
+
+T7 (`docs/TARGETS.md`) asks for **top-1 token match against the NVFP4 reference
+on the fixed prompt set, >= 32 greedy tokens**. The committed gate checks one
+prompt for 16 tokens, so the horizon had never actually been exercised. It is
+now: eight prompts, up to 64 tokens each, including a 367-token prefill.
+
+```
+python3 tools/full_oracle.py --n 64 --prompts-file tools/oracle_prompts.json \
+    --out-dir fixtures/oracle-multi
+python3 bench/ppl/multi_prompt_check.py --n 64
+```
+
+| prompt | prompt tok | generated | agreement | first divergence |
+|---|---|---|---|---|
+| p01-capital | 59 | 29 (EOS) | 29/29 | **exact** |
+| p02-math | 110 | 64 | 13/64 | 11 |
+| p03-code | 76 | 64 | 62/64 | 57 |
+| p04-chinese | 76 | 64 | 61/64 | 61 |
+| p05-prime | 74 | 64 | 64/64 | **exact** |
+| p06-kyoto | 93 | 64 | 55/64 | 55 |
+| p07-proof | 80 | 64 | 64/64 | **exact** |
+| p08-longctx | 367 | 64 | 61/64 | 61 |
+| **total** | | **477** | **409/477 = 85.74 %** | 3/8 exact |
+
+The original fixed prompt (p01) is still exact over its whole 29-token run; it
+ends in EOS, which is why T7's ">= 32 tokens" is not reachable on it.
+
+### Why the other five are not an accuracy drop
+
+The reference emits **bf16 logits**. At `|logit| ~ 23` a bf16 ulp is 0.125 and at
+`~27` it is 0.25, so its logits sit on a coarse grid and ties are common.
+Measured on the reference's own trajectory, at the exact step the engine first
+disagrees:
+
+| prompt | step | margin | in bf16 ulp | engine's token tied with the reference's top-1 |
+|---|---|---|---|---|
+| p02-math | 11 | 0.1250 | 1 | no |
+| p03-code | 57 | 0.0000 | 0 | **yes** |
+| p04-chinese | 61 | 0.0000 | 0 | **yes** |
+| p06-kyoto | 55 | 0.0000 | 0 | **yes** |
+| p08-longctx | 61 | 0.0000 | 0 | **yes** |
+
+**Four of five engine divergences are the engine emitting a token the reference
+scores exactly as high as its own top-1**, and the fifth is one ulp below. 2.2 %
+of the reference's greedy decisions (7/320) are exact ties. At such a step "the"
+greedy token is not defined, and the choice is made by whichever tie-breaking
+rule the implementation happens to use — `argmax` and `topk(logits, 1)` on the
+same tensor return different tokens.
+
+That is not hypothetical; it is how this investigation first went wrong. An
+earlier revision of `divergence_analysis.py` picked with `topk` where
+`full_oracle.py` picks with `argmax`. At p04-chinese step 1 the reference scores
+tokens 96719 and 95826 **both at 27.5**; the two rules chose differently, and the
+script then spent a run analysing a trajectory that had nothing to do with the
+one the engine was compared against. `bench/ppl/oracle_determinism.py` confirms
+the reference is otherwise reproducible: 3 repetitions of the same decode in one
+process agree exactly on all 4 prompts tested.
+
+### The reference is not self-consistent either
+
+Stronger control: the same model, same prompt, same argmax, decoded
+incrementally against a **KV cache** instead of by recomputing the sequence.
+`tools/full_oracle.py` avoids the cache path deliberately ("it avoids depending
+on the KV-cache path being bit-identical to a one-token-at-a-time decode"); the
+engine uses it.
+
+| prompt | reference cache-vs-recompute first divergence | engine first divergence |
+|---|---|---|
+| p02-math | none (64/64) | 11 |
+| p03-code | **38** | 57 |
+| p04-chinese | **35** | 61 |
+| p06-kyoto | **55** | **55** |
+| p08-longctx | **61** | **61** |
+
+On p06-kyoto and p08-longctx the reference's own cache path leaves the recompute
+path at *precisely* the step the engine does. On p03-code and p04-chinese it
+leaves **earlier** than the engine. So token-exactness against a recomputing
+reference is a property of the decode strategy, not of the engine: on four of
+five prompts no KV-cache implementation, including the reference's, can hold it.
+
+p02-math is the one case where the reference's cache path does agree with itself
+(64/64) and the engine still diverges at step 11 — that is the one-ulp margin
+above, where a difference below the reference's own representable resolution
+decides the token.
+
+### What this does not establish
+
+It shows the engine's tokens are ones the reference scores identically or within
+one ulp, and that a recomputing reference is not a stable target. It does **not**
+prove the engine's logits track the reference's to within an ulp everywhere —
+that needs a per-step top-k comparison of engine logits against reference logits,
+which is not built. The layer-parity contract remains the looser 2e-3 relative
+norm / 5e-2 relative (`crates/gb10-verify/src/main.rs`).
+
 ## Negative finding: the llama.cpp NVFP4 path is the outlier
 
 The 1.5 % gap is systematic, not noise. The cumulative traces track each other
@@ -156,6 +258,13 @@ python bench/ppl/bf16_ppl.py --model-path <bf16-dir> \
 
 # 4. combine
 python3 bench/ppl/compare.py
+
+# 5. token-level: 8 prompts, 64 tokens, vs the NVFP4 reference
+python3 tools/full_oracle.py --n 64 --prompts-file tools/oracle_prompts.json \
+    --out-dir fixtures/oracle-multi               # ~6 min, one model load
+python3 bench/ppl/multi_prompt_check.py --n 64    # 3/8 exact, 409/477 tokens
+python3 bench/ppl/oracle_determinism.py --reps 3  # reference is reproducible
+python3 bench/ppl/divergence_analysis.py          # margins at every divergence
 ```
 
 The engine perplexity path costs ~3.9 s per 512-token window against llama.cpp's
@@ -166,21 +275,32 @@ documents; it is not a new finding.
 
 | file | what |
 |---|---|
-| `bench/ppl/compare.json` | the table above, machine-readable |
+| `bench/ppl/compare.json` | the perplexity table, machine-readable |
 | `bench/ppl/engine.json` | engine result + full config |
 | `bench/ppl/bf16.json` | BF16 reference result |
 | `bench/ppl/bf16-nll.json` | per-window mean NLL, all 580 windows |
 | `bench/ppl/engine.log` | engine cumulative trace |
 | `bench/ppl/llamacpp-nvfp4.log` | llama.cpp cumulative trace + final estimate |
 | `bench/ppl/wiki.tokens.txt` | the shared 297,054-token stream |
+| `bench/ppl/multi-prompt.json` | per-prompt token agreement |
+| `bench/ppl/divergence-analysis.json` | margins, tie sets, cache control |
+| `bench/ppl/oracle-determinism.json` | reference repeatability |
+| `fixtures/oracle-multi/<tag>/greedy_tokens.json` | the 8 NVFP4-reference traces |
+| `tools/oracle_prompts.json` | the prompt set |
 
 ## What this does not establish
 
-* Only **one** dataset (wikitext-2). Task accuracy (MMLU-style few-shot) was not
-  run; the scope chosen for this evaluation was perplexity.
-* Perplexity is a smooth aggregate. It would not catch a rare, catastrophic
-  failure on an unusual input; the token-exact `generate` gate covers that
-  direction, but only on one prompt.
+* Only **one** dataset for perplexity (wikitext-2). Task accuracy (MMLU-style
+  few-shot) was not run; the scope chosen for this evaluation was perplexity
+  plus token agreement.
+* Perplexity is a smooth aggregate and would not catch a rare, catastrophic
+  failure on an unusual input. The token-level work above covers that direction
+  on 8 prompts, and what it caught was divergence at ties, not bad text.
+* **No engine logits were ever compared to reference logits.** Every token-level
+  conclusion here is inferred from token identity and from the *reference's*
+  margins. A per-step top-k comparison would measure the engine's actual error
+  directly instead of bounding it by the reference's resolution, and it is the
+  single most valuable missing measurement.
 * The 1.5 % disagreement with llama.cpp is characterised, not explained. If the
   two must agree exactly, the next step is to compare one tensor's dequantized
   values elementwise, which needs no GPU.

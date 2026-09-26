@@ -1,0 +1,34 @@
+[
+  {
+    "tag": "p01-capital",
+    "prompt": "What is the capital of France?"
+  },
+  {
+    "tag": "p02-math",
+    "prompt": "A train leaves Boston at 2:15 PM traveling 68 mph. A second train leaves the same station at 3:00 PM traveling 82 mph on a parallel track. At what time does the second train catch up to the first? Show your reasoning."
+  },
+  {
+    "tag": "p03-code",
+    "prompt": "Write a Python function that takes a list of integers and returns the longest strictly increasing subsequence. Explain the time complexity."
+  },
+  {
+    "tag": "p04-chinese",
+    "prompt": "\u8bf7\u7528\u4e2d\u6587\u89e3\u91ca\u4e00\u4e0b\u4ec0\u4e48\u662f\u6df7\u5408\u4e13\u5bb6\u6a21\u578b\uff08MoE\uff09\uff0c\u4ee5\u53ca\u5b83\u76f8\u6bd4\u7a20\u5bc6\u6a21\u578b\u5728\u63a8\u7406\u65f6\u7684\u4f18\u52bf\u548c\u6311\u6218\u3002"
+  },
+  {
+    "tag": "p05-prime",
+    "prompt": "List the first 12 prime numbers and then explain in one sentence why 1 is not considered prime."
+  },
+  {
+    "tag": "p06-kyoto",
+    "prompt": "I am planning a 5-day trip to Kyoto in November. Days 1 and 2 are for temples. Suggest a detailed plan for days 3 to 5, including food and transport."
+  },
+  {
+    "tag": "p07-proof",
+    "prompt": "Prove that the square root of 2 is irrational, then explain where the proof breaks down if you replace 2 with 4."
+  },
+  {
+    "tag": "p08-longctx",
+    "prompt": "Read the following passage carefully.\n\nDu Fu is noted for having written more on poetics and painting than any other writer of his time . He wrote eighteen poems on painting alone , more than any other Tang poet . Du Fu 's seemingly negative commentary on the prized horse paintings of Han Gan ignited a controversy that has persisted to the present day . \n\n The tenor of his work changed as he developed his style and adapted to his surroundings ( \" chameleon @-@ like \" according to Watson ) : his earliest works are in a relatively derivative , courtly style , but he came into his own in the years of the rebellion . Owen comments on the \" grim simplicity \" of the Qinzhou poems , which mirrors the desert landscape ; the works from his Chengdu period are \" light , often finely observed \" ; while the poems from the late Kuizhou period have a \" density and power of vision \" . \n\n Although he wrote in all poetic forms , Du Fu is best known for his l\u01dcshi , a type of poem with strict constraints on form and content , for example : \n\n About two thirds of Du Fu 's 1500 extant works are in this form , and he is generally considered to be its leading exponent . His best l\u01dcshi use the parallelisms required by the form to add expressive content rather than as mere technical restrictions . Hawkes comments that , \" it is amazing that Tu Fu is able to use so immensely stylized a form in so\n\nQuestion: In one sentence, what is this passage about?"
+  }
+]

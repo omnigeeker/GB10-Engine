@@ -1,0 +1,26 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+loading weights ...
+  loaded 400/851
+  loaded 800/851
+  loaded 851/851
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+p01-capital    stable=True  run-vs-run diffs=[None, None]  vs fixture first diff=16
+    run0: [1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]
+    run1: [1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]
+    run2: [1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]
+p02-math       stable=True  run-vs-run diffs=[None, None]  vs fixture first diff=16
+    run0: [1596, 1144, 4087, 6673, 3299, 3377, 13, 14235, 11290, 13, 25291, 16, 10583, 220, 17, 25]
+    run1: [1596, 1144, 4087, 6673, 3299, 3377, 13, 14235, 11290, 13, 25291, 16, 10583, 220, 17, 25]
+    run2: [1596, 1144, 4087, 6673, 3299, 3377, 13, 14235, 11290, 13, 25291, 16, 10583, 220, 17, 25]
+p04-chinese    stable=True  run-vs-run diffs=[None, None]  vs fixture first diff=16
+    run0: [97237, 95826, 99986, 104118, 4960, 139054, 99986, 98682, 97434, 108829, 101742, 98138, 103725, 9616, 24797, 36]
+    run1: [97237, 95826, 99986, 104118, 4960, 139054, 99986, 98682, 97434, 108829, 101742, 98138, 103725, 9616, 24797, 36]
+    run2: [97237, 95826, 99986, 104118, 4960, 139054, 99986, 98682, 97434, 108829, 101742, 98138, 103725, 9616, 24797, 36]
+p06-kyoto      stable=True  run-vs-run diffs=[None, None]  vs fixture first diff=16
+    run0: [1596, 1144, 4087, 1156, 579, 1622, 303, 6163, 13, 14235, 7936, 1534, 11346, 3019, 364, 2756]
+    run1: [1596, 1144, 4087, 1156, 579, 1622, 303, 6163, 13, 14235, 7936, 1534, 11346, 3019, 364, 2756]
+    run2: [1596, 1144, 4087, 1156, 579, 1622, 303, 6163, 13, 14235, 7936, 1534, 11346, 3019, 364, 2756]
+
+stable prompts: 4/4 at n=16, reps=3
+wrote bench/ppl/oracle-determinism.json

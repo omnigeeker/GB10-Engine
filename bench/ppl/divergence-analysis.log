@@ -1,0 +1,25 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+loading weights ...
+  loaded 400/851
+  loaded 800/851
+  loaded 851/851
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+[transformers] `causal_conv1d_update` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `fused_recurrent_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+p02-math       engine diverged @  11 margin   0.1250 tied=False  cached-vs-recompute first None (64/64)
+p03-code       engine diverged @  57 margin   0.0000 tied=True   cached-vs-recompute first   38 (38/64)
+p04-chinese    engine diverged @  61 margin   0.0000 tied=True   cached-vs-recompute first   35 (37/64)
+p06-kyoto      engine diverged @  55 margin   0.0000 tied=True   cached-vs-recompute first   55 (55/64)
+p08-longctx    engine diverged @  61 margin   0.0000 tied=True   cached-vs-recompute first   61 (61/64)
+
+at the engine's first divergence (bf16 ulp at |logit|~23 is 0.125):
+  p02-math       step  11  margin 0.1250 (~1.00 bf16 ulp)  engine 220 vs oracle 16  engine token tied with oracle top-1: False
+  p03-code       step  57  margin 0.0000 (~0.00 bf16 ulp)  engine 958 vs oracle 635  engine token tied with oracle top-1: True
+  p04-chinese    step  61  margin 0.0000 (~0.00 bf16 ulp)  engine 98628 vs oracle 95865  engine token tied with oracle top-1: True
+  p06-kyoto      step  55  margin 0.0000 (~0.00 bf16 ulp)  engine 20329 vs oracle 3487  engine token tied with oracle top-1: True
+  p08-longctx    step  61  margin 0.0000 (~0.00 bf16 ulp)  engine 1304 vs oracle 13  engine token tied with oracle top-1: True
+
+exact ties in the reference's own logits: 7/320 steps (2.2%)
+
+wrote bench/ppl/divergence-analysis.json
