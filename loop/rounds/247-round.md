@@ -1,5 +1,27 @@
 # Round 247 — 20260926T051852Z
 
+**Milestone: the determinism question answered with power, and gated.** No model
+behaviour changed. `gb10-verify generate` gained `--repeat N`, which runs the
+same prefill+decode N times from fresh state and fails if any run differs; the
+round gate now uses `--repeat 8`. Full write-up in `docs/ACCURACY.md`.
+
+## What was measured
+
+The round-1 incident — one `generate` run emitting `[760, ...]` instead of
+`[1421, ...]` under llama.cpp's load — was retried under the *exact* original
+condition and did not recur:
+
+| test | result |
+|---|---|
+| 8 prompts x 64 tokens, llama.cpp holding the GPU | **byte-identical to the clean run** — same divergence indices, same token ids; only TTFT moved (455 -> 963 ms) |
+| `generate --n 16 --repeat 100`, same load | **99/99 extra repeats identical to run 0** (450 s of GPU work) |
+| round gate `--repeat 8`, clean | 7/7 identical (31.9 s) |
+| 580-window perplexity | bit-reproducible; a 21-window re-run reproduces `[20] ppl=6.8307` |
+
+Roughly 700 forward passes, under load and idle, with no observed
+nondeterminism. A non-deterministic path now fails the gate instead of being
+discovered later.
+
 ## Gates
 
 | gate | result |
