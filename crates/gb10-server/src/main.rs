@@ -11,8 +11,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::cell::RefCell;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -371,6 +370,132 @@ fn openai_messages(body: &Value) -> Result<Vec<ChatMessage>> {
         .collect())
 }
 
+/// Legacy OpenAI text completion.
+///
+/// The checkpoint is a chat model, so the prompt is wrapped as a single user
+/// turn and the reply is the assistant's text. The wire shape is the legacy one
+/// -- `object: "text_completion"` with a bare `text` per choice, no `message`
+/// and no `delta` -- because clients that ask for `/v1/completions` are parsing
+/// that shape, not the chat one.
+fn handle_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream) -> Result<()> {
+    let prompt = match body.get("prompt") {
+        Some(Value::String(s)) => s.clone(),
+        // The legacy API accepts a batch. This server serves one sequence at a
+        // time, so a batch is refused rather than silently answered with only
+        // its first element.
+        Some(Value::Array(a)) => {
+            anyhow::ensure!(a.len() == 1, "`prompt` array must have exactly one element");
+            a[0].as_str()
+                .context("`prompt` array element must be a string")?
+                .to_string()
+        }
+        _ => anyhow::bail!("`prompt` is required and must be a string"),
+    };
+    let messages = vec![text_message("user", &prompt)];
+    let max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(512) as usize;
+    let want_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let thinking = body
+        .get("enable_thinking")
+        .or_else(|| body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let id = format!("cmpl-{}", now_secs());
+    let created = now_secs();
+    let name = model_name();
+
+    if !want_stream {
+        let r = remote_generate(tx, &messages, max_tokens, thinking, |_| Ok(()))?;
+        return respond_json(
+            stream,
+            200,
+            &json!({
+                "id": id,
+                "object": "text_completion",
+                "created": created,
+                "model": name,
+                "choices": [{
+                    "index": 0,
+                    "text": visible(&r.text),
+                    "logprobs": Value::Null,
+                    "finish_reason": r.finish,
+                }],
+                "usage": {
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.ids.len(),
+                    "total_tokens": r.prompt_tokens + r.ids.len(),
+                },
+            }),
+        );
+    }
+
+    write_head(
+        stream,
+        200,
+        "text/event-stream",
+        "Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
+    )?;
+    let mut send = |v: &Value| -> Result<()> {
+        let line = format!("data: {}\n\n", serde_json::to_string(v)?);
+        write_chunk(stream, line.as_bytes())
+    };
+
+    let mut err: Option<anyhow::Error> = None;
+    let mut finish = "length";
+    let mut n_out = 0usize;
+    let mut prompt_tokens = 0usize;
+    {
+        let (id2, name2) = (id.clone(), name.clone());
+        let mut gate = ThinkGate::new();
+        let res = remote_generate(tx, &messages, max_tokens, thinking, |piece| {
+            match gate.push(piece) {
+                Some(t) => send(&json!({
+                    "id": id2, "object": "text_completion", "created": created,
+                    "model": name2,
+                    "choices": [{"index": 0, "text": t, "logprobs": Value::Null,
+                                 "finish_reason": Value::Null}],
+                })),
+                None => Ok(()),
+            }
+        });
+        if let Some(t) = gate.flush() {
+            send(&json!({
+                "id": id2, "object": "text_completion", "created": created,
+                "model": name2,
+                "choices": [{"index": 0, "text": t, "logprobs": Value::Null,
+                             "finish_reason": Value::Null}],
+            }))?;
+        }
+        match res {
+            Ok(r) => {
+                finish = r.finish;
+                n_out = r.ids.len();
+                prompt_tokens = r.prompt_tokens;
+            }
+            Err(e) => err = Some(e),
+        }
+    }
+    if let Some(e) = err {
+        send(&json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}))?;
+        end_chunked(stream)?;
+        return Ok(());
+    }
+
+    send(&json!({
+        "id": id, "object": "text_completion", "created": created, "model": name,
+        "choices": [{"index": 0, "text": "", "logprobs": Value::Null,
+                     "finish_reason": finish}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n_out,
+                  "total_tokens": prompt_tokens + n_out},
+    }))?;
+    write_chunk(stream, b"data: [DONE]\n\n")?;
+    end_chunked(stream)?;
+    Ok(())
+}
+
 fn handle_chat_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream) -> Result<()> {
     let messages = openai_messages(body)?;
     let max_tokens = body
@@ -388,7 +513,7 @@ fn handle_chat_completions(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut Tc
         .unwrap_or(true);
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
-    let name = MODEL_NAME.with(|n| n.borrow().clone());
+    let name = model_name();
 
     if !want_stream {
         let r = remote_generate(tx, &messages, max_tokens, thinking, |_| Ok(()))?;
@@ -523,7 +648,7 @@ fn handle_messages(tx: &mpsc::Sender<Job>, body: &Value, stream: &mut TcpStream)
         .map(|t| t.get("type").and_then(|v| v.as_str()) != Some("disabled"))
         .unwrap_or(true);
     let id = format!("msg_{}", now_secs());
-    let name = MODEL_NAME.with(|n| n.borrow().clone());
+    let name = model_name();
 
     if !want_stream {
         let r = remote_generate(tx, &messages, max_tokens, thinking, |_| Ok(()))?;
@@ -644,6 +769,10 @@ fn handle(tx: &mpsc::Sender<Job>, name: &str, req: &Request, stream: &mut TcpStr
             let body = req.json()?;
             handle_chat_completions(tx, &body, stream)
         }
+        ("POST", "/v1/completions") => {
+            let body = req.json()?;
+            handle_completions(tx, &body, stream)
+        }
         ("POST", "/v1/messages") => {
             let body = req.json()?;
             handle_messages(tx, &body, stream)
@@ -660,10 +789,17 @@ fn handle(tx: &mpsc::Sender<Job>, name: &str, req: &Request, stream: &mut TcpStr
 // Batching scheduler
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// The model name, published once so the request handlers do not need the
-    /// `Engine` (which now lives on the scheduler thread).
-    static MODEL_NAME: RefCell<String> = RefCell::new(String::new());
+/// The model name, published once at startup so request handlers do not need
+/// the `Engine` (which lives on the scheduler thread).
+///
+/// This must be a process-wide `OnceLock`, not a `thread_local!`: it is written
+/// on the main thread and read on every connection thread, and a thread-local
+/// would give each reader its own empty copy -- which is exactly what happened,
+/// and why `model` was `""` in every response.
+static MODEL_NAME: OnceLock<String> = OnceLock::new();
+
+fn model_name() -> String {
+    MODEL_NAME.get().cloned().unwrap_or_default()
 }
 
 enum Msg {
@@ -813,7 +949,7 @@ fn main() -> Result<()> {
     eprintln!("gb10-server: loading {}", args.model.display());
     let t = std::time::Instant::now();
     let eng = Engine::new(&args)?;
-    MODEL_NAME.with(|n| *n.borrow_mut() = eng.name.clone());
+    let _ = MODEL_NAME.set(eng.name.clone());
     eprintln!("gb10-server: ready in {:.1}s", t.elapsed().as_secs_f64());
 
     let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -847,7 +983,7 @@ fn main() -> Result<()> {
                     return;
                 }
             };
-            let name = MODEL_NAME.with(|n| n.borrow().clone());
+            let name = model_name();
             if let Err(e) = handle(&tx, &name, &req, &mut stream) {
                 eprintln!("{} {}: {e:#}", req.method, req.path);
                 let _ = respond_json(

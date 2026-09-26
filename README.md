@@ -122,8 +122,13 @@ It takes about 95 s to load the weights, then it serves:
 | route | protocol | notes |
 |---|---|---|
 | `POST /v1/chat/completions` | OpenAI | supports `stream`, `max_tokens`, `enable_thinking` |
+| `POST /v1/completions` | OpenAI | legacy text completion; `prompt` must be a single string |
 | `POST /v1/messages` | Anthropic | supports `stream`, `max_tokens` |
 | `GET /v1/models` | both | returns the loaded model id |
+| `GET /health` | — | liveness; use this to wait for startup |
+
+A full usage guide — Python and streaming examples, the parameter table, and the
+decoding limits — is in **[`docs/USAGE.md`](docs/USAGE.md)**.
 
 **OpenAI client:**
 
