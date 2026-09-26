@@ -67,9 +67,18 @@ strips everything through `</think>`**, so `content` is the answer alone.
 * `enable_thinking: false` — no reasoning generated at all; shorter and faster,
   and the stripper becomes a no-op.
 
-**If the response is truncated before `</think>` appears, the text is returned
-unstripped** rather than emptied — so with thinking on, give `max_tokens` enough
-room or you will see raw reasoning.
+Measured on 10 ordinary questions at the **default `max_tokens: 512`**, all 10
+finished with `stop` and used 13–188 completion tokens, so the default is
+adequate for normal use.
+
+**The failure mode to know about:** on an ambiguous or open-ended question the
+model can reason indefinitely and never emit `</think>`. `In one short sentence,
+what is GB10?` did exactly that — 800 completion tokens, still no closing tag,
+`finish_reason: "length"`, and the raw reasoning returned as `content`. If you
+see the model's inner monologue in `content`, that is what happened: either raise
+`max_tokens` or set `enable_thinking: false`. The stripper deliberately returns
+truncated reasoning unstripped rather than emptying the response, since an empty
+answer would be worse than a verbose one.
 
 ## curl
 
