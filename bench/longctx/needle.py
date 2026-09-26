@@ -29,7 +29,10 @@ CHUNK = 2048
 DEPTHS = [float(x) for x in os.environ.get("DEPTHS", "0.1,0.5,0.9").split(",")]
 
 
-def ask(prompt, max_tokens=24, timeout=20000):
+def ask(prompt, max_tokens=24, timeout=172800):
+    # 48 h, because the read timeout is what bounds the *whole* wait on a
+    # non-streaming request: the server sends nothing until the prefill is done.
+    # A 256K prefill is ~12 h and would be abandoned by the old 20000 s.
     r = requests.post(
         URL,
         json={
