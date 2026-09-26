@@ -1,0 +1,37 @@
+==============================================================================
+MMLU accuracy
+==============================================================================
+run                            correct   total   accuracy               95% CI
+ref-bf16                          2616    3240     0.8074     [0.7935, 0.8206]
+ref-nvfp4-dequant                 2607    3240     0.8046     [0.7906, 0.8179]
+engine-mmlu                       2603    3240     0.8034     [0.7894, 0.8167]
+llamacpp                          2588    3240     0.7988     [0.7846, 0.8122]
+
+==============================================================================
+Paired comparison vs ref-bf16 (McNemar, same 3240 questions)
+==============================================================================
+run                              delta   gained   lost    agree          p
+ref-nvfp4-dequant              -0.0028       51     60   0.9580     0.4477
+engine-mmlu                    -0.0040       48     61   0.9596     0.2504
+llamacpp                       -0.0086       42     70   0.9574     0.0107
+
+==============================================================================
+Per-subject accuracy
+==============================================================================
+subject                                       ref-bf16  ref-nvfp4-dequ     engine-mmlu        llamacpp
+business_ethics                                  0.800           0.810           0.810           0.810
+global_facts                                     0.580           0.580           0.560           0.570
+high_school_government_and_politics              0.969           0.964           0.974           0.974
+human_sexuality                                  0.947           0.939           0.939           0.939
+management                                       0.903           0.922           0.913           0.913
+marketing                                        0.957           0.953           0.949           0.949
+moral_disputes                                   0.815           0.801           0.801           0.798
+moral_scenarios                                  0.663           0.667           0.667           0.650
+philosophy                                       0.820           0.823           0.823           0.830
+public_relations                                 0.773           0.736           0.736           0.745
+security_studies                                 0.841           0.833           0.820           0.816
+sociology                                        0.900           0.905           0.910           0.900
+us_foreign_policy                                0.940           0.930           0.920           0.930
+world_religions                                  0.901           0.883           0.889           0.883
+
+wrote bench/mmlu/compare.json

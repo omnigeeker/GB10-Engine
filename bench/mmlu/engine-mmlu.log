@@ -1,0 +1,57 @@
+answer letters " A".." D" -> token ids [357, 417, 351, 414]
+MMLU: 3240 questions
+  model loaded in 41.2s
+  [0/3240] acc=0.0000  0.76s/q  eta 41.1 min
+  [100/3240] acc=0.8119  0.70s/q  eta 36.5 min
+  [200/3240] acc=0.6866  0.69s/q  eta 34.8 min
+  [300/3240] acc=0.7807  0.70s/q  eta 34.4 min
+  [400/3240] acc=0.8304  0.71s/q  eta 33.4 min
+  [500/3240] acc=0.8503  0.68s/q  eta 31.1 min
+  [600/3240] acc=0.8652  0.66s/q  eta 28.9 min
+  [700/3240] acc=0.8773  0.65s/q  eta 27.4 min
+  [800/3240] acc=0.8801  0.65s/q  eta 26.3 min
+  [900/3240] acc=0.8790  0.65s/q  eta 25.3 min
+  [1000/3240] acc=0.8731  0.66s/q  eta 24.5 min
+  [1100/3240] acc=0.8683  0.66s/q  eta 23.5 min
+  [1200/3240] acc=0.8618  0.66s/q  eta 22.5 min
+  [1300/3240] acc=0.8509  0.67s/q  eta 21.8 min
+  [1400/3240] acc=0.8344  0.69s/q  eta 21.0 min
+  [1500/3240] acc=0.8241  0.70s/q  eta 20.1 min
+  [1600/3240] acc=0.8157  0.70s/q  eta 19.2 min
+  [1700/3240] acc=0.8066  0.71s/q  eta 18.2 min
+  [1800/3240] acc=0.7962  0.72s/q  eta 17.2 min
+  [1900/3240] acc=0.7906  0.72s/q  eta 16.1 min
+  [2000/3240] acc=0.7871  0.73s/q  eta 15.0 min
+  [2100/3240] acc=0.7792  0.73s/q  eta 13.9 min
+  [2200/3240] acc=0.7837  0.73s/q  eta 12.6 min
+  [2300/3240] acc=0.7831  0.73s/q  eta 11.4 min
+  [2400/3240] acc=0.7843  0.72s/q  eta 10.1 min
+  [2500/3240] acc=0.7829  0.72s/q  eta 8.9 min
+  [2600/3240] acc=0.7816  0.73s/q  eta 7.8 min
+  [2700/3240] acc=0.7842  0.75s/q  eta 6.7 min
+  [2800/3240] acc=0.7872  0.76s/q  eta 5.6 min
+  [2900/3240] acc=0.7918  0.76s/q  eta 4.3 min
+  [3000/3240] acc=0.7964  0.76s/q  eta 3.0 min
+  [3100/3240] acc=0.7991  0.75s/q  eta 1.7 min
+  [3200/3240] acc=0.8016  0.74s/q  eta 0.5 min
+  [3239/3240] acc=0.8034  0.74s/q  eta 0.0 min
+
+MMLU accuracy: 2603/3240 = 0.8034
+  95% CI: [0.7894, 0.8167]
+
+  business_ethics                            81/100  0.810
+  global_facts                               56/100  0.560
+  high_school_government_and_politics       188/193  0.974
+  human_sexuality                           123/131  0.939
+  management                                 94/103  0.913
+  marketing                                 222/234  0.949
+  moral_disputes                            277/346  0.801
+  moral_scenarios                           597/895  0.667
+  philosophy                                256/311  0.823
+  public_relations                           81/110  0.736
+  security_studies                          201/245  0.820
+  sociology                                 183/201  0.910
+  us_foreign_policy                          92/100  0.920
+  world_religions                           152/171  0.889
+  wall 2394.8s
+wrote bench/mmlu/engine-mmlu.json

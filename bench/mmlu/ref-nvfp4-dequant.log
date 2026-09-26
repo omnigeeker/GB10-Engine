@@ -1,0 +1,64 @@
+questions: 3240
+answer letters " A".." D" -> token ids [357, 417, 351, 414]
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+  loaded 400/851
+  loaded 800/851
+  loaded 851/851
+model loaded in 311.0s
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+  [0/3240] acc=0.0000  1.82s/q  eta 98.3 min
+  [100/3240] acc=0.8119  0.35s/q  eta 18.4 min
+  [200/3240] acc=0.6965  0.34s/q  eta 17.3 min
+  [300/3240] acc=0.7874  0.34s/q  eta 16.7 min
+  [400/3240] acc=0.8304  0.34s/q  eta 16.1 min
+  [500/3240] acc=0.8503  0.34s/q  eta 15.4 min
+  [600/3240] acc=0.8652  0.33s/q  eta 14.7 min
+  [700/3240] acc=0.8787  0.33s/q  eta 14.1 min
+  [800/3240] acc=0.8826  0.33s/q  eta 13.5 min
+  [900/3240] acc=0.8812  0.33s/q  eta 13.0 min
+  [1000/3240] acc=0.8751  0.34s/q  eta 12.5 min
+  [1100/3240] acc=0.8701  0.34s/q  eta 12.0 min
+  [1200/3240] acc=0.8634  0.34s/q  eta 11.4 min
+  [1300/3240] acc=0.8524  0.34s/q  eta 10.9 min
+  [1400/3240] acc=0.8358  0.34s/q  eta 10.4 min
+  [1500/3240] acc=0.8254  0.34s/q  eta 9.9 min
+  [1600/3240] acc=0.8170  0.34s/q  eta 9.4 min
+  [1700/3240] acc=0.8078  0.35s/q  eta 8.9 min
+  [1800/3240] acc=0.7973  0.35s/q  eta 8.3 min
+  [1900/3240] acc=0.7917  0.35s/q  eta 7.8 min
+  [2000/3240] acc=0.7881  0.35s/q  eta 7.2 min
+  [2100/3240] acc=0.7801  0.35s/q  eta 6.7 min
+  [2200/3240] acc=0.7846  0.35s/q  eta 6.1 min
+  [2300/3240] acc=0.7840  0.35s/q  eta 5.5 min
+  [2400/3240] acc=0.7851  0.35s/q  eta 4.9 min
+  [2500/3240] acc=0.7837  0.35s/q  eta 4.3 min
+  [2600/3240] acc=0.7824  0.35s/q  eta 3.7 min
+  [2700/3240] acc=0.7860  0.35s/q  eta 3.2 min
+  [2800/3240] acc=0.7890  0.35s/q  eta 2.6 min
+  [2900/3240] acc=0.7932  0.35s/q  eta 2.0 min
+  [3000/3240] acc=0.7981  0.35s/q  eta 1.4 min
+  [3100/3240] acc=0.8007  0.35s/q  eta 0.8 min
+  [3200/3240] acc=0.8029  0.35s/q  eta 0.2 min
+  [3239/3240] acc=0.8046  0.35s/q  eta 0.0 min
+
+MMLU accuracy: 2607/3240 = 0.8046
+  95% CI: [0.7906, 0.8179]
+  prompt-token cross-check: 0 mismatches / 3240
+
+  business_ethics                            81/100  0.810
+  global_facts                               58/100  0.580
+  high_school_government_and_politics       186/193  0.964
+  human_sexuality                           123/131  0.939
+  management                                 95/103  0.922
+  marketing                                 223/234  0.953
+  moral_disputes                            277/346  0.801
+  moral_scenarios                           597/895  0.667
+  philosophy                                256/311  0.823
+  public_relations                           81/110  0.736
+  security_studies                          204/245  0.833
+  sociology                                 182/201  0.905
+  us_foreign_policy                          93/100  0.930
+  world_religions                           151/171  0.883
+  wall 1133.4s
+wrote bench/mmlu/ref-nvfp4-dequant.json

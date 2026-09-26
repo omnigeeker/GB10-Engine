@@ -612,6 +612,11 @@ struct Args {
     chunks: i64,
     /// `perplexity`: where to write the JSON result.
     out: Option<PathBuf>,
+    /// `choice`: JSONL of multiple-choice questions (id, subject, question,
+    /// options, answer).
+    jsonl: Option<PathBuf>,
+    /// `choice`: score at most this many questions; -1 for all.
+    limit: i64,
 }
 
 fn parse_args() -> Result<(String, Args)> {
@@ -643,6 +648,8 @@ fn parse_args() -> Result<(String, Args)> {
         ctx: 512,
         chunks: -1,
         out: None,
+        jsonl: None,
+        limit: -1,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -712,6 +719,14 @@ fn parse_args() -> Result<(String, Args)> {
             }
             "--tokens" => {
                 a.tokens = Some(PathBuf::from(val()?));
+                i += 2;
+            }
+            "--jsonl" => {
+                a.jsonl = Some(PathBuf::from(val()?));
+                i += 2;
+            }
+            "--limit" => {
+                a.limit = val()?.parse()?;
                 i += 2;
             }
             "--text" => {
@@ -1357,6 +1372,199 @@ fn perplexity(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// One MMLU-style multiple-choice question.
+#[derive(serde::Deserialize, Debug, Clone)]
+struct Question {
+    id: String,
+    subject: String,
+    question: String,
+    options: Vec<String>,
+    answer: usize,
+}
+
+/// Render a question in the canonical MMLU format.
+///
+/// This string is a contract between the engine and the Python reference
+/// scorer: if they disagree on a single character the comparison measures the
+/// prompt rather than the weights, so both build it from the same rule and the
+/// engine records its token count per question for the reference to check.
+fn render_choice_prompt(q: &Question) -> String {
+    let subject = q.subject.replace('_', " ");
+    let mut s = format!(
+        "The following are multiple choice questions (with answers) about {subject}.\n\n{}\n",
+        q.question.trim()
+    );
+    for (i, opt) in q.options.iter().enumerate() {
+        s.push_str(&format!("{}. {}\n", (b'A' + i as u8) as char, opt.trim()));
+    }
+    s.push_str("Answer:");
+    s
+}
+
+/// Multiple-choice accuracy by answer-letter log-probability.
+///
+/// Standard MMLU scoring: one forward pass per question, then argmax over the
+/// logits of the four answer-letter tokens at the position after `Answer:`.
+/// " A".." D" are each a single token in this vocabulary, which is asserted
+/// rather than assumed.
+fn choice(args: &Args) -> Result<()> {
+    let jsonl = args
+        .jsonl
+        .as_ref()
+        .context("choice needs --jsonl FILE")?;
+    let raw = std::fs::read_to_string(jsonl)
+        .with_context(|| format!("reading {}", jsonl.display()))?;
+    let parsed: Vec<Question> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l))
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("parsing {}", jsonl.display()))?;
+    anyhow::ensure!(!parsed.is_empty(), "no questions in {}", jsonl.display());
+    let n = if args.limit < 0 {
+        parsed.len()
+    } else {
+        (args.limit as usize).min(parsed.len())
+    };
+    let questions = &parsed[..n];
+
+    let cfg = load_config(&args.model)?;
+    let text = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let tok = QwenTokenizer::from_model_dir(&args.model)?;
+
+    let mut letters = [0u32; 4];
+    for (i, l) in [" A", " B", " C", " D"].iter().enumerate() {
+        let ids = tok.encode(l, false)?;
+        anyhow::ensure!(
+            ids.len() == 1,
+            "answer letter {l:?} tokenises to {} tokens; letter scoring assumes 1",
+            ids.len()
+        );
+        letters[i] = ids[0];
+    }
+    println!("answer letters \" A\"..\" D\" -> token ids {letters:?}");
+
+    println!("MMLU: {} questions", questions.len());
+    let t0 = std::time::Instant::now();
+    let model = Model::load_from(&dev, cfg.clone(), &args.model)?;
+    println!("  model loaded in {:.1}s", t0.elapsed().as_secs_f64());
+
+    let vocab = model.vocab_size();
+    let hidden = text.hidden_size;
+    let max_seq = args.max_seq;
+    let mut state = ModelState::new(&dev, &model, max_seq, 1)?;
+    let mut sc = Scratch::new(&dev, &text, max_seq)?;
+    let mut x = dev.stream().alloc_zeros::<f32>(hidden)?;
+    let mut lg = dev.stream().alloc_zeros::<f32>(vocab)?;
+
+    let mut correct = 0usize;
+    let mut per_subject: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut rows = Vec::with_capacity(questions.len());
+    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+    let started = std::time::Instant::now();
+
+    for (qi, q) in questions.iter().enumerate() {
+        anyhow::ensure!(q.options.len() == 4, "{}: {} options", q.id, q.options.len());
+        anyhow::ensure!(q.answer < 4, "{}: answer out of range", q.id);
+        let prompt = render_choice_prompt(q);
+        let ids = tok.encode(&prompt, false)?;
+        anyhow::ensure!(
+            ids.len() < max_seq,
+            "{}: prompt {} tokens exceeds max_seq {}",
+            q.id,
+            ids.len(),
+            max_seq
+        );
+
+        state.reset(&dev)?;
+        model.forward_normed(&dev, &ids, &mut state, &mut sc, 0)?;
+        dev.ops()
+            .copy_rows(&dev, &state.normed, &mut x, ids.len() - 1, 1, hidden)?;
+        model.lm_head.forward_prefill(&dev, &x, &mut lg, 1)?;
+        let host = dev.stream().memcpy_dtov(&lg)?;
+        dev.check_err()?;
+
+        let mut scores = [f32::NEG_INFINITY; 4];
+        let mut pick = 0usize;
+        for (i, &t) in letters.iter().enumerate() {
+            scores[i] = host[t as usize];
+            if scores[i] > scores[pick] {
+                pick = i;
+            }
+        }
+        let ok = pick == q.answer;
+        if ok {
+            correct += 1;
+        }
+        let e = counts.entry(q.subject.clone()).or_insert((0, 0));
+        e.1 += 1;
+        if ok {
+            e.0 += 1;
+        }
+        rows.push(serde_json::json!({
+            "id": q.id, "subject": q.subject, "gold": q.answer, "pred": pick,
+            "scores": scores, "prompt_tokens": ids.len(),
+        }));
+
+        if qi % 100 == 0 || qi + 1 == questions.len() {
+            let el = started.elapsed().as_secs_f64();
+            println!(
+                "  [{qi}/{}] acc={:.4}  {:.2}s/q  eta {:.1} min",
+                questions.len(),
+                correct as f64 / (qi + 1) as f64,
+                el / (qi + 1) as f64,
+                el / (qi + 1) as f64 * (questions.len() - qi - 1) as f64 / 60.0
+            );
+        }
+    }
+
+    let acc = correct as f64 / questions.len() as f64;
+    // Wilson score interval, so a subset result carries its own uncertainty.
+    let nf = questions.len() as f64;
+    let z = 1.96f64;
+    let denom = 1.0 + z * z / nf;
+    let centre = (acc + z * z / (2.0 * nf)) / denom;
+    let half = z * ((acc * (1.0 - acc) / nf + z * z / (4.0 * nf * nf)).sqrt()) / denom;
+
+    println!();
+    println!("MMLU accuracy: {correct}/{} = {:.4}", questions.len(), acc);
+    println!("  95% CI: [{:.4}, {:.4}]", centre - half, centre + half);
+    println!();
+    let mut subs: Vec<_> = counts.iter().collect();
+    subs.sort_by(|a, b| a.0.cmp(b.0));
+    for (s, (c, t)) in &subs {
+        println!("  {s:<40} {c:>4}/{t:<4} {:.3}", *c as f64 / *t as f64);
+        per_subject.insert(
+            (*s).clone(),
+            serde_json::json!({"correct": c, "total": t, "accuracy": *c as f64 / *t as f64}),
+        );
+    }
+    println!("  wall {:.1}s", started.elapsed().as_secs_f64());
+
+    if let Some(out) = &args.out {
+        let result = serde_json::json!({
+            "kind": "mmlu-choice",
+            "model": args.model.display().to_string(),
+            "quant": "nvfp4-fp8-mixed (modelopt)",
+            "jsonl": jsonl.display().to_string(),
+            "questions": questions.len(),
+            "correct": correct,
+            "accuracy": acc,
+            "ci95": [centre - half, centre + half],
+            "letter_token_ids": letters.to_vec(),
+            "prompt_tokens": rows.iter().filter_map(|r| r["prompt_tokens"].as_u64()).sum::<u64>(),
+            "per_subject": serde_json::Value::Object(per_subject),
+            "rows": rows,
+            "wall_s": started.elapsed().as_secs_f64(),
+        });
+        std::fs::write(out, serde_json::to_string_pretty(&result)?)
+            .with_context(|| format!("writing {}", out.display()))?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1410,6 +1618,10 @@ fn main() -> Result<()> {
             perplexity(&args)?;
             return Ok(());
         }
+        "choice" => {
+            choice(&args)?;
+            return Ok(());
+        }
         "batch-parity" => {
             let ok = batch_parity(&args, args.n_seq, args.n_new)?;
             if !ok {
@@ -1426,7 +1638,7 @@ fn main() -> Result<()> {
             }
         }
         other => bail!(
-            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill|forward-cost|perplexity)"
+            "unknown subcommand {other:?} (expected layer-parity|all|generate|batch-parity|mtp-probe|mtp-generate|chunked-prefill|forward-cost|perplexity|choice)"
         ),
     };
 
@@ -1452,6 +1664,8 @@ fn main() -> Result<()> {
             ctx: args.ctx,
             chunks: args.chunks,
             out: args.out.clone(),
+            jsonl: args.jsonl.clone(),
+            limit: args.limit,
         };
         all_ok &= layer_parity(&a)?;
     }

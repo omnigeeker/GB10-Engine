@@ -1,0 +1,550 @@
+{
+  "accuracy": 0.875,
+  "ci95": [
+    0.7388757932976187,
+    0.9454058022645873
+  ],
+  "correct": 35,
+  "jsonl": "bench/mmlu/mmlu.jsonl",
+  "kind": "mmlu-choice",
+  "letter_token_ids": [
+    357,
+    417,
+    351,
+    414
+  ],
+  "model": "models/Qwen3.8-27B-NVFP4",
+  "per_subject": {
+    "business_ethics": {
+      "accuracy": 0.875,
+      "correct": 35,
+      "total": 40
+    }
+  },
+  "prompt_tokens": 3541,
+  "quant": "nvfp4-fp8-mixed (modelopt)",
+  "questions": 40,
+  "rows": [
+    {
+      "gold": 2,
+      "id": "business_ethics-0",
+      "pred": 0,
+      "prompt_tokens": 116,
+      "scores": [
+        20.461809158325195,
+        13.822059631347656,
+        20.096019744873047,
+        10.698016166687012
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-1",
+      "pred": 1,
+      "prompt_tokens": 102,
+      "scores": [
+        15.165166854858398,
+        19.593645095825195,
+        8.84132194519043,
+        8.278159141540527
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-2",
+      "pred": 3,
+      "prompt_tokens": 58,
+      "scores": [
+        13.122876167297363,
+        12.032510757446289,
+        13.142786026000977,
+        19.803693771362305
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-3",
+      "pred": 3,
+      "prompt_tokens": 82,
+      "scores": [
+        11.649971961975098,
+        11.64293098449707,
+        14.78408432006836,
+        23.565629959106445
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-4",
+      "pred": 1,
+      "prompt_tokens": 95,
+      "scores": [
+        11.706631660461426,
+        22.23416519165039,
+        12.200267791748047,
+        12.087861061096191
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-5",
+      "pred": 1,
+      "prompt_tokens": 112,
+      "scores": [
+        15.657069206237793,
+        17.10700035095215,
+        12.32923412322998,
+        15.731705665588379
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-6",
+      "pred": 0,
+      "prompt_tokens": 70,
+      "scores": [
+        20.000686645507812,
+        16.17380142211914,
+        11.128901481628418,
+        10.155826568603516
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-7",
+      "pred": 0,
+      "prompt_tokens": 84,
+      "scores": [
+        17.72003746032715,
+        10.7306489944458,
+        8.04620361328125,
+        8.11877155303955
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-8",
+      "pred": 0,
+      "prompt_tokens": 79,
+      "scores": [
+        22.50933837890625,
+        16.504323959350586,
+        19.94532585144043,
+        14.000751495361328
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-9",
+      "pred": 2,
+      "prompt_tokens": 53,
+      "scores": [
+        17.674531936645508,
+        20.2934513092041,
+        21.62860870361328,
+        12.389281272888184
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-10",
+      "pred": 2,
+      "prompt_tokens": 87,
+      "scores": [
+        16.354137420654297,
+        15.231278419494629,
+        18.306367874145508,
+        9.771120071411133
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-11",
+      "pred": 2,
+      "prompt_tokens": 101,
+      "scores": [
+        15.573454856872559,
+        16.06993293762207,
+        22.69247817993164,
+        12.889079093933105
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-12",
+      "pred": 3,
+      "prompt_tokens": 95,
+      "scores": [
+        12.109781265258789,
+        14.253642082214355,
+        9.769515037536621,
+        20.302379608154297
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-13",
+      "pred": 1,
+      "prompt_tokens": 57,
+      "scores": [
+        10.34441089630127,
+        19.19385528564453,
+        8.345382690429688,
+        10.498589515686035
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-14",
+      "pred": 3,
+      "prompt_tokens": 81,
+      "scores": [
+        10.708758354187012,
+        11.428321838378906,
+        8.747330665588379,
+        18.6209659576416
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-15",
+      "pred": 1,
+      "prompt_tokens": 81,
+      "scores": [
+        10.25779914855957,
+        22.093957901000977,
+        9.46314525604248,
+        9.802501678466797
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-16",
+      "pred": 0,
+      "prompt_tokens": 67,
+      "scores": [
+        18.50629234313965,
+        12.359289169311523,
+        11.717360496520996,
+        17.528186798095703
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-17",
+      "pred": 2,
+      "prompt_tokens": 109,
+      "scores": [
+        10.391207695007324,
+        9.987141609191895,
+        18.183507919311523,
+        8.998656272888184
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-18",
+      "pred": 2,
+      "prompt_tokens": 64,
+      "scores": [
+        13.681357383728027,
+        19.153297424316406,
+        21.934326171875,
+        11.584807395935059
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-19",
+      "pred": 0,
+      "prompt_tokens": 80,
+      "scores": [
+        19.789274215698242,
+        18.785484313964844,
+        18.97092628479004,
+        19.53976821899414
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-20",
+      "pred": 0,
+      "prompt_tokens": 124,
+      "scores": [
+        23.944658279418945,
+        13.337444305419922,
+        13.892495155334473,
+        14.499147415161133
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-21",
+      "pred": 1,
+      "prompt_tokens": 75,
+      "scores": [
+        10.818140983581543,
+        21.000587463378906,
+        10.651429176330566,
+        9.879758834838867
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-22",
+      "pred": 2,
+      "prompt_tokens": 88,
+      "scores": [
+        13.57348346710205,
+        15.93757438659668,
+        21.01529312133789,
+        12.762540817260742
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-23",
+      "pred": 0,
+      "prompt_tokens": 89,
+      "scores": [
+        17.902490615844727,
+        13.32638168334961,
+        16.074525833129883,
+        8.60023021697998
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-24",
+      "pred": 0,
+      "prompt_tokens": 66,
+      "scores": [
+        20.731264114379883,
+        11.7342529296875,
+        9.5385160446167,
+        12.69611644744873
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-25",
+      "pred": 1,
+      "prompt_tokens": 72,
+      "scores": [
+        11.092239379882812,
+        21.154565811157227,
+        10.070849418640137,
+        8.965977668762207
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-26",
+      "pred": 1,
+      "prompt_tokens": 66,
+      "scores": [
+        10.337345123291016,
+        19.919219970703125,
+        10.295098304748535,
+        9.287287712097168
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-27",
+      "pred": 2,
+      "prompt_tokens": 117,
+      "scores": [
+        13.768390655517578,
+        11.883566856384277,
+        19.353748321533203,
+        8.36817741394043
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-28",
+      "pred": 3,
+      "prompt_tokens": 91,
+      "scores": [
+        11.71395492553711,
+        14.087869644165039,
+        14.560114860534668,
+        21.59149169921875
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-29",
+      "pred": 3,
+      "prompt_tokens": 77,
+      "scores": [
+        11.638440132141113,
+        10.834884643554688,
+        9.991561889648438,
+        20.538667678833008
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-30",
+      "pred": 0,
+      "prompt_tokens": 116,
+      "scores": [
+        21.66476821899414,
+        10.125414848327637,
+        10.033963203430176,
+        8.82636833190918
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-31",
+      "pred": 0,
+      "prompt_tokens": 114,
+      "scores": [
+        20.23790168762207,
+        13.23497486114502,
+        9.254971504211426,
+        8.579564094543457
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-32",
+      "pred": 1,
+      "prompt_tokens": 56,
+      "scores": [
+        16.44049644470215,
+        18.594141006469727,
+        16.640085220336914,
+        16.324338912963867
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 0,
+      "id": "business_ethics-33",
+      "pred": 0,
+      "prompt_tokens": 118,
+      "scores": [
+        20.29108238220215,
+        12.406255722045898,
+        16.417139053344727,
+        10.34135627746582
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-34",
+      "pred": 3,
+      "prompt_tokens": 124,
+      "scores": [
+        12.969507217407227,
+        10.356684684753418,
+        9.82583999633789,
+        18.727956771850586
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-35",
+      "pred": 2,
+      "prompt_tokens": 92,
+      "scores": [
+        15.741055488586426,
+        14.696070671081543,
+        22.516111373901367,
+        10.847684860229492
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-36",
+      "pred": 0,
+      "prompt_tokens": 74,
+      "scores": [
+        20.410659790039062,
+        17.006746292114258,
+        12.263677597045898,
+        11.43375015258789
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 3,
+      "id": "business_ethics-37",
+      "pred": 3,
+      "prompt_tokens": 96,
+      "scores": [
+        11.510536193847656,
+        13.100065231323242,
+        9.552062034606934,
+        19.119245529174805
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 2,
+      "id": "business_ethics-38",
+      "pred": 2,
+      "prompt_tokens": 123,
+      "scores": [
+        13.20486831665039,
+        14.686941146850586,
+        16.88440704345703,
+        6.749686241149902
+      ],
+      "subject": "business_ethics"
+    },
+    {
+      "gold": 1,
+      "id": "business_ethics-39",
+      "pred": 1,
+      "prompt_tokens": 90,
+      "scores": [
+        13.73012638092041,
+        21.46738624572754,
+        12.095674514770508,
+        14.710298538208008
+      ],
+      "subject": "business_ethics"
+    }
+  ],
+  "wall_s": 27.664501684
+}

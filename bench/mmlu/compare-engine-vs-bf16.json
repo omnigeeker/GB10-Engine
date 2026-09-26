@@ -1,0 +1,19 @@
+{
+  "labels": [
+    "ref-bf16",
+    "engine-mmlu"
+  ],
+  "accuracy": {
+    "ref-bf16": 0.8074074074074075,
+    "engine-mmlu": 0.803395061728395
+  },
+  "paired_vs_baseline": {
+    "engine-mmlu": {
+      "delta_vs_baseline": -0.00401234567901243,
+      "gained": 48,
+      "lost": 61,
+      "agreement": 0.9595679012345679,
+      "mcnemar_p": 0.25039456598854226
+    }
+  }
+}

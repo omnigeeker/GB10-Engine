@@ -1,0 +1,37 @@
+{
+  "labels": [
+    "ref-bf16",
+    "ref-nvfp4-dequant",
+    "engine-mmlu",
+    "llamacpp"
+  ],
+  "accuracy": {
+    "ref-bf16": 0.8074074074074075,
+    "ref-nvfp4-dequant": 0.8046296296296296,
+    "engine-mmlu": 0.803395061728395,
+    "llamacpp": 0.7987654320987654
+  },
+  "paired_vs_baseline": {
+    "ref-nvfp4-dequant": {
+      "delta_vs_baseline": -0.002777777777777879,
+      "gained": 51,
+      "lost": 60,
+      "agreement": 0.9580246913580247,
+      "mcnemar_p": 0.4476573308627534
+    },
+    "engine-mmlu": {
+      "delta_vs_baseline": -0.00401234567901243,
+      "gained": 48,
+      "lost": 61,
+      "agreement": 0.9595679012345679,
+      "mcnemar_p": 0.25039456598854226
+    },
+    "llamacpp": {
+      "delta_vs_baseline": -0.00864197530864208,
+      "gained": 42,
+      "lost": 70,
+      "agreement": 0.9574074074074074,
+      "mcnemar_p": 0.010733416102997193
+    }
+  }
+}

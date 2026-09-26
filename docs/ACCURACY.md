@@ -2,9 +2,15 @@
 
 **Question asked:** run an accuracy evaluation and make sure nothing is dropped.
 
-**Answer:** the engine does not drop accuracy. On wikitext-2 it lands **0.68 % above
-the unquantized BF16 model**, against **2.24 %** for llama.cpp's NVFP4 path on the
-same weights. The engine is the closer of the two to the reference.
+**Answer:** the engine does not drop accuracy, on either measure.
+
+* **Language modelling** (wikitext-2): the engine lands **0.68 % above the
+  unquantized BF16 model**, against **2.24 %** for llama.cpp's NVFP4 path on the
+  same weights — the closer of the two to the reference.
+* **Task accuracy** (MMLU, 3,240 questions): engine **80.34 %** vs BF16
+  **80.74 %** — a 0.40-point gap, 13 questions in 3,240, **not significant**
+  (McNemar p = 0.25). Against a reference holding *exactly the same NVFP4
+  weights* the engine agrees on **99.26 %** of questions.
 
 At the token level, extended from 1 prompt x 16 tokens to **8 prompts x 64 tokens**
 (including a 367-token prefill), the engine agrees on **409/477 = 85.74 %** of
@@ -207,6 +213,85 @@ product, while llama.cpp takes the Blackwell native-FP4 tensor-core path
 more accurate of the two on this checkpoint. No mechanism-level attribution was
 attempted beyond this, and none is needed to answer the question asked.
 
+## Task accuracy: MMLU
+
+Perplexity is a language-modelling score. "Dropping points" normally means a
+benchmark score, so all four implementations were run on MMLU as well.
+
+### What was measured
+
+**3,240 multiple-choice questions** from 14 MMLU test subjects, scored the
+standard way: one forward pass per question, then argmax over the logits of the
+four answer-letter tokens at the position after `Answer:`. `" A"`..`" D"` are
+each a single token in this vocabulary (357, 417, 351, 414) — the engine asserts
+that rather than assuming it. Zero-shot, no chain of thought, no few-shot
+examples.
+
+The prompt is a contract between four implementations, so it is defined once
+(`bench/mmlu/render.py`, mirrored by `render_choice_prompt()` in the engine).
+The engine records its token count per question, and both `transformers`
+references check in against it: **0 prompt-token mismatches / 3,240**. The
+implementations scored the same strings, so a difference cannot be a
+tokenisation artefact.
+
+| implementation | weights | correct | accuracy | 95 % CI | vs BF16 | McNemar p |
+|---|---|---|---|---|---|---|
+| `transformers` | BF16 base (unquantized) | 2616/3240 | **80.74 %** | [79.35, 82.06] | — | — |
+| `transformers` | NVFP4 dequantized — *the engine's own weights* | 2607/3240 | 80.46 % | [79.06, 81.79] | −0.28 % | 0.45 |
+| **gb10-engine** | NVFP4 (the checkpoint) | 2603/3240 | **80.34 %** | [78.94, 81.67] | **−0.40 %** | **0.25** |
+| llama.cpp | NVFP4 (GGUF of this checkpoint) | 2588/3240 | 79.88 % | [78.46, 81.22] | −0.86 % | 0.011 |
+
+### Two comparisons, two different questions
+
+**Implementation fidelity — the engine against its own weights.** The second row
+holds *exactly* the weights the engine holds, dequantized and run by
+`transformers`. Against it the engine agrees on **3216/3240 = 99.26 %** of
+questions, netting −0.12 % (7 gained, 11 lost, p = 0.48). Twenty-four questions
+out of 3,240 are the entire difference between the engine and an independent
+implementation of the same weights. The engine's arithmetic is not what costs
+accuracy.
+
+**Quantization cost — the engine against the unquantized model.** The engine is
+0.40 points below BF16. That is 13 questions in 3,240 and **not statistically
+significant** (p = 0.25). The dequantized reference — the same NVFP4 weights with
+the engine *not* in the loop — sits 0.28 points below BF16 (p = 0.45). So what
+gap exists is the price of 4-bit weights, and the engine pays essentially none
+of it on top.
+
+### Pairing is what makes this sensitive
+
+Compared unpaired, two accuracies at n = 3,240 need roughly a 1-point difference
+to reach significance. Every run here answers the *same* questions, so the
+question-difficulty variance cancels and McNemar's test works on the discordant
+pairs. The engine and BF16 disagree on only **131 of 3,240** questions (4.0 %),
+which is the same near-tie behaviour seen at token level in T7: the decisions
+that separate these implementations are the close ones.
+
+### The same ordering as perplexity
+
+llama.cpp's NVFP4 path is again the outlier: −0.86 points against BF16, the only
+gap in the table that reaches significance (p = 0.011), and the largest of the
+four. This is an independent confirmation of the perplexity result — on a task
+metric rather than a likelihood one, and on a different data set — that the
+engine's NVFP4 implementation is the more faithful of the two.
+
+One measurement caveat, resolved rather than left standing. llama.cpp's server
+returns a candidate list of a fixed width, and at `n_probs = 100` that list
+omitted an answer letter on 130/3,240 questions (mostly `philosophy`). The run
+was repeated at `n_probs = 1000`, which reduced the omissions to 3/3,240 and
+changed **0 of 3,240 picks** — so the number above was already correct, and the
+defect was measured rather than argued away.
+
+### What this does not establish
+
+* This is **zero-shot** MMLU on 14 of the 57 subjects, not the 5-shot all-subject
+  number usually quoted in model cards. It is a like-for-like comparison between
+  four implementations, not a claim about the model's absolute MMLU score.
+* The absolute values depend on the prompt format. The *comparison* does not,
+  because all four used the same one.
+* 3,240 questions resolve about a 1-point difference at 95 % confidence. A real
+  difference smaller than that would not be detected here.
+
 ## Incident: one load-induced divergent token
 
 While llama.cpp's perplexity run held the GPU, one `generate` invocation
@@ -280,11 +365,26 @@ python3 tools/full_oracle.py --n 64 --prompts-file tools/oracle_prompts.json \
 python3 bench/ppl/multi_prompt_check.py --n 64    # 3/8 exact, 409/477 tokens
 python3 bench/ppl/oracle_determinism.py --reps 3  # reference is reproducible
 python3 bench/ppl/divergence_analysis.py          # margins at every divergence
+
+# 6. task accuracy: MMLU, 3,240 questions x 4 implementations
+python3 bench/mmlu/build_mmlu.py                  # fetch + validate the question set
+target/release/gb10-verify choice --jsonl bench/mmlu/mmlu.jsonl \
+    --out bench/mmlu/engine-mmlu.json             # 80.34 %, 40 min
+./bench/mmlu/run_refs.sh                          # bf16 80.74 %, dequant 80.46 %, ~12 min each
+./bench/mmlu/run_llamacpp.sh                      # 79.88 %, ~25 min
+python3 bench/mmlu/compare_mmlu.py bench/mmlu/ref-bf16.json \
+    bench/mmlu/ref-nvfp4-dequant.json bench/mmlu/engine-mmlu.json \
+    bench/mmlu/llamacpp.json                      # paired McNemar + per-subject
 ```
+
+The two `transformers` references are deliberately serialised: each holds a
+~52 GB bf16 model, and running one of those beside the engine is what OOM-killed
+the bf16 perplexity job in round 2.
 
 The engine perplexity path costs ~3.9 s per 512-token window against llama.cpp's
 ~0.79 s, which is the same prefill deficit the performance work already
-documents; it is not a new finding.
+documents; it is not a new finding. MMLU scoring is 0.70 s/question for the
+engine against 0.37 s for `transformers` and 0.46 s for llama.cpp.
 
 ## Artifacts
 
@@ -302,20 +402,29 @@ documents; it is not a new finding.
 | `bench/ppl/oracle-determinism.json` | reference repeatability |
 | `fixtures/oracle-multi/<tag>/greedy_tokens.json` | the 8 NVFP4-reference traces |
 | `tools/oracle_prompts.json` | the prompt set |
+| `bench/mmlu/mmlu.jsonl` | the 3,240 questions, with gold answers |
+| `bench/mmlu/engine-mmlu.json` | engine MMLU result + per-question picks |
+| `bench/mmlu/ref-bf16.json` | BF16 base reference |
+| `bench/mmlu/ref-nvfp4-dequant.json` | same-weights reference (implementation fidelity) |
+| `bench/mmlu/llamacpp.json` | llama.cpp reference (`n_probs = 1000`) |
+| `bench/mmlu/compare.json` | the MMLU table + paired statistics |
+| `bench/mmlu/compare.txt` | the human-readable comparison |
+| `bench/mmlu/render.py` | the prompt, defined once for all implementations |
 
 ## What this does not establish
 
-* Only **one** dataset for perplexity (wikitext-2). Task accuracy (MMLU-style
-  few-shot) was not run; the scope chosen for this evaluation was perplexity
-  plus token agreement.
-* Perplexity is a smooth aggregate and would not catch a rare, catastrophic
-  failure on an unusual input. The token-level work above covers that direction
-  on 8 prompts, and what it caught was divergence at ties, not bad text.
 * **No engine logits were ever compared to reference logits.** Every token-level
   conclusion here is inferred from token identity and from the *reference's*
   margins. A per-step top-k comparison would measure the engine's actual error
   directly instead of bounding it by the reference's resolution, and it is the
   single most valuable missing measurement.
+* **The MMLU subset is 14 of 57 subjects and zero-shot.** It is a valid
+  like-for-like comparison between four implementations, not the headline MMLU
+  number for this model, and it resolves differences only down to about 1 point.
+* Perplexity is a smooth aggregate and MMLU is a coarse one; neither would catch
+  a rare, catastrophic failure on an unusual input. The token-level work above
+  covers that direction on 8 prompts, and what it caught was divergence at ties,
+  not bad text.
 * The 1.5 % disagreement with llama.cpp is characterised, not explained. If the
   two must agree exactly, the next step is to compare one tensor's dequantized
   values elementwise, which needs no GPU.

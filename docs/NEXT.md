@@ -13,6 +13,33 @@ wikitext-2, `n_ctx=512`, identical token ids for all three runs (297,054 tokens,
 
 **No accuracy drop.** Reproduce with `python3 bench/ppl/compare.py`.
 
+### Task accuracy: MMLU, 3,240 questions, four implementations
+
+Standard letter-log-prob scoring, zero-shot, same prompt for all four (the engine
+records its token count per question; both `transformers` references report
+**0 mismatches / 3,240**):
+
+| implementation | weights | accuracy | vs BF16 | McNemar p |
+|---|---|---|---|---|
+| `transformers` | BF16 base | **80.74 %** | — | — |
+| `transformers` | NVFP4 dequantized — *the engine's own weights* | 80.46 % | −0.28 % | 0.45 |
+| **gb10-engine** | NVFP4 | **80.34 %** | **−0.40 %** | **0.25** |
+| llama.cpp | NVFP4 GGUF | 79.88 % | −0.86 % | 0.011 |
+
+Against a reference holding **exactly the same weights**, the engine agrees on
+**3216/3240 = 99.26 %** of questions (net −0.12 %, p = 0.48) — the engine's own
+arithmetic costs essentially nothing. The 0.40-point gap to BF16 is 13 questions
+and is **not significant**; it is the price of 4-bit weights, which the
+dequantized reference pays too (−0.28 %). llama.cpp's NVFP4 path is again the
+outlier, and the only significant gap. Same ordering as perplexity, on a task
+metric and a different dataset.
+
+Reproduce: `python3 bench/mmlu/build_mmlu.py`, then `gb10-verify choice --jsonl
+bench/mmlu/mmlu.jsonl --out bench/mmlu/engine-mmlu.json`, then
+`./bench/mmlu/run_refs.sh` and `./bench/mmlu/run_llamacpp.sh` (~40 + 25 + 25 min;
+the two 52 GB references must not run concurrently), then
+`python3 bench/mmlu/compare_mmlu.py ...` for the paired statistics.
+
 `gb10-verify perplexity --tokens <llama-tokenize --ids output> [--text <raw>]
 [--ctx 512] [--chunks N] [--out f.json]` is the new path. `--text` runs the
 tokenizer cross-check and is how the "0 mismatches / 297,054" claim is made; a
@@ -42,18 +69,25 @@ Reproduce: `python3 bench/ppl/multi_prompt_check.py --n 64` then
    the single most valuable missing measurement.
 2. **One `generate` run diverged under load** — `[760, ...]` instead of
    `[1421, ...]`, no error printed, while llama.cpp's perplexity job held the
-   GPU. **15 further runs have passed** (8 clean, 3 under BF16 load, 4 under a
-   concurrent engine perplexity run). `Device::check_err` now makes such a
-   failure loud (it used to be swallowed by `CudaSlice::drop` -> `record_err`),
-   but the root cause is unknown. The one load not yet retried is llama.cpp
-   specifically. Do not run two 50 GB-class CUDA jobs at once: that OOM-killed
-   the BF16 job once already.
+   GPU. It has not recurred: **23 further runs have passed**, including 8 under
+   that *exact* condition (llama.cpp's perplexity job holding the GPU), every one
+   of them byte-identical to its clean-machine counterpart, plus
+   `generate --repeat 100` under the same load giving **99/99 identical**. That
+   is ~700 forward passes with no observed nondeterminism. `--repeat 8` is now
+   part of the round gate. `Device::check_err` makes such a failure loud (it used
+   to be swallowed by `CudaSlice::drop` -> `record_err`), but the root cause is
+   still unknown and the incident stays open. Do not run two 50 GB-class CUDA
+   jobs at once: that OOM-killed the BF16 job once already.
 3. **The 1.53 % disagreement with llama.cpp is characterised, not explained.**
    No GPU needed to go further: compare one tensor's dequantized values
    elementwise against the GGUF's NVFP4.
 4. **The bit-exactness gate cannot be tightened to 32+ tokens on this
    reference.** If T7 is to be met literally, the reference has to change (logits
    in f32, or a defined tie-break), not the engine.
+5. **MMLU coverage is 14 of 57 subjects, zero-shot.** The mirror reachable from
+   this host (`bench/mmlu/build_mmlu.py`) carries only those 14. All 57 subjects
+   is 14,042 questions, ~2.7 h on the engine, and would resolve a difference of
+   about 0.5 points instead of 1. The comparison method needs no change.
 
 ## Where this stands, as of round 140
 
