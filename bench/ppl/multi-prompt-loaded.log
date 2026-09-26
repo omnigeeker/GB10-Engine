@@ -1,0 +1,16 @@
+8 prompts, up to 64 greedy tokens each, weights = NVFP4
+
+prompt          tok  out   agree  ttft_ms  wall_s  result
+------------------------------------------------------------------------
+p01-capital      59   29   29/29    962.8    57.2  exact
+p02-math        110   64   13/64   1569.5    66.8  DIVERGE@11 engine=220 oracle=16
+p03-code         76   64   62/64   1534.6    68.8  DIVERGE@57 engine=958 oracle=635
+p04-chinese      76   64   61/64   1533.4    64.7  DIVERGE@61 engine=98628 oracle=95865
+p05-prime        74   64   64/64   1523.7    65.0  exact
+p06-kyoto        93   64   55/64   1587.2    70.2  DIVERGE@55 engine=20329 oracle=3487
+p07-proof        80   64   64/64   1545.5    67.8  exact
+p08-longctx     367   64   61/64   4752.3    60.7  DIVERGE@61 engine=1304 oracle=13
+
+exact prompts : 3/8
+tokens agreed : 409/477 (85.74%)
+wrote bench/ppl/multi-prompt-loaded.json

@@ -496,6 +496,47 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
     println!("ids:  {:?}", &out[..out.len().min(24)]);
     println!("text: {:?}", tok.decode(&out, false)?);
 
+    // High-power determinism check: the same prompt, the same weights, fresh
+    // state every time. A single run cannot distinguish "deterministic" from
+    // "got lucky"; this can, and it is the only way to tell a real numerical
+    // flip from a race.
+    if args.repeat > 1 {
+        let mut identical = 0usize;
+        let t_r = std::time::Instant::now();
+        for rep in 1..args.repeat {
+            let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
+            let mut sc2 = Scratch::new(&dev, &text, 512)?;
+            let mut nx = model.prefill(&dev, &ids, &mut st, &mut sc2)?;
+            let mut o2 = Vec::with_capacity(n_new);
+            for _ in 0..n_new {
+                if tok.is_eos(nx) {
+                    break;
+                }
+                o2.push(nx);
+                nx = model.step(&dev, nx, &mut st, &mut sc2)?;
+            }
+            if o2 == out {
+                identical += 1;
+            } else {
+                let k = o2.iter().zip(&out).position(|(a, b)| a != b);
+                println!(
+                    "  rep {rep}: DIFFERS first at {:?}  got {:?}",
+                    k,
+                    &o2[..o2.len().min(24)]
+                );
+            }
+        }
+        println!(
+            "determinism: {}/{} extra repeats identical to run 0 ({:.1}s total)",
+            identical,
+            args.repeat - 1,
+            t_r.elapsed().as_secs_f64()
+        );
+        if identical != args.repeat - 1 {
+            bail!("non-deterministic: {} of {} repeats differed", args.repeat - 1 - identical, args.repeat - 1);
+        }
+    }
+
     let Some(o) = &oracle else {
         println!("no {} — nothing to compare against", oracle_path.display());
         return Ok(true);
@@ -555,6 +596,11 @@ struct Args {
     /// The oracle is bf16-rounded, so bit-exactness is not expected; see
     /// docs/TARGETS.md T7.
     min_agree: f64,
+    /// `generate`: run the whole prefill+decode this many times from fresh
+    /// state and require every run to produce the same tokens. One run proves
+    /// nothing about a race; this is the high-power version of the question
+    /// "is the compute path deterministic".
+    repeat: usize,
     /// `perplexity`: file of token ids (llama-tokenize `--ids` format).
     tokens: Option<PathBuf>,
     /// `perplexity`: raw text to tokenize with the engine's own tokenizer, used
@@ -590,6 +636,7 @@ fn parse_args() -> Result<(String, Args)> {
         n_new: 32,
         n_seq: 4,
         min_agree: 0.85,
+        repeat: 1,
         profile: false,
         tokens: None,
         text: None,
@@ -657,6 +704,10 @@ fn parse_args() -> Result<(String, Args)> {
             }
             "--min-agree" => {
                 a.min_agree = val()?.parse()?;
+                i += 2;
+            }
+            "--repeat" => {
+                a.repeat = val()?.parse()?;
                 i += 2;
             }
             "--tokens" => {
@@ -1394,6 +1445,7 @@ fn main() -> Result<()> {
             n_new: args.n_new,
             n_seq: args.n_seq,
             min_agree: args.min_agree,
+            repeat: args.repeat,
             profile: args.profile,
             tokens: args.tokens.clone(),
             text: args.text.clone(),

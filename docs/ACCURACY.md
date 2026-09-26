@@ -213,8 +213,23 @@ While llama.cpp's perplexity run held the GPU, one `generate` invocation
 produced `[760, ...]` instead of the oracle's `[1421, ...]` — a fluent but
 different continuation, with no error printed. On an idle machine it is 16/16.
 
-It did not reproduce: **7 further runs passed**, 3 of them under the BF16 job's
-load and 4 under a concurrent engine perplexity run.
+It did not reproduce. The compute path was then put under a test with real
+statistical power rather than more one-shot runs:
+
+* 23 further `generate` runs passed — 8 of them under the **exact** original
+  condition (llama.cpp's perplexity job holding the GPU), and every one of those
+  8 produced output **byte-identical** to its clean-machine counterpart: same
+  divergence indices, same token ids. Only TTFT moved (455 -> 963 ms; the
+  367-token prompt 2290 -> 4752 ms).
+* `gb10-verify generate --repeat 100` under that same load: **99/99 extra
+  repeats identical to run 0** (450 s of continuous GPU work).
+* The 580-window perplexity run is bit-reproducible, and a 21-window re-run
+  reproduces the full run's `[20] ppl=6.8307` exactly.
+
+That is roughly 700 forward passes with no observed nondeterminism, under load
+as well as idle. The `--repeat` flag is now part of the round gate
+(`--repeat 8`), so a nondeterministic path fails the gate rather than being
+discovered later.
 
 The mechanism that permits a *silent* wrong answer was found regardless and is
 now closed. `CudaSlice::drop` in cudarc synchronises the stream and hands the

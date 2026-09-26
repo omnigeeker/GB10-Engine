@@ -87,7 +87,10 @@ fi
 if [ "$GATE_TEST" = pass ]; then
   if [ -x "$ROOT/target/release/gb10-verify" ] && [ -f "$ROOT/fixtures/oracle/greedy_tokens.json" ]; then
     say "gb10-verify generate (64-layer greedy decode vs full-model oracle)"
-    if "$ROOT/target/release/gb10-verify" generate --n 16 \
+    # --repeat makes the same prefill+decode run 8 times from fresh state and
+    # fails the gate if any repeat differs. One run cannot distinguish a
+    # deterministic path from a lucky one; this can, and it costs ~18s.
+    if "$ROOT/target/release/gb10-verify" generate --n 16 --repeat 8 \
          --oracle "$ROOT/fixtures/oracle" --model "$ROOT/models/Qwen3.8-27B-NVFP4" >>"$LOG" 2>&1; then
       GATE_GENERATE=pass; say "generate OK"
     else

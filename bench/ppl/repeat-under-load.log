@@ -1,0 +1,12 @@
+prompt: 59 tokens
+prompt ids match the oracle (59 tokens)
+model loaded in 52.6s  (17.60 GB streamed per token)
+TTFT 960.3 ms (59 prompt tokens)
+decoded 16 tokens in 3.502s -> 4.57 tok/s
+ids:  [1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]
+text: "User asks: \"What is the capital of France?\" Simple factual question. Answer"
+determinism: 99/99 extra repeats identical to run 0 (450.1s total)
+oracle agreement: 16/16 (100.0%)  reference=Qwen3_5ForCausalLM, weights dequantized from NVFP4 to bf16
+  exact match
+
+generate: OK

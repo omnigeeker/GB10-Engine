@@ -1,0 +1,143 @@
+{
+  "kind": "multi-prompt-token-exactness",
+  "model": "models/Qwen3.8-27B-NVFP4",
+  "n": 64,
+  "prompts": 8,
+  "exact_prompts": 3,
+  "tokens_agreed": 409,
+  "tokens_compared": 477,
+  "rows": [
+    {
+      "oracle": "p01-capital",
+      "exit": 0,
+      "wall_s": 57.2,
+      "exact": true,
+      "first_bad": null,
+      "prompt_tokens": 59,
+      "ttft_ms": 962.8,
+      "agree": 29,
+      "compared": 29,
+      "rate": 100.0,
+      "decoded": 29,
+      "decode_s": 6.214
+    },
+    {
+      "oracle": "p02-math",
+      "exit": 1,
+      "wall_s": 66.8,
+      "exact": false,
+      "first_bad": {
+        "index": 11,
+        "engine": 220,
+        "oracle": 16
+      },
+      "prompt_tokens": 110,
+      "ttft_ms": 1569.5,
+      "agree": 13,
+      "compared": 64,
+      "rate": 20.3,
+      "decoded": 64,
+      "decode_s": 14.367
+    },
+    {
+      "oracle": "p03-code",
+      "exit": 0,
+      "wall_s": 68.8,
+      "exact": false,
+      "first_bad": {
+        "index": 57,
+        "engine": 958,
+        "oracle": 635
+      },
+      "prompt_tokens": 76,
+      "ttft_ms": 1534.6,
+      "agree": 62,
+      "compared": 64,
+      "rate": 96.9,
+      "decoded": 64,
+      "decode_s": 14.353
+    },
+    {
+      "oracle": "p04-chinese",
+      "exit": 0,
+      "wall_s": 64.7,
+      "exact": false,
+      "first_bad": {
+        "index": 61,
+        "engine": 98628,
+        "oracle": 95865
+      },
+      "prompt_tokens": 76,
+      "ttft_ms": 1533.4,
+      "agree": 61,
+      "compared": 64,
+      "rate": 95.3,
+      "decoded": 64,
+      "decode_s": 14.081
+    },
+    {
+      "oracle": "p05-prime",
+      "exit": 0,
+      "wall_s": 65.0,
+      "exact": true,
+      "first_bad": null,
+      "prompt_tokens": 74,
+      "ttft_ms": 1523.7,
+      "agree": 64,
+      "compared": 64,
+      "rate": 100.0,
+      "decoded": 64,
+      "decode_s": 14.129
+    },
+    {
+      "oracle": "p06-kyoto",
+      "exit": 0,
+      "wall_s": 70.2,
+      "exact": false,
+      "first_bad": {
+        "index": 55,
+        "engine": 20329,
+        "oracle": 3487
+      },
+      "prompt_tokens": 93,
+      "ttft_ms": 1587.2,
+      "agree": 55,
+      "compared": 64,
+      "rate": 85.9,
+      "decoded": 64,
+      "decode_s": 14.363
+    },
+    {
+      "oracle": "p07-proof",
+      "exit": 0,
+      "wall_s": 67.8,
+      "exact": true,
+      "first_bad": null,
+      "prompt_tokens": 80,
+      "ttft_ms": 1545.5,
+      "agree": 64,
+      "compared": 64,
+      "rate": 100.0,
+      "decoded": 64,
+      "decode_s": 14.369
+    },
+    {
+      "oracle": "p08-longctx",
+      "exit": 0,
+      "wall_s": 60.7,
+      "exact": false,
+      "first_bad": {
+        "index": 61,
+        "engine": 1304,
+        "oracle": 13
+      },
+      "prompt_tokens": 367,
+      "ttft_ms": 4752.3,
+      "agree": 61,
+      "compared": 64,
+      "rate": 95.3,
+      "decoded": 64,
+      "decode_s": 8.28
+    }
+  ]
+}
