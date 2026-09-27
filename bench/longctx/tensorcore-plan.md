@@ -53,6 +53,26 @@ well fail. Two ways to soften it, in order of preference:
 Either way the honest statement is: the tensor-core path is a bet on the gate
 tolerating reduced activation precision, and that bet has not been tested yet.
 
+### Measured: the bet is won
+
+It has now been tested, before writing any of the cuBLAS path. `gemm2d_outer_bf16`
+in `kernels/gemm.cu` carries an off-by-default diagnostic (`-DGB10_SIM_BF16_ACT=1`,
+define added in `crates/gb10-cuda/build.rs`) that rounds the activations to bf16
+and back inside the existing fp32 GEMM -- exactly the rounding a bf16 cuBLAS GEMM
+imposes on its input. With it on:
+
+    gb10-verify generate --n 16 --repeat 8 --oracle fixtures/oracle
+    -> oracle agreement: 16/16 (100.0%), exact match
+
+**The gate tolerates bf16 activations.** Since activation error is the one that
+propagates through all 64 layers, and it survives, the output rounding that
+cudarc's safe API would additionally impose is a much smaller concern -- and the
+`cudarc::cublas::sys` route with `C = CUDA_R_32F` removes it entirely anyway.
+
+So the plan proceeds on the bf16 path, not the TF32 fallback. The diagnostic is
+kept in the kernel, off by default and inert, because it is the cheapest possible
+re-test of this question if anything downstream changes the numerics.
+
 ## Pieces
 
 1. **cudarc feature.** `crates/gb10-cuda/Cargo.toml`: add `"cublas"` to the

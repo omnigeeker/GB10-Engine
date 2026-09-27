@@ -222,7 +222,19 @@ __device__ __forceinline__ void gemm2d_outer(const float (*wt)[GB10_WSTRIDE],
         // activation feeds 8 rows instead of 4 (40 B -> 32 B of shared per 32 FMA).
         const float4 wv0 = *reinterpret_cast<const float4*>(&wt[k][ty * GB10_TM]);
         const float4 wv1 = *reinterpret_cast<const float4*>(&wt[k][ty * GB10_TM + 4]);
-        const float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        float4 xv = *reinterpret_cast<const float4*>(&xt[k][tx * GB10_TNREG]);
+        // Diagnostic harness, off unless built with -DGB10_SIM_BF16_ACT=1 (add
+        // the define in crates/gb10-cuda/build.rs). It simulates the activation
+        // rounding a bf16 tensor-core GEMM imposes, to answer whether the
+        // token-exact gate tolerates it. Measured: it does -- `generate --n 16
+        // --repeat 8 --oracle` stays 16/16, which is what clears the cuBLAS
+        // rewrite to proceed. See bench/longctx/tensorcore-plan.md.
+#ifdef GB10_SIM_BF16_ACT
+        xv.x = __bfloat162float(__float2bfloat16_rn(xv.x));
+        xv.y = __bfloat162float(__float2bfloat16_rn(xv.y));
+        xv.z = __bfloat162float(__float2bfloat16_rn(xv.z));
+        xv.w = __bfloat162float(__float2bfloat16_rn(xv.w));
+#endif
         acc[0][0] = fmaf(wv0.x, xv.x, acc[0][0]);
         acc[0][1] = fmaf(wv0.y, xv.y, acc[0][1]);
         acc[0][2] = fmaf(wv0.z, xv.z, acc[0][2]);
