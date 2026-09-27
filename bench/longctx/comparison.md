@@ -809,18 +809,29 @@ was never touched.
 | 8K | cold TTFT | **20.21 s** | 10.58 s | 1.91x slower (was 5.2x) |
 | 8K | warm TTFT | **0.03 s** | 0.237 s | **7.9x faster** |
 | 8K | OTPS | **8.6** | 7.32 | **1.18x faster** |
-| 32K | cold TTFT | **134.73 s** | 44.55 s | 3.02x slower (was 6.0x) |
-| 32K | warm TTFT | **0.06 s** | 0.29 s | **4.8x faster** |
-| 32K | OTPS | **7.12** | 6.865 | **1.04x faster** |
+| 32K | cold TTFT | **129.11 s** | 44.55 s | 2.90x slower (was 6.0x) |
+| 32K | warm TTFT | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | OTPS | **7.05** | 6.865 | **1.03x faster** |
 
 Progress on the one metric that is still behind, over this session:
 
 | | start of session | now | |
 |---|---|---|---|
 | 8K cold TTFT | 88.81 s (8.4x slower) | **20.21 s (1.91x slower)** | **4.4x** |
-| 32K cold TTFT | 826.09 s (18.5x slower) | **134.73 s (3.02x slower)** | **6.1x** |
+| 32K cold TTFT | 826.09 s (18.5x slower) | **129.11 s (2.90x slower)** | **6.4x** |
 
-The 32K number also checks the decomposition: 134.73 s against the fitted
-attention term of ~65 s leaves ~70 s of GEMM, down from 202.6 s -- a 2.9x cut,
-consistent with the 2.74x measured at 8K. So the two independent fits agree, and
-the remaining 32K gap is now **more than half attention**.
+Both contexts are now measured on the same build, with the persistent scratch in
+place:
+
+| | 8K | 32K |
+|---|---|---|
+| cold TTFT | 20.21 s | **129.11 s** |
+| llama.cpp | 10.58 s | 44.55 s |
+| | 1.91x slower | 2.90x slower |
+
+The 32K number also checks the decomposition: 134.73 s (before the scratch) against
+the fitted attention term of ~65 s left ~70 s of GEMM, down from 202.6 s -- a 2.9x
+cut, consistent with the 2.74x measured at 8K. The scratch then took 32K from
+134.73 to 129.11 s, a 1.04x gain, in line with the 1.10x it gave at 8K. So the two
+independent fits agree, and the remaining 32K gap is now **more than half
+attention** -- roughly 65 s of the 129.11 s.
