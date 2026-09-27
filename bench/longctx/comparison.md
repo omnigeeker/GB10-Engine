@@ -1650,3 +1650,42 @@ precision.
 Standing best configuration: fp16 `Qs`/`Ks` with `PADH = 130`, `BK = 16`, `__half2`
 score loop. 8K in situ 20.11 -> 19.24 s; attention term 1.50x faster; 32K projected
 129.11 -> 107.5 s (2.41x against llama.cpp, from 2.90x).
+
+### Scorecard re-measured after the fp16 staging and `__half2` work (round 47)
+
+Both kernel changes landed after the last server-side comparison, so the headline numbers
+were stale. Re-measured through `gb10-server` with the same harness and settings used for
+the llama.cpp side (`bench/longctx/ttft.py`, reps 263 / trials 2 at 8K, reps 1054 /
+trials 1 at 32K, max_tokens 200, greedy):
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K (8225) | cold TTFT | **18.90 s** (18.81 / 18.99) | 10.58 s | 1.79x slower |
+| 8K | warm TTFT | **0.03 s** | 0.237 s | **7.9x faster** |
+| 8K | OTPS | **8.61** (8.62 / 8.59) | 7.32 | **1.17x faster** |
+| 32K (32747) | cold TTFT | **107.89 s** | 44.55 s | 2.42x slower |
+| 32K | warm TTFT | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | OTPS | **7.04** | 6.865 | **1.03x faster** |
+
+Movement against the previous scorecard:
+
+| metric | before | after | |
+|---|---|---|---|
+| 8K cold TTFT | 20.21 s | **18.90 s** | 1.07x |
+| 32K cold TTFT | 129.11 s | **107.89 s** | **1.20x** |
+| 8K vs llama | 1.91x slower | **1.79x slower** | |
+| 32K vs llama | 2.90x slower | **2.42x slower** | |
+
+The 32K projection made in round 45 from the fitted attention slope was 107.5 s; the
+measured value is **107.89 s**, so the per-key model that the whole attention analysis
+rests on predicted the end-to-end result to within 0.4%. That is worth noting because it
+is the first time in this document that a fitted prediction survived contact with a full
+server-side measurement at a different context length.
+
+Session cumulative cold TTFT: 8K 88.81 -> 18.90 s (**4.70x**), 32K 826.09 -> 107.89 s
+(**7.66x**).
+
+Warm TTFT and OTPS beat llama.cpp at both contexts, as they have throughout; cold TTFT
+does not, and remains the gap to close. The two wins are unaffected by the kernel work
+(warm TTFT is prefix-cache-bound and OTPS is decode-bound), and the cold-TTFT ratio
+improved only because the prefill itself got faster.
