@@ -1735,3 +1735,70 @@ score loop.
 
 Standing best configuration: fp16 `Qs`/`Ks`, `PADH = 130`, `BK = 16`, `__half2` score
 loop, no manual pipelining.
+
+### The GEMM pipeline is now the largest lever: 60% of 32K, running at 28% of the measured peak (round 49)
+
+Rounds 42-48 spent themselves on the attention score loop and took it from 1.00x to 1.50x.
+With that done, the fitted per-chunk constant `G` -- everything that is not the attention
+-- is no longer the smaller term. From the round-47 server measurement and the round-45
+fit:
+
+| term | per chunk | across 32K (16 chunks) | share of 107.89 s |
+|---|---|---|---|
+| `G` (GEMM pipeline + everything else) | 4.023 s | **64.4 s** | **60%** |
+| attention slab | -- | 43.5 s | 40% |
+
+**And `G` is 3.6x off its floor.** The prefill path multiplies weights by activations for
+every token, so its arithmetic is fixed:
+
+| quantity | value |
+|---|---|
+| FLOPs per token, whole model, prefill path | 43.6 GFLOP |
+| per 2048-token chunk | 89.3 TFLOP |
+| at the **measured** cuBLAS bf16 peak (78-87 TFLOPS, rounds 22-27) | **1.12 s** |
+| as measured in situ (`G`) | **4.023 s** |
+| effective throughput | **22.2 TFLOPS = 28% of peak** |
+
+That is not a small inefficiency: `G` is the single largest item in the model now, and it
+has 2.9 s per chunk of headroom that the attention no longer has.
+
+**`tc-phase` says why, and says it was already visible.** Its breakdown for mlp gate/up
+(n=17408, k=5120, t=2048) was alloc 39.0%, dequant 11.8%, `f32_to_bf16` 2.5%,
+`cublas_gemm` 41.6%, epilogue 5.0%. The GEMM itself is *at* peak -- 4.761 ms for that
+shape is 76.7 TFLOPS -- and the other 58% of the pipeline is what drags the average to 28%.
+Round 27's lesson applies: `tc-phase`'s own alloc pattern overstates the model's cost
+(persistent scratch bought only 1.10x), so the exact split needs an in-model measurement,
+but the shape of the answer is not in doubt.
+
+**The dequantization is repeated for every chunk, and that is pure redundancy.** Each
+2048-token chunk re-runs `dequant_nvfp4_to_bf16` / `dequant_fp8_to_bf16` over the entire
+weight set before the GEMM that consumes it. At 32K that is 16 identical passes over the
+same 21.9 GB of quantized weights. It is the one part of `G` that is provably avoidable.
+
+**And caching the dequantized weights is feasible in memory.** Holding every weight in
+bf16 for the prefill path costs:
+
+| item | size |
+|---|---|
+| total parameters (mlp 17.11B, attn 4.70B, lm_head 1.27B, embed 1.27B) | 24.35B |
+| all-bf16 working set | **~49 GB** |
+| quantized masters (estimate; 17.6 GB against 21.921 GB actual, so the split is approximate) | ~18-22 GB |
+| GB10 unified memory | 121.7 GiB |
+| KV cache, 32K x 10 sequences | ~2.7 GB |
+
+~49 GB fits comfortably, and the quantized masters can be dropped once the bf16 copy
+exists, so the two do not have to coexist. The prize, holding the attention fixed at
+43.5 s:
+
+| `G` per chunk | 32K cold TTFT | vs llama.cpp |
+|---|---|---|
+| 4.02 s (now) | 107.9 s | 2.42x |
+| 2.50 s | 83.5 s | 1.87x |
+| 2.00 s | 75.5 s | **1.69x** |
+| 1.60 s | 69.1 s | **1.55x** |
+
+**So the ordering has flipped.** The attention score loop is close to done -- three
+consecutive negative results (rounds 43, 46, 48) bracket it tightly, and its remaining
+width is capped by the bank padding. The GEMM pipeline is 60% of the time, 3.6x off its
+floor, and its largest component is provably redundant work with a memory-feasible fix.
+That is where the next round should go.
