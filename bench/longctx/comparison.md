@@ -1186,3 +1186,41 @@ attention term**, taking 32K cold TTFT from 129.11 s to ~92.4 s, i.e. from 2.90x
 need the attention's quadratic term attacked further (bf16 tensor cores for QK^T/PV)
 and the GEMM's linear term raised (the dequant plus cuBLAS pipeline is ~70 s of the
 129 s and is already measured near its limits).
+
+### Two things the occupancy probe does not establish (round 37)
+
+Round 36's conclusion is being used to argue for or against a kernel rewrite, so the
+parts of it that are not measured need to be separated from the part that is.
+
+**Established by measurement:** halving the resident blocks costs 1.40x at 65,536
+tokens and 1.44x at 16,384 tokens, with output bit-identical. That is solid.
+
+**Not established, and load-bearing:**
+
+1. **The penalty was measured at 16,384 and 65,536 tokens; the model runs 2,048-token
+   chunks.** The per-tile fixed costs (K/V staging, four barriers per tile) are a much
+   larger share of a 2,048-token tile than of a 65,536-token one, so the marginal value
+   of the second resident block need not be the same. The `attn-tile` "cache sized for
+   the real context" rows are the closest thing measured at that size, and they are not
+   usable: the same 2,048-token case reports 0.40 s baseline against 0.05 s under the
+   probe, which is a warm-cache artifact and not an occupancy effect. **The 1.40x should
+   be re-measured at 2,048 tokens before it is relied on.**
+
+2. **The combination rule is assumed.** Round 36 computed `net = load gain / 1.40`,
+   i.e. it treated the occupancy penalty and the load-ratio gain as
+   multiplicative and independent. Neither is checked. They plausibly are not
+   independent -- both are latency-hiding effects on the same loop -- in which case the
+   net could be better or worse than that table.
+
+Neither gap changes the qualitative finding, which is that the occupancy penalty is
+real and large enough that `BK = 32` cannot pay it back. It does mean the specific net
+numbers (1.14x, 1.64x, 2.30x and the 92.4 s figure) are extrapolations and should be
+labelled as such rather than quoted as measurements.
+
+**What is now in place for whoever picks this up:** the shared-memory ceiling can be
+raised (`CudaFunction::set_attribute`, wired through `GB10_ATTN_SMEM_PROBE`), so a
+`BK > 16` tile is *launchable* for the first time -- round 264 hit the 48 KB guard and
+had nothing to do about it. The remaining work is the score-loop restructure (3 rows x
+`BK/16` `j` per thread, with the `BQ*BK == 3*(nt>>1)` guard generalised) plus bf16
+staging for `Qs`/`Ks`, and the first measurement of it should be the 2,048-token
+occupancy penalty above, not a full end-to-end run.
