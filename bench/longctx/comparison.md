@@ -361,3 +361,50 @@ dominates *decode* is a ~120 ms rounding error during prefill, so nothing about
 the prefill is helped by shrinking or re-laying-out weights. Only raising FLOPS
 helps the linear term, and only cutting the attention's redundant work helps the
 quadratic one.
+
+## What the prefill GEMM is actually bound by
+
+`gb10-verify forward-cost` runs the same model two ways and prices the GEMM
+path directly. The shape of it rules out the explanation I was working from:
+
+| t | one t-row forward (ms) | FLOP |
+|---|---|---|
+| 8 | 180.75 | 2.7e11 |
+| 16 | 315.21 | 5.4e11 |
+| 32 | 400.11 | 1.1e12 |
+| 64 | 441.04 | 2.2e12 |
+
+Between t=32 and t=64 the arithmetic **doubles** while the time grows 10%. If the
+kernel were arithmetic-bound the time would roughly double, so at these sizes it
+is bound by the weight loads, which do not change with t.
+
+But that stops being true at the size the prefill actually uses. `PREFILL_CHUNK`
+is 2048, and a chunk of 2048 tokens costs about 13 s
+(`t = 5.1072e-3*T + 5.9269e-7*T^2` at T = 2048), which is 8.97e13 FLOP -- about
+**7 TFLOPS**. So the same kernel is load-bound at t<=64 and arithmetic-bound at
+t=2048, and the arithmetic it settles at is ~7 TFLOPS against this part's ~23
+TFLOPS fp32 peak.
+
+I tried to exploit the load-bound half. The grid is
+`(N/GB10_TN, T/GB10_TT, gridDim.z)`, so each weight tile is re-read `T/GB10_TT`
+times -- 32 times at T = 2048. Raising `GB10_TT` from 64 to 128 halves that, and
+is bit-identical because `GB10_KC` and the k-chunk order are untouched, so every
+output element accumulates in exactly the same order. Measured:
+
+| | GB10_TT = 64 | GB10_TT = 128 |
+|---|---|---|
+| 8K cold TTFT | 88.81 s | 88.33 s |
+| `forward-cost` t=32 | 400.11 ms | 624.63 ms |
+| `forward-cost` t=64 | 441.04 ms | 712.25 ms |
+
+No help at the size that matters (88.33 vs 88.81 is inside the noise) and
+clearly worse at t=32/64, because a 128-token tile is half empty at those sizes
+while the shared tile grows to 40 KB/block. Reverted. The reason it cannot help
+is the same reason it was worth trying: at T = 2048 the kernel is **not** bound
+by those re-reads, so halving them buys nothing.
+
+That leaves the cold-TTFT gap as an arithmetic gap with no tiling fix. ~7 TFLOPS
+out of ~23 is what fp32 `fmaf` on CUDA cores gets here, and llama.cpp's ~45
+TFLOPS comes from bf16 tensor cores. Reaching it means an `mma.sync` GEMM on the
+staging tiles that are already bf16 in shared, which is a numerical change and a
+much larger piece of work than anything above.
