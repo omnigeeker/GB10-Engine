@@ -1802,3 +1802,48 @@ consecutive negative results (rounds 43, 46, 48) bracket it tightly, and its rem
 width is capped by the bank padding. The GEMM pipeline is 60% of the time, 3.6x off its
 floor, and its largest component is provably redundant work with a memory-feasible fix.
 That is where the next round should go.
+
+### The dequant is only 12% of G, so round 49's weight-caching plan is not worth it (round 50)
+
+Round 49 sized the per-chunk constant `G` at 60% of 32K cold TTFT and named the repeated
+weight dequantization as its provably redundant part, projecting 1.55-1.87x from caching
+the dequantized weights (~49 GB, which does fit). That projection rested on `tc-phase`'s
+breakdown, in which dequant plus cast plus alloc plus epilogue was 58% of the mlp gate/up
+pipeline. Round 27's own lesson was that `tc-phase`'s alloc pattern overstates the model's
+cost, so this round measured it in the model: `GB10_SKIP_DEQUANT=1` skips the per-call
+weight staging entirely, leaving `wb` uninitialized. The results are wrong and the GEMM may
+consume NaN, but every GEMM shape is unchanged, so the timing is valid.
+
+| term | dequant ON | dequant OFF | ratio |
+|---|---|---|---|
+| `G` (per chunk) | 4.014 s | **3.533 s** | **0.880x** |
+| slope `k` (attention) | 1.2061e-4 | 1.3916e-4 | 1.154x |
+
+**The dequant is 12.0% of `G`, not 58%.** Removing it entirely buys 7.7 s across the 16
+chunks of a 32K prefill:
+
+| `G` per chunk | 32K cold TTFT | vs llama.cpp |
+|---|---|---|
+| 4.01 s (now) | 107.9 s | 2.42x |
+| 3.53 s (dequant deleted) | **100.0 s** | **2.25x** |
+
+So caching the dequantized weights would move the objective from 2.42x to 2.25x for a
+~49 GB redesign that changes how the model is loaded and stored. **That is not worth doing**,
+and round 49 said otherwise on the strength of a bench-internal breakdown. Corrected.
+
+**The more important half is what this leaves unexplained.** With the dequant deleted, `G`
+is still 3.5 s per chunk against a 1.12 s GEMM floor -- **3.2x** -- and `tc-phase` had put
+`cublas_gemm` itself at 76.7 TFLOPS, essentially peak. So the remaining 3.5 s is not the
+GEMM and is not the dequant, and no measurement in this document accounts for it. My
+per-token 43.6 GFLOP count covers only the linear projections (q/k/v/o, gate/up/down) and
+**not the Gated-DeltaNet recurrence that 48 of the 64 layers run**, which is the obvious
+candidate for a large omitted term. Until `G` is decomposed in the model the way the
+attention term was, any further prefill work is a guess -- and this round is the second
+time a `tc-phase`-based projection has failed to survive an in-model check.
+
+The slope moved 1.154x under a weight-only change, which it should not; that bounds the
+attention-slab fit's run-to-run error at roughly 15%, so the 43.5 s attention figure and
+anything derived from it should be read with that in mind.
+
+Reverted the probe; the tree is back to the round-45 kernel, which remains the best
+measured configuration.
