@@ -25,10 +25,33 @@ kernel is already at ~76% of what fp32 can ever do. Getting to llama.cpp's
 2. Any bf16 value is exactly representable in fp32, which is why the current
    mixed bf16-weight/fp32-accumulate kernel is bit-comparable to the oracle.
 
-So a cuBLAS bf16 GEMM with fp32 accumulate differs from today only in the
-*fp32 accumulation order*, not in the operand precision. That is the same class
-of change as the `GB10_KC` / `KSPLIT` variations the gate has already accepted,
-not a precision reduction.
+**CORRECTION (round 15), because the paragraph that used to be here was wrong.**
+I wrote that a cuBLAS bf16 GEMM would differ from today only in accumulation
+order, not operand precision. That is false, and the way it is false matters:
+
+- The current kernel's weights are bf16 but its **activations are fp32**
+  (`xt[2][GB10_KC][GB10_XSTRIDE]` is `float`), and its **output is fp32**
+  (the accumulator is written as `float`). Only the weights are bf16.
+- cudarc's `impl Gemm<half::bf16>` passes `CUDA_R_16BF` for **A, B *and* C**.
+  So the safe API would round the activations to bf16 on the way in and the
+  output to bf16 on the way out. Those are two real precision reductions that
+  the oracle the gate compares against does not take.
+
+So this is not the same class of change as the `GB10_KC`/`KSPLIT` variations.
+It has to be validated empirically by `generate` against the oracle, and it may
+well fail. Two ways to soften it, in order of preference:
+
+1. Call `cublasGemmEx` through `cudarc::cublas::sys` directly with
+   `C = CUDA_R_32F` (fp32 output) and bf16 inputs. That removes the output
+   rounding and leaves only the activation rounding. `cudarc::cublas::sys` is
+   public, so this is a small amount of unsafe FFI rather than a rewrite.
+2. If the activation rounding is what breaks the gate, keep fp32 activations and
+   use TF32 tensor cores (`CUBLAS_COMPUTE_32F_FAST_TF32`). That is roughly half
+   of bf16 throughput, so ~40 TFLOPS, which puts 8K at ~13.1 s against
+   llama.cpp's 10.58 s -- i.e. *not* a win. It is the fallback, not the plan.
+
+Either way the honest statement is: the tensor-core path is a bet on the gate
+tolerating reduced activation precision, and that bet has not been tested yet.
 
 ## Pieces
 
@@ -36,6 +59,14 @@ not a precision reduction.
    cudarc feature list. `CudaBlas::new(stream)` gives a handle;
    `impl Gemm<half::bf16> for CudaBlas` lives at
    `cudarc-0.19*/src/cublas/safe/gemm.rs:143` and takes `DevicePtr<half::bf16>`.
+
+1b. **`s2` handling.** `s2` (the per-tensor scale) is not folded into the
+   staged weights -- `stage_wtile` takes it and ignores it (`(void)s2`). The
+   NVFP4 GEMM applies it as a post-scale on the fp32 accumulator
+   (`gemm2d_store_scaled`, `acc[i][j] *= s2`). A dequant kernel must therefore
+   **not** fold `s2` into the bf16 weights: dequantise with the group scale only,
+   then scale the fp32 result of the GEMM. Folding it in would round each weight
+   after scaling instead of scaling the fp32 sum, which is a different number.
 
 2. **Dequant kernels** in `kernels/gemm.cu`, modelled directly on the existing
    staging code. Each takes the same packed weight/scales and writes bf16 to a
