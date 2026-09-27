@@ -280,6 +280,125 @@ fn lcg(seed: &mut u64) -> f32 {
 /// running-max correction applied to the wrong rows all produce O(1) errors.
 /// A tolerance of 1e-4 relative is loose enough to accept reordering and far
 /// too tight to accept any of them.
+/// Decode attention, warp-parallel versus serial, on random inputs.
+///
+/// Two questions at once. First, do they agree? The serial kernel materialises
+/// its running state with a `block_reduce_sum` per key and the warp kernel
+/// reduces inside a warp instead, so the summation order differs and equality
+/// is only up to f32 rounding -- a tolerance, not bit equality, and a tiling or
+/// indexing bug shows up as an O(1) error rather than a 1e-7 one. Second, what
+/// does each actually cost? Decode is the metric llama.cpp leads by 6x, and the
+/// serial kernel's per-key barrier is the suspect, so the timing is the point
+/// of the exercise, not a side effect.
+///
+/// Timed with a sync after the loop because CUDA launches are asynchronous; a
+/// timer stopped without one reads back the launch cost, not the kernel.
+fn decode_bench(args: &Args) -> Result<bool> {
+    let cfg = load_config(&args.model)?;
+    let t = cfg.text_config.clone();
+    let dev = Device::new(0)?;
+    let ops = dev.ops();
+
+    let (nh, nkv, hd) = (t.num_attention_heads, t.num_key_value_heads, t.head_dim);
+    let n_seq = args.n_seq.min(16).max(1);
+    println!("q heads {nh}, kv heads {nkv}, head_dim {hd}, n_seq {n_seq}");
+    println!(
+        "  {:>7} {:>11} {:>11} {:>8}  {:>10}",
+        "keys", "serial ms", "warp ms", "speedup", "rms rel"
+    );
+
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut seed = 999u64;
+    let mut ok = true;
+
+    for &keys in &args.kv_keys {
+        let cap = keys;
+        let qh: Vec<f32> = (0..n_seq * nh * hd).map(|_| lcg(&mut seed)).collect();
+        let kh: Vec<f32> = (0..n_seq * cap * nkv * hd).map(|_| lcg(&mut seed)).collect();
+        let vh: Vec<f32> = (0..n_seq * cap * nkv * hd).map(|_| lcg(&mut seed)).collect();
+        let pos: Vec<i32> = (0..n_seq).map(|_| keys as i32).collect();
+
+        let mut qd = dev.stream().alloc_zeros::<f32>(n_seq * nh * hd)?;
+        let mut kd = dev.stream().alloc_zeros::<f32>(n_seq * cap * nkv * hd)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(n_seq * cap * nkv * hd)?;
+        let mut pd = dev.stream().alloc_zeros::<i32>(n_seq)?;
+        dev.stream().memcpy_htod(&qh, &mut qd)?;
+        dev.stream().memcpy_htod(&kh, &mut kd)?;
+        dev.stream().memcpy_htod(&vh, &mut vd)?;
+        dev.stream().memcpy_htod(&pos, &mut pd)?;
+
+        let mut a = dev.stream().alloc_zeros::<f32>(n_seq * nh * hd)?;
+        let mut b = dev.stream().alloc_zeros::<f32>(n_seq * nh * hd)?;
+        let stride = cap * nkv * hd;
+
+        // Warm up, then time. One launch each would measure the first-touch
+        // page mapping as much as the kernel.
+        let reps = 20;
+        for _ in 0..2 {
+            ops.attn_decode_multi_serial(
+                &dev, &qd, &kd, &vd, &mut a, &pd, nh, nkv, hd, scale, stride,
+            )?;
+        }
+        dev.stream().synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            ops.attn_decode_multi_serial(
+                &dev, &qd, &kd, &vd, &mut a, &pd, nh, nkv, hd, scale, stride,
+            )?;
+        }
+        dev.stream().synchronize()?;
+        let serial_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+        for _ in 0..2 {
+            ops.attn_decode_multi(
+                &dev, &qd, &kd, &vd, &mut b, &pd, nh, nkv, hd, scale, stride,
+            )?;
+        }
+        dev.stream().synchronize()?;
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            ops.attn_decode_multi(
+                &dev, &qd, &kd, &vd, &mut b, &pd, nh, nkv, hd, scale, stride,
+            )?;
+        }
+        dev.stream().synchronize()?;
+        let warp_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+        // RMS-relative, because a per-element relative error is meaningless on
+        // values that cross zero.
+        let ah = dev.stream().clone_dtoh(&a)?;
+        let bh = dev.stream().clone_dtoh(&b)?;
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..ah.len() {
+            let d = (ah[i] - bh[i]) as f64;
+            num += d * d;
+            den += (ah[i] as f64) * (ah[i] as f64);
+        }
+        let rms = (num / den.max(1e-30)).sqrt();
+        if !(rms < 1e-4) {
+            println!("    ^^ MISMATCH at {keys} keys: rms rel {rms:.3e}");
+            ok = false;
+        }
+
+        // The bytes each kernel must move: every query head reads its own
+        // group's K and V, so it is `nh` heads x one kv head's worth of rows --
+        // NOT `nh * nkv`, which would over-count by the group size.
+        let bytes = (nh * n_seq * keys * hd * 4 * 2) as f64;
+        println!(
+            "  {:>7} {:>11.3} {:>11.3} {:>7.2}x  {:>10.2e}   ({:.0} GB/s serial, {:.0} GB/s warp)",
+            keys,
+            serial_ms,
+            warp_ms,
+            serial_ms / warp_ms.max(1e-9),
+            rms,
+            bytes / (serial_ms * 1e-3) / 1e9,
+            bytes / (warp_ms * 1e-3) / 1e9,
+        );
+    }
+    Ok(ok)
+}
+
 fn attn_tile(args: &Args) -> Result<bool> {
     let cfg = load_config(&args.model)?;
     let t = cfg.text_config.clone();
@@ -912,6 +1031,8 @@ struct Args {
     jsonl: Option<PathBuf>,
     /// `choice`: score at most this many questions; -1 for all.
     limit: i64,
+    /// `decode-bench`: cache lengths to time, in tokens.
+    kv_keys: Vec<usize>,
 }
 
 fn parse_args() -> Result<(String, Args)> {
@@ -945,6 +1066,7 @@ fn parse_args() -> Result<(String, Args)> {
         out: None,
         jsonl: None,
         limit: -1,
+        kv_keys: vec![2048, 8192, 32768],
     };
     let mut i = 0;
     while i < rest.len() {
@@ -974,6 +1096,13 @@ fn parse_args() -> Result<(String, Args)> {
             }
             "--n-seq" => {
                 a.n_seq = val()?.parse()?;
+                i += 2;
+            }
+            "--kv-keys" => {
+                a.kv_keys = val()?
+                    .split(',')
+                    .map(|s| s.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 i += 2;
             }
             "--tol-norm" => {
@@ -1901,6 +2030,14 @@ fn main() -> Result<()> {
             println!("\nattn-tile: OK");
             return Ok(());
         }
+        "decode-bench" => {
+            let ok = decode_bench(&args)?;
+            if !ok {
+                bail!("decode-bench FAILED: kernels disagree");
+            }
+            println!("\ndecode-bench: OK");
+            return Ok(());
+        }
         "chunked-prefill" => {
             let ok = chunked_prefill(&args, args.n_new.max(1))?;
             if !ok {
@@ -1973,6 +2110,7 @@ fn main() -> Result<()> {
             out: args.out.clone(),
             jsonl: args.jsonl.clone(),
             limit: args.limit,
+            kv_keys: args.kv_keys.clone(),
         };
         all_ok &= layer_parity(&a)?;
     }

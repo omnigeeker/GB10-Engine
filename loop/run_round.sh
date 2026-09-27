@@ -38,7 +38,7 @@ REPORT="$ROUNDS/$(printf '%03d' "$ROUND")-round.md"
 
 say() { echo "[round $ROUND] $*" | tee -a "$LOG"; }
 
-GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_BENCH=skip
+GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_DECODE=skip; GATE_BENCH=skip
 STATUS=FAIL
 
 {
@@ -122,6 +122,25 @@ if [ "$GATE_TEST" = pass ]; then
   fi
 fi
 
+# `decode-bench` checks the warp-parallel decode kernel against the serial
+# reference and times both. It is not redundant with `batch-parity`: that gate
+# compares batched against one-at-a-time, and both of those now take the warp
+# path, so a bug inside the warp kernel would cancel out of it.
+if [ "$GATE_TEST" = pass ]; then
+  if [ -x "$ROOT/target/release/gb10-verify" ]; then
+    say "gb10-verify decode-bench (warp vs serial reference)"
+    if "$ROOT/target/release/gb10-verify" decode-bench --n-seq 4 \
+         --kv-keys 8192 --model "$ROOT/models/Qwen3.8-27B-NVFP4" >>"$LOG" 2>&1; then
+      GATE_DECODE=pass; say "decode-bench OK"
+      grep -h "8192" "$LOG" | tail -1
+    else
+      GATE_DECODE=fail; say "decode-bench FAILED (see $LOG)"
+    fi
+  else
+    GATE_DECODE=missing; say "gb10-verify not built yet — decode gate pending"
+  fi
+fi
+
 # ------------------------------------------------------------ 4. benchmark ---
 if [ "$QUICK" = 0 ] && [ "$GATE_BUILD" = pass ] && [ -x "$ROOT/target/release/gb10-bench" ]; then
   say "gb10-bench"
@@ -135,6 +154,7 @@ fi
 if [ "$GATE_BUILD" = pass ] && [ "$GATE_TEST" = pass ] &&
    { [ "$GATE_CORRECT" = pass ] || [ "$GATE_CORRECT" = missing ]; } &&
    { [ "$GATE_GENERATE" = pass ] || [ "$GATE_GENERATE" = missing ]; } &&
+   { [ "$GATE_DECODE" = pass ] || [ "$GATE_DECODE" = missing ]; } &&
    { [ "$GATE_BENCH" = pass ] || [ "$GATE_BENCH" = skip ]; }; then
   STATUS=PASS
 fi
@@ -149,6 +169,7 @@ fi
   echo "| test | $GATE_TEST |"
   echo "| correctness (layers) | $GATE_CORRECT |"
   echo "| correctness (64-layer) | $GATE_GENERATE |"
+  echo "| decode-bench (warp vs serial) | $GATE_DECODE |"
   echo "| benchmark | $GATE_BENCH |"
   echo
   echo "**status: $STATUS**"
@@ -161,16 +182,17 @@ fi
 } >> "$REPORT"
 
 # ---------------------------------------------------------------- 6. state ---
-python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_BENCH" <<'PY'
+python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_DECODE" "$GATE_BENCH" <<'PY'
 import json, sys
-state_path, rnd, status, stamp, b, t, c, g, bm = sys.argv[1:10]
+state_path, rnd, status, stamp, b, t, c, g, dc, bm = sys.argv[1:11]
 s = json.load(open(state_path))
 s["round"] = int(rnd)
 s["last_round_at"] = stamp
 s["last_status"] = status
 s.setdefault("history", []).append(
     {"round": int(rnd), "at": stamp, "status": status,
-     "gates": {"build": b, "test": t, "correctness": c, "generate": g, "benchmark": bm}}
+     "gates": {"build": b, "test": t, "correctness": c, "generate": g,
+               "decode": dc, "benchmark": bm}}
 )
 json.dump(s, open(state_path, "w"), indent=2)
 print(f"state: round={rnd} status={status}")

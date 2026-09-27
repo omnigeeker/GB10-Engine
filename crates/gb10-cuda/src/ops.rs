@@ -40,6 +40,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "gated_delta_rule_step_multi_kernel",
     "kv_cache_append_multi_kernel",
     "attn_decode_multi_kernel",
+    "attn_decode_multi_serial_kernel",
     "argmax_multi_kernel",
     "gated_delta_rule_chunk_kernel",
     "deinterleave_heads_batched_kernel",
@@ -85,6 +86,7 @@ pub struct Ops {
     gated_delta_rule_step_multi: CudaFunction,
     kv_cache_append_multi: CudaFunction,
     attn_decode_multi: CudaFunction,
+    attn_decode_multi_serial: CudaFunction,
     l2norm_scale_batched: CudaFunction,
     delta_gate_batched: CudaFunction,
     conv1d_prefill_silu: CudaFunction,
@@ -144,6 +146,7 @@ impl Ops {
             gated_delta_rule_step_multi: take(map, "gated_delta_rule_step_multi_kernel")?,
             kv_cache_append_multi: take(map, "kv_cache_append_multi_kernel")?,
             attn_decode_multi: take(map, "attn_decode_multi_kernel")?,
+            attn_decode_multi_serial: take(map, "attn_decode_multi_serial_kernel")?,
             l2norm_scale_batched: take(map, "l2norm_scale_batched_kernel")?,
             delta_gate_batched: take(map, "delta_gate_batched_kernel")?,
             conv1d_prefill_silu: take(map, "conv1d_prefill_silu_kernel")?,
@@ -506,9 +509,65 @@ impl Ops {
         )?;
         let (nq, nkv, hd, bs) =
             (n_q_heads as i32, n_kv_heads as i32, head_dim as i32, base_stride as i32);
+        // The warp kernel covers head_dim == 256 (32 lanes x 8 dims) and wants
+        // the full eight warps of a 256-thread block; any other head width goes
+        // to the serial reference.
+        let warp_ok = head_dim == 256;
+        let (func, block) = if warp_ok {
+            (&self.attn_decode_multi, 256u32)
+        } else {
+            (&self.attn_decode_multi_serial, block_for(head_dim, 256))
+        };
         unsafe {
             dev.stream()
-                .launch_builder(&self.attn_decode_multi)
+                .launch_builder(func)
+                .arg(q)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(out)
+                .arg(positions)
+                .arg(&nq)
+                .arg(&nkv)
+                .arg(&hd)
+                .arg(&scale)
+                .arg(&bs)
+                .launch(LaunchConfig {
+                    grid_dim: (n_q_heads as u32, n_seq as u32, 1),
+                    block_dim: (block, 1, 1),
+                    // No dynamic shared memory: the scores stream through
+                    // registers, so this no longer scales with the cache. The
+                    // warp kernel additionally needs its 8 KB merge scratch,
+                    // which is static.
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// The serial decode reference, always, regardless of head width. Exists so
+    /// `gb10-verify decode-bench` can time the two against each other and check
+    /// that they agree; the model path uses `attn_decode_multi`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_multi_serial(
+        &self,
+        dev: &Device,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaSlice<f32>,
+        v_cache: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        base_stride: usize,
+    ) -> Result<()> {
+        let n_seq = positions.len();
+        let (nq, nkv, hd, bs) =
+            (n_q_heads as i32, n_kv_heads as i32, head_dim as i32, base_stride as i32);
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.attn_decode_multi_serial)
                 .arg(q)
                 .arg(k_cache)
                 .arg(v_cache)
@@ -522,15 +581,11 @@ impl Ops {
                 .launch(LaunchConfig {
                     grid_dim: (n_q_heads as u32, n_seq as u32, 1),
                     block_dim: (block_for(head_dim, 256), 1, 1),
-                    // No dynamic shared memory: the scores stream through
-                    // registers, so this no longer scales with the cache.
                     shared_mem_bytes: 0,
                 })?;
         }
         Ok(())
     }
-
-    /// Per-row argmax over a `[n_seq, n]` buffer.
     pub fn argmax_multi(
         &self,
         dev: &Device,

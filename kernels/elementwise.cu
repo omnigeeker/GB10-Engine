@@ -938,7 +938,106 @@ extern "C" __global__ void kv_cache_append_multi_kernel(
     v_cache[dst + i] = v[src + i];
 }
 
-// Decode attention for every sequence.
+// Decode attention for every sequence, warp-parallel over the keys.
+//
+// The previous shape gave every thread one `head_dim` lane and walked the keys
+// serially, calling `block_reduce_sum` once per key. That puts two
+// `__syncthreads()` inside the loop, so the entire block advances exactly one
+// key per barrier and no two keys are ever in flight. Measured at 32K keys it
+// was 847 ms per token -- about 1.2 tok/s, against a memory bound nearer 100 ms.
+//
+// Here a warp owns a strided subset of the keys: lane l holds dims
+// [8l, 8l+8), a key's score is a five-step `__shfl_xor` reduction inside the
+// warp, and the eight warps' online-softmax partials are merged once at the
+// end. There is no barrier inside the loop, and the warps' key ranges are
+// interleaved so their loads cover adjacent lines.
+//
+// Requires `head_dim == 256` (32 lanes x 8 dims). The host dispatches
+// `attn_decode_multi_serial_kernel` for any other head width; that one is also
+// the independent implementation the batch-parity gate compares against.
+extern "C" __global__ void attn_decode_multi_kernel(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out,
+    const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
+    float scale, int base_stride) {
+    constexpr int DPL = 8;   // dims per lane
+    constexpr int NW = 8;    // warps per block
+    const int h = blockIdx.x;
+    const int s = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int d0 = lane * DPL;
+    const int group = n_q_heads / n_kv_heads;
+    const int kh = h / group;
+    const int n_keys = positions[s];
+
+    const size_t qb = (size_t)s * n_q_heads * head_dim;
+    const size_t cb = (size_t)s * base_stride;
+
+    float qv[DPL];
+#pragma unroll
+    for (int j = 0; j < DPL; ++j) qv[j] = q[qb + (size_t)h * head_dim + d0 + j];
+
+    float mx = -INFINITY, sum = 0.0f;
+    float acc[DPL];
+#pragma unroll
+    for (int j = 0; j < DPL; ++j) acc[j] = 0.0f;
+
+    for (int t = warp; t < n_keys; t += NW) {
+        const size_t off = cb + ((size_t)t * n_kv_heads + kh) * head_dim + d0;
+        const float* kp = k_cache + off;
+        float dot = 0.0f;
+#pragma unroll
+        for (int j = 0; j < DPL; ++j) dot = fmaf(qv[j], kp[j], dot);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+        dot *= scale;
+
+        const float m_new = fmaxf(mx, dot);
+        const float corr = __expf(mx - m_new);
+        const float p = __expf(dot - m_new);
+        sum = sum * corr + p;
+        const float* vp = v_cache + off;
+#pragma unroll
+        for (int j = 0; j < DPL; ++j) acc[j] = fmaf(p, vp[j], acc[j] * corr);
+        mx = m_new;
+    }
+
+    // One merge of the NW per-warp partials. `sm_acc` is sized for the 256-wide
+    // head this kernel requires, so it is 8 KB, not one entry per key.
+    __shared__ float sm_m[NW], sm_l[NW], sm_acc[NW][256];
+    if (lane == 0) {
+        sm_m[warp] = mx;
+        sm_l[warp] = sum;
+    }
+#pragma unroll
+    for (int j = 0; j < DPL; ++j) sm_acc[warp][d0 + j] = acc[j];
+    __syncthreads();
+
+    const int d = threadIdx.x;
+    if (d < head_dim) {
+        float m = -INFINITY, l = 0.0f, a = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) {
+            const float pm = sm_m[w];
+            if (pm == -INFINITY) continue;   // that warp saw no keys
+            const float m_new = fmaxf(m, pm);
+            const float corr = __expf(m - m_new);
+            const float wt = __expf(pm - m_new);
+            l = l * corr + sm_l[w] * wt;
+            a = a * corr + sm_acc[w][d] * wt;
+            m = m_new;
+        }
+        // An empty cache leaves `l` at zero; the old form returned 0 here
+        // because its accumulation loop never ran, so keep that rather than
+        // emitting NaN.
+        out[qb + (size_t)h * head_dim + d] = (l > 0.0f) ? a / l : 0.0f;
+    }
+}
+
+// Serial reference: one thread per `head_dim` lane, one block reduction per
+// key. Kept for head widths the warp kernel above does not cover, and as the
+// independent implementation the batch-parity gate compares against.
 //
 // The score for each key used to be materialised in dynamic shared memory --
 // one entry per position in the context -- so the shared-memory request grew
@@ -946,7 +1045,7 @@ extern "C" __global__ void kv_cache_append_multi_kernel(
 // 48 KB a launch can request (12,288 keys). Streaming the keys through the
 // online-softmax recurrence keeps the running state in two registers instead,
 // so the context length no longer affects shared memory at all.
-extern "C" __global__ void attn_decode_multi_kernel(
+extern "C" __global__ void attn_decode_multi_serial_kernel(
     const float* __restrict__ q, const float* __restrict__ k_cache,
     const float* __restrict__ v_cache, float* __restrict__ out,
     const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
