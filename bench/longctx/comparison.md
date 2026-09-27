@@ -2610,3 +2610,64 @@ what its body does not do.
 
 The 4x split was reverted -- it is correct but buys nothing, and it costs a 4x redundant
 `sk` load. The tree is back to the round-63 state.
+
+### The prize, quantified: the one fix flips 8K cold TTFT from 1.79x slower to 1.63x faster (round 66)
+
+Round 65 refuted the occupancy route and left the true chunked form as the only
+evidence-backed fix. This round sizes what it is worth before anyone writes it, so the
+work is either justified or abandoned on numbers rather than on hope.
+
+The recurrence moves, per 2048-token chunk, `2 * D * D * n_v_heads` FMAs per token per
+layer over 48 layers:
+
+| quantity | value |
+|---|---|
+| FMAs per token per layer | 1,572,864 (3.15 MFLOP) |
+| per 2048-token chunk, 48 layers | 154.6G FMA = **309 GFLOP** |
+| whole 8K run (5 chunks) | **~2 TFLOP** |
+| measured DeltaNet GPU time (round 63/65) | **13.17 s** |
+| **effective throughput** | **117 GFLOP/s = 0.64% of fp32 peak** |
+| per layer per 2048 tokens | 68.6 ms (33.5 us per token per layer) |
+
+**0.64% of peak is the number.** Nothing in this document runs that far below its ceiling;
+the GEMM is at 84% of its isolated rate, the dequant is at ~86% of the memory bandwidth.
+A kernel at 0.64% of peak is not tuned, it is barely started.
+
+And the payout, holding everything else in the prefill fixed at its measured value:
+
+| chunked-form throughput | DeltaNet time | 8K cold prefill | vs llama.cpp (10.58 s) |
+|---|---|---|---|
+| 0.117 TFLOP/s (now) | 13.17 s | 18.87 s | 1.79x slower |
+| **2 TFLOP/s** | 0.77 s | **6.5 s** | **1.63x FASTER** |
+| 5 TFLOP/s | 0.31 s | 6.0 s | **1.76x FASTER** |
+| 10 TFLOP/s | 0.15 s | 5.9 s | **1.79x FASTER** |
+
+**2 TFLOP/s is 11% of fp32 peak** -- an unremarkable target for a matrix-product-shaped
+kernel. At that rate the 8K cold-TTFT objective is not merely met, it is met with room to
+spare, and the whole three-way scorecard turns green: warm TTFT already wins by 7.9x, OTPS
+by 1.17x, and cold TTFT would win by 1.63x.
+
+At 32K the same fix is necessary but not sufficient: the recurrence scales with `T`, so it
+is ~42 s of the 107.89 s there (16 chunks vs 5), and taking it to 2 TFLOP/s gives roughly
+**68 s, or 1.54x slower than llama's 44.55 s** -- a large improvement on the current 2.42x
+but still short. At 32K the attention slab (~22% of the prefill, and itself quadratic in
+context) would be the next target.
+
+**So the plan is now ordered by measured value:** rewrite `gated_delta_rule_chunk_kernel`
+into a genuine chunked form (intra-chunk dense matrix products, inter-chunk scan of T/C
+steps instead of T). That is the change that decides whether this objective is met at 8K,
+and it is worth roughly 12.4 s of an 18.9 s prefill.
+
+Implementation notes for whoever does it, so nothing has to be re-derived:
+
+- The state is `D=128` per value head, `n_v_heads=48`, fp32, held in `state` at
+  `(b * n_v_heads + hv) * D * D` with `base` offset; `rec_stride()` gives the per-sequence
+  stride.
+- Inputs to the layer, all already present at the call site (`layer.rs` `forward_prefill`,
+  around the `gated_delta_rule_chunk` call): `sc.conv_ln` (q at 0, k at `qk_dim`, v at
+  `2*qk_dim`), `sc.decay`, `sc.beta`, plus `group = n_v_heads / n_k_heads`.
+- `delta_gate_batched` already produces `decay` and `beta` per `(t, head)`; the chunked form
+  consumes the same two arrays.
+- The correctness gate is `gb10-verify generate --oracle fixtures/oracle` plus
+  `batch-parity`; `attn-tile` does **not** cover this kernel, which is why round 65's
+  correctness check could only assert that the *attention* output was unchanged.
