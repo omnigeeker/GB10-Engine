@@ -18,18 +18,18 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| **cold TTFT** | **88.1 s** | **10.45 s** | 8.4× slower |
-| **warm TTFT** | **0.03 s** | **0.24 s** | **8.0× faster** |
-| **OTPS** | **8.65** | **7.43** | **1.16× faster** |
+| cold TTFT | 88.8 s | **10.58 s** | 8.4× slower |
+| **warm TTFT** | **0.03 s** | 0.237 s | **7.9× faster** |
+| **OTPS** | **8.65** | 7.32 | **1.18× faster** |
 
 ## 32K
 
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| **cold TTFT** | **826.1 s** | **44.3 s** | 18.6× slower |
-| **warm TTFT** | **0.05 s** | **0.27 s** | **5.4× faster** |
-| **OTPS** | **7.06** | **7.0** | **1.01× faster** |
+| cold TTFT | 826.1 s | **44.55 s** | 18.5× slower |
+| **warm TTFT** | **0.05 s** | 0.29 s | **5.8× faster** |
+| **OTPS** | **7.065** | 6.865 | **1.03× faster** |
 
 llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
 cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
@@ -296,3 +296,30 @@ summation order for no measured gain, and it was reverted. The memset and the
 atomicAdds evidently overlap with the neighbouring GEMMs' loads, so they are not
 on the critical path. The `gb10-bench stream` spread (91.6-95.3 ms across runs)
 is itself wider than any effect being chased here.
+
+## Error bars, because a 1.03x claim needs them
+
+Every llama.cpp row above is a fresh 3-trial run (6 OTPS samples, since the
+harness reports one after the cold prefill and one after the warm one), and the
+gb10 rows are the same harness on the same prompts.
+
+**8K** (prompt 8,263 tokens for llama, 8,225 for gb10):
+
+| | llama.cpp samples | mean | gb10 samples | mean |
+|---|---|---|---|---|
+| OTPS | 7.39 7.37 7.34 7.39 7.18 7.27 | 7.32 | 8.70 8.63 8.63 8.64 | **8.65** |
+| cold TTFT | 10.35 10.65 10.73 | 10.58 | 88.13 89.49 | 88.81 |
+| warm TTFT | 0.23 0.24 0.24 | 0.237 | 0.03 0.03 | **0.03** |
+
+**32K** (32,785 vs 32,747 tokens):
+
+| | llama.cpp samples | mean | gb10 samples | mean |
+|---|---|---|---|---|
+| OTPS | 6.89 6.82 6.86 6.76 6.94 6.92 | 6.87 | 7.06 7.07 | **7.065** |
+| cold TTFT | 43.77 44.89 45.00 | 44.55 | 826.09 | 826.1 |
+| warm TTFT | 0.29 0.29 0.29 | 0.29 | 0.05 | **0.05** |
+
+The OTPS win is real but modest at 32K, and the two distributions do not
+overlap: llama.cpp's **best** sample at 32K is 6.94 against gb10's **worst** of
+7.06, and at 8K llama's best is 7.39 against gb10's worst of 8.63. The warm
+TTFT and cold TTFT gaps are far outside the noise in opposite directions.
