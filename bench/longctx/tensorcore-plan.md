@@ -162,6 +162,34 @@ re-test of this question if anything downstream changes the numerics.
          exact against host matmul: 816 / 816
        cublas-parity: OK
 
+4. **Scratch budget, and a correction (round 21).** The dispatch needs three
+   shared bf16 buffers, and working out their sizes turned up an error in my own
+   accounting. `forward_normed` explicitly leaves the final-norm rows of every
+   position in `state.normed` "with no `lm_head`", and `prefill_seq` then scores
+   **only the last row**; `state.logits` is sized `vocab * n_seq`, not
+   `vocab * t`. So `lm_head` is not in the prefill at all -- it is a one-row GEMV
+   for the last token.
+
+   I had been counting `lm_head` as ~6% of the prefill's GEMM FLOPs in the
+   per-chunk arithmetic. It is not in that path, so the measured `G` is entirely
+   layer projections; the correction goes the right way (there is slightly less
+   work than I assumed) but the number was wrong.
+
+   It also means no `t x vocab` buffer is needed. Had `lm_head` been scored for
+   all rows it would want `y` at 2048 x 248320 = 2.0 GB in fp32 / 1.0 GB in bf16,
+   which would have dominated the budget. The actual requirement is:
+
+   | buffer | max shape | bf16 |
+   |---|---|---|
+   | `W` dequantised | 17408 x 5120 (MLP gate/up) | 178 MB |
+   | `x` activations | 2048 x 17408 (MLP down) | 71 MB |
+   | `y` output | 2048 x 17408 (MLP gate/up) | 71 MB |
+   | | **total** | **321 MB** |
+
+   All three are shared across every `Linear` and grown on demand, so the
+   allocation is one-off. 321 MB against a 40 GB KV budget is not a constraint,
+   which removes the main risk I had been carrying about this step.
+
 4. **Dispatch (the only step left).** `Linear::forward_prefill` in `crates/gb10-model/src/weights.rs`
    — replace the GEMM branch (the `n >= 256 && t > 16` side of the existing
    crossover) with: dequant -> convert x -> `blas.gemm` -> (x stays fp32 for the
