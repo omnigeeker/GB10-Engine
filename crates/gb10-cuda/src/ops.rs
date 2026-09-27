@@ -49,6 +49,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "copy_rows_kernel",
     "concat2_kernel",
     "nvfp4_gemm_kernel",
+    "dequant_nvfp4_to_bf16_kernel",
     "fp8_gemm_kernel",
     "bf16_gemm_kernel",
 ];
@@ -99,6 +100,7 @@ pub struct Ops {
     copy_rows: CudaFunction,
     concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
+    dequant_nvfp4_to_bf16: CudaFunction,
     fp8_gemm: CudaFunction,
     bf16_gemm: CudaFunction,
 }
@@ -159,6 +161,7 @@ impl Ops {
             copy_rows: take(map, "copy_rows_kernel")?,
             concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
+            dequant_nvfp4_to_bf16: take(map, "dequant_nvfp4_to_bf16_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
             bf16_gemm: take(map, "bf16_gemm_kernel")?,
         })
@@ -694,6 +697,40 @@ impl Ops {
     }
 
     /// `y *= sigmoid(gate)` — the attention output gate (sigmoid, not swish).
+    /// Dequantize a whole NVFP4 matrix `[N, K]` to row-major bf16 `[N, K]`.
+    ///
+    /// The per-tensor scale `s2` is *not* applied -- see the kernel comment.
+    pub fn dequant_nvfp4_to_bf16(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<u8>,
+        sc: &CudaSlice<u8>,
+        out: &mut CudaSlice<half::bf16>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        need(out.len() >= n * k, "dequant_nvfp4_to_bf16")?;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let total = n * k;
+        let grid = cdiv(total, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.dequant_nvfp4_to_bf16)
+                .arg(w)
+                .arg(sc)
+                .arg(out)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn sigmoid_mul(
         &self,
         dev: &Device,
@@ -1463,4 +1500,5 @@ fn need(ok: bool, what: &str) -> Result<()> {
             "{what}: buffer too small"
         )))
     }
+
 }

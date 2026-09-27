@@ -89,7 +89,22 @@ re-test of this question if anything downstream changes the numerics.
    after scaling instead of scaling the fp32 sum, which is a different number.
 
 2. **Dequant kernels** in `kernels/gemm.cu`, modelled directly on the existing
-   staging code. Each takes the same packed weight/scales and writes bf16 to a
+   staging code.
+
+   **DONE for NVFP4 (round 17).** `dequant_nvfp4_to_bf16_kernel` is implemented,
+   wired through `Ops::dequant_nvfp4_to_bf16`, and gated by a new
+   `gb10-bench dequant-parity` that compares it against the host reference
+   `dequant_nvfp4_row` on a synthetic 256x512 matrix covering all 16 E2M1 codes:
+
+       dequant nvfp4 -> bf16   256 x 512  (256 rows, 131072 elements)
+         bit-exact against dequant_nvfp4_row: 131072 / 131072
+       dequant-parity: OK
+
+   Two things that cost a rebuild each and are worth knowing for the FP8 kernel:
+   the entry point needs `extern "C"` (the other gemm kernels carry a comment
+   explaining that C++ mangling otherwise makes the name unloadable), and
+   appending to a `.cu` file does not always invalidate the PTX -- `touch` it.
+ Each takes the same packed weight/scales and writes bf16 to a
    **global** scratch buffer instead of shared:
    - `dequant_nvfp4_to_bf16` — copy the index math from `stage_wtile`
      (that is the authoritative on-device layout), write

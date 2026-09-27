@@ -44,6 +44,7 @@ fn main() -> Result<()> {
         "store-stream" => store_stream(&model),
         "launch-overhead" => launch_overhead(),
         "cublas-gemm" => cublas_gemm(),
+        "dequant-parity" => dequant_parity(),
         _ => {
             eprintln!(
                 "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
@@ -774,4 +775,82 @@ fn cublas_gemm() -> Result<()> {
     }
     println!("\nreference: the current fp32 CUDA-core GEMM measures ~7 TFLOP/s, {:.1}x below this", 43.0/7.0);
     Ok(())
+}
+
+/// Gate the NVFP4 -> bf16 dequantise kernel against the host reference
+/// `dequant_nvfp4_row` on a synthetic matrix.
+///
+/// This is the one piece of the cuBLAS prefill path whose correctness depends on
+/// a bit-level layout (nibble order, group-16 scale row, E4M3 decode) rather
+/// than on plumbing, so it gets its own gate before anything is wired up.
+fn dequant_parity() -> Result<()> {
+    use crate::reference::dequant_nvfp4_row;
+    use half::bf16;
+
+    let dev = Device::new(0)?;
+    let (n, k) = (256usize, 512usize);
+
+    // Deterministic synthetic matrix. Scales are kept in E4M3's small positive
+    // range (exponent 6, mantissa 0..7) so no byte decodes to NaN/Inf, and the
+    // packed nibbles cover all 16 E2M1 codes.
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut packed = vec![0u8; n * (k / 2)];
+    for b in packed.iter_mut() {
+        *b = (next() & 0xFF) as u8;
+    }
+    let mut scales = vec![0u8; n * (k / 16)];
+    for b in scales.iter_mut() {
+        *b = 0x30 | ((next() & 0x07) as u8);
+    }
+
+    let cpu: Vec<f32> = (0..n)
+        .flat_map(|row| {
+            dequant_nvfp4_row(
+                &packed[row * (k / 2)..(row + 1) * (k / 2)],
+                &scales[row * (k / 16)..(row + 1) * (k / 16)],
+                1.0,
+                k,
+            )
+        })
+        .collect();
+
+    let w_dev = dev.stream().memcpy_stod(&packed)?;
+    let sc_dev = dev.stream().memcpy_stod(&scales)?;
+    let mut out_dev = dev.stream().alloc_zeros::<bf16>(n * k)?;
+    dev.ops().dequant_nvfp4_to_bf16(&dev, &w_dev, &sc_dev, &mut out_dev, n, k)?;
+    let gpu_raw = dev.stream().memcpy_dtov(&out_dev)?;
+
+    let mut bad = 0usize;
+    let mut worst = 0.0f32;
+    let mut first_bad = None;
+    for i in 0..n * k {
+        let g = bf16::to_f32(gpu_raw[i]);
+        let c = cpu[i];
+        if g.to_bits() != c.to_bits() {
+            bad += 1;
+            let rel = if c == 0.0 { 0.0 } else { ((g - c) / c).abs() };
+            if rel > worst {
+                worst = rel;
+            }
+            if first_bad.is_none() {
+                first_bad = Some((i, i / k, i % k, c, g));
+            }
+        }
+    }
+    println!("dequant nvfp4 -> bf16   {n} x {k}  ({n} rows, {} elements)", n * k);
+    if bad == 0 {
+        println!("  bit-exact against dequant_nvfp4_row: {} / {}", n * k, n * k);
+        println!("dequant-parity: OK");
+        return Ok(());
+    }
+    let (i, row, col, c, g) = first_bad.unwrap();
+    println!("  mismatches {bad} / {}   worst relative {worst:.3e}", n * k);
+    println!("  first at idx {i} (row {row}, col {col}): cpu {c:e} gpu {g:e}");
+    anyhow::bail!("dequant-parity: FAILED");
 }

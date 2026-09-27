@@ -506,3 +506,32 @@ extern "C" __global__ void __launch_bounds__(GB10_GEMM_BLOCK) bf16_gemm_kernel(
     int K, int T) {
     bf16_gemm_body(w, x, y, N, K, T);
 }
+
+// ---- NVFP4 -> bf16 whole-matrix dequantise -------------------------------
+//
+// Feeds the cuBLAS bf16 prefill path: the tensor core GEMM needs both operands
+// in bf16, while the weights on disk are NVFP4. The nibble order, the group-16
+// scale row and the E4M3 scale decode are all copied from `stage_wtile` above,
+// which is the authoritative on-device layout.
+//
+// `s2` (the per-tensor scale) is deliberately NOT applied here. The existing
+// NVFP4 GEMM applies it as a post-scale on the fp32 accumulator
+// (`gemm2d_store_scaled`), so folding it into the bf16 weights would round each
+// weight after scaling instead of scaling the fp32 sum -- a different number.
+// The caller scales the GEMM output instead.
+extern "C" __global__ void dequant_nvfp4_to_bf16_kernel(const uint8_t* __restrict__ w,
+                                             const uint8_t* __restrict__ sc,
+                                             __nv_bfloat16* __restrict__ out,
+                                             int N, int K) {
+    const size_t total = (size_t)N * (size_t)K;
+    const int kk = K;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (size_t)gridDim.x * blockDim.x) {
+        const int n = (int)(idx / (size_t)kk);
+        const int k = (int)(idx % (size_t)kk);
+        const uint8_t byte = __ldg(w + (size_t)n * (size_t)(kk >> 1) + (size_t)(k >> 1));
+        const uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+        const float s = e4m3_to_float(__ldg(sc + (size_t)n * (size_t)(kk >> 4) + (size_t)(k >> 4)));
+        out[idx] = __float2bfloat16_rn(e2m1_to_float(nib) * s);
+    }
+}
