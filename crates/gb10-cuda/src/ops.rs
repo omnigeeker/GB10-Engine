@@ -1136,9 +1136,10 @@ impl Ops {
                 "attn_prefill_tiled needs BQ * BK == 3 * (head_dim / 2), got {BQ} * {BK} against head_dim {head_dim}"
             )));
         }
-        // Q and K rows are padded to head_dim + 1 floats in the kernel to break
-        // the 32-way shared bank conflict the natural stride causes.
-        let smem = (BQ * (head_dim + 1) + BK * (head_dim + 1) + BQ * BK + 3 * BQ) * 4;
+        // Q and K rows are padded in the kernel to break the shared bank
+        // conflicts the natural stride causes: the row stride is head_dim + 2
+        // with the two halves separated by one extra float.
+        let smem = (BQ * (head_dim + 2) + BK * (head_dim + 2) + BQ * BK + 3 * BQ) * 4;
         if smem > 48 * 1024 {
             return Err(CudaError::InvalidArgument(format!(
                 "attn_prefill_tiled needs {smem} B of shared memory, over the 48 KB limit"

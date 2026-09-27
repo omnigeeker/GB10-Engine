@@ -539,3 +539,52 @@ the 333 GFLOPS figure (1.4% of fp32 peak) was real, but I attributed it to the
 algorithm's structure rather than to a one-character addressing bug. A stride
 that is a multiple of 32 is the single most common way to destroy a shared
 memory kernel, and it had been sitting in the hottest loop the whole time.
+
+## Killing the last bank conflict moved the microbenchmark but not the model
+
+With rows padded, the only conflict left in the score loop was the 2-way one
+between the two `sub` halves: their offsets differ by `half == 128`, and 128 is a
+multiple of 32, so both halves sat in the same bank. Separating them by one extra
+float (`PADH = half + 1`, row stride `2 * PADH`) makes the 16 `j` values and 2
+`sub` values of a warp span all 32 banks:
+
+| `attn-tile` | padded | **split halves** |
+|---|---|---|
+| 65536 tokens | 28.46 s | **17.36 s** (1.64x) |
+| 16384 tokens | 1.09 s | 1.04 s |
+
+So the conflict arithmetic was right again. But it did **not** move the thing the
+goal is measured on:
+
+| | padded | split halves |
+|---|---|---|
+| 8K cold TTFT | 54.49 s | 54.68 s |
+| 32K cold TTFT | 272.62 s | 269.41 s |
+
+Both are inside the run-to-run spread. I checked that the real prefill really
+does call `attn_prefill_tiled` (`Model` -> `Layer::forward_prefill` ->
+`ops.attn_prefill` -> `self.attn_prefill_tiled`), so this is not the kernel
+being bypassed. The reading is that after the padding fix the attention stopped
+being conflict-bound and became bound by something the standalone benchmark does
+not reproduce: **KV cache traffic**.
+
+The arithmetic for that is not subtle. Every one of the 24 query heads walks the
+whole key prefix for its layer, but there are only 4 KV heads, so the cache is
+read 6 times over. Per layer per prefill the key+value reads are
+
+    6 * (T^2 / 2) * 2 * n_kv_heads * head_dim * 4 bytes
+
+which at T = 32747 is ~4.4 TB per layer and ~70 TB over the 16 full-attention
+layers. The measured remaining quadratic term at 32K is ~105 s, so the cache is
+being served at an effective ~670 GB/s -- above DRAM, so largely out of L2.
+
+That makes **GQA-aware attention** the next real lever: fusing the 6 query heads
+that share a KV head so the cache is read once instead of 6 times is a 6x cut on
+the dominant term. It is also the change I costed earlier and deferred -- it
+needs either a key split with a global partial buffer and a second merge kernel,
+or a register budget of `6 * BQ` accumulators per thread, which forces BQ down to
+about 8.
+
+The split-halves change is kept: it is numerically identical, correctness-gated,
+and a real 1.64x on the isolated kernel. It simply is not what the model is
+waiting on right now, and it will matter again once the KV traffic is fixed.
