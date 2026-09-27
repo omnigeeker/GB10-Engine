@@ -11,4 +11,4 @@ anyhow.workspace = true
 thiserror.workspace = true
 half.workspace = true
 tracing.workspace = true
-cudarc = { version = "0.19", features = ["cuda-13000"] }
+cudarc = { version = "0.19", features = ["cuda-13000", "cublas", "f16"] }

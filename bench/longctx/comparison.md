@@ -766,3 +766,32 @@ verification order are written up in [tensorcore-plan.md](tensorcore-plan.md).
 The one number to watch when it lands is the per-chunk constant `G` from the fit
 above: it should fall from 12.4 s to about 2 s. If it does not, the cuBLAS path
 is not being reached, and that is a faster diagnostic than any end-to-end run.
+
+## The number the whole plan rested on was 2x pessimistic
+
+`gb10-bench cublas-gemm` measures a real cuBLAS bf16 GEMM with fp32 accumulate at
+the prefill's own shapes. I had been assuming ~43 TFLOPS, inferred backwards from
+llama.cpp's prompt-eval time. The measurement says **~80 TFLOPS**:
+
+| shape (n x k x t) | ms | TFLOP/s | vs fp32 |
+|---|---|---|---|
+| mlp gate/up 17408x5120x2048 | 4.63 | **78.8** | 11.3x |
+| mlp down 5120x17408x2048 | 4.10 | **89.1** | 12.7x |
+| lm_head 248320x5120x2048 | 64.89 | 80.2 | 11.5x |
+| attn q_proj 6144x5120x2048 | 1.53 | 84.0 | 12.0x |
+
+against the current fp32 CUDA-core GEMM's ~7 TFLOPS. Putting that through the
+measured GEMM/attention split from the per-chunk fit:
+
+| | GEMM | attention | total | vs llama.cpp |
+|---|---|---|---|---|
+| 8K now | 49.6 s | 4.4 s | 54 s | 5.2x slower |
+| **8K + tensor cores** | **4.4 s** | 4.4 s | **8.8 s** | **1.20x FASTER** |
+| 32K now | 202.6 s | 65.2 s | 268 s | 6.0x slower |
+| 32K + tensor cores + 3x attention | 18.0 s | 21.7 s | **39.7 s** | **1.12x FASTER** |
+| 32K + tensor cores + 6x attention | 18.0 s | 10.9 s | **28.9 s** | **1.54x FASTER** |
+
+The tensor-core GEMM by itself is enough to win 8K. That is the first time in
+this session that a single identified change has been sufficient for a metric
+rather than merely closing part of a gap, and it is worth recording that the
+thing standing in the way of knowing it was a 20-line benchmark, not the rewrite.

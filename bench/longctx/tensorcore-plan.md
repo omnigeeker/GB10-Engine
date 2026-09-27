@@ -81,13 +81,37 @@ not a precision reduction.
    launched per-matrix with the wrong shape.
 4. Only then the end-to-end 8K / 32K runs.
 
-## Expected result
+## Measured: what bf16 tensor cores actually do on this part
 
-| | now | after |
-|---|---|---|
-| 8K cold TTFT | 54 s | ~12 s (llama 10.58 s) |
-| 32K cold TTFT | 268 s | ~102 s (llama 44.55 s) |
+`gb10-bench cublas-gemm` (added this round) runs a real cuBLAS bf16 GEMM with
+fp32 accumulate at the shapes the prefill actually uses. This replaced an
+assumption with a number, and the assumption was **too pessimistic by 2x**:
 
-8K needs the GQA attention fusion as well to actually cross over
-(~8.9 s, 1.19x faster than llama.cpp). 32K is a coin flip that depends on how
-much of the attention's key/value traffic is really served from DRAM.
+| shape (n x k x t) | ms | TFLOP/s | vs fp32 |
+|---|---|---|---|
+| mlp gate/up 17408x5120x2048 | 4.63 | **78.8** | 11.3x |
+| mlp down 5120x17408x2048 | 4.10 | **89.1** | 12.7x |
+| lm_head 248320x5120x2048 | 64.89 | 80.2 | 11.5x |
+| attn q_proj 6144x5120x2048 | 1.53 | 84.0 | 12.0x |
+
+I had been assuming ~43 TFLOPS, inferred backwards from llama.cpp's own prompt
+eval time. This part does **~80 TFLOPS** of bf16, i.e. **11-13x** the current fp32
+GEMM, not 6x. Applying that to the measured GEMM/attention split:
+
+| | GEMM | attention | total | vs llama.cpp |
+|---|---|---|---|---|
+| 8K now | 49.6 s | 4.4 s | 54 s | 5.2x slower |
+| **8K + tensor cores** | **4.4 s** | 4.4 s | **8.8 s** | **1.20x FASTER** |
+| 32K now | 202.6 s | 65.2 s | 268 s | 6.0x slower |
+| 32K + tensor cores | 18.0 s | 65.2 s | 83.2 s | 1.9x slower |
+| 32K + tensor cores + 3x attention | 18.0 s | 21.7 s | **39.7 s** | **1.12x FASTER** |
+| 32K + tensor cores + 6x attention | 18.0 s | 10.9 s | **28.9 s** | **1.54x FASTER** |
+
+**So the tensor-core GEMM alone wins 8K cold TTFT outright, with no attention
+work at all.** 32K then needs the GQA fusion, and it wins even at a pessimistic
+3x rather than the hoped-for 6x.
+
+That is a materially better position than the 43 TFLOPS assumption implied, and
+it is the reason this benchmark exists as its own subcommand: the single most
+consequential number in the whole plan turned out to be 2x off, and it cost one
+20-line measurement to find out instead of a multi-round rewrite.

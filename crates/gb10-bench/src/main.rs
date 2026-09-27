@@ -43,6 +43,7 @@ fn main() -> Result<()> {
         "stream" => stream(&model, opt("--out")),
         "store-stream" => store_stream(&model),
         "launch-overhead" => launch_overhead(),
+        "cublas-gemm" => cublas_gemm(),
         _ => {
             eprintln!(
                 "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
@@ -707,5 +708,70 @@ fn stream(model: &str, out: Option<String>) -> Result<()> {
         std::fs::write(&out, serde_json::to_string_pretty(&j)?)?;
         println!("wrote {out}");
     }
+    Ok(())
+}
+
+/// cuBLAS bf16 GEMM at the shapes the prefill actually runs, to answer one
+/// question with a measurement rather than an assumption: can this part reach
+/// the ~43 TFLOPS that llama.cpp gets on bf16 tensor cores, when the current
+/// fp32 CUDA-core GEMM is stuck at ~7?
+///
+/// Layout: y[t, n] = x[t, k] * W[n, k]^T with y row-major [t, n_out]. cuBLAS is
+/// column-major and computes C(m, n) = op(A) * op(B), so with m = n_out and
+/// n = t the output C viewed column-major is exactly our y row-major. W is
+/// row-major [n_out, k] which, read column-major with lda = k, is W^T -- hence
+/// transa = T. x is row-major [t, k] which, read column-major with ldb = k, is
+/// already the (k, t) matrix we want -- hence transb = N.
+fn cublas_gemm() -> Result<()> {
+    use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+    use half::bf16;
+
+    let dev = Device::new(0)?;
+    let blas = CudaBlas::new(dev.stream().clone())?;
+
+    println!("{:<22} {:>8} {:>8} {:>9} {:>10} {:>9}", "shape (n x k x t)", "ms", "TFLOP/s", "GB", "GB/s", "vs fp32");
+    let fp32_tflops = 7.0f64;
+    for (label, n, k, t) in [
+        ("mlp gate/up", 17408usize, 5120usize, 2048usize),
+        ("mlp down", 5120, 17408, 2048),
+        ("lm_head", 248320, 5120, 2048),
+        ("attn q_proj", 6144, 5120, 2048),
+    ] {
+        let w = dev.stream().alloc_zeros::<bf16>(n * k)?;
+        let x = dev.stream().alloc_zeros::<bf16>(t * k)?;
+        let mut y = dev.stream().alloc_zeros::<bf16>(n * t)?;
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: t as i32,
+            k: k as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        for _ in 0..3 {
+            unsafe { blas.gemm(cfg, &w, &x, &mut y) }?;
+        }
+        dev.synchronize()?;
+        let reps = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            unsafe { blas.gemm(cfg, &w, &x, &mut y) }?;
+        }
+        dev.synchronize()?;
+        let secs = t0.elapsed().as_secs_f64() / reps as f64;
+        let flop = 2.0 * n as f64 * k as f64 * t as f64;
+        let tflops = flop / secs / 1e12;
+        let gbytes = (n * k * 2) as f64 / 1e9;
+        println!(
+            "{:<22} {:>8.2} {:>8.1} {:>9.3} {:>10.0} {:>8.1}x",
+            label, secs * 1e3, tflops, gbytes, gbytes / secs, tflops / fp32_tflops
+        );
+    }
+    println!("\nreference: the current fp32 CUDA-core GEMM measures ~7 TFLOP/s, {:.1}x below this", 43.0/7.0);
     Ok(())
 }

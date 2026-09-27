@@ -9,6 +9,8 @@ description = "Benchmark and verification harness"
 gb10-core.workspace = true
 gb10-cuda.workspace = true
 gb10-model.workspace = true
+cudarc = { version = "0.19", features = ["cuda-13000", "cublas", "f16"] }
+half.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
