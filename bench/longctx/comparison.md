@@ -18,9 +18,9 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| **cold TTFT** | **89.0 s** | **10.45 s** | 8.5× slower |
-| **warm TTFT** | **89.0 s** | **0.24 s** | 371× slower |
-| **OTPS** | **2.41** | **7.43** | 3.1× slower |
+| **cold TTFT** | **88.9 s** | **10.45 s** | 8.5× slower |
+| **warm TTFT** | **0.035 s** | **0.24 s** | **6.9× faster** |
+| **OTPS** | **2.34** | **7.43** | 3.2× slower |
 
 ## 32K
 
@@ -28,11 +28,46 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
 | **cold TTFT** | **821.0 s** | **44.3 s** | 18.5× slower |
-| **warm TTFT** | **821.3 s** | **0.27 s** | 3042× slower |
-| **OTPS** | **1.18** | **7.0** | 5.9× slower |
+| **warm TTFT** | **0.05 s** | **0.27 s** | **5.4× faster** |
+| **OTPS** | **3.13** | **7.0** | 2.2× slower |
 
-gb10's 32K row is the serial kernel; llama.cpp's is the mean of three trials
-(43.55 / 44.85 / 44.46 cold, 0.29 / 0.28 / 0.25 warm).
+llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
+cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
+cache, which is the point of it: a cold request has nothing to resume from.
+
+**Warm TTFT is won.** It was 821 s at 32K — byte-identical to cold, because the
+server wiped its own cache every request — and is now 0.05 s, faster than
+llama.cpp's 0.27 s. At 8K it is 0.035 s against 0.24 s. The two numbers below
+are what the two mechanisms bought, separately.
+
+## The prefix cache
+
+`run_group` used to start with `state.reset(dev)`, which zeroed every KV cache,
+conv history and recurrence on **every** request. There was no warm path at all.
+
+The interesting part is that a position counter is not enough to rewind: the 48
+Gated-DeltaNet layers carry a *recurrence*, and the state after N-1 tokens
+cannot be recovered from the state after N by moving an offset. So the cache
+snapshots the recurrence (`ModelState::snapshot_recurrent`, which already
+existed for the MTP verify path) and restores it.
+
+A snapshot is taken **after** each prompt rather than one token short of it, and
+the token that prompt prefilled to is cached beside it. An exact repeat
+therefore runs no forward pass at all: restore, hand back the cached token, and
+let the decode loop continue from a state that is already exactly where it
+should be. That is why warm TTFT is 35 ms and not ~250 ms — it is the cost of a
+160 MB device-to-device copy, not of a forward pass.
+
+Correctness of that is not assumed. `bench/longctx/prefix_ab.sh` runs one
+request sequence — a repeat, an unrelated prompt after a cached one, and a
+prefix extension — against a caching server and against one started with
+`--no-prefix-cache`, and requires the output to be identical. It is wired into
+`loop/run_round.sh` as its own gate, because none of the `gb10-verify` gates go
+through the server's resume path and so none of them test it.
+
+One limitation, deliberate: a miss costs the whole group its cache, since
+`reset` and the snapshot are both whole-state operations. Mixed groups fall back
+to a full prefill. This can make a group slower, never wrong.
 
 ## What the new decode kernel bought
 
@@ -65,18 +100,13 @@ spends its time. Working back from the measured numbers at 8K:
 * all 21.9 GB of weights, streamed once per token at the measured 228 GB/s, is
   **96 ms** — a hard floor of ~10.4 tok/s;
 * attention, at the warp kernel's 1.58 ms per layer × 16, is **~25 ms**;
-* measured is 415 ms/token.
+* measured is ~430 ms/token.
 
-So ~300 ms, most of the decode step, is neither weights-at-peak nor attention.
-That is the number to chase next, and it is why OTPS is 3.1× off and not 6×.
-
-## Warm TTFT is a missing feature, not a slow kernel
-
-`run_group` calls `state.reset()` on every request
-(`crates/gb10-server/src/main.rs`), which wipes the KV cache, so gb10's warm time
-is its cold time by construction — 89.0 s versus 89.0 s at 8K. llama.cpp caches
-the slot's prompt and answers from it. Until that is implemented, this column
-cannot move no matter what the kernels do.
+So most of the decode step is neither weights-at-peak nor attention, and that is
+why OTPS is 3.2× off rather than 6×. Note also that the server decodes a single
+request through a 24-block grid — one block per query head — on a GPU with 48
+SMs, so the decode kernels are running at half occupancy before anything else is
+considered. Sizing that grid to the work is the next thing to look at.
 
 ## Cold TTFT
 

@@ -87,6 +87,11 @@ struct Args {
     /// Concurrent sequences to size the KV cache for. `None` means "as many as
     /// the KV budget allows, up to `MAX_CONCURRENT`".
     concurrency: Option<usize>,
+    /// Diagnostic: refuse every prefix-cache resume, so a request pair can be
+    /// compared against the same pair on a caching server. The two must agree
+    /// token for token; that equality is the cache's correctness contract and
+    /// the only way to test it, since the outputs are otherwise unlabelled.
+    no_prefix_cache: bool,
 }
 
 impl Args {
@@ -97,6 +102,7 @@ impl Args {
         let mut model_name = "Qwen3.8-27B-NVFP4".to_string();
         let mut ctx = 32768usize;
         let mut concurrency = None;
+        let mut no_prefix_cache = false;
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -108,6 +114,7 @@ impl Args {
                 "--concurrency" => {
                     concurrency = Some(it.next().context("--concurrency needs a value")?.parse()?)
                 }
+                "--no-prefix-cache" => no_prefix_cache = true,
                 other => anyhow::bail!("unknown argument: {other}"),
             }
         }
@@ -119,7 +126,7 @@ impl Args {
         if let Some(c) = concurrency {
             anyhow::ensure!(c >= 1, "--concurrency must be at least 1");
         }
-        Ok(Self { model, host, port, model_name, ctx, concurrency })
+        Ok(Self { model, host, port, model_name, ctx, concurrency, no_prefix_cache })
     }
 }
 
@@ -246,6 +253,22 @@ struct Engine {
     /// Sequence slots actually allocated. The batcher must not group more
     /// requests than this, or `prefill_seq` indexes past the state.
     n_seq: usize,
+    /// Per slot, the exact token sequence `state`'s recurrent snapshot stands
+    /// for. A new prompt that starts with this can skip the prefill of
+    /// everything before it. Empty means "nothing worth resuming", either a
+    /// fresh slot or one that was reset since.
+    ///
+    /// The snapshot is taken one token *short* of each prompt, so that resuming
+    /// re-runs the final prompt token and regenerates its logits -- the
+    /// recurrent state after N-1 tokens cannot be recovered by moving a counter,
+    /// which is the whole reason this is a snapshot and not an offset.
+    prefix_ids: Vec<Vec<u32>>,
+    /// The token each cached prompt prefilled to. An exact repeat is answered
+    /// from here without running the model, which is why the snapshot is taken
+    /// *after* the prompt rather than one token short of it.
+    prefix_next: Vec<Option<u32>>,
+    /// See [`Args::no_prefix_cache`].
+    no_prefix_cache: bool,
 }
 
 /// Qwen's chat template puts the opening ` thinking` into the *prompt*, so generation
@@ -379,6 +402,9 @@ impl Engine {
             name: args.model_name.clone(),
             ctx: args.ctx,
             n_seq,
+            prefix_ids: vec![Vec::new(); n_seq],
+            prefix_next: vec![None; n_seq],
+            no_prefix_cache: args.no_prefix_cache,
         })
     }
 
@@ -1033,13 +1059,14 @@ fn scheduler(mut eng: Engine, rx: mpsc::Receiver<Job>) {
 /// and KV cache for no benefit.
 fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
     let k = group.len();
-    let Engine { dev, model, tok, tmpl, state, sc, ctx, .. } = eng;
+    let Engine { dev, model, tok, tmpl, state, sc, ctx, prefix_ids, prefix_next, no_prefix_cache, .. } =
+        eng;
     let timing = std::env::var_os("GB10_TIMING").is_some();
-    let t_reset = std::time::Instant::now();
-    state.reset(dev)?;
-    if timing {
-        eprintln!("  reset {:.2}s", t_reset.elapsed().as_secs_f64());
-    }
+    // No unconditional `state.reset()` here any more. It used to wipe every KV
+    // cache, conv history and recurrence at the top of each group -- precisely
+    // the state the prefix cache needs to keep. The reset now happens below,
+    // where the resume decision is known, and only when some slot in the group
+    // cannot be resumed.
 
     let mut next: Vec<u32> = Vec::with_capacity(k);
     let mut prompt_tokens = Vec::with_capacity(k);
@@ -1054,6 +1081,13 @@ fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
     // appends past this slot's KV cache and into the next sequence's.
     let mut limit = vec![0usize; k];
 
+    // --- tokenize, then decide what can be resumed -------------------------
+    //
+    // `prefix_ids[s]` is the token sequence that `state`'s snapshot stands for.
+    // A prompt that starts with it can skip everything before it; the snapshot
+    // supplies the conv history and the 48 DeltaNet recurrences, which cannot
+    // be rewound by moving a position counter.
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(k);
     for (s, job) in group.iter().enumerate() {
         let opts =
             ChatTemplateOptions { enable_thinking: job.enable_thinking, ..Default::default() };
@@ -1065,35 +1099,116 @@ fn run_group(eng: &mut Engine, group: Vec<Job>) -> Result<()> {
                 p.len()
             )));
             done[s] = true;
+            // Kept in step with `s` even on the failure path: `GenResult`
+            // below indexes `prompt_tokens` by slot.
             prompt_tokens.push(p.len());
-            next.push(0);
+            prompts.push(Vec::new());
             continue;
         }
         prompt_tokens.push(p.len());
         limit[s] = job.max_tokens.min(*ctx - p.len());
+        prompts.push(p);
+    }
+
+    // One miss costs the whole group its cache, because `reset` and the
+    // snapshot are both whole-state operations -- there is no per-slot reset.
+    // Reusing only when every slot can be resumed is therefore the conservative
+    // choice: it can only ever make a group slower, never wrong.
+    let mut resume_at: Vec<usize> = vec![0; k];
+    let mut all_hit = !*no_prefix_cache;
+    for s in 0..k {
+        if done[s] {
+            continue;
+        }
+        let saved = &prefix_ids[s];
+        // A non-empty prefix is only resumable if its next token was cached
+        // with it; without it an exact repeat has nothing to answer with, so
+        // fall back to a full prefill rather than trusting the invariant.
+        let usable = saved.is_empty() || prefix_next[s].is_some();
+        if usable && prompts[s].starts_with(saved) {
+            resume_at[s] = saved.len();
+        } else {
+            all_hit = false;
+        }
+    }
+
+    if all_hit {
+        state.restore_recurrent(dev)?;
+    } else {
+        state.reset(dev)?;
+        prefix_ids.iter_mut().for_each(|v| v.clear());
+        prefix_next.iter_mut().for_each(|v| *v = None);
+        resume_at.iter_mut().for_each(|v| *v = 0);
+    }
+
+    // Prefill whatever each prompt adds on top of what it resumed from. The
+    // snapshot is taken once every slot has consumed its whole prompt, so it
+    // carries the state at position `len` -- and `nx`, the token the prefill
+    // produced, is cached next to it. An exact repeat therefore needs no
+    // forward pass at all: restore, hand back `nx`, and let the decode loop
+    // take over from a state that is already exactly where it should be.
+    let mut fresh_next: Vec<Option<u32>> = vec![None; k];
+    for s in 0..k {
+        if done[s] {
+            continue;
+        }
+        let p = &prompts[s];
+        let start = resume_at[s];
+        if start == p.len() {
+            // Exact repeat of a cached prompt: the answer is already known.
+            match prefix_next[s] {
+                Some(t) => fresh_next[s] = Some(t),
+                None => {
+                    // Cannot happen given the `usable` check above; if it ever
+                    // does, prefill rather than fail.
+                    let start = 0;
+                    resume_at[s] = start;
+                    let mut nx = 0u32;
+                    for c in p.chunks(PREFILL_CHUNK) {
+                        nx = model.prefill_seq(dev, c, state, sc, s)?;
+                    }
+                    fresh_next[s] = Some(nx);
+                }
+            }
+            continue;
+        }
+        let t0 = std::time::Instant::now();
         let mut nx = 0u32;
-        let t_all = std::time::Instant::now();
-        for (i, c) in p.chunks(PREFILL_CHUNK).enumerate() {
-            let t0 = std::time::Instant::now();
+        for (i, c) in p[start..].chunks(PREFILL_CHUNK).enumerate() {
             nx = model.prefill_seq(dev, c, state, sc, s)?;
             if timing {
                 eprintln!(
                     "  slot {s} chunk {i} ({} tok, start {}): {:.2}s",
                     c.len(),
-                    i * PREFILL_CHUNK,
+                    start + i * PREFILL_CHUNK,
                     t0.elapsed().as_secs_f64()
                 );
             }
         }
         if timing {
             eprintln!(
-                "  slot {s}: prefill {} tok in {:.2}s ({:.1} ms/tok)",
+                "  slot {s}: prefilled {} of {} tok in {:.2}s",
+                p.len() - start,
                 p.len(),
-                t_all.elapsed().as_secs_f64(),
-                t_all.elapsed().as_secs_f64() * 1e3 / p.len() as f64
+                t0.elapsed().as_secs_f64()
             );
         }
-        next.push(nx);
+        fresh_next[s] = Some(nx);
+    }
+
+    state.snapshot_recurrent(dev)?;
+    for s in 0..k {
+        if !done[s] {
+            prefix_ids[s] = prompts[s].clone();
+            prefix_next[s] = fresh_next[s];
+        }
+    }
+    for s in 0..k {
+        if done[s] {
+            next.push(0);
+        } else {
+            next.push(fresh_next[s].expect("live slot without a next token"));
+        }
     }
 
     let mut live = done.iter().filter(|d| !**d).count();

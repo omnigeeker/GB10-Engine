@@ -38,7 +38,7 @@ REPORT="$ROUNDS/$(printf '%03d' "$ROUND")-round.md"
 
 say() { echo "[round $ROUND] $*" | tee -a "$LOG"; }
 
-GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_DECODE=skip; GATE_BENCH=skip
+GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_DECODE=skip; GATE_PREFIX=skip; GATE_BENCH=skip
 STATUS=FAIL
 
 {
@@ -122,6 +122,19 @@ if [ "$GATE_TEST" = pass ]; then
   fi
 fi
 
+# The server's prefix cache is invisible to every gate above: they drive the
+# model directly and never go through the server's resume path. So this runs
+# one request sequence twice -- once against a caching server, once against a
+# server started with --no-prefix-cache -- and requires byte-identical output.
+if [ "$GATE_BUILD" = pass ] && [ -x "$ROOT/target/release/gb10-server" ]; then
+  say "prefix cache A/B (caching vs --no-prefix-cache)"
+  if "$ROOT/bench/longctx/prefix_ab.sh" >>"$LOG" 2>&1; then
+    GATE_PREFIX=pass; say "prefix cache OK"
+  else
+    GATE_PREFIX=fail; say "prefix cache FAILED (see $LOG)"
+  fi
+fi
+
 # `decode-bench` checks the warp-parallel decode kernel against the serial
 # reference and times both. It is not redundant with `batch-parity`: that gate
 # compares batched against one-at-a-time, and both of those now take the warp
@@ -155,6 +168,7 @@ if [ "$GATE_BUILD" = pass ] && [ "$GATE_TEST" = pass ] &&
    { [ "$GATE_CORRECT" = pass ] || [ "$GATE_CORRECT" = missing ]; } &&
    { [ "$GATE_GENERATE" = pass ] || [ "$GATE_GENERATE" = missing ]; } &&
    { [ "$GATE_DECODE" = pass ] || [ "$GATE_DECODE" = missing ]; } &&
+   { [ "$GATE_PREFIX" = pass ] || [ "$GATE_PREFIX" = missing ]; } &&
    { [ "$GATE_BENCH" = pass ] || [ "$GATE_BENCH" = skip ]; }; then
   STATUS=PASS
 fi
@@ -170,6 +184,7 @@ fi
   echo "| correctness (layers) | $GATE_CORRECT |"
   echo "| correctness (64-layer) | $GATE_GENERATE |"
   echo "| decode-bench (warp vs serial) | $GATE_DECODE |"
+  echo "| prefix cache A/B | $GATE_PREFIX |"
   echo "| benchmark | $GATE_BENCH |"
   echo
   echo "**status: $STATUS**"
@@ -182,9 +197,9 @@ fi
 } >> "$REPORT"
 
 # ---------------------------------------------------------------- 6. state ---
-python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_DECODE" "$GATE_BENCH" <<'PY'
+python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_DECODE" "$GATE_PREFIX" "$GATE_BENCH" <<'PY'
 import json, sys
-state_path, rnd, status, stamp, b, t, c, g, dc, bm = sys.argv[1:11]
+state_path, rnd, status, stamp, b, t, c, g, dc, pf, bm = sys.argv[1:12]
 s = json.load(open(state_path))
 s["round"] = int(rnd)
 s["last_round_at"] = stamp
@@ -192,7 +207,7 @@ s["last_status"] = status
 s.setdefault("history", []).append(
     {"round": int(rnd), "at": stamp, "status": status,
      "gates": {"build": b, "test": t, "correctness": c, "generate": g,
-               "decode": dc, "benchmark": bm}}
+               "decode": dc, "prefix": pf, "benchmark": bm}}
 )
 json.dump(s, open(state_path, "w"), indent=2)
 print(f"state: round={rnd} status={status}")
