@@ -588,3 +588,39 @@ about 8.
 The split-halves change is kept: it is numerically identical, correctness-gated,
 and a real 1.64x on the isolated kernel. It simply is not what the model is
 waiting on right now, and it will matter again once the KV traffic is fixed.
+
+## The KV traffic, counted
+
+The GQA redundancy is worth putting numbers on before committing to a rewrite.
+Every query block walks the whole key prefix for its own KV head, and there are
+6 query heads per KV head, so the cache is read 6 times over:
+
+| | 8K | 32K |
+|---|---|---|
+| query blocks per layer | 8,208 | 32,736 |
+| average keys each | 4,112 | 16,374 |
+| KV traffic per layer | 69 GB | 1.10 TB |
+| KV traffic, 16 full-attention layers | **1.11 TB** | **17.6 TB** |
+| KV cache size per layer | 67 MB | 268 MB |
+| implied rate over the measured attention term | 89 GB/s | 167 GB/s |
+
+Two things fall out of this. At 32K the attention term is running at 167 GB/s
+against a measured 185 GB/s achievable and a 228 GB/s peak, so it is essentially
+**DRAM-bound** and 6x less traffic is 6x less time: 17.6 TB -> 2.9 TB -> ~16 s at
+185 GB/s, against the ~105 s it takes now.
+
+At 8K the same arithmetic gives only 89 GB/s, i.e. it is *not* DRAM-bound there --
+roughly half the bandwidth is still being left on the table by the kernel itself.
+So the picture is: at long context the attention is a traffic problem, at short
+context it is still partly a kernel problem, and those want different fixes. That
+is the honest state of it; I have not resolved why the half-split's 1.64x on the
+isolated kernel vanishes end to end, and I would rather leave that recorded as
+open than paper over it.
+
+The 6x lever is GQA fusion -- one block per KV head serving all 6 query heads so
+the cache is read once. The blocker is that the budget wants `6 * BQ` row
+accumulators and `6 * BQ` rows of Q in shared, which forces BQ down to about 4
+and needs V to stay in registers, in which case the shared budget is
+`6 * BQ * (HD + 2)` for Q plus `BK * (HD + 2)` for K, about 43 KB at BQ = 4,
+BK = 16. That fits, but it is a rewrite of the score, softmax and accumulator
+loops to carry a head dimension, not a tuning change.
