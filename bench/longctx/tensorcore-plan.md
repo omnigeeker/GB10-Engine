@@ -261,3 +261,70 @@ That is a materially better position than the 43 TFLOPS assumption implied, and
 it is the reason this benchmark exists as its own subcommand: the single most
 consequential number in the whole plan turned out to be 2x off, and it cost one
 20-line measurement to find out instead of a multi-round rewrite.
+
+## Implemented and measured (rounds 22)
+
+The dispatch is in: `Linear::forward_prefill` calls `forward_prefill_tensor_core`
+when `GB10_TC_GEMM=1`. The three scratch buffers are per-call rather than a shared
+persistent scratch, which relies on cudarc's caching allocator to make the repeat
+allocations cheap; that kept the change local instead of threading a scratch
+through 17 call sites.
+
+**Correctness:**
+
+    GB10_TC_GEMM=1 gb10-verify generate --n 16 --repeat 8 --oracle fixtures/oracle
+    -> oracle agreement: 16/16 (100.0%), exact match
+
+**Speed — per-chunk (`prefill-shape --limit 8225`):**
+
+| chunk | start | fp32 GEMM | **tensor core** |
+|---|---|---|---|
+| 0 | 0 | 12.62 s | **4.72 s** |
+| 1 | 2048 | 13.09 s | 5.02 s |
+| 2 | 4096 | 13.80 s | 5.55 s |
+| 3 | 6144 | 14.10 s | 5.97 s |
+| 4 | 33 tokens | 0.48 s | 1.03 s |
+| **total** | | **54.09 s** | **22.28 s (2.43x)** |
+
+Fitting the same `t = G + k*(start + chunk/2)`: **G falls from 12.35 s to 4.51 s**,
+a 2.74x cut in the constant term.
+
+**Speed — end to end, through the server:**
+
+| | fp32 GEMM | tensor core | |
+|---|---|---|---|
+| 8K cold TTFT | 54.88 s | **22.15 s** | **2.48x** |
+| 8K warm TTFT | 0.03 s | 0.03 s | unchanged |
+| 8K OTPS | 8.60 | 8.64-8.74 | unchanged |
+| vs llama.cpp 10.58 s | 5.2x slower | **2.09x slower** | |
+
+Warm TTFT and OTPS are unchanged exactly as intended -- the change touches only
+the prefill GEMM, so the decode roofline is untouched.
+
+### The measurement disagrees with the prediction, and that is the next lead
+
+The plan predicted ~11x on the GEMM (7 -> 80 TFLOP/s) and an 8.8 s 8K cold TTFT.
+It measured 2.74x and 22.15 s. The gap is real and worth naming rather than
+rounding away:
+
+The pipeline now does, per chunk, roughly **72 GB of pure zeroing** (`alloc_zeros`
+is the only allocator cudarc exposes, and every buffer is fully overwritten right
+after), plus ~44 GB of bf16 writes from the dequant, ~22 GB of NVFP4 reads, and
+~44 GB of bf16 reads by the GEMM. That is ~180 GB per chunk against the ~18 GB the
+fp32 GEMM needed, and at the measured ~200 GB/s it is ~0.9 s -- not enough on its
+own to explain 4.51 s, so the zeroing and the four-kernel-per-matrix structure are
+the first suspects but not yet proven ones.
+
+The order to attack it, cheapest first:
+
+1. **Drop the zeroing.** 72 GB per chunk of memset that is immediately written
+   over. cudarc exposes no uninitialised allocator, so this needs a persistent
+   scratch (which removes the zeroing *and* the allocation churn in one move).
+2. **Hoist the scratch** into the 321 MB shared buffer computed above, which also
+   removes per-call pool traffic.
+3. **Fuse dequant into the GEMM** (or cache the dequantised weights) if 1 and 2
+   are not enough -- but note the dequantised model is 44 GB and the NVFP4 one is
+   22 GB, so caching it trades the decode roofline away and is likely wrong.
+
+Even at 2.74x this is the largest single win of the session on the metric the
+objective is about: 8K cold TTFT went from 5.2x slower than llama.cpp to 2.09x.

@@ -61,6 +61,72 @@ impl Linear {
     /// Unlike `forward(batch = t)`, which runs `t` independent GEMVs and
     /// re-reads W every time, this reads each weight once and reuses it across
     /// all `t` activations.
+    /// The prefill GEMM on bf16 tensor cores, via cuBLAS.
+    ///
+    /// The fp32 CUDA-core GEMM this replaces runs at ~7 TFLOP/s, which is 76% of
+    /// what fp32 can reach on this part at all (128 FMA/cycle/SM * 48 SM *
+    /// 1.5 GHz = 9.2 TFLOP/s), so there is no fp32 tuning left in it. cuBLAS bf16
+    /// measures ~80 TFLOP/s at these exact shapes -- an 11-12x step -- and the
+    /// prefill is 75-93% GEMM, so this is the whole remaining gap.
+    ///
+    /// Four kernels per matrix: dequantise W to bf16, cast the activations to
+    /// bf16, the cuBLAS GEMM, then an epilogue back to fp32 that also applies
+    /// `s2` for the NVFP4 case (which must *not* be folded into the weights --
+    /// the reference applies it to the fp32 accumulator).
+    ///
+    /// The buffers are per-call rather than a shared persistent scratch, which
+    /// relies on cudarc's caching allocator to make the repeat allocations
+    /// cheap. It keeps this change local instead of threading a scratch through
+    /// 17 call sites. If the measured gain is real, the next step is to hoist
+    /// them into one 321 MB shared scratch (largest W 17408x5120 = 178 MB, and
+    /// x/y 2048x17408 = 71 MB each; `lm_head` is not on this path).
+    ///
+    /// `alloc_zeros` is the only allocator cudarc exposes, so every buffer is
+    /// zeroed before being fully overwritten. That is pure waste and is the
+    /// first thing to remove if the profile says so.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prefill_tensor_core(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<()> {
+        use half::bf16;
+        let kern = dev.ops();
+        let (n, k) = (self.n, self.k);
+        let stream = dev.stream();
+
+        let mut wb = stream.alloc_zeros::<bf16>(n * k)?;
+        match &self.data {
+            LinearData::NvFp4 { w, wscale, .. } => {
+                kern.dequant_nvfp4_to_bf16(dev, w, wscale, &mut wb, n, k)?;
+            }
+            LinearData::Fp8 { w, scale } => {
+                kern.dequant_fp8_to_bf16(dev, w, scale, &mut wb, n, k)?;
+            }
+            LinearData::Bf16 { w } => {
+                kern.u16_to_bf16(dev, w, &mut wb, n * k)?;
+            }
+        }
+
+        let mut xb = stream.alloc_zeros::<bf16>(t * k)?;
+        kern.f32_to_bf16(dev, x, &mut xb, t * k)?;
+
+        let mut yb = stream.alloc_zeros::<bf16>(t * n)?;
+        kern.cublas_gemm_bf16(dev, &wb, &xb, &mut yb, n, k, t)?;
+
+        // Only NVFP4 defers a scale to the epilogue; the others pass a dummy.
+        let dummy = stream.alloc_zeros::<f32>(1)?;
+        match &self.data {
+            LinearData::NvFp4 { scale2, .. } => {
+                kern.bf16_to_f32_scaled(dev, &yb, y, scale2, true, t * n)?
+            }
+            _ => kern.bf16_to_f32_scaled(dev, &yb, y, &dummy, false, t * n)?,
+        }
+        Ok(())
+    }
+
     pub fn forward_prefill(
         &self,
         dev: &Device,
@@ -94,6 +160,13 @@ impl Linear {
         // conservative cut.
         if self.n < 256 || t <= 16 {
             return self.forward(dev, x, y, t);
+        }
+        // Opt-in bf16 tensor-core GEMM (see `forward_prefill_tensor_core`).
+        // Default off so the committed default stays on the verified fp32 path;
+        // the measurement that decides the default is `prefill-shape`, whose
+        // per-chunk constant should fall from ~12.4 s to ~1.3 s.
+        if std::env::var("GB10_TC_GEMM").map(|v| v == "1").unwrap_or(false) {
+            return self.forward_prefill_tensor_core(dev, x, y, t);
         }
         let kern = dev.ops();
         match &self.data {

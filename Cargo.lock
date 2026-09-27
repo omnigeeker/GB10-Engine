@@ -309,6 +309,7 @@ dependencies = [
  "anyhow",
  "gb10-core",
  "gb10-cuda",
+ "half",
  "serde_json",
  "tracing",
 ]
