@@ -37,9 +37,58 @@ not fit. The startup line reports the decision:
 context 262144 tokens, 1 concurrent sequence(s), KV cache 34.4 GB (34360 MB per sequence)
 ```
 
-The KV cache is the only structure that scales with the context window: 16
-full-attention layers hold K and V for 4 KV heads of 256 f32 dimensions, which
-is **128 KB per token**, so 34.4 GB at 256K for a single sequence.
+Two things scale with the context window:
+
+| per token | scales with | size |
+|---|---|---|
+| KV cache — 16 full-attention layers, K and V, 4 KV heads × 256 f32 dims | `--concurrency` | **128 KiB** per sequence |
+| `a`, `b`, `normed` — residual buffers, `hidden × ctx × 4` each | no | **60 KiB** total |
+
+So the window costs `128 KiB × concurrency + 60 KiB` per token. At 256K that is
+32 GiB of KV and 15 GiB of residual buffers. The 48 Gated-DeltaNet layers hold
+a fixed-size recurrent state and do **not** grow with the window.
+
+`a`/`b`/`normed` are the odd ones out: they are sized to the whole window, but
+prefill only ever touches one 2048-token chunk at a time, so at 256K that 15 GiB
+is slack rather than a requirement.
+
+### How much context fits
+
+GB10 has no separate VRAM — it is one 121.7 GiB pool of unified LPDDR5X shared
+with the CPU. Measured on this machine, with everything else idle:
+
+```
+total                     121.7 GiB
+system resident           - 8.0 GiB
+weights (NVFP4)           -20.4 GiB
+Scratch (2048 rows)       - 1.1 GiB   (chunk-sized, not ctx-sized)
+CUDA context and misc     - 1.5 GiB
+--------------------------------------
+left for the context        90.7 GiB
+```
+
+| concurrency | per token | physical max | at the native 262144 | total |
+|---|---|---|---|---|
+| 1 | 188 KiB | **~506 K** | 47 GiB | 78 GiB |
+| 2 | 316 KiB | ~301 K | 79 GiB | 110 GiB |
+| 4 | 572 KiB | ~166 K | 143 GiB | does not fit |
+| 8 | 1084 KiB | ~88 K | 271 GiB | does not fit |
+| 16 | 2108 KiB | ~45 K | 527 GiB | does not fit |
+
+The model's own `max_position_embeddings` is **262144**, and `--ctx` above that
+is refused because the model would be extrapolating outside its RoPE range.
+Memory is not the binding constraint: one sequence at the full 262144 uses only
+47 GiB of the 90.7 GiB available, so there is room for roughly twice the native
+window if the model had the positions to use.
+
+Two consequences worth knowing:
+
+* **`--concurrency 2` at 262144 fits physically but is refused.** `KV_BUDGET_BYTES`
+  is a 40 GiB *policy* ceiling, and two sequences would need 64 GiB of KV. The
+  ceiling is a constant in `crates/gb10-server/src/main.rs`, not a hardware
+  limit — raise it if two 256K sequences are wanted and the box is otherwise free.
+* **The real cost of a long window is time, not memory.** Prefill grows
+  quadratically; see the next section.
 
 The weights take **~40–95 s** to load, during which the port is not yet open.
 There is no `--help`; unknown arguments are a hard error.
