@@ -1689,3 +1689,49 @@ Warm TTFT and OTPS beat llama.cpp at both contexts, as they have throughout; col
 does not, and remains the gap to close. The two wins are unaffected by the kernel work
 (warm TTFT is prefix-cache-bound and OTPS is decode-bound), and the cold-TTFT ratio
 improved only because the prefill itself got faster.
+
+### Manual prefetching is slower, and 128-bit loads are ruled out (round 48)
+
+Round 46 concluded the critical latency is the load and named two remaining levers:
+software-pipeline the fetch, or widen to 128-bit loads. Both are now settled, and neither
+works.
+
+**Software pipelining: measured slower.** The loop was rewritten so that iteration
+`d+1`'s four `__half2` fetches are issued before iteration `d`'s FMAs, with the last
+iteration peeled (prefetching one element past the end would read the row's padding gap,
+which is never written). The fma order is untouched, and the output is bit-identical --
+`nonzero 402652988/402653184`, the same count as the round-45 kernel. It is still slower:
+
+| config | attn-tile 16384 | attn-tile 65536 |
+|---|---|---|
+| `__half2`, as shipped (round 45) | 0.74 s | 12.27-12.29 s |
+| `__half2` + manual prefetch (round 48) | 0.80-0.81 s | 13.14-13.18 s |
+
+About 7% worse, reproducibly (two clean runs each). The compiler was already scheduling
+these fetches; doing it by hand adds registers and moves for no gain. Reverted.
+
+**128-bit loads are impossible with the conflict-free padding.** An 8-half load needs the
+element index to be a multiple of 8, i.e. `8 | PADH * (2j + sub)`, which needs `8 | PADH`.
+But round 41 required `floor(PADH/2) % 32` to be odd for the `(j, sub)` pairs to spread
+over all 32 banks, and that forces `PADH = 2 * (32k + odd)`. For `8 | PADH` we would need
+`(32k + odd) % 4 == 0` -- an odd number divisible by 4. The two conditions are mutually
+exclusive, so `PADH = 130` and 128-bit fetches cannot coexist. The bank-conflict fix and
+the widest possible load are on opposite sides of the same constraint.
+
+**Three consecutive negative results now bracket this loop tightly.** Round 43: more key
+columns per thread (`BK=48`) changed nothing, because the load:flop accounting ignored the
+conversions. Round 46: splitting the accumulator chain changed nothing, because the fma
+chain is not the constraint. Round 48: hand-scheduling the loads is slower, because the
+compiler already does it. The one change that worked -- round 45's `__half2` -- worked
+because it genuinely *reduced the number of load instructions in the chain*, not because
+of scheduling. Nothing in the remaining space reduces that count further: the width is
+capped by the bank padding, the count per element is already 1, and 2 blocks/SM is full
+speed (round 42).
+
+So the score loop looks close to done at 1.50x over where the session started on it, and
+further prefill gains have to come from elsewhere: the GEMM pipeline is the other half of
+the 32K time (~70 s of 107.89 s) and the attention's remaining cost is no longer in the
+score loop.
+
+Standing best configuration: fp16 `Qs`/`Ks`, `PADH = 130`, `BK = 16`, `__half2` score
+loop, no manual pipelining.
