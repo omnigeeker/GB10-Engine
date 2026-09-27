@@ -256,6 +256,21 @@ fn prefill_shape(args: &Args) -> Result<()> {
     let wall = t_all.elapsed().as_secs_f64();
     println!("  total {:.2}s", wall);
     {
+        let (lms, lns, tried, made, errs) = gb10_model::model::layer_event_snapshot();
+        let (dms, ams) = (lms[0], lms[1]);
+        let (dn, an) = (lns[0], lns[1]);
+        if tried > 0 {
+            println!("  [diag] layers tried={tried} made={made} measured={} errs={}",
+                dn + an, errs.len());
+            for e in errs.iter().take(3) {
+                println!("  [diag]   event error: {e}");
+            }
+            if dn + an > 0 {
+                println!("  [diag] LAYER GPU: delta {:.2}s / {} = {:.1}%   attn {:.2}s / {} = {:.1}%",
+                    dms / 1e3, dn, 100.0 * dms / 1e3 / wall,
+                    ams / 1e3, an, 100.0 * ams / 1e3 / wall);
+            }
+        }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
         if n > 0 {
             let tot: f64 = ph.iter().sum();

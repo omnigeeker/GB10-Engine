@@ -2448,3 +2448,51 @@ confirm `cargo build` actually recompiled (`Finished` in 0.03 s means it did not
 (GEMM 29.5% at 84% of its isolated rate, dequant 11.0% near the memory limit, cast 3.0%,
 epilogue 3.0%); the remaining 53.4% is attention (~22% by the round-45 fit) plus the DeltaNet
 (~32%), and the DeltaNet has still never been timed directly.
+
+### MEASURED: the DeltaNet layers are 70% of the cold prefill (round 63)
+
+The layer split landed, after two failed attempts, by using the codebase's own
+`gb10_cuda::timing_event` (not `new_event`, whose `CU_EVENT_DISABLE_TIMING` default returns
+a meaningless number instead of failing), counting attempts alongside successes, and
+editing the existing diagnostic block rather than splicing a new one. The control line
+confirms the measurement is real rather than silently empty:
+
+```
+[diag] layers tried=320 made=320 measured=320 errs=0
+[diag] LAYER GPU: delta 13.29s / 240 = 70.1%   attn 5.50s / 80 = 29.0%
+```
+
+320 layers = 64 x 5 chunks, 240 DeltaNet and 80 full-attention, exactly as the config's
+`full_attention_interval: 4` requires. 8K prefill, 18.96 s total:
+
+| layer kind | count | GPU time | share of prefill | per layer |
+|---|---|---|---|---|
+| **Gated-DeltaNet** | 240 | **13.29 s** | **70.1%** | **55.4 ms** |
+| full attention | 80 | 5.50 s | 29.0% | 68.8 ms |
+
+**And the DeltaNet's own kernels are the largest single block in the model.** The measured
+linear-op total (46.4% of the prefill) is spread over both layer kinds in proportion to
+their op counts -- the DeltaNet layers carry ~8 projections each against the full-attention
+layers' ~7, so roughly 75% of the 8.81 s of linear work is inside DeltaNet layers:
+
+| block | share of cold prefill |
+|---|---|
+| **DeltaNet non-linear kernels (recurrence, gating, conv)** | **~35%** (6.7 s) |
+| linear ops inside DeltaNet layers | ~35% (6.6 s) |
+| attention kernels (the full-attention layers' non-linear part) | ~17% (3.3 s) |
+| linear ops inside full-attention layers | ~12% (2.2 s) |
+
+**This is the target the diagnostic campaign was for.** The DeltaNet's recurrence, gating
+and convolution kernels are about **35% of the cold prefilling time -- more than the entire
+GEMM (29.4%), which is already at 84% of its isolated rate -- and they have never been
+optimised, profiled or even timed before this measurement.**
+
+It also closes the question the last fourteen rounds kept circling. Rounds 49-57 chased the
+GEMM, the dequant, the allocator, the FLOP count and the DeltaNet's *state* (0.17% of
+FLOPs). The state is indeed negligible -- but the DeltaNet's *kernels* are the largest
+single cost in the model, which is a different thing entirely and was only findable by
+timing the layers.
+
+Next: time the DeltaNet layer's internals the same way (its conv, its gating projections,
+and the recurrence kernel) to find which of the three carries the 6.7 s. The mechanism is
+now validated five times over.

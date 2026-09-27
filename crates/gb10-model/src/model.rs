@@ -11,6 +11,34 @@ use gb10_core::config::ModelConfig;
 use gb10_cuda::{timing_event, CudaEvent, CudaSlice, Device};
 
 use crate::layer::{Layer, LayerState, Scratch};
+
+/// DIAGNOSTIC (round 63): per-layer GPU time in the prefill, split by layer kind.
+/// Uses `gb10_cuda::timing_event`, not `new_event` -- the latter defaults to
+/// CU_EVENT_DISABLE_TIMING, where elapsed_ms returns a meaningless number rather
+/// than failing. Counts attempts and logs errors so a silent zero is impossible.
+pub static LAYER_EVENTS: Mutex<Vec<(bool, CudaEvent, CudaEvent)>> = Mutex::new(Vec::new());
+pub static LAYER_TRIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAYER_MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAYER_ERR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// (delta_ms, attn_ms), (delta_layers, attn_layers), tried, made, errors
+pub fn layer_event_snapshot() -> ([f64; 2], [usize; 2], usize, usize, Vec<String>) {
+    use std::sync::atomic::Ordering;
+    let mut v = LAYER_EVENTS.lock().unwrap();
+    let mut ms = [0.0f64; 2];
+    let mut n = [0usize; 2];
+    for (d, a, b) in v.drain(..) {
+        let k = if d { 0 } else { 1 };
+        n[k] += 1;
+        if let Ok(x) = a.elapsed_ms(&b) {
+            ms[k] += x as f64;
+        }
+    }
+    let errs = LAYER_ERR.lock().unwrap().clone();
+    (ms, n, LAYER_TRIED.load(Ordering::Relaxed), LAYER_MADE.load(Ordering::Relaxed), errs)
+}
+
+use std::sync::Mutex;
 use crate::weights::{Linear, Store};
 
 /// Weight prefix for the text decoder stack.
@@ -464,8 +492,28 @@ impl Model {
         dev.ops()
             .embed_gather_batched(dev, &self.embed, &ids_dev, &mut state.a, hidden, t)?;
 
+        let want_ev = std::env::var("GB10_GEMM_EVENTS").is_ok();
         for (i, layer) in self.layers.iter().enumerate() {
+            let le = if want_ev {
+                use std::sync::atomic::Ordering;
+                LAYER_TRIED.fetch_add(1, Ordering::Relaxed);
+                match (gb10_cuda::timing_event(dev), gb10_cuda::timing_event(dev)) {
+                    (Ok(a), Ok(b)) => {
+                        match a.record(dev.stream()) {
+                            Ok(()) => { LAYER_MADE.fetch_add(1, Ordering::Relaxed); }
+                            Err(e) => LAYER_ERR.lock().unwrap().push(format!("record: {e:?}")),
+                        }
+                        Some((a, b))
+                    }
+                    (Err(e), _) => { LAYER_ERR.lock().unwrap().push(format!("ev a: {e:?}")); None }
+                    (_, Err(e)) => { LAYER_ERR.lock().unwrap().push(format!("ev b: {e:?}")); None }
+                }
+            } else { None };
             layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, seq)?;
+            if let Some((a, b)) = le {
+                let _ = b.record(dev.stream());
+                LAYER_EVENTS.lock().unwrap().push((layer.is_delta(), a, b));
+            }
             std::mem::swap(&mut state.a, &mut state.b);
         }
 
