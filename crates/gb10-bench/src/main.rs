@@ -965,8 +965,43 @@ fn cublas_parity() -> Result<()> {
             }
         }
     }
+    // ---- full pipeline: GEMM (bf16) -> epilogue (bf16 -> fp32, * s2) --------
+    let s2v: f32 = 0.375;
+    let s2d = dev.stream().memcpy_stod(&[s2v])?;
+    let mut yf = dev.stream().alloc_zeros::<f32>(t * n)?;
+    dev.ops()
+        .bf16_to_f32_scaled(&dev, &yd, &mut yf, &s2d, true, t * n)?;
+    let yfv = dev.stream().memcpy_dtov(&yf)?;
+    // The epilogue must reproduce bf16-rounded values scaled by s2 exactly:
+    // x * s2 with s2 = 0.375 = 3/8 is a power-of-two times 3, so it stays exact
+    // in fp32 for the small integer magnitudes these products have.
+    let mut ep_bad = 0usize;
+    for i in 0..t * n {
+        let want_scaled = bf16::to_f32(got[i]) * s2v;
+        if yfv[i] != want_scaled {
+            ep_bad += 1;
+        }
+    }
+    println!(
+        "epilogue bf16->f32 * s2: {}",
+        if ep_bad == 0 {
+            format!("exact: {} / {}", t * n, t * n)
+        } else {
+            format!("MISMATCH: {ep_bad} bad")
+        }
+    );
+
+    // ---- u16-held bf16 weights -> bf16 operand ----------------------------
+    let u16s: Vec<u16> = wb.iter().map(|v| v.to_bits()).collect();
+    let ud = dev.stream().memcpy_stod(&u16s)?;
+    let mut ub = dev.stream().alloc_zeros::<bf16>(n * k)?;
+    dev.ops().u16_to_bf16(&dev, &ud, &mut ub, n * k)?;
+    let ug = dev.stream().memcpy_dtov(&ub)?;
+    let u_ok = (0..n * k).all(|i| ug[i].to_bits() == wb[i].to_bits());
+    println!("weights u16 -> bf16 operand: {}", if u_ok { "exact" } else { "MISMATCH" });
+
     println!("cublas bf16 layout: y[{t},{n}] = x[{t},{k}] * W[{n},{k}]^T");
-    if bad == 0 {
+    if bad == 0 && ep_bad == 0 && u_ok {
         println!("  exact against host matmul: {} / {}", t * n, t * n);
         println!("cublas-parity: OK");
         return Ok(());

@@ -52,6 +52,8 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "dequant_nvfp4_to_bf16_kernel",
     "dequant_fp8_to_bf16_kernel",
     "f32_to_bf16_kernel",
+    "bf16_to_f32_scaled_kernel",
+    "u16_to_bf16_kernel",
     "fp8_gemm_kernel",
     "bf16_gemm_kernel",
 ];
@@ -105,6 +107,8 @@ pub struct Ops {
     dequant_nvfp4_to_bf16: CudaFunction,
     dequant_fp8_to_bf16: CudaFunction,
     f32_to_bf16: CudaFunction,
+    bf16_to_f32_scaled: CudaFunction,
+    u16_to_bf16: CudaFunction,
     fp8_gemm: CudaFunction,
     bf16_gemm: CudaFunction,
 }
@@ -168,6 +172,8 @@ impl Ops {
             dequant_nvfp4_to_bf16: take(map, "dequant_nvfp4_to_bf16_kernel")?,
             dequant_fp8_to_bf16: take(map, "dequant_fp8_to_bf16_kernel")?,
             f32_to_bf16: take(map, "f32_to_bf16_kernel")?,
+            bf16_to_f32_scaled: take(map, "bf16_to_f32_scaled_kernel")?,
+            u16_to_bf16: take(map, "u16_to_bf16_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
             bf16_gemm: take(map, "bf16_gemm_kernel")?,
         })
@@ -841,6 +847,64 @@ impl Ops {
             dev.blas()
                 .gemm(cfg, w, x, y)
                 .map_err(|e| CudaError::Cublas(format!("{e:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// Convert `n` bf16 values back to fp32, multiplying by `s2` when
+    /// `has_scale` is set. This is the epilogue of the bf16 tensor-core GEMM.
+    pub fn bf16_to_f32_scaled(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<half::bf16>,
+        out: &mut CudaSlice<f32>,
+        s2: &CudaSlice<f32>,
+        has_scale: bool,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && out.len() >= n, "bf16_to_f32_scaled")?;
+        let hs = has_scale as i32;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.bf16_to_f32_scaled)
+                .arg(x)
+                .arg(out)
+                .arg(s2)
+                .arg(&hs)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Copy u16-held bf16 weights into a `half::bf16` operand buffer.
+    pub fn u16_to_bf16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<u16>,
+        out: &mut CudaSlice<half::bf16>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && out.len() >= n, "u16_to_bf16")?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.u16_to_bf16)
+                .arg(x)
+                .arg(out)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
         Ok(())
     }

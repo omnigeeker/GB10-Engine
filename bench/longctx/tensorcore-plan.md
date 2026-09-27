@@ -144,14 +144,25 @@ re-test of this question if anything downstream changes the numerics.
    chunks — the whole point is that token generation is bandwidth-bound on the
    NVFP4 bytes, and a 178 MB bf16 cache would be a different (worse) tradeoff.
 
-3b. **Epilogue.** The cuBLAS output is bf16 (cudarc's safe `Gemm<half::bf16>`
+3b. **Epilogue (DONE and verified, round 20).** The cuBLAS output is bf16 (cudarc's safe `Gemm<half::bf16>`
    fixes A, B *and* C to `CUDA_R_16BF`), so `forward_prefill` still needs a
    bf16 -> fp32 convert-and-scale epilogue to apply `s2` and hand fp32 back to
    the rest of the layer. Rounding the output to bf16 is the same class of
    rounding as the activation rounding already measured to keep the gate at
    16/16, since the output is simply the next layer's activation.
+   `bf16_to_f32_scaled_kernel` does the convert-and-scale (taking `has_scale` as
+   an int so the caller can always pass a valid slice), and `u16_to_bf16_kernel`
+   bridges `LinearData::Bf16`, which stores weights as `CudaSlice<u16>`, to the
+   `CudaSlice<half::bf16>` that cuBLAS needs. `cublas-parity` now covers the
+   whole pipeline:
 
-4. **Dispatch.** `Linear::forward_prefill` in `crates/gb10-model/src/weights.rs`
+       epilogue bf16->f32 * s2: exact: 816 / 816
+       weights u16 -> bf16 operand: exact
+       cublas bf16 layout: y[17,48] = x[17,32] * W[48,32]^T
+         exact against host matmul: 816 / 816
+       cublas-parity: OK
+
+4. **Dispatch (the only step left).** `Linear::forward_prefill` in `crates/gb10-model/src/weights.rs`
    — replace the GEMM branch (the `n >= 256 && t > 16` side of the existing
    crossover) with: dequant -> convert x -> `blas.gemm` -> (x stays fp32 for the
    rest of the layer). Keep `forward` (the NVFP4 GEMV) for `t <= 16` and for

@@ -562,3 +562,31 @@ extern "C" __global__ void f32_to_bf16_kernel(const float* __restrict__ x,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2bfloat16_rn(__ldg(x + i));
 }
+
+// ---- bf16 -> fp32 epilogue, with the optional per-tensor nvfp4 scale -------
+//
+// cuBLAS hands back bf16 (cudarc's safe Gemm fixes A, B and C all to
+// CUDA_R_16BF) while the rest of the layer works in fp32, and the nvfp4 path
+// still owes its `s2`. Both happen here. `has_scale` is an int rather than a
+// nullable pointer so the caller can always pass a valid (possibly dummy) slice.
+extern "C" __global__ void bf16_to_f32_scaled_kernel(const __nv_bfloat16* __restrict__ x,
+                                                     float* __restrict__ out,
+                                                     const float* __restrict__ s2,
+                                                     int has_scale, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __bfloat162float(__ldg(x + i));
+        if (has_scale) v *= __ldg(s2);
+        out[i] = v;
+    }
+}
+
+// ---- bf16 weights held as u16 -> bf16 tensor-core operand -----------------
+//
+// `LinearData::Bf16` stores weights as `CudaSlice<u16>`; cuBLAS needs
+// `CudaSlice<half::bf16>`. Same bits, different Rust type.
+extern "C" __global__ void u16_to_bf16_kernel(const uint16_t* __restrict__ x,
+                                              __nv_bfloat16* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __ushort_as_bfloat16(__ldg(x + i));
+}
