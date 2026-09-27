@@ -2496,3 +2496,73 @@ timing the layers.
 Next: time the DeltaNet layer's internals the same way (its conv, its gating projections,
 and the recurrence kernel) to find which of the three carries the 6.7 s. The mechanism is
 now validated five times over.
+
+### ROOT CAUSE: the DeltaNet recurrence runs at 6% occupancy with a serial scan (round 64)
+
+Round 63 measured the DeltaNet's own kernels at ~35% of the cold prefill. This round found
+why, by reading `gated_delta_rule_chunk_kernel` (`kernels/elementwise.cu:837`) and its launch
+site.
+
+```cuda
+extern "C" __global__ void gated_delta_rule_chunk_kernel(...) {
+    constexpr int D = 128;
+    const int hv = blockIdx.x;
+    const int b  = blockIdx.y;      // grid_dim.y == 1, so this is always 0
+    ...
+    for (int t = 0; t < T; ++t) {   // serial scan over the whole chunk
+        ...
+        for (int i = threadIdx.x; i < D; i += blockDim.x) sk[i] = khp[i];
+        __syncthreads();            // 2 syncs per token
+        ...
+        for (int i = 0; i < D; ++i) {          // 128-long dependent chain
+            const float s = S[i][j] * dec; S[i][j] = s; kv = fmaf(s, sk[i], kv);
+        }
+        ...
+        for (int i = 0; i < D; ++i) {          // another 128-long dependent chain
+            const float s = fmaf(sk[i], delta, S[i][j]); S[i][j] = s;
+            o = fmaf(s, qh[i], o);
+        }
+    }
+}
+```
+
+with the launch:
+
+```rust
+.launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
+```
+
+**The grid is 48 blocks.** `n_v_heads` is 48, and GB10 has exactly 48 SMs -- so this kernel
+occupies one block per SM and nothing more. 48 x 128 threads = **6,144 threads against
+98,304 thread slots, about 6% occupancy**, and each thread then executes two dependent
+chains of 128 FMAs per token inside a serial loop over `T`, with two `__syncthreads()` per
+iteration (4,096 barriers per layer per chunk). There is no second block per SM to hide the
+latency of either the shared-memory traffic, the barriers, or the fma chains.
+
+This is the 6.7 s. It is not a FLOP problem -- the state is small (128x128 fp32 per head,
+3.1 MB per layer per sequence, and round 53 already showed the state update is 0.17% of the
+model's FLOPs). It is an **occupancy and parallelism** problem: 48 blocks of 128 threads
+doing a serial scan.
+
+It also explains observations that never fit before:
+
+- **Round 51's flat-in-`n_seq` result.** `blockIdx.y` is always 0 because `grid_dim.y` is 1,
+  so the kernel's parallelism does not grow with batch at all. Ten sequences cost the same
+  as one because the grid is shaped by heads alone.
+- **Rounds 54-55's large CPU time.** A kernel with two barriers per token in a 2048-token
+  serial loop is exactly the shape that leaves a GPU idle and the host spinning.
+- **Why the linear-op accounting never closed the gap** (round 60): the missing 53% was
+  never a staging kernel. It is one badly-parallelised recurrence kernel, 48 layers deep.
+
+The fix is structural rather than incremental, and there are two standard routes:
+
+1. **Chunk the recurrence.** The classic gated-delta-rule formulation splits the sequence
+   into blocks and computes each block's contribution with dense matrix products (the
+   "chunked" form this kernel is named for but does not implement), which turns the serial
+   scan into GEMM-shaped work that cuBLAS-class kernels can execute at high occupancy.
+2. **Parallelise within the scan.** Give each `(head, batch)` more than one block, or give
+   each SM multiple blocks, and/or split `D` across warps so the two 128-long chains become
+   independent partial sums.
+
+Route 1 is the one that scales -- it is what every performant gated-delta-rule
+implementation does -- and it is what makes the name of this kernel honest.
