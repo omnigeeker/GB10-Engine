@@ -753,3 +753,16 @@ the 1.01x column above is the optimistic end of the range -- the pessimistic end
 at 3x, is 55.7 s, still 0.8x (i.e. 1.25x slower than llama.cpp). So 8K is the
 context where the objective is most clearly winnable, and 32K is a coin flip that
 depends on how much of that traffic is really coming from DRAM.
+
+## The remaining work, specified
+
+The two fixes above are now costed against measured baselines, so the next step
+does not need to re-derive anything. The tensor-core GEMM in particular has its
+prerequisites already in the tree -- `stage_wtile` already converts every weight
+to bf16 before staging, the oracle is itself bf16, and cudarc already exposes
+`Gemm<half::bf16> for CudaBlas` -- and the exact dispatch, layout and
+verification order are written up in [tensorcore-plan.md](tensorcore-plan.md).
+
+The one number to watch when it lands is the per-chunk constant `G` from the fit
+above: it should fall from 12.4 s to about 2 s. If it does not, the cuBLAS path
+is not being reached, and that is a faster diagnostic than any end-to-end run.
