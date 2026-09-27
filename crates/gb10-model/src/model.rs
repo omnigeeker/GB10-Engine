@@ -280,6 +280,12 @@ impl Model {
         anyhow::ensure!(n_seq <= state.n_seq, "step_batch: batch exceeds state");
 
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        // Splits the step into host submission time and device drain time. Every
+        // kernel launch is asynchronous, so the first number is how long the CPU
+        // takes to *enqueue* the layer stack and the difference is how long the
+        // GPU then takes to finish it. If submit dominates, the step is
+        // launch-bound and no kernel optimisation will help.
+        let submit_t0 = std::time::Instant::now();
         dev.stream().memcpy_htod(&ids, &mut state.tokens_dev)?;
         dev.ops().embed_gather_batched(
             dev,
@@ -309,9 +315,27 @@ impl Model {
             .argmax_multi(dev, &state.logits, &mut state.idx, self.vocab_size(), n_seq)?;
 
         state.n_tokens += 1;
+        let submit = submit_t0.elapsed().as_secs_f64();
         let v = dev.stream().memcpy_dtov(&state.idx)?;
         dev.check_err()?;
-        Ok(v.iter().map(|&x| x as u32).collect())
+        if std::env::var_os("GB10_STEP_TIMING").is_some() {
+            let total = submit_t0.elapsed().as_secs_f64();
+            eprintln!(
+                "  step: submit {:.1} ms, drain {:.1} ms, total {:.1} ms (n_seq {n_seq})",
+                submit * 1e3,
+                (total - submit) * 1e3,
+                total * 1e3
+            );
+        }
+        // Truncate to the batch. `state.idx` is `state.n_seq` long, so returning
+        // it whole made a caller that feeds the result straight back in -- the
+        // server's decode loop -- silently promote a group of 1 to a group of
+        // `state.n_seq` on its second step, and keep it there. The extra slots
+        // are idle, so the answers stayed right and only the cost was wrong:
+        // 16x the work per token, which is why a lone request measured the same
+        // 380 ms/step as a full batch of 16 and why OTPS fell when the server
+        // was started with a larger concurrency.
+        Ok(v.iter().take(n_seq).map(|&x| x as u32).collect())
     }
 
     /// Feed a prompt, return the greedy token after the last prompt token.
