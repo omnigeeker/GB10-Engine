@@ -408,3 +408,37 @@ out of ~23 is what fp32 `fmaf` on CUDA cores gets here, and llama.cpp's ~45
 TFLOPS comes from bf16 tensor cores. Reaching it means an `mma.sync` GEMM on the
 staging tiles that are already bf16 in shared, which is a numerical change and a
 much larger piece of work than anything above.
+
+## Raising the prefill attention tile: 3.5%, not the 3x the model predicted
+
+V is only ever read as `Vs[j * HD + tid]` -- one column per thread for each j --
+so it never needed shared memory. Moving it into a per-thread register array
+frees the `BK * HD` staging buffer, which is what lets `BQ * BK` grow without
+exceeding the 48 KB shared limit:
+
+| | BQ | BK | BQ*BK | shared |
+|---|---|---|---|---|
+| before | 8 | 16 | 128 (1 pass) | 41,568 B |
+| after | 24 | 16 | 384 (3 passes) | 42,784 B |
+
+`PREFILL_BQ * PREFILL_BK` must stay a multiple of `blockDim.x / 2` (the score
+loop pairs two threads per `(i,j)` behind a `__shfl_xor_sync(0xffffffff)`), and
+384 = 3 x 128 satisfies that with every lane running the same number of passes.
+
+The change is numerically identical -- same K and V values, same dot products,
+same accumulation order -- and `attn-tile` and `generate` both still pass
+(`generate` 16/16 token-exact).
+
+Measured on 8K cold TTFT:
+
+| | before | after |
+|---|---|---|
+| cold TTFT | 88.81 s | **85.71 s** |
+| OTPS | 8.65 | 8.69 |
+
+So a 3x larger score tile bought **3.5%**, not 3x. That falsifies the "attention
+time is proportional to 1 / (BQ * BK)" model I had been carrying. The per-tile
+cost is evidently dominated by something that does not shrink with the tile --
+the K and V staging and the four barriers per tile are all still there, and the
+score-loop shared reads per thread (3 pairs x 256 floats) actually grew. Tiling
+alone will not close a gap that is now 8.1x at 8K.

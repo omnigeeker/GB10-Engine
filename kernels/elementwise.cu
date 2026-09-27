@@ -338,7 +338,17 @@ extern "C" __global__ void attn_prefill_kernel(
 // the shuffle named lanes that were not executing. Raise BQ * BK only to a
 // multiple of 128, and re-check the 48 KB shared-memory budget in
 // gb10_cuda::ops::attn_prefill_tiled.
-#define PREFILL_BQ 8
+// The score loop pairs two threads per (i,j) with `__shfl_xor_sync(0xffffffff)`,
+// so PREFILL_BQ * PREFILL_BK must be a multiple of blockDim.x / 2 and every lane
+// of a warp must run the same number of passes. With blockDim.x == head_dim ==
+// 256 that is a multiple of 128, and 24 * 16 == 384 == exactly 3 passes.
+//
+// V does not need shared memory. It is only ever read as `Vs[j * HD + tid]` --
+// one column per thread for each j -- so each thread can hold its own BK values
+// in registers. Dropping the BK * HD staging buffer is what makes room for the
+// 3x larger BQ * BK tile: the shared budget is
+// (BQ + BK) * HD + BQ * BK + 3 * BQ = 10696 floats = 42,784 B, against 48 KB.
+#define PREFILL_BQ 24
 #define PREFILL_BK 16
 
 extern "C" __global__ void attn_prefill_tiled_kernel(
@@ -349,8 +359,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     const int HD = head_dim;
     float* Qs = smem;                              // BQ * HD
     float* Ks = Qs + PREFILL_BQ * HD;              // BK * HD
-    float* Vs = Ks + PREFILL_BK * HD;              // BK * HD
-    float* S = Vs + PREFILL_BK * HD;               // BQ * BK  (running p, then probabilities)
+    float* S = Ks + PREFILL_BK * HD;               // BQ * BK  (running p, then probabilities)
     float* red = S + PREFILL_BQ * PREFILL_BK;      // 3 * BQ  (m, l, correction)
 
     const int h = blockIdx.x;
@@ -376,6 +385,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     float acc[PREFILL_BQ];
 #pragma unroll
     for (int i = 0; i < PREFILL_BQ; ++i) acc[i] = 0.0f;
+    float vr[PREFILL_BK];
 
     __syncthreads();
 
@@ -388,14 +398,20 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            if (s <= win_max) {
-                const size_t off = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d;
-                Ks[idx] = k[off];
-                Vs[idx] = v[off];
-            } else {
-                Ks[idx] = 0.0f;
-                Vs[idx] = 0.0f;
-            }
+            Ks[idx] = (s <= win_max)
+                          ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
+                          : 0.0f;
+        }
+        // This thread's column of V, held in registers. Consecutive threads read
+        // consecutive addresses, so each of the BK loads is one 128-byte
+        // transaction per warp. Issued here so the latency overlaps the score
+        // loop and the softmax rather than stalling the accumulator loop.
+#pragma unroll
+        for (int j = 0; j < PREFILL_BK; ++j) {
+            const int s = s0 + j;
+            vr[j] = (s <= win_max)
+                        ? v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + tid]
+                        : 0.0f;
         }
         __syncthreads();
 
@@ -453,7 +469,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
             float a = acc[i] * c;
             const float* prow = S + i * PREFILL_BK;
             for (int j = 0; j < PREFILL_BK; ++j)
-                a = fmaf(prow[j], Vs[j * HD + tid], a);
+                a = fmaf(prow[j], vr[j], a);
             acc[i] = a;
         }
         __syncthreads();

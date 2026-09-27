@@ -1108,8 +1108,11 @@ impl Ops {
         kv_base: usize,
     ) -> Result<()> {
         // Must match PREFILL_BQ / PREFILL_BK in kernels/elementwise.cu. BQ * BK
-        // must also divide evenly into the score loop's passes there.
-        const BQ: usize = 8;
+        // must also divide evenly into the score loop's passes there, which with
+        // head_dim == 256 threads means a multiple of 128; 24 * 16 == 384 is
+        // exactly 3 passes. V is held in registers there, not staged, so the
+        // shared budget below has no `2 * BK * head_dim` term.
+        const BQ: usize = 24;
         const BK: usize = 16;
         need(
             q.len() >= n_tokens * n_q_heads * head_dim
@@ -1125,7 +1128,7 @@ impl Ops {
                 "attn_prefill_tiled needs head_dim a multiple of 32 and <= 1024, got {head_dim}"
             )));
         }
-        let smem = (BQ * head_dim + 2 * BK * head_dim + BQ * BK + 3 * BQ) * 4;
+        let smem = (BQ * head_dim + BK * head_dim + BQ * BK + 3 * BQ) * 4;
         if smem > 48 * 1024 {
             return Err(CudaError::InvalidArgument(format!(
                 "attn_prefill_tiled needs {smem} B of shared memory, over the 48 KB limit"
