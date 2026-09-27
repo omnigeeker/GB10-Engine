@@ -835,3 +835,67 @@ cut, consistent with the 2.74x measured at 8K. The scratch then took 32K from
 134.73 to 129.11 s, a 1.04x gain, in line with the 1.10x it gave at 8K. So the two
 independent fits agree, and the remaining 32K gap is now **more than half
 attention** -- roughly 65 s of the 129.11 s.
+
+## Correction: the 32K attention is compute-bound, not KV-bandwidth-bound (round 30)
+
+At 32K the attention term is ~65 s of the 129.11 s total, so it is the largest
+single remaining cost. I had been carrying it as "KV-traffic-bound" and had queued
+GQA fusion (to remove the 6x redundancy of 24 query heads re-reading 4 KV heads)
+as the main lever for long context. The arithmetic says that is aimed at the wrong
+wall.
+
+**The KV traffic is not the cost.** At 32K, one pass over the cache is
+
+    32768 tokens * 4 kv heads * 256 dim * 4 B = 134 MB per layer
+    134 MB * 16 full-attention layers      = 2.1 GB
+    with the 6x head redundancy            = 12.9 GB
+
+which at the measured 228 GB/s is **57 ms**. The attention term is ~65 s, i.e.
+~1100x that. Even granting that the L2 absorbs some of the redundancy, there is no
+bandwidth story here at all.
+
+**The O(t^2) scores are the cost.** QK^T plus the weighted sum is
+`2 * t^2 * d * heads * layers`:
+
+    t = 32768, d = 256, heads = 24, layers = 16
+    -> 2.11e14 FLOP over ~65 s = 3.2 TFLOP/s
+
+So the attention runs at 3.2 TFLOP/s. That is **17% of this part's fp32 peak**, and
+that is where the remaining long-context time is.
+
+### A second correction, which is mine and not the kernel's
+
+Those percentages use the correct peak, and the peak I had been quoting is wrong.
+I wrote, and repeated all session, that fp32 tops out at 9.2 TFLOP/s on GB10
+("128 FMA/cycle/SM * 48 SM * 1.5 GHz"). That counts **1 FLOP per FMA**. A fused
+multiply-add is 2 FLOP:
+
+    128 FP32 cores/SM * 2 FLOP/FMA * 48 SM * 1.5 GHz = 18.43 TFLOP/s
+
+So the fp32 ceiling is **2x higher than I had been quoting**, and two earlier
+conclusions have to be restated:
+
+- the fp32 prefill GEMM at ~7 TFLOP/s was described as "already at 76% of its
+  ceiling, so tensor cores are mandatory". It is at **38%**, not 76%. Tensor cores
+  were the right call and the measurement (78-87 TFLOP/s) still stands, but the
+  stated reason overstated how little headroom fp32 had.
+- the attention at 3.2 TFLOP/s has up to **~5.8x** available from fp32 tuning
+  alone, before bf16 tensor cores enter the picture at all.
+
+### What this changes about the remaining plan
+
+GQA fusion targets the KV read, which is 57 ms of a 65 s term. It should be
+dropped from the critical path -- it is a rounding error at 32K, whatever it may do
+for decode. The lever is the score loop's arithmetic:
+
+1. **fp32 tuning first**, since it is the cheapest and needs no precision
+   argument: 3.2 -> up to 18 TFLOP/s is ~5.8x, worth ~50 s at 32K and ~? at 8K.
+   The score loop is already register-blocked (round 265's 4-reads/3-fma hoist),
+   so this needs the real in-model phase timing from round 27's lesson rather than
+   another guess about where the cycles go.
+2. **bf16 tensor cores for QK^T and PV** only if (1) plateaus. This is a
+   flash-attention-shaped rewrite, and the accuracy argument is not free: the
+   score matrix feeds a softmax, so bf16 scores would need checking against the
+   needle and perplexity gates, not just `generate`.
+
+The ordering matters and it is the reverse of what I had planned.
