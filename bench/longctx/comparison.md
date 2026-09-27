@@ -1615,3 +1615,38 @@ currently relies on lane-adjacent `__shfl_xor` over single elements.
 
 Reverted the isolation probe; the tree is back to fp16 `BK=16`, the best measured
 configuration.
+
+### Splitting the accumulator chain does nothing: the critical latency is the load (round 46)
+
+Round 45's `__half2` loop cut the loads in the chain and bought 1.30-1.50x. The obvious
+follow-up was to cut the other chain: each accumulator still carried 128 serial
+dependent FMAs (two per iteration over 64 iterations), so splitting every row into two
+half-sums that combine once at the end halves it to 64, at the cost of six accumulators
+instead of three.
+
+**It changed nothing:**
+
+| config | attn-tile 16384 | attn-tile 65536 |
+|---|---|---|
+| `__half2`, one chain (round 45) | 0.74 s | 12.29 s |
+| `__half2`, two chains (round 46) | 0.75 s | 12.19 s |
+
+Within noise, while reordering the summation and so giving up bit-identity with the
+previous kernel for no return. Reverted.
+
+**Read together with round 45, this pins the latency down.** Round 45 shortened the
+*load* path and gained 1.30-1.50x; round 46 shortened the *FMA* path and gained nothing.
+So the dependency that matters is the **load**, not the arithmetic -- the loop is waiting
+on shared-memory fetches, and the FMA chain has more than enough independent work to
+hide behind them. Round 44's phrasing ("latency-bound on the load-to-fma chain") was
+right in substance but had the culprit one step too late in the chain.
+
+**So the remaining lever is to overlap loads better, not to change the arithmetic:**
+software-pipeline the fetch (issue iteration `d+1`'s `__half2` loads before iteration
+`d`'s FMAs) or widen further to 128-bit loads. Neither has been tried, and both leave the
+arithmetic order untouched, so unlike the accumulator split they cost nothing in
+precision.
+
+Standing best configuration: fp16 `Qs`/`Ks` with `PADH = 130`, `BK = 16`, `__half2`
+score loop. 8K in situ 20.11 -> 19.24 s; attention term 1.50x faster; 32K projected
+129.11 -> 107.5 s (2.41x against llama.cpp, from 2.90x).
