@@ -982,3 +982,61 @@ Both contexts' cold-TTFT gaps reduce to this one kernel:
 
 at which point 32K is 1.71x from llama.cpp and the remainder is the dequant plus the
 cuBLAS GEMM, both of which are already measured near their limits.
+
+### The 5.3x is not reachable as stated; the real target is ~2.3x (round 33)
+
+Round 32 said an 8x8 register tile over the score matrix would hit the shared-load
+ratio exactly and give 5.3x. Reading the mapping properly, that is wrong, and the
+reason matters more than the number.
+
+**`j` is not a loop.** It is fixed per thread:
+
+    const int j  = q % PREFILL_BK;      // q = tid >> 1
+    const int i0 = q / PREFILL_BK;
+
+so each thread owns **3 rows x exactly one `j`**, and the score pair count is
+`BQ * BK = 384`, or 768 work items once the two `sub` halves are counted. Spread
+over `nt = 256` threads that is **3.0 work items per thread** -- the tile is already
+fully subscribed, with only 3 accumulators each.
+
+The consequence is that the Q value at `(row i, offset d)` is re-loaded by every one
+of the 16 threads that own a *different* `j` for that row. **The Q loads carry a 16x
+redundancy**, and they are 3 of the 4 loads per inner iteration.
+
+**Why the 8x8 tile cannot simply be applied.** Giving a thread more accumulators
+means giving it more `j`s, which means fewer threads for the same 384 pairs:
+
+| j's per thread | loads/d | FMA/d | FMA/load | accumulators | threads needed |
+|---|---|---|---|---|---|
+| **1 (now)** | 4 | 3 | 0.75 | 3 | 256 |
+| 2 | 5 | 6 | 1.20 | 6 | 128 |
+| 4 | 7 | 12 | **1.71** | 12 | 64 |
+| 8 | 11 | 24 | 2.18 | 24 | 32 |
+| 16 | 19 | 48 | 2.53 | 48 | 16 |
+
+So every step toward the 4.0 ratio **collapses the block**. At 16 threads the block
+no longer has enough warps to hide latency and the gain evaporates. The 5.3x figure
+assumed the arithmetic could be re-tiled at constant parallelism, which this mapping
+does not allow.
+
+**The fix has to grow the tile instead of shrinking the block.** Keep 256 threads,
+give each 3 rows x 4 `j` (12 accumulators, 1.71 FMA/load), and enlarge `BK` so there
+are `384 * 4 = 1536` pairs to cover -- `BK = 64` rather than 16. That raises shared
+usage for the K tile from `16*258*4 = 16.5 KB` to `64*258*4 = 66 KB`, which is over
+the 48 KB default and into the 99 KB opt-in limit, so it also forces the
+`cudaFuncAttributeMaxDynamicSharedMemorySize` path and a re-check of the occupancy
+that the extra shared memory costs back.
+
+**Revised expectation: ~2.3x on the score phase for `BK = 64` with 12 accumulators**,
+not 5.3x. Applied to the measured 32K decomposition:
+
+    129.11 - 65.0 + 65.0/2.3 = 92.4 s   vs llama.cpp 44.55 s = 2.07x  (from 2.90x)
+
+which is worth doing but is not the ~1.7x I wrote in round 32. I would rather
+correct that here than have it carried forward as a promise.
+
+The larger tile also has to be checked against the guard at
+`kernels/elementwise.cu:448` (`BQ * BK != 3 * (nt >> 1)`) and against round 264's
+finding that `BQ = 24, BK = 11` was ~5x slower for shuffle-uniformity reasons --
+`BK = 64` is even and a multiple of the warp width, so it should be clear of that
+particular trap, but the guard exists because the trap is real.
