@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use gb10_core::safetensors::{DType, ShardedSafeTensors, TensorInfo};
-use gb10_cuda::{CudaSlice, Device};
+use gb10_cuda::{CudaSlice, Device, TcScratch};
 use std::path::Path;
 
 /// A weight matrix plus the scales its format needs.
@@ -97,32 +97,54 @@ impl Linear {
         let (n, k) = (self.n, self.k);
         let stream = dev.stream();
 
-        let mut wb = stream.alloc_zeros::<bf16>(n * k)?;
+        // Grow the shared scratch to fit, then split it so the three buffers can
+        // be borrowed independently. Each is only ever allocated once and then
+        // grown, which is what removes the per-call allocator cost.
+        let mut sc = dev.tc_scratch();
+        if sc.w.as_ref().map_or(true, |b| b.len() < n * k) {
+            sc.w = Some(stream.alloc_zeros::<bf16>(n * k)?);
+        }
+        if sc.x.as_ref().map_or(true, |b| b.len() < t * k) {
+            sc.x = Some(stream.alloc_zeros::<bf16>(t * k)?);
+        }
+        if sc.y.as_ref().map_or(true, |b| b.len() < t * n) {
+            sc.y = Some(stream.alloc_zeros::<bf16>(t * n)?);
+        }
+        if sc.one.is_none() {
+            let mut one = stream.alloc_zeros::<f32>(1)?;
+            dev.stream().memcpy_htod(&[1.0f32], &mut one)?;
+            sc.one = Some(one);
+        }
+        // Named with an `s` prefix because `x` and `y` are already the fp32
+        // input and output of this function.
+        let TcScratch { w: sw, x: sx, y: sy, one } = &mut *sc;
+        let (wb, xb, yb) = (
+            sw.as_mut().unwrap(),
+            sx.as_mut().unwrap(),
+            sy.as_mut().unwrap(),
+        );
+
         match &self.data {
-            LinearData::NvFp4 { w, wscale, .. } => {
-                kern.dequant_nvfp4_to_bf16(dev, w, wscale, &mut wb, n, k)?;
+            LinearData::NvFp4 { w: qw, wscale, .. } => {
+                kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
             }
-            LinearData::Fp8 { w, scale } => {
-                kern.dequant_fp8_to_bf16(dev, w, scale, &mut wb, n, k)?;
+            LinearData::Fp8 { w: qw, scale } => {
+                kern.dequant_fp8_to_bf16(dev, qw, scale, wb, n, k)?;
             }
-            LinearData::Bf16 { w } => {
-                kern.u16_to_bf16(dev, w, &mut wb, n * k)?;
+            LinearData::Bf16 { w: qw } => {
+                kern.u16_to_bf16(dev, qw, wb, n * k)?;
             }
         }
+        kern.f32_to_bf16(dev, x, xb, t * k)?;
+        kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;
 
-        let mut xb = stream.alloc_zeros::<bf16>(t * k)?;
-        kern.f32_to_bf16(dev, x, &mut xb, t * k)?;
-
-        let mut yb = stream.alloc_zeros::<bf16>(t * n)?;
-        kern.cublas_gemm_bf16(dev, &wb, &xb, &mut yb, n, k, t)?;
-
-        // Only NVFP4 defers a scale to the epilogue; the others pass a dummy.
-        let dummy = stream.alloc_zeros::<f32>(1)?;
+        // Only NVFP4 defers a scale to the epilogue; the others pass one.
+        let one = one.as_ref().unwrap();
         match &self.data {
             LinearData::NvFp4 { scale2, .. } => {
-                kern.bf16_to_f32_scaled(dev, &yb, y, scale2, true, t * n)?
+                kern.bf16_to_f32_scaled(dev, yb, y, scale2, true, t * n)?
             }
-            _ => kern.bf16_to_f32_scaled(dev, &yb, y, &dummy, false, t * n)?,
+            _ => kern.bf16_to_f32_scaled(dev, yb, y, one, false, t * n)?,
         }
         Ok(())
     }

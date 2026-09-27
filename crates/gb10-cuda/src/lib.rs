@@ -13,7 +13,7 @@ use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaModule, CudaStream, DriverError};
 use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use cudarc::driver::{CudaEvent, CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits};
 pub use kernels::Kernels;
@@ -51,6 +51,25 @@ pub enum CudaError {
 
 pub type Result<T> = std::result::Result<T, CudaError>;
 
+/// Growable bf16 buffers shared by every tensor-core prefill GEMM.
+///
+/// The prefill path used to allocate these per matrix, which measured at 39% of
+/// the whole pipeline (`gb10-bench tc-phase`) -- not because of the memset, which
+/// a bandwidth estimate would put at ~1.2 ms, but because the measured 4.46 ms
+/// works out to ~60 GB/s once the per-call allocation and launch overhead is
+/// included. Held here so each buffer is allocated once and then only grown.
+#[derive(Default)]
+pub struct TcScratch {
+    /// Dequantised weights, `[n, k]`.
+    pub w: Option<CudaSlice<half::bf16>>,
+    /// bf16 activations, `[t, k]`.
+    pub x: Option<CudaSlice<half::bf16>>,
+    /// bf16 GEMM output, `[t, n]`.
+    pub y: Option<CudaSlice<half::bf16>>,
+    /// One fp32 element, passed to the epilogue when there is no `s2` to apply.
+    pub one: Option<CudaSlice<f32>>,
+}
+
 /// A CUDA device with the engine's kernels loaded.
 pub struct Device {
     ctx: Arc<CudaContext>,
@@ -59,6 +78,7 @@ pub struct Device {
     ops: Ops,
     modules: Vec<Arc<CudaModule>>,
     blas: CudaBlas,
+    tc_scratch: Mutex<TcScratch>,
 }
 
 impl Device {
@@ -97,6 +117,7 @@ impl Device {
             ops,
             modules,
             blas,
+            tc_scratch: Mutex::new(TcScratch::default()),
         })
     }
 
@@ -119,6 +140,15 @@ impl Device {
     /// The cuBLAS handle used by the bf16 tensor-core prefill GEMM.
     pub fn blas(&self) -> &CudaBlas {
         &self.blas
+    }
+
+    /// The shared tensor-core prefill scratch. Poisoning is ignored: these are
+    /// plain device buffers and a panic elsewhere must not make the device
+    /// permanently unusable.
+    pub fn tc_scratch(&self) -> std::sync::MutexGuard<'_, TcScratch> {
+        self.tc_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn synchronize(&self) -> Result<()> {

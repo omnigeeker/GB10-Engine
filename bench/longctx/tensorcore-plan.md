@@ -410,3 +410,48 @@ The residual after that would be the dequant (11.8%), which is the next candidat
 it is a pure streaming pass over the packed weights and should be closer to
 bandwidth than 1.35 ms for 89 MB read + 178 MB written (197 GB/s, i.e. already
 near the measured 228 GB/s peak, so it may genuinely have little left in it).
+
+### Persistent scratch: landed, and it gains less than the phase timing predicted (round 27)
+
+The fix went in. `Device` now owns a `Mutex<TcScratch>` holding `w`, `x`, `y` and a
+one-element fp32 buffer, each allocated once and only grown; `forward_prefill_tensor_core`
+splits the guard so the three buffers can be borrowed independently against the
+function's own fp32 `x`/`y` (hence the `sw`/`sx`/`sy` names).
+
+**Correctness holds:** `generate --n 16 --repeat 8 --oracle` is still an exact
+match, 16/16.
+
+**Speed, same `prefill-shape --limit 8225` harness as every other number here:**
+
+| chunk | start | per-call alloc | **persistent scratch** |
+|---|---|---|---|
+| 0 | 0 | 4.72 s | **4.29 s** |
+| 1 | 2048 | 5.02 s | 4.58 s |
+| 2 | 4096 | 5.55 s | 5.06 s |
+| 3 | 6144 | 5.97 s | 5.53 s |
+| 4 | 33 tok | 1.03 s | 0.77 s |
+| **total** | | **22.28 s** | **20.23 s (1.10x)** |
+
+**That is 1.10x, not the 1.64x the phase timing predicted.** The prediction was
+wrong and the way it was wrong is the useful part: `tc-phase` measures the
+allocator by allocating and dropping the same three buffers in a tight loop, and
+it charges 4.458 ms for that. Extrapolating that across the model assumes the
+model pays the same per matrix. It does not. The model allocates ~7 distinct
+sizes, so cudarc's pool serves most repeats from an already-resident segment, and
+the real per-chunk allocator cost was ~2 s rather than ~6.9 s. The phase timing
+measured a real cost but not the model's version of it.
+
+So the honest summary of this round is: a 1.10x win on a measured 39%-of-pipeline
+phase, because that phase was measured under conditions that overstated it. The
+per-phase instrument is still the right tool; it just needs to be run against
+buffers allocated and dropped the way the model does, which means in-place in the
+model rather than in the bench.
+
+Cumulative effect on the objective's metric, using `prefill-shape` as the
+comparable harness (22.28 -> 20.23 s, i.e. the GEMM-pipeline share is now ~15.8 s
+of the ~20.2 s):
+
+| | session start | round 24 | now |
+|---|---|---|---|
+| 8K cold TTFT | 88.81 s | 22.15 s | **~20.1 s** |
+| vs llama.cpp 10.58 s | 8.4x | 2.09x | **~1.90x** |
