@@ -795,3 +795,32 @@ The tensor-core GEMM by itself is enough to win 8K. That is the first time in
 this session that a single identified change has been sufficient for a metric
 rather than merely closing part of a gap, and it is worth recording that the
 thing standing in the way of knowing it was a 20-line benchmark, not the rewrite.
+
+## Tensor-core prefill GEMM: the scorecard after the change
+
+The bf16 cuBLAS prefill GEMM is now the default (round 282). Both token-exact
+gates hold with it active -- `generate` 16/16 against the oracle and
+`batch-parity` 16/16 over 16 sequences -- and warm TTFT and OTPS are unchanged by
+construction, because the decode path still runs the NVFP4 GEMV and its roofline
+was never touched.
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | cold TTFT | **22.15 s** | 10.58 s | 2.09x slower (was 5.2x) |
+| 8K | warm TTFT | **0.03 s** | 0.237 s | **7.9x faster** |
+| 8K | OTPS | **8.6** | 7.32 | **1.18x faster** |
+| 32K | cold TTFT | **134.73 s** | 44.55 s | 3.02x slower (was 6.0x) |
+| 32K | warm TTFT | **0.06 s** | 0.29 s | **4.8x faster** |
+| 32K | OTPS | **7.12** | 6.865 | **1.04x faster** |
+
+Progress on the one metric that is still behind, over this session:
+
+| | start of session | now | |
+|---|---|---|---|
+| 8K cold TTFT | 88.81 s (8.4x slower) | **22.15 s (2.09x slower)** | **4.0x** |
+| 32K cold TTFT | 826.09 s (18.5x slower) | **134.73 s (3.02x slower)** | **6.1x** |
+
+The 32K number also checks the decomposition: 134.73 s against the fitted
+attention term of ~65 s leaves ~70 s of GEMM, down from 202.6 s -- a 2.9x cut,
+consistent with the 2.74x measured at 8K. So the two independent fits agree, and
+the remaining 32K gap is now **more than half attention**.
