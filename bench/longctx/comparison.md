@@ -882,6 +882,24 @@ conclusions have to be restated:
 - the attention at 3.2 TFLOP/s has up to **~5.8x** available from fp32 tuning
   alone, before bf16 tensor cores enter the picture at all.
 
+### The 3.2 TFLOP/s figure is now confirmed two independent ways (round 31)
+
+Round 30 inferred the attention's achieved rate from the end-to-end per-chunk fit,
+which left one thing assumed: whether `attn-tile` exercises one layer or all 16.
+It is a **single-layer** synthetic tile benchmark, and it reproduces the rate on
+its own:
+
+| measured by | tokens | time | FLOP | rate |
+|---|---|---|---|---|
+| `attn-tile` | 16384 | 1.04 s | 3.30e12 | **3.17 TFLOP/s** |
+| `attn-tile` | 65536 | 17.35 s | 5.28e13 | **3.04 TFLOP/s** |
+| end-to-end per-chunk fit | 32768 | ~65 s | 2.11e14 | **3.25 TFLOP/s** |
+
+Three numbers across a 4x range of context and two independent methods land on
+**3.0-3.25 TFLOP/s**. That is **16-18% of the corrected 18.43 TFLOP/s fp32 peak**,
+so the ~5.8x headroom figure is a measurement and not an extrapolation. The
+assumption round 30 flagged is the one that held.
+
 ### What this changes about the remaining plan
 
 GQA fusion targets the KV read, which is 57 ms of a 65 s term. It should be
