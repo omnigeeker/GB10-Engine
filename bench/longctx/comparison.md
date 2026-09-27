@@ -2366,3 +2366,37 @@ recurrence launches, which no measurement in this document covers.
 
 Next: bracket the DeltaNet's forward the same way, which is now a mechanical extension of a
 mechanism validated four times over.
+
+### A note on the layer-split instrumentation that was tried and reverted (round 61)
+
+Round 60 localised the remaining 53.6% of the prefill to "attention (~22%) plus the
+DeltaNet (~32%)", the latter by subtraction rather than measurement. The obvious next step
+was to bracket the per-layer forward in `forward_normed` and split the total by
+`is_delta()`.
+
+**That was implemented and then reverted, and the reason is worth recording so it is not
+repeated.** The five-event per-op mechanism from rounds 58-60 is validated and stays. The
+layer-level version added a second global event `Vec` plus a `layer_event_snapshot()`, built
+cleanly, and then **printed nothing** -- `dn + an` stayed 0 even with `GB10_GEMM_EVENTS=1`
+and with `prefill_shape` confirmed to reach the patched loop through
+`prefill_seq -> forward_normed`. The failed `new_event` calls were being swallowed by
+`match (a, b) { (Ok(a), Ok(b)) => ..., _ => None }`, so the mechanism failed silently
+rather than loudly -- which is exactly the failure mode that produced the round-60 epilogue
+bug (a `Vec` drained before its last reader, also silent).
+
+Rather than leave a second, silently-broken diagnostic in the tree, the layer-split change
+was reverted in full. `git status` is clean, both files contain zero references to
+`layer_event_snapshot`, the per-op diagnostic still reports its four phases, and the
+ungated server path is unaffected. **The state committed at round 60 is the state that
+stands.**
+
+The lesson, which this document has now earned four times over: on this codebase an
+instrumentation change that compiles and runs is not evidence that it measured anything.
+Every diagnostic here needs its control -- a gated run against an ungated one, or a value
+checked against an independent estimate -- and the per-op mechanism earned that in round 59
+by reproducing three predictions to within a point.
+
+The DeltaNet's ~32% therefore remains **unmeasured but well-bounded**: it is what is left of
+the prefill after the whole linear op (46.4%) and the attention slab (~22%) are removed.
+The next attempt should print a diagnostic count of successfully created event pairs
+alongside the totals, so a silent zero is distinguishable from a real zero.
