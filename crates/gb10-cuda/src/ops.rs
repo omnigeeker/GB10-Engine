@@ -795,6 +795,56 @@ impl Ops {
         Ok(())
     }
 
+    /// `y[t, n] = x[t, k] * W[n, k]^T` on bf16 tensor cores, fp32 accumulate.
+    ///
+    /// All three buffers are row-major as written here, but cuBLAS is
+    /// column-major and its C(m, n) = op(A) * op(B). Setting `m = n_out` and
+    /// `n = t` makes C, read column-major, exactly our row-major `y[t, n_out]`.
+    /// W is row-major `[n_out, k]`, which read column-major with `lda = k` is
+    /// W^T, hence `transa = T`; x is row-major `[t, k]`, which read
+    /// column-major with `ldb = k` is already the `(k, t)` operand we want,
+    /// hence `transb = N`. Getting `m`/`n` the other way round silently produces
+    /// a transposed result, which is what `gb10-bench cublas-parity` exists to
+    /// catch.
+    ///
+    /// The output is bf16, so the caller is expected to convert back to fp32
+    /// (and apply any per-tensor `s2`) in its epilogue.
+    pub fn cublas_gemm_bf16(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<half::bf16>,
+        x: &CudaSlice<half::bf16>,
+        y: &mut CudaSlice<half::bf16>,
+        n: usize,
+        k: usize,
+        t: usize,
+    ) -> Result<()> {
+        use cudarc::cublas::sys::cublasOperation_t;
+        use cudarc::cublas::{Gemm, GemmConfig};
+        need(
+            w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
+            "cublas_gemm_bf16",
+        )?;
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: t as i32,
+            k: k as i32,
+            alpha: half::bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: half::bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            dev.blas()
+                .gemm(cfg, w, x, y)
+                .map_err(|e| CudaError::Cublas(format!("{e:?}")))?;
+        }
+        Ok(())
+    }
+
     pub fn sigmoid_mul(
         &self,
         dev: &Device,

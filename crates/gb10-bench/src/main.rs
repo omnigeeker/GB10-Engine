@@ -45,6 +45,7 @@ fn main() -> Result<()> {
         "launch-overhead" => launch_overhead(),
         "cublas-gemm" => cublas_gemm(),
         "dequant-parity" => dequant_parity(),
+        "cublas-parity" => cublas_parity(),
         _ => {
             eprintln!(
                 "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
@@ -908,4 +909,82 @@ fn dequant_parity() -> Result<()> {
         println!("  first at idx {i} (row {row}, col {col}): cpu {c:e} gpu {g:e}");
     }
     anyhow::bail!("dequant-parity: FAILED (nvfp4 {bad} bad, fp8 {fbad} bad)");
+}
+
+/// Gate the cuBLAS bf16 GEMM wrapper's *layout* against a host matmul.
+///
+/// `cublas-gemm` already measures throughput; this checks the thing that is
+/// actually easy to get wrong. The call transposes one operand and not the other,
+/// and if `m`/`n` are swapped the result comes out silently transposed rather
+/// than failing. Integer-valued inputs keep every product exact in bf16 (and the
+/// sums exact in fp32), so the comparison is exact rather than tolerance-based.
+fn cublas_parity() -> Result<()> {
+    use half::bf16;
+
+    let dev = Device::new(0)?;
+    let (n, k, t) = (48usize, 32usize, 17usize);
+
+    // x[t][k], w[n][k] in small integers so the bf16 products are exact.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let xs: Vec<f32> = (0..t * k).map(|_| ((next() % 7) as f32) - 3.0).collect();
+    let ws: Vec<f32> = (0..n * k).map(|_| ((next() % 7) as f32) - 3.0).collect();
+
+    // Host reference: y[t][n] = sum_k x[t][k] * w[n][k]
+    let mut want = vec![0f32; t * n];
+    for i in 0..t {
+        for j in 0..n {
+            let mut a = 0f32;
+            for kk in 0..k {
+                a += xs[i * k + kk] * ws[j * k + kk];
+            }
+            want[i * n + j] = a;
+        }
+    }
+
+    let xb: Vec<bf16> = xs.iter().map(|&v| bf16::from_f32(v)).collect();
+    let wb: Vec<bf16> = ws.iter().map(|&v| bf16::from_f32(v)).collect();
+    let xd = dev.stream().memcpy_stod(&xb)?;
+    let wd = dev.stream().memcpy_stod(&wb)?;
+    let mut yd = dev.stream().alloc_zeros::<bf16>(t * n)?;
+    dev.ops().cublas_gemm_bf16(&dev, &wd, &xd, &mut yd, n, k, t)?;
+    let got = dev.stream().memcpy_dtov(&yd)?;
+
+    let mut bad = 0usize;
+    let mut first = None;
+    for i in 0..t * n {
+        if bf16::to_f32(got[i]) != want[i] {
+            bad += 1;
+            if first.is_none() {
+                first = Some((i, i / n, i % n, want[i], bf16::to_f32(got[i])));
+            }
+        }
+    }
+    println!("cublas bf16 layout: y[{t},{n}] = x[{t},{k}] * W[{n},{k}]^T");
+    if bad == 0 {
+        println!("  exact against host matmul: {} / {}", t * n, t * n);
+        println!("cublas-parity: OK");
+        return Ok(());
+    }
+    let (i, row, col, w, g) = first.unwrap();
+    println!("  mismatches {bad} / {}", t * n);
+    println!("  first at idx {i} (y[{row},{col}]): want {w} got {g}");
+    // A wholesale transpose is the failure this test is really for.
+    let mut transposed = true;
+    for i in 0..t {
+        for j in 0..n {
+            if bf16::to_f32(got[i * n + j]) != want[j * n + i] {
+                transposed = false;
+            }
+        }
+    }
+    if transposed {
+        println!("  NOTE: the output is exactly the transpose of the reference -- m/n or the transposes are swapped");
+    }
+    anyhow::bail!("cublas-parity: FAILED");
 }

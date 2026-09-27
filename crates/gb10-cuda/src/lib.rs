@@ -9,6 +9,7 @@
 pub mod kernels;
 pub mod ops;
 
+use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaModule, CudaStream, DriverError};
 use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
@@ -44,6 +45,8 @@ pub enum CudaError {
     NoKernels,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("cublas error: {0}")]
+    Cublas(String),
 }
 
 pub type Result<T> = std::result::Result<T, CudaError>;
@@ -55,6 +58,7 @@ pub struct Device {
     kernels: Kernels,
     ops: Ops,
     modules: Vec<Arc<CudaModule>>,
+    blas: CudaBlas,
 }
 
 impl Device {
@@ -83,12 +87,16 @@ impl Device {
         let kernels = Kernels::from_map(&mut by_name)?;
         let ops = Ops::from_map(&mut by_name)?;
 
+        let blas = CudaBlas::new(stream.clone())
+            .map_err(|e| CudaError::Cublas(format!("{e:?}")))?;
+
         Ok(Self {
             ctx,
             stream,
             kernels,
             ops,
             modules,
+            blas,
         })
     }
 
@@ -106,6 +114,11 @@ impl Device {
 
     pub fn ops(&self) -> &Ops {
         &self.ops
+    }
+
+    /// The cuBLAS handle used by the bf16 tensor-core prefill GEMM.
+    pub fn blas(&self) -> &CudaBlas {
+        &self.blas
     }
 
     pub fn synchronize(&self) -> Result<()> {

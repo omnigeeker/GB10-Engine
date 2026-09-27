@@ -144,18 +144,37 @@ re-test of this question if anything downstream changes the numerics.
    chunks — the whole point is that token generation is bandwidth-bound on the
    NVFP4 bytes, and a 178 MB bf16 cache would be a different (worse) tradeoff.
 
+3b. **Epilogue.** The cuBLAS output is bf16 (cudarc's safe `Gemm<half::bf16>`
+   fixes A, B *and* C to `CUDA_R_16BF`), so `forward_prefill` still needs a
+   bf16 -> fp32 convert-and-scale epilogue to apply `s2` and hand fp32 back to
+   the rest of the layer. Rounding the output to bf16 is the same class of
+   rounding as the activation rounding already measured to keep the gate at
+   16/16, since the output is simply the next layer's activation.
+
 4. **Dispatch.** `Linear::forward_prefill` in `crates/gb10-model/src/weights.rs`
    — replace the GEMM branch (the `n >= 256 && t > 16` side of the existing
    crossover) with: dequant -> convert x -> `blas.gemm` -> (x stays fp32 for the
    rest of the layer). Keep `forward` (the NVFP4 GEMV) for `t <= 16` and for
    decode, so the OTPS win is untouched.
 
-5. **Layout.** `C[t, n] = X[t, k] * W[n, k]^T`, both row-major:
+5. **Layout (DONE and verified, round 19).** `C[t, n] = X[t, k] * W[n, k]^T`,
+   both row-major:
    `cublasGemmEx(OP_T, OP_N, m = n_out, n = t, k = k_dim, A = W (lda = k_dim),
    B = x (ldb = k_dim), C = y (ldc = n_out))`, compute type `CUBLAS_COMPUTE_32F`,
    scale type `CUDA_R_32F`. Note `m` is the *weight* dimension and `n` is the
    token dimension — that is the whole trick of this layout, and getting it
-   backwards is the likely first failure.
+   backwards is the likely first failure. `Ops::cublas_gemm_bf16` implements
+   this and `gb10-bench cublas-parity` gates the layout against a host matmul on
+   integer-valued inputs (so bf16 products and fp32 sums are exact and the
+   comparison is exact, not tolerance-based):
+
+       cublas bf16 layout: y[17,48] = x[17,32] * W[48,32]^T
+         exact against host matmul: 816 / 816
+       cublas-parity: OK
+
+   The gate also detects the specific silent failure worth fearing -- a wholesale
+   transposed result from swapping `m`/`n` or the two transpose flags -- and says
+   so explicitly rather than just reporting a mismatch count.
 
 ## Verification order
 
