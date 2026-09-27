@@ -18,18 +18,18 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| **cold TTFT** | **88.3 s** | **10.45 s** | 8.4× slower |
+| **cold TTFT** | **88.2 s** | **10.45 s** | 8.4× slower |
 | **warm TTFT** | **0.035 s** | **0.24 s** | **6.9× faster** |
-| **OTPS** | **5.94** | **7.43** | 1.25× slower |
+| **OTPS** | **7.81** | **7.43** | **1.05× faster** |
 
 ## 32K
 
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| **cold TTFT** | **822.1 s** | **44.3 s** | 18.6× slower |
+| **cold TTFT** | **821.9 s** | **44.3 s** | 18.6× slower |
 | **warm TTFT** | **0.05 s** | **0.27 s** | **5.4× faster** |
-| **OTPS** | **4.43** | **7.0** | 1.58× slower |
+| **OTPS** | **5.31** | **7.0** | 1.32× slower |
 
 llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
 cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
@@ -152,3 +152,65 @@ tuning can close that: `gemm.cu` uses no tensor cores at all — no `mma.sync`, 
 `wgmma`, no `__hfma2`, just scalar `fmaf`. Reaching llama.cpp's prefill rate
 means bf16 or tf32 tensor cores, which is a numerical change, not just a
 scheduling one.
+
+## What the copy was costing
+
+The single largest cost in a DeltaNet layer, after the GEMMs, was a
+`memcpy_dtod` that looked free. `CudaStream::memcpy_dtod` copies
+`src.num_bytes()` -- the *whole allocation*, not the live part -- and `Scratch`
+is sized for a full prefill chunk. So `sc.conv` is `conv_dim * 2048 * 4` = 84 MB,
+and every DeltaNet layer copied all 84 MB to produce the 40 KB that the l2norm
+and the recurrence actually read. At 48 layers that is **4 GB of dead traffic per
+token**, and `GB10_OP_TIMING=1` showed it as 0.716 ms of a 2.57 ms layer.
+
+The kernel it fed was innocent:
+
+| op (one DeltaNet layer) | before | after |
+|---|---|---|
+| `copy_live` (was `memcpy_dtod`) | 0.716 ms | **0.007 ms** |
+| l2norm q | 0.004 ms | 0.007 ms |
+| l2norm k | 0.004 ms | 0.007 ms |
+| delta_step | 0.037 ms | 0.051 ms |
+| **layer total** | **2.57 ms** | **~1.76 ms** |
+
+`copy_live` copies only the `conv_dim * batch` floats the layer goes on to
+read. End to end this is **OTPS 5.94 → 7.81 at 8K** and **4.43 → 5.31 at 32K**,
+which is what puts 8K ahead of llama.cpp.
+
+Two other things the same instrumentation ruled *out*, which is worth recording
+because both were plausible and neither was true:
+
+* `gated_delta_rule_step_multi` is not the cost. `GB10_SKIP_DELTA_STEP=1` makes
+  it a no-op and the layer time does not move.
+* host submission is not the cost. `GB10_STEP_TIMING=1` splits host from device
+  with CUDA events: host 34 ms, device 143 ms, and the wall equals the device
+  time, so the host work is fully hidden. `gb10-bench launch-overhead` puts a
+  launch at 4.7 us, and CUDA graphs would buy nothing here.
+
+## Where the remaining OTPS gap is
+
+`gb10-bench store-stream` gives per-shape bandwidth, which is how the decode
+step was attributed at all:
+
+| kind | n | k | calls | ms/step | GB/s |
+|---|---|---|---|---|---|
+| nvfp4 | 17408 | 5120 | 128 | 30.00 | 213.9 |
+| nvfp4 | 5120 | 17408 | 64 | 15.97 | 200.9 |
+| fp8 | 10240 | 5120 | 48 | 11.73 | 214.5 |
+| fp8 | 5120 | 6144 | 64 | 9.83 | 204.8 |
+| fp8 | 6144 | 5120 | 48 | 7.94 | 190.2 |
+| fp8 | 12288 | 5120 | 16 | 4.47 | 225.2 |
+| **bf16** | **48** | **5120** | **96** | **2.51** | **18.8** |
+| fp8 | 1024 | 5120 | 32 | 1.48 | 113.7 |
+
+The GEMMs are at 190-225 GB/s, so weight streaming is not the problem. The
+`bf16 48x5120` rows are the `linear_attn.in_proj_a`/`in_proj_b` pair: N=48 is
+below the kernel's 64-wide N tile, so `grid.x` is **1 block** walking all 160
+K-chunks behind a barrier each. It is 2.51 ms for 47 MB.
+
+At 32K the binding constraint is instead the decode attention: 4.88 ms per layer
+x 16 = **78 ms of a 188 ms step**. The warp kernel gives each query head its own
+block, so all 24 query heads stream the same K/V and the GQA group is read 6x
+over from L2 (344 GB/s of L2 traffic against 268 MB of unique DRAM data). Fusing
+the group so one block serves all 6 query heads is worth ~6x on that traffic and
+is what the next round is for.

@@ -423,12 +423,6 @@ impl Ops {
         let (qo, ko, vo, rs) = (q_off as i32, k_off as i32, v_off as i32, row_stride as i32);
         let (nv, nk, g, bs) =
             (n_v_heads as i32, n_k_heads as i32, group as i32, base_stride as i32);
-        // DIAGNOSTIC: GB10_SKIP_DELTA_STEP makes this a no-op so the cost of the
-        // recurrence alone can be attributed. It corrupts the output; it exists
-        // only to answer "how much of a DeltaNet layer is this kernel?".
-        if std::env::var_os("GB10_SKIP_DELTA_STEP").is_some() {
-            return Ok(());
-        }
         unsafe {
             dev.stream()
                 .launch_builder(&self.gated_delta_rule_step_multi)
