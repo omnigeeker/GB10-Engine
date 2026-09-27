@@ -1943,3 +1943,68 @@ caught this document out three times.
 
 **The `cublas-gemm` shape sweep is kept** -- it is a permanent record of the shape
 efficiency curve, and it is what turned this from a guess into an elimination.
+
+### The DeltaNet is eliminated with the real config dims, and the FLOP count is confirmed (round 53)
+
+Round 51's DeltaNet story deserved one more check, because the flat-in-`n_seq` result only
+ruled out per-*sequence* state -- it did not rule out DeltaNet *compute*, which is flat in
+`n_seq` too. And rounds 49-52 all rest on a FLOP count that used the **full-attention**
+q/k/v/o dims for all 64 layers, when 48 of them are Gated-DeltaNet. The config gives the
+real ones:
+
+| field | value |
+|---|---|
+| `linear_num_key_heads` / `linear_key_head_dim` | 16 / 128 -> 2048 |
+| `linear_num_value_heads` / `linear_value_head_dim` | 48 / 128 -> 6144 |
+| `linear_conv_kernel_dim` | 4 |
+| `num_attention_heads` / `num_key_value_heads` / `head_dim` | 24 / 4 / 256 |
+| `full_attention_interval` | 4 |
+
+With those, a DeltaNet layer's linear projections (q 10.5M + k 10.5M + v 31.5M + out
+31.5M = 83.9M MACs) are **14% larger** than a full-attention layer's (73.4M), not smaller:
+
+| | per layer (with MLP 267.4M) | layers | subtotal |
+|---|---|---|---|
+| DeltaNet | 351.3M MACs | 48 | 16.87B |
+| full attention | 340.8M MACs | 16 | 5.45B |
+| **total** | | | **22.3B MACs/token = 44.6 GFLOP/token** |
+
+So round 49's 43.6 GFLOP/token was **2.4% low**, not wrong. The floor stands.
+
+**And the DeltaNet's own compute is negligible**, which is what finally kills round 51's
+hypothesis:
+
+| term | MACs/token (x48 layers) | share of the linear projections |
+|---|---|---|
+| state update, `d_k * d_v * n_v_heads` | 37.7M | **0.17%** |
+| chunked delta-rule term, `C^2 * d_k * n_kh` at C=64 | 402.7M | **1.80%** |
+
+Both under 2%. The DeltaNet cannot move the total, whether or not its state scales with
+`n_seq`. Combined with round 51's flat measurement, the recurrence is eliminated twice
+over, by two independent routes.
+
+**Also eliminated this round: per-op synchronization.** `grep` finds five `dev.synchronize()`
+calls in `model.rs`, but they are all in the **decode** step, where they exist to populate
+`PhaseTimes` (the loop syncs once per layer, 64 times per token). The prefill path has
+none. That was the most plausible mechanism for a 6.5 ms-per-op cost, and it is not there.
+
+**Where that leaves it.** Every candidate for `G`'s 3.5x is now measured or bounded:
+
+| candidate | status |
+|---|---|
+| FLOPs (44.6 GFLOP/token) | verified against the real config dims, +2.4% |
+| GEMM efficiency, large `n`, t=2048 | 74.8-89.2 TFLOP/s (measured) |
+| GEMM efficiency, short `t`=256 | 42.8 TFLOP/s worst (measured) |
+| dequantization | 12% of `G` (measured) |
+| DeltaNet state | 0.17% of FLOPs (computed) and flat in `n_seq` (measured) |
+| DeltaNet chunked rule | 1.80% of FLOPs (computed) |
+| per-op synchronization | absent from the prefill path (checked) |
+| **unexplained** | **2.90 s/chunk, 6.5 ms per linear op** |
+
+The remaining possibility is that the model's GEMMs simply do not achieve their isolated
+throughput once they are interleaved with the staging kernels, the DeltaNet and the
+attention in one stream -- an effect no isolated-shape benchmark can see and one this
+document cannot resolve without timing the phases **inside** the model. That measurement
+has now been the named next step for three rounds; it is a small change to
+`prefill_seq`, and picking a cause without it has already produced two wrong conclusions
+(rounds 49 and 50) and one incomplete one (round 51).
