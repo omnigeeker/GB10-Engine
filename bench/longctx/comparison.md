@@ -275,3 +275,24 @@ is back to being L2-bound rather than occupancy-bound -- 1.6 GB of L2 traffic fo
 KV head's cache independently. Fusing the group (split the keys across blocks,
 merge the online-softmax partials in a second pass) is the next lever; it should
 take the attention to the ~19 ms DRAM floor.
+
+## A second change that measured as nothing
+
+`nvfp4_gemm` splits K across `grid.z = 2` unconditionally, which forces a
+`memset_zeros` of the whole output plus the `atomicAdd` store path in
+`gemm2d_store`. Since every shape here already has 80-3880 blocks without the
+split, it looked like ~1.1M atomicAdds per call bought for nothing.
+
+Making the split conditional on the grid being small measured as **no change at
+all**:
+
+| measurement | unconditional | conditional |
+|---|---|---|
+| `gb10-bench stream` | 91.56 / 94.76 ms | 95.28 ms |
+| 8K OTPS (4 samples) | 8.70, 8.63, 8.63, 8.64 | 8.71, 8.64, 8.59, 8.62 |
+
+`generate` stayed token-exact, so the change was safe, but it perturbs the GEMM
+summation order for no measured gain, and it was reverted. The memset and the
+atomicAdds evidently overlap with the neighbouring GEMMs' loads, so they are not
+on the critical path. The `gb10-bench stream` spread (91.6-95.3 ms across runs)
+is itself wider than any effect being chased here.

@@ -1392,6 +1392,13 @@ impl Ops {
         let (nn, kk, tt) = (n as i32, k as i32, t as i32);
         // K-SPLIT host half (round 187): split K across grid.z, zero y first because
         // block>0 accumulates. The kernel half (nsplit = gridDim.z) is already in.
+        //
+        // Making the split conditional on the grid being small was tried (round
+        // 259) and measured as NO CHANGE: `gb10-bench stream` 95.28 ms against
+        // 91.56/94.76 ms on other runs, and 8K OTPS 8.64 mean against 8.65. The
+        // memset and the atomicAdds overlap with the neighbouring GEMMs' loads,
+        // so removing them buys nothing. It was reverted because it perturbs the
+        // GEMM summation order for no measured gain.
         let want = t * n;
         dev.stream().memset_zeros(&mut y.slice_mut(..want))?;
         unsafe {
