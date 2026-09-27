@@ -479,12 +479,30 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         const __half* qr0 = Qs + i0 * PS + sub * PADH;
         const __half* qr1 = Qs + (i0 + step) * PS + sub * PADH;
         const __half* qr2 = Qs + (i0 + 2 * step) * PS + sub * PADH;
+        // Two elements per load. Round 44 showed this loop is latency-bound on
+        // the load-to-fma chain rather than limited by any counted resource:
+        // BK=48 cut loads and instructions per fma and changed nothing, while a
+        // 32-way bank conflict (which inflates each request's *latency* 32x) was
+        // worth 8.05x. So the lever is fewer dependent steps, not fewer loads:
+        // one __half2 fetch feeds two independent fmas and halves the chain
+        // length. All row starts are even -- PS == 260 and sub * PADH == 130 are
+        // both even -- so the reinterpret is 4-byte aligned.
+        const __half2* krow2 = reinterpret_cast<const __half2*>(krow);
+        const __half2* qr02 = reinterpret_cast<const __half2*>(qr0);
+        const __half2* qr12 = reinterpret_cast<const __half2*>(qr1);
+        const __half2* qr22 = reinterpret_cast<const __half2*>(qr2);
         float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
-        for (int d = 0; d < half; ++d) {
-            const float kv = __half2float(krow[d]);
-            d0 = fmaf(__half2float(qr0[d]), kv, d0);
-            d1 = fmaf(__half2float(qr1[d]), kv, d1);
-            d2 = fmaf(__half2float(qr2[d]), kv, d2);
+        for (int d = 0; d < half / 2; ++d) {
+            const float2 k = __half22float2(krow2[d]);
+            const float2 a0 = __half22float2(qr02[d]);
+            const float2 a1 = __half22float2(qr12[d]);
+            const float2 a2 = __half22float2(qr22[d]);
+            d0 = fmaf(a0.x, k.x, d0);
+            d0 = fmaf(a0.y, k.y, d0);
+            d1 = fmaf(a1.x, k.x, d1);
+            d1 = fmaf(a1.y, k.y, d1);
+            d2 = fmaf(a2.x, k.x, d2);
+            d2 = fmaf(a2.y, k.y, d2);
         }
         d0 += __shfl_xor_sync(0xffffffffu, d0, 1);
         d1 += __shfl_xor_sync(0xffffffffu, d1, 1);
