@@ -1381,3 +1381,49 @@ measurement is the larger half of the work.
 is computed from, and it feeds a softmax, so the needle and perplexity gates are
 required -- `generate` alone does not cover it. That requirement is unchanged from
 round 39; only its size changed.
+
+### The bf16 staging has a trap in it, and the padding that avoids it is not the current one (round 41)
+
+Round 40's plan is to stage `Qs`/`Ks` as bf16 to halve the shared budget. That change
+touches the one thing in this kernel that has already cost an 8x: **bank conflicts**.
+The whole 8.05x attention gain of this session came from discovering that the row stride
+was a multiple of 32 and padding it, so any change to the element width has to be
+re-derived rather than assumed.
+
+Shared-memory bank of the element at index `i` is `(i * width / 4) % 32`, and the 32
+lanes that access a K/Q row concurrently are the `(j, sub)` pairs with
+`index = j*PS + sub*PADH`, `PS = 2*PADH`. So:
+
+| staging | PADH | distinct banks (of 32) | |
+|---|---|---|---|
+| **fp32 (shipped)** | **129** | **32** | ok |
+| fp32 | 130 | 16 | conflict |
+| fp32 | 131 | 32 | ok |
+| **bf16** | **129** | **16** | **conflict** |
+| **bf16** | **130** | **32** | **ok** |
+| bf16 | 131 | 27 | conflict |
+| bf16 | 132 | 16 | conflict |
+
+**Keeping `PADH = 129` while moving to bf16 would reintroduce a 2-way conflict in the
+score loop** -- the loop would go from 4 loads / 3 FMA to the same count but with half of
+them serialised, and given that this is the same mechanism that was worth 8.05x when
+fixed, it would likely eat most or all of the occupancy gain round 40 is counting on.
+
+**The fix is one number: bf16 needs `PADH = 130`,** i.e. `PS = 260`. The reasoning is
+visible in the table: with 2-byte elements two adjacent elements share a 4-byte bank, so
+the `sub` offset has half the bank resolution it has for fp32. `PADH = 129` puts
+`floor(129/2) = 64` banks of shift between the halves, and `64 % 32 = 0`, so both halves
+land in the same bank class. `PADH = 130` gives `floor(130/2) = 65`, and `65 % 32 = 1`,
+restoring the odd shift that spreads `(j, sub)` across all 32 banks -- the same property
+`PADH = 129` provides for fp32, for exactly the same reason.
+
+This is worth recording rather than leaving to implementation, because it is invisible in
+the shared-memory arithmetic (round 40's table, which only counts bytes, is unaffected --
+22,464 B becomes 22,624 B and the occupancy result stands) and only shows up as the
+kernel mysteriously not going as fast as predicted. It is the same failure mode as the
+original conflict: correct output, no error, just slower.
+
+**Updated round-40 plan, in order:** (1) stage bf16 with `PADH = 130`; (2) confirm the
+occupancy actually rises to 4 blocks/SM and measure the gain against the 1.0x-2.69x
+range, using the probe to check the saturation question; (3) only then the precision
+gates, which are required either way because the score matrix feeds a softmax.
