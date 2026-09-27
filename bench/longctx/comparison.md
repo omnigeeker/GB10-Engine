@@ -680,3 +680,27 @@ at 32K the linear term is ~199 s and the attention ~105 s, so a 6x GEMM and a 6x
 attention give ~33 s + ~17 s = ~50 s against llama.cpp's 44.55 s. That is close
 enough to be worth chasing rather than hopeless, which is not what I would have
 said two rounds ago.
+
+## Provenance of the numbers in the tables above
+
+The scorecard mixed measurements taken on three consecutive builds, so they were
+re-checked on the final one. All of these are the same harness, the same prompt
+(8,225 / 32,747 tokens) and the same llama.cpp build:
+
+| 8K cold TTFT | value | build |
+|---|---|---|
+| round 266 (row padding) | 54.49 s | pad |
+| round 267 (split halves) | 54.68 s | pad + split |
+| **round 270 (HEAD)** | **54.88 s** | pad + split |
+
+The three agree inside the run-to-run spread, which is the point: the split
+halves are neutral end to end, exactly as reported, and nothing in the table
+depends on which of the three builds it came from. 32K is 269.41 s on the same
+binary that HEAD carries for the attention path.
+
+Reproduce with:
+
+    gb10-server --model models/Qwen3.8-27B-NVFP4 --port 8080 --ctx 16384
+    python bench/longctx/ttft.py --port 8080 --reps 263 --trials 2 --max-tokens 200
+
+for 8K, and `--ctx 36864 --reps 1054` for 32K.
