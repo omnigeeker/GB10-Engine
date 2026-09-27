@@ -1,0 +1,27 @@
+[22:16:25] === 32K  (ctx 36864, reps 1054, depths 0.1,0.5,0.9) ===
+[22:17:18] 32K: server ready
+context 36864 tokens, 8 concurrent sequence(s), KV cache 38.7 GB (4832 MB per sequence)
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 1054    0.1    32733      16    815.8      25  PASS '74921'
+ 1054    0.5    32733      16    816.6      25  PASS '74921'
+ 1054    0.9    32733      16    819.3      25  PASS '74921'
+
+3/3 passed
+[22:58:10] 32K: needle exit 0 after 2452s
+[22:58:19] === 128K  (ctx 139264, reps 4214, depths 0.5) ===
+[22:59:12] 128K: server ready
+context 139264 tokens, 2 concurrent sequence(s), KV cache 36.5 GB (18254 MB per sequence)
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 4214    0.5   130693      64  10784.7      83  PASS '74921'
+
+1/1 passed
+[01:58:56] 128K: needle exit 0 after 10784s
+[01:59:05] === 256K  (ctx 262144, reps 8429, depths 0.5) ===
+[01:59:59] 256K: server ready
+context 262144 tokens, 1 concurrent sequence(s), KV cache 34.4 GB (34360 MB per sequence)
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 8429    0.5   261358     128  41821.6     160  PASS '74921'
+
+1/1 passed
+[13:37:00] 256K: needle exit 0 after 41821s
+[13:37:09] DONE

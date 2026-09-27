@@ -252,23 +252,20 @@ Set `GB10_BATCH_LOG=1` to log the group size per step.
   and generation is clamped so the two together stay inside the window.
 * **Prefill cost grows quadratically with the prompt.** The 48 Gated-DeltaNet
   layers are linear, but the 16 full-attention layers attend over the whole
-  prefix, so a long prompt is priced by that term. Measured on this box
-  (prompts of repeated filler, needle recovered at 10/50/90% depth):
+  prefix, so a long prompt is priced by that term. Measured end to end on this
+  box with a needle hidden in repeated filler and recovered in every case:
 
-  | prompt | prefill |
-  |---|---|
-  | 5 K | ~50 s |
-  | 12 K | ~170 s |
-  | 24 K | ~9 min |
-  | 32 K | ~16 min |
-  | 128 K | ~3 h |
-  | 256 K | ~12 h |
+  | prompt | prefill | tokens | needles |
+  |---|---|---|---|
+  | 32 K | 13.6 min | 32,733 | 3/3 at 10/50/90% depth |
+  | 128 K | 3.00 h | 130,693 | 1/1 at 50% |
+  | 256 K | 11.62 h | 261,358 | 1/1 at 50% |
 
-  Fitting those gives `≈ 8.8 ms·T + 6.0e-7·T²` seconds. The quadratic term is
-  the attention kernel's key range and is inherent to dense attention at this
-  scale, not an artefact of chunking; chunking only bounds *memory*, not time.
-  Short and medium prompts are unaffected — the quadratic term is under 10% of
-  the total below ~16 K tokens.
+  Fitting those gives `t ≈ 5.11 ms·T + 5.93e-7·T²` seconds, accurate to 1.8%.
+  The quadratic term is the attention kernel's key range and is inherent to
+  dense attention at this scale, not an artefact of chunking; chunking bounds
+  *memory*, not time. It is 97% of the total at 256K and under 10% below ~16 K
+  tokens, so short and medium prompts are unaffected.
 * **Greedy only** — no sampling controls, no `n`/`best_of`, no tool calling, no
   JSON mode, no vision.
 * **No authentication**, bound to loopback. Put a proxy in front if it needs to

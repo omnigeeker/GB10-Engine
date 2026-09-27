@@ -139,11 +139,15 @@ so a long context lowers it automatically:
 
 Prefill cost grows quadratically with prompt length, because the 16
 full-attention layers attend over the whole prefix while the 48 Gated-DeltaNet
-layers stay linear: roughly 16 min at 32 K, 3 h at 128 K and 12 h at 256 K on
-this machine. Short prompts are unaffected.
+layers stay linear. Measured end to end on this machine, with the needle
+recovered at each length: 13 min at 32 K, 3.0 h at 128 K and 11.6 h at 256 K.
+Short prompts are unaffected.
 
 A full usage guide — Python and streaming examples, the parameter table, and the
-decoding limits — is in **[`docs/USAGE.md`](docs/USAGE.md)**.
+decoding limits — is in **[`docs/USAGE.md`](docs/USAGE.md)**. The long-context
+work — the tiled attention kernel, why chunking was needed, the memory budget,
+and the needle results at 32 K / 128 K / 256 K — is in
+**[`docs/LONG_CONTEXT.md`](docs/LONG_CONTEXT.md)**.
 
 **OpenAI client:**
 
