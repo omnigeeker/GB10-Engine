@@ -2400,3 +2400,51 @@ The DeltaNet's ~32% therefore remains **unmeasured but well-bounded**: it is wha
 the prefill after the whole linear op (46.4%) and the attention slab (~22%) are removed.
 The next attempt should print a diagnostic count of successfully created event pairs
 alongside the totals, so a silent zero is distinguishable from a real zero.
+
+### `timing_event` exists, and why the round-58 event work was valid (round 62)
+
+Retrying round 61's layer split turned up the explanation for a class of silent failure on
+this codebase, and it is worth recording even though the layer split is again not in the
+tree.
+
+`crates/gb10-cuda/src/lib.rs:24-33` has a helper the per-op instrumentation should have been
+using:
+
+```rust
+/// `CudaContext::new_event` defaults to `CU_EVENT_DISABLE_TIMING`, and under
+/// that flag `CudaEvent::elapsed_ms` returns a meaningless number rather than
+/// failing. Anything that reports a duration must get its events from here.
+pub fn timing_event(dev: &Device) -> std::result::Result<CudaEvent, CudaError>
+```
+
+So the failure mode on this platform is not an error -- **it is a plausible-looking wrong
+number**. `new_event(None)` yields events whose `elapsed_ms` is meaningless and does not
+fail, which is exactly the shape of bug that a diagnostic cannot detect by inspection.
+
+**This confirms the round-58/59/60 numbers are sound**, because `weights.rs:166` passes the
+flag explicitly:
+
+```rust
+match ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+```
+
+The four-phase breakdown (stage 11.0%, cast 3.0%, gemm 29.5%, epilogue 3.0%, op total
+46.6%) therefore stands, and it is still the case that all four reproduce their independent
+predictions.
+
+**The layer split remains unimplemented.** This round it was rebuilt using `timing_event`
+with attempt/success counters and an error log so that a silent zero could not recur, but
+the reporting half never landed in `gb10-verify/src/main.rs` -- an edit that reported
+success and was then not present in the file. Rather than commit a second half-wired
+diagnostic, the change was reverted again and the tree is clean at the round-60 state.
+
+Two attempts at the layer split have now failed for two *different* reasons, both in the
+plumbing rather than the concept. The next attempt should not add the report to
+`main.rs` by string-splicing: it should call the snapshot from inside `prefill_shape`'s
+existing diagnostic block, verify the file changed with `grep` **before** building, and
+confirm `cargo build` actually recompiled (`Finished` in 0.03 s means it did not).
+
+**What stands unchanged:** the linear op is 46.6% of the cold prefill and is fully attributed
+(GEMM 29.5% at 84% of its isolated rate, dequant 11.0% near the memory limit, cast 3.0%,
+epilogue 3.0%); the remaining 53.4% is attention (~22% by the round-45 fit) plus the DeltaNet
+(~32%), and the DeltaNet has still never been timed directly.
