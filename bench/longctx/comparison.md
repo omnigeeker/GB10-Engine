@@ -2008,3 +2008,62 @@ document cannot resolve without timing the phases **inside** the model. That mea
 has now been the named next step for three rounds; it is a small change to
 `prefill_seq`, and picking a cause without it has already produced two wrong conclusions
 (rounds 49 and 50) and one incomplete one (round 51).
+
+### The prefill is CPU-bound, which is what the 3.5x actually is (round 54)
+
+Rounds 49-53 chased `G`'s 3.5x through every GPU-side candidate -- FLOP count, GEMM shape
+efficiency, dequantization, the DeltaNet state, hidden synchronization -- and eliminated
+all of them. The candidate never tested was that the GPU is not the constraint at all.
+
+`prefill-shape` at two limits, with `/usr/bin/time`:
+
+| | wall | user | sys | total CPU | CPU/wall |
+|---|---|---|---|---|---|
+| 4 chunks (8225 tok) | 60.52 s | 53.95 s | 7.10 s | 61.05 s | 1.009 |
+| 16 chunks (32747 tok) | 149.84 s | 143.97 s | 7.16 s | 151.13 s | 1.009 |
+| **difference** | **+89.32 s** | **+90.02 s** | +0.06 s | +90.08 s | **1.008** |
+
+The difference is the clean measurement: both runs load the same model, so subtracting
+cancels the load phase and leaves only the prefill. Over the 12 extra chunks, **user time
+grew by 90.02 s while wall time grew by 89.32 s -- a ratio of 1.008.**
+
+**During the prefill the process is consuming essentially one full CPU core, continuously,
+for as long as the prefill lasts.** GPU kernel execution does not appear in a process's
+user time. A read of ~22 GB of weights and 89.3 TFLOP of GEMM against a GPU that measures
+77-89 TFLOP/s on these exact shapes cannot take 89 s unless the GPU is idle waiting.
+
+This resolves the contradiction that rounds 49-53 could not. The model's GEMM shapes really
+do run at 75-89 TFLOP/s in isolation, and the prefill really does take 3.5x longer than
+those shapes imply, and both are true because **the kernels are not the bottleneck -- the
+CPU work that enqueues them is.** At ~448 linear ops per chunk and ~1800 kernel launches
+per chunk (dequant, cast, cublas, epilogue x 448), the prefill spends ~7.5 s of CPU per
+chunk to feed a GPU that could consume it in ~2 s.
+
+So the 1.12 s "GEMM floor" was never the thing to close, and rounds 49-52's implicit plan
+-- make the GEMMs faster -- had nothing to gain. The lever is **the number of launches and
+the CPU cost per op**, and the standard fix is CUDA Graphs: capture one chunk's work and
+replay it, collapsing ~1800 launches into one.
+
+Two mechanisms produce this signature and the measurement above does not separate them:
+
+1. **Launch/enqueue cost** -- the CPU simply cannot issue work fast enough. Fixed by CUDA
+   Graphs or by fusing the staging kernels into the GEMM.
+2. **Unified-memory page faults** -- GB10 has 121.7 GiB of unified LPDDR5X; if weight
+   pages are faulted in per access rather than resident, the CPU services the faults.
+   Fixed by pinning/prefetching (`cudaMemPrefetchAsync`) rather than by graphs.
+
+They are distinguishable with one more measurement: count page faults (`/usr/bin/time -v`
+reports minor/major faults, which the run above did not capture) or time a prefill that
+reads a weight set small enough to be certainly resident. Given that `Maximum resident` was
+reported as 0 in the earlier `/usr/bin/time -v` output -- i.e. the memory accounting is not
+straightforward on this unified-memory part -- the fault count is the better probe.
+
+**This is the single most important measurement in this document for the cold-TTFT
+objective.** It says the 2.42x gap at 32K is not a kernel problem, that eight rounds of
+attention-kernel work could not have closed it, and that the remaining work is
+architectural -- fewer launches, or no page faults -- rather than arithmetic.
+
+Note also that it retroactively explains round 27's puzzle: a persistent 321 MB scratch
+bought only 1.10x, which I read as `tc-phase` overstating allocation cost. If the bottleneck
+is CPU time per op, then removing the *allocation* while keeping the *launch count* would
+indeed buy very little.
