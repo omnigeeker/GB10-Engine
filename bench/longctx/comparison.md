@@ -2067,3 +2067,44 @@ Note also that it retroactively explains round 27's puzzle: a persistent 321 MB 
 bought only 1.10x, which I read as `tc-phase` overstating allocation cost. If the bottleneck
 is CPU time per op, then removing the *allocation* while keeping the *launch count* would
 indeed buy very little.
+
+### Page faults are refuted; the CPU time is launch/enqueue overhead (round 55)
+
+Round 54 established the prefill is CPU-bound but could not say whether the CPU was
+launching kernels or servicing unified-memory page faults. `/usr/bin/time -v` at the same
+two limits separates them:
+
+| | 4 chunks | 16 chunks | scales with prefill? |
+|---|---|---|---|
+| Major (I/O) page faults | 0 | 0 | no -- **zero** |
+| Minor page faults | 3,536,283 | 3,499,287 | **no** (slightly *lower*) |
+| Voluntary context switches | 14,243 | 31,385 | **yes, +17,142** |
+| Involuntary context switches | 729 | 2,033 | yes |
+| File system inputs | 0 | 0 | no |
+
+**The fault hypothesis is refuted.** Minor faults are flat-to-slightly-decreasing across a
+4x increase in prefill work, and major faults are zero in both runs. Page faulting happens
+during model load and not at all during the prefill. Round 54's alternative (2) is dead.
+
+**The scaling signal is the context switch**: 1,429 voluntary switches per chunk, which is
+the fingerprint of a thread that blocks repeatedly -- enqueuing work, blocking when the
+queue or a resource is unavailable, and doing that roughly once per kernel. With ~1,800
+launches per chunk this is the right order of magnitude for one switch per launch.
+
+So the mechanism is round 54's alternative (1): **launch/enqueue cost, with the CPU
+blocking per operation.** The fix is the standard one for this signature and it is
+architectural rather than arithmetic:
+
+- **CUDA Graphs.** Capture one chunk's work once and replay it, collapsing ~1,800 launches
+  into one. This is the direct answer to a launch-bound prefill.
+- **Kernel fusion.** Fuse the four staging kernels per linear op (dequant, cast, cublas,
+  epilogue) so one op is one launch.
+
+Both are worth doing and neither is a kernel-optimization exercise. In particular this
+closes the question that rounds 42-48 spent themselves on: the attention score loop was
+never going to move the cold-TTFT number much, because the prefill is not limited by what
+the kernels compute.
+
+At ~7.5 s of CPU per chunk feeding a GPU that needs ~2 s, even a 2x reduction in launch
+count would take the 32K prefill from 107.89 s toward the 60 s range, which is the first
+step that would put the objective in reach. Recorded as the next implementation target.
