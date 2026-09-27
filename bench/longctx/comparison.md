@@ -2566,3 +2566,47 @@ The fix is structural rather than incremental, and there are two standard routes
 
 Route 1 is the one that scales -- it is what every performant gated-delta-rule
 implementation does -- and it is what makes the name of this kernel honest.
+
+### The occupancy hypothesis is refuted: 4x the blocks changes nothing (round 65)
+
+Round 64 concluded the DeltaNet recurrence was occupancy-limited -- one 48-block grid on a
+48-SM part, ~6% occupancy -- and named two fixes: give each head more blocks, or implement
+the true chunked form. The first of those is a small, correct change, so it was made.
+
+The state columns are independent: thread `j` reads and writes only column `j` of `S`, the
+output write is per `(t, hv, j)`, and the only shared input is `sk`, which each block can
+load itself. So the kernel was changed from a `(n_v_heads, 1, 1)` grid of 128-thread blocks
+to `(n_v_heads * 4, 1, 1)` with 32 threads each, holding `S[D][D/4 + 1]` (16.9 KB instead of
+66 KB) and writing back only its own columns.
+
+**Correctness is preserved exactly** -- `attn-tile` reports `nonzero 402652988/402653184`,
+the same count as before, at the same 12.35 s.
+
+**And it makes no difference at all:**
+
+| | before (round 63) | after (4x blocks) |
+|---|---|---|
+| DeltaNet layers | 13.29 s / 240 = 70.1% | **13.17 s / 240 = 69.8%** |
+| full-attention layers | 5.50 s / 80 = 29.0% | 5.53 s / 80 = 29.3% |
+| total prefill | 18.96 s | 18.87 s |
+
+Within run-to-run noise. **The kernel is not limited by the number of blocks.** 192 blocks
+over 48 SMs performs identically to 48 over 48.
+
+That is a genuinely useful negative result, and it kills route 2 from round 64. It also
+sharpens the arithmetic: the recurrence moves about 308 GFLOP per chunk (48 layers x 2048
+tokens x 1.57M MACs) and takes 13.17 s over 5 chunks, i.e. **~117 GFLOP/s, about 0.6% of
+this part's 18.4 TFLOP/s fp32 peak.** Adding parallelism across independent columns cannot
+help that, because the cost is not in the columns -- it is in the **serial dependency along
+`T`**: each token's state update depends on the previous token's, 2048 times per layer, and
+that chain is the critical path no matter how the columns are laid out.
+
+**So route 1 is the only one left, and it is now the only one that has ever been supported
+by evidence.** The classic chunked gated-delta-rule formulation breaks that dependency by
+computing, for each block of tokens, a matrix-product form that is parallel in the block
+index; the intra-block part becomes dense GEMM-shaped work and the inter-block part becomes
+a much shorter scan (T/C steps instead of T). That is what this kernel's name claims and
+what its body does not do.
+
+The 4x split was reverted -- it is correct but buys nothing, and it costs a 4x redundant
+`sk` load. The tree is back to the round-63 state.
