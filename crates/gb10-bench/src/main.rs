@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         "cublas-gemm" => cublas_gemm(),
         "dequant-parity" => dequant_parity(),
         "cublas-parity" => cublas_parity(),
+        "tc-phase" => tc_phase(),
         _ => {
             eprintln!(
                 "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
@@ -1042,4 +1043,96 @@ fn cublas_parity() -> Result<()> {
         println!("  NOTE: the output is exactly the transpose of the reference -- m/n or the transposes are swapped");
     }
     anyhow::bail!("cublas-parity: FAILED");
+}
+
+/// Per-phase timing of `forward_prefill_tensor_core` for the dominant shape.
+///
+/// Four independent end-to-end fits now agree with each other and disagree with
+/// the phase model, so the way to locate the residual ~2 s per 2048-token chunk
+/// is to time the phases directly instead of fitting the total again. Sizes are
+/// the MLP gate/up matrix (17408 x 5120) at t = 2048, which is the largest one
+/// on the prefill path.
+fn tc_phase() -> Result<()> {
+    use half::bf16;
+
+    let dev = Device::new(0)?;
+    let (n, k, t) = (17408usize, 5120usize, 2048usize);
+    let reps = 5;
+
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // Synthetic NVFP4 weights: packed E2M1 plus E4M3 group-16 scales.
+    let wh: Vec<u8> = (0..n * k / 2).map(|_| (next() & 0xFF) as u8).collect();
+    let sh: Vec<u8> = (0..n * k / 16)
+        .map(|_| (0x30 | (next() & 0x07)) as u8)
+        .collect();
+    let xh: Vec<f32> = (0..t * k)
+        .map(|_| ((next() % 1024) as f32) / 512.0 - 1.0)
+        .collect();
+
+    let wd = dev.stream().memcpy_stod(&wh)?;
+    let sd = dev.stream().memcpy_stod(&sh)?;
+    let xd = dev.stream().memcpy_stod(&xh)?;
+    let s2 = dev.stream().memcpy_stod(&[1.0f32])?;
+
+    let mut wb = dev.stream().alloc_zeros::<bf16>(n * k)?;
+    let mut xb = dev.stream().alloc_zeros::<bf16>(t * k)?;
+    let mut yb = dev.stream().alloc_zeros::<bf16>(t * n)?;
+    let mut yf = dev.stream().alloc_zeros::<f32>(t * n)?;
+    let kern = dev.ops();
+
+    // Each phase timed over `reps`, after one warmup pass so the first-touch
+    // page mapping is not billed to the phase.
+    let mut time = |label: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+        f()?;
+        dev.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            f()?;
+        }
+        dev.synchronize()?;
+        let secs = t0.elapsed().as_secs_f64() / reps as f64;
+        println!("  {:<34} {:>9.3} ms", label, secs * 1e3);
+        Ok(secs)
+    };
+
+    println!("tc-phase: mlp gate/up  n={n} k={k} t={t}  (prefill, bf16 tensor core)");
+    let a = time("alloc_zeros (w,x,y)", &mut || {
+        let _a = dev.stream().alloc_zeros::<bf16>(n * k)?;
+        let _b = dev.stream().alloc_zeros::<bf16>(t * k)?;
+        let _c = dev.stream().alloc_zeros::<bf16>(t * n)?;
+        Ok(())
+    })?;
+    let d = time("dequant_nvfp4_to_bf16 (w)", &mut || {
+        kern.dequant_nvfp4_to_bf16(&dev, &wd, &sd, &mut wb, n, k)?;
+        Ok(())
+    })?;
+    let c = time("f32_to_bf16 (x)", &mut || {
+        kern.f32_to_bf16(&dev, &xd, &mut xb, t * k)?;
+        Ok(())
+    })?;
+    let g = time("cublas_gemm_bf16", &mut || {
+        kern.cublas_gemm_bf16(&dev, &wb, &xb, &mut yb, n, k, t)?;
+        Ok(())
+    })?;
+    let e = time("bf16_to_f32_scaled (epilogue)", &mut || {
+        kern.bf16_to_f32_scaled(&dev, &yb, &mut yf, &s2, true, t * n)?;
+        Ok(())
+    })?;
+
+    let total = a + d + c + g + e;
+    println!("  {:-<34} {:>9.3} ms", "sum", total * 1e3);
+    println!(
+        "  GEMM is {:.1}% of the pipeline; the non-GEMM work is {:.2}x the GEMM",
+        g / total * 100.0,
+        (total - g) / g
+    );
+    println!();
+    println!("  For reference, the whole prefill measured 4.44 s per 2048-token chunk.");
+    Ok(())
 }

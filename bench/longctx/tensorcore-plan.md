@@ -365,3 +365,48 @@ attribute it without evidence. The next measurement should be per-phase timing
 inside `forward_prefill_tensor_core` (dequant / activation cast / GEMM / epilogue)
 rather than more end-to-end fits, since four independent fits now agree with each
 other and disagree with the phase model.
+
+### Per-phase timing: the residual is the allocator, not the GEMM (round 26)
+
+Four end-to-end fits agreed with each other and disagreed with the phase model, so
+I stopped fitting the total and timed the phases directly. `gb10-bench tc-phase`,
+MLP gate/up at t = 2048:
+
+| phase | ms | share |
+|---|---|---|
+| `alloc_zeros (w,x,y)` | **4.458** | **39.0%** |
+| `dequant_nvfp4_to_bf16` | 1.353 | 11.8% |
+| `f32_to_bf16` | 0.291 | 2.5% |
+| `cublas_gemm_bf16` | 4.761 | 41.6% |
+| `bf16_to_f32_scaled` | 0.569 | 5.0% |
+| **sum** | **11.433** | |
+
+**The GEMM is only 41.6% of the pipeline, and the non-GEMM work is 1.40x the
+GEMM.** The allocator alone is 39%.
+
+This corrects round 25's estimate by a wide margin, and the earlier reasoning was
+wrong for an instructive reason: I costed the zeroing as 270 MB of memset at the
+nominal 228 GB/s read bandwidth and got ~1.2 ms. The measured 4.458 ms is
+**~60 GB/s** -- so the memset is not the cost at all. The per-call allocation and
+launch overhead dominates it, which is exactly what a bandwidth calculation cannot
+see. The round-25 A/B (2.44 ms alloc against a 4.68 ms GEMM) was already pointing
+here; splitting the phases shows the allocator is the single largest phase after
+the GEMM itself.
+
+**What that is worth.** If the allocator cost is removed (a persistent 321 MB
+scratch, which removes the zeroing and the allocation churn together), the GEMM
+pipeline keeps 6.975 / 11.433 = 61% of its time -- a **1.64x** cut on every
+prefill GEMM. Against the measured 8K decomposition (22.15 s = ~4.4 s attention +
+~17.75 s GEMM pipeline):
+
+    4.4 + 17.75 * 0.61 = ~15.2 s
+
+which would be **1.44x slower than llama.cpp's 10.58 s**, down from 2.09x. At 32K
+the same scaling gives roughly 82 s against 44.55 s. That is the largest single
+remaining lever, and unlike the previous two rounds it is now measured rather than
+inferred -- one allocation change, no kernel work.
+
+The residual after that would be the dequant (11.8%), which is the next candidate:
+it is a pure streaming pass over the packed weights and should be closer to
+bandwidth than 1.35 ms for 89 MB read + 178 MB written (197 GB/s, i.e. already
+near the measured 228 GB/s peak, so it may genuinely have little left in it).
