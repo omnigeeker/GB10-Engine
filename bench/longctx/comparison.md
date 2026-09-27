@@ -1128,3 +1128,61 @@ This is the same instrument-plus-control discipline that rounds 30-34 kept
 re-learning: measure the variable in isolation before paying for the rewrite. The
 probe is a host-side change of a few lines with no kernel edit, which is why it is
 worth doing before `BK = 32` rather than after.
+
+### The occupancy probe, run: the attention IS occupancy-sensitive, and that inverts round 34's recommendation (round 36)
+
+`GB10_ATTN_SMEM_PROBE=<bytes>` is now implemented in `attn_prefill_tiled`: it raises
+the dynamic shared-memory request (setting
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` first, via `CudaFunction::set_attribute`,
+which cudarc does expose -- no raw FFI needed) without touching one line of kernel
+arithmetic. 43,104 B lets two blocks co-reside per SM; 61,440 B allows only one.
+The launch is numerically identical, and the output says so: `max|abs| 1.27e-7` and
+`rms rel 4.76e-7` are unchanged to the digit.
+
+| `attn-tile` case | 2 blocks/SM | **1 block/SM** | penalty |
+|---|---|---|---|
+| 65536 tokens | 17.16 s | **24.01 s** | **1.40x** |
+| 16384 tokens | 1.04 s | **1.50 s** | 1.44x |
+
+**So the answer is yes: halving the resident blocks costs ~1.40x.** That was the open
+question of rounds 33-34 and it is now measured rather than argued.
+
+**What it does to the `BK` plan** -- the combined effect is the load-ratio gain
+divided by the occupancy penalty, since every larger `BK` pays the full 1.40x:
+
+| BK | load-ratio gain | net | 32K cold TTFT | vs llama |
+|---|---|---|---|---|
+| 16 (now) | 1.00x | 1.00x | 129.11 s | 2.90x |
+| 32 | 1.60x | **1.14x** | 121.0 s | 2.72x |
+| 48 | 2.00x | 1.43x | 109.6 s | 2.46x |
+| 64 | 2.30x | **1.64x** | 103.7 s | 2.33x |
+
+**This inverts round 34's recommendation.** Round 34 said "test `BK = 32` first,
+because it is the smallest change that moves the ratio at all and it already pays the
+full occupancy cost". The second half is exactly why it is the *worst* choice: `BK = 32`
+pays the entire 1.40x occupancy penalty to buy the smallest load-ratio gain, netting
+1.14x. If the occupancy cost is going to be paid, it should be paid once and for
+`BK = 64`. There is no reason to spend a rewrite on 1.14x.
+
+**And with bf16 Q/K staging the occupancy cost disappears entirely.** Halving `Qs` and
+`Ks` brings `BK = 64` to 51,840 B, back under the 50,688 B that two blocks need:
+
+| BK | gain (2 blocks/SM) | 32K cold TTFT | vs llama |
+|---|---|---|---|
+| 32 | 1.60x | 104.7 s | 2.35x |
+| 48 | 2.00x | 96.6 s | 2.17x |
+| **64** | **2.30x** | **92.4 s** | **2.07x** |
+
+So the route to the ~2.3x is `BK = 64` **plus** bf16 Q/K in shared, and the bf16 part
+is doing as much work as the tiling: it converts a 1.64x into a 2.30x. That makes the
+precision question the load-bearing one, not an afterthought -- the score matrix feeds
+a softmax, so it needs the needle and perplexity gates, not just `generate`.
+
+### Where this leaves the objective
+
+Measured, not projected: the largest remaining lever is worth **~2.3x on the 65 s
+attention term**, taking 32K cold TTFT from 129.11 s to ~92.4 s, i.e. from 2.90x to
+**2.07x** behind llama.cpp. It does not close the gap, and reaching parity would still
+need the attention's quadratic term attacked further (bf16 tensor cores for QK^T/PV)
+and the GEMM's linear term raised (the dequant plus cuBLAS pipeline is ~70 s of the
+129 s and is already measured near its limits).

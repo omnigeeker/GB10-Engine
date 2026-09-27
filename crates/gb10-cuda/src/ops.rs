@@ -1355,10 +1355,41 @@ impl Ops {
         // conflicts the natural stride causes: the row stride is head_dim + 2
         // with the two halves separated by one extra float.
         let smem = (BQ * (head_dim + 2) + BK * (head_dim + 2) + BQ * BK + 3 * BQ) * 4;
+
+        // Occupancy probe. The computed request (43,104 B here) is what lets two
+        // blocks co-reside per SM; `GB10_ATTN_SMEM_PROBE=<bytes>` raises the
+        // request past the 50,688 B that two blocks would need, forcing one block
+        // per SM. Not a line of kernel arithmetic changes and the launch is
+        // numerically identical, so this isolates occupancy as a variable on its
+        // own -- which is the one thing standing between the `BK` tiling work and
+        // knowing whether it can pay off at all. Anything past the 48 KB default
+        // also requires the opt-in ceiling to be raised on the function first.
+        let smem = match std::env::var("GB10_ATTN_SMEM_PROBE") {
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n) if n >= smem => n,
+                _ => smem,
+            },
+            Err(_) => smem,
+        };
         if smem > 48 * 1024 {
-            return Err(CudaError::InvalidArgument(format!(
-                "attn_prefill_tiled needs {smem} B of shared memory, over the 48 KB limit"
-            )));
+            let ceiling = self
+                .attn_prefill_tiled
+                .get_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                )
+                .unwrap_or(0);
+            if (smem as i32) > ceiling {
+                self.attn_prefill_tiled
+                    .set_attribute(
+                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem as i32,
+                    )
+                    .map_err(|e| {
+                        CudaError::InvalidArgument(format!(
+                            "attn_prefill_tiled: cannot raise dynamic shared memory to {smem} B: {e:?}"
+                        ))
+                    })?;
+            }
         }
         let (t, nq, nk, hd) =
             (n_tokens as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
