@@ -624,3 +624,59 @@ and needs V to stay in registers, in which case the shared budget is
 `6 * BQ * (HD + 2)` for Q plus `BK * (HD + 2)` for K, about 43 KB at BQ = 4,
 BK = 16. That fits, but it is a rewrite of the score, softmax and accumulator
 loops to carry a head dimension, not a tuning change.
+
+## The prefill is 93% GEMM, and that resolves the open contradiction
+
+`gb10-verify prefill-shape --limit 8225` runs a real chunked prefill and prints
+each chunk separately. Same binary as the server, so this is the same code path:
+
+| chunk | tokens | start | time |
+|---|---|---|---|
+| 0 | 2048 | 0 | 12.62 s |
+| 1 | 2048 | 2048 | 13.09 s |
+| 2 | 2048 | 4096 | 13.80 s |
+| 3 | 2048 | 6144 | 14.10 s |
+| 4 | 33 | 8192 | 0.48 s |
+| | | **total** | **54.09 s** |
+
+This is the measurement I should have taken several rounds ago. The per-chunk
+cost is almost **flat**: growing the key range from 1024 to 7168, a 7x increase,
+costs 12.62 s -> 14.10 s, i.e. +11.7%. Only the attention can grow with the key
+range, so its share is bounded by that difference. Solving
+`a(start) ~ k * (start + chunk/2)` from chunks 0 and 3:
+
+| | per chunk | total |
+|---|---|---|
+| attention | 0.25, 0.74, 1.23, 1.73 s | **3.95 s (7%)** |
+| GEMM + everything else | ~12.4 s each | **49.66 s (93%)** |
+
+So at 8K the prefill is **93% GEMM**. That single number resolves the open
+contradiction from the last two rounds: the half-split's 1.64x on the isolated
+attention kernel is worth about 0.5 s of a 54 s prefill, which is exactly the
+noise band it disappeared into. It was not that the change failed to translate --
+it is that **I had the attention's share wrong by roughly an order of magnitude**,
+because I was deriving it from a linear coefficient fitted on 32K/128K/256K data
+where the attention genuinely does dominate, and extrapolating that fit down to
+8K.
+
+It also re-ranks every remaining option, and for the better:
+
+| | now | with a tensor-core GEMM (43 TFLOPS) | + GQA-fused attention |
+|---|---|---|---|
+| GEMM | 49.7 s | 8.1 s | 8.1 s |
+| attention | 4.0 s | 4.0 s | 0.7 s |
+| **8K cold TTFT** | **54.5 s** | **12.0 s** | **8.7 s** |
+| vs llama.cpp 10.58 s | 5.2x slower | 1.13x slower | **1.2x FASTER** |
+
+The GEMM is the whole game at 8K. It is ~7 TFLOPS of fp32 against llama.cpp's
+~43 TFLOPS of bf16 tensor cores -- the same 6x that closes almost the entire gap
+by itself -- and the weights are *already staged as bf16* in shared, and the
+oracle the gate compares against is *itself bf16*. The path is cuBLAS bf16
+(cudarc exposes `cublas` and a `bf16` `Gemm` impl) over a per-matrix dequantise
+into a scratch buffer, or an `mma.sync` version of the existing staging.
+
+For the longer contexts the two fixes are both needed and the margin is thinner:
+at 32K the linear term is ~199 s and the attention ~105 s, so a 6x GEMM and a 6x
+attention give ~33 s + ~17 s = ~50 s against llama.cpp's 44.55 s. That is close
+enough to be worth chasing rather than hopeless, which is not what I would have
+said two rounds ago.
