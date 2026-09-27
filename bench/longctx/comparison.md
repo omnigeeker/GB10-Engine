@@ -917,3 +917,68 @@ for decode. The lever is the score loop's arithmetic:
    needle and perplexity gates, not just `generate`.
 
 The ordering matters and it is the reverse of what I had planned.
+
+## The attention bottleneck, identified exactly: shared-load bound (round 32)
+
+Round 31 established the rate (3.0-3.25 TFLOP/s, 16-18% of fp32 peak) but not the
+cause. The cause is in the score loop itself, `kernels/elementwise.cu:457-466`:
+
+    const float* krow = Ks + j * PS + sub * PADH;
+    const float* qr0  = Qs + i0 * PS + sub * PADH;
+    const float* qr1  = Qs + (i0 + step) * PS + sub * PADH;
+    const float* qr2  = Qs + (i0 + 2 * step) * PS + sub * PADH;
+    ...
+        const float kv = krow[d];       // 1 shared load, hoisted out of the 3
+        d0 = fmaf(qr0[d], kv, d0);      // 1 shared load + 1 FMA
+        d1 = fmaf(qr1[d], kv, d1);      // 1 shared load + 1 FMA
+        d2 = fmaf(qr2[d], kv, d2);      // 1 shared load + 1 FMA
+
+That is **4 shared loads for 3 FMA**. The hardware ratio is
+
+    128 FMA/cycle/SM  vs  128 B/cycle/SM of shared = 32 float loads/cycle
+    -> 4 FMA per shared load
+
+so the loop runs at 0.75/4.0 = **18.8% of the load-limited peak**, and the measured
+rate is **17% of the fp32 peak**. Two independent derivations -- one from the source
+structure, one from timing -- land on the same number, which is what identifies this
+as a load bound rather than a FLOP bound. (Round 265's hoist of `krow[d]` is what
+took it from 6 reads/3 FMA to 4; it was a real 1.5x on the load side, and it is also
+why the remaining headroom is exactly 4/0.75.)
+
+The fix is a register tile on the score matrix. Per k-step a `TxT` tile costs `2T`
+loads for `T^2` FMA:
+
+| tile | loads | FMA | FMA/load | of the 4.0 ratio |
+|---|---|---|---|---|
+| now (1x3) | 4 | 3 | 0.75 | 19% |
+| 4x4 | 8 | 16 | 2.00 | 50% |
+| **8x8** | **16** | **64** | **4.00** | **100%** |
+| 16x16 | 32 | 256 | 8.00 | (past it) |
+
+**An 8x8 tile reaches the shared-load limit exactly**, so it is the target: no
+further tiling helps, and the score phase could gain up to **4/0.75 = 5.3x**.
+
+Extrapolating on the measured 32K decomposition (65.0 s of attention inside
+129.11 s):
+
+    129.11 - 65.0 + 65.0/5.3 = 76.3 s   vs llama.cpp 44.55 s = 1.71x  (from 2.90x)
+
+Note what this is *not*: it is not a precision change, not a bandwidth change, and
+not GQA fusion. It is holding more of the score matrix in registers so that each
+shared load feeds four FMAs instead of 0.75. 8x8 float accums is 64 registers per
+thread, which is affordable, and the 24-row BQ means the tile needs to divide
+cleanly into the existing blocking -- the same constraint that made `BQ=24, BK=11`
+fail in round 264 for shuffle-uniformity reasons, so it should be checked against
+that guard before being trusted.
+
+### This is now the single remaining lever
+
+Both contexts' cold-TTFT gaps reduce to this one kernel:
+
+| | attention share | after a 5.3x score phase |
+|---|---|---|
+| 8K (20.21 s) | ~4.4 s | ~19.4 s |
+| 32K (129.11 s) | ~65.0 s | **~76.3 s** |
+
+at which point 32K is 1.71x from llama.cpp and the remainder is the dequant plus the
+cuBLAS GEMM, both of which are already measured near their limits.
