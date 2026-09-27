@@ -1224,3 +1224,40 @@ had nothing to do about it. The remaining work is the score-loop restructure (3 
 `BK/16` `j` per thread, with the `BQ*BK == 3*(nt>>1)` guard generalised) plus bf16
 staging for `Qs`/`Ks`, and the first measurement of it should be the 2,048-token
 occupancy penalty above, not a full end-to-end run.
+
+### The 2,048-token occupancy measurement: the instrument cannot resolve it (round 38)
+
+Round 37 said the 1.40x occupancy penalty should be re-measured at the model's actual
+2,048-token chunk before being relied on. I ran that, three times per configuration:
+
+| case | baseline mean / min / max / spread | probe mean / min / max / spread | ratio |
+|---|---|---|---|
+| start 0 | 0.26 / 0.02 / 0.38 / **19.0x** | 0.26 / 0.03 / 0.38 / **12.7x** | 1.01x |
+| start 10240 | 0.43 / 0.19 / 0.55 / 2.9x | 0.39 / 0.27 / 0.62 / 2.3x | 0.91x |
+| start 20480 | 0.47 / 0.35 / 0.70 / 2.0x | 0.50 / 0.50 / 0.50 / 1.0x | 1.06x |
+
+The ratios (~1.0) say "no occupancy penalty at 2,048 tokens", but they must not be
+believed, because **the within-configuration spread is up to 19x -- far larger than the
+1.40x effect being looked for**. And it is not Gaussian noise: the values are bimodal,
+clustering at 0.02-0.05 s and at 0.36-0.39 s for the same configuration. That is a
+state effect (warm/cold, or first-touch), not scatter, which means averaging over more
+repetitions would not fix it either -- the two modes are distinct populations.
+
+So the honest result of this round is negative: **`attn-tile` at 2,048 tokens cannot
+measure the thing it was run to measure.** The 1.40x at 16,384 and 65,536 tokens
+remains the only clean number, and whether it transfers to the model's chunk size is
+still open.
+
+What is needed instead is a purpose-built measurement rather than this benchmark: a
+loop that times the kernel launch for a fixed 2,048-token tile many hundreds of times
+after an explicit warmup, reporting a median and a spread, with the cache state fixed.
+`attn-tile`'s 2,048 rows are incidental output from a benchmark built to exercise
+large contexts, and they show it.
+
+**Practical consequence for the `BK` decision:** the 1.40x should be treated as an
+upper bound on the occupancy cost at the model's operating point, since it was measured
+where the per-tile fixed costs are amortised best. If the real penalty at 2,048 tokens
+is smaller, the `BK = 32` net improves from 1.14x; if the bimodality is itself a
+symptom of occupancy pressure, it could be worse. Either way the rewrite decision
+should not be made on the current evidence, and the cost of getting the evidence is one
+small dedicated benchmark rather than a kernel change.
