@@ -1502,3 +1502,61 @@ known to be affordable: 42,048 B leaves it at 2 blocks, which the curve says is 
 speed. It also needs the fp16 precision gates, which `attn-tile` plus the round gate's
 `generate`/`batch-parity` cover at this stage; needle and perplexity remain required
 before the change is called done.
+
+### `BK = 48` implemented and measured: no gain, because fp16 moved the bottleneck (round 43)
+
+Round 42 predicted `BK = 48` with fp16 staging would net 2.00x on the attention. I built it
+-- 3 rows x 3 key columns per thread, nine accumulators, `step = PREFILL_BQ / 3`
+independent of `BK`, 42,336 B, 2 blocks/SM, host guard generalised to
+`BQ*BK == 9*(nt>>1) && BK % 3 == 0`. It passes `attn-tile` at `max|abs| 2.279e-5`, the
+same as `BK = 16`.
+
+**It is not faster. It is slightly slower:**
+
+| config | attn-tile 16384 | attn-tile 65536 | in situ (8225 tok) |
+|---|---|---|---|
+| fp32, `BK=16` (round 39) | 1.04 s | 17.16 s | 20.31 s |
+| **fp16, `BK=16` (round 42, shipped)** | **0.99-1.01 s** | **15.95-16.11 s** | **20.11 s** |
+| fp16, `BK=48` (round 43) | 1.08 s | 17.00 s | 20.31 s |
+
+**The reason is that fp16 staging moved the bottleneck from shared loads to conversions.**
+The round-40/42 load-ratio arithmetic counted shared *reads* per FMA, which was the right
+model for fp32. Once Q and K are fp16, every value read also needs a `__half2float`
+before it can feed an FMA, so the real ratio is (loads + converts) per FMA:
+
+| config | loads | converts | FMA | (loads+converts)/FMA |
+|---|---|---|---|---|
+| fp32 `BK=16` | 4 | 0 | 3 | 1.33 |
+| fp16 `BK=16` | 4 | 4 | 3 | 2.67 |
+| fp16 `BK=48` | 6 | 6 | 9 | **1.33** |
+
+`BK = 48` halves the loads-per-FMA exactly as designed -- 6/9 against 4/3 -- but it adds
+conversions in the same proportion, so the combined instruction budget per FMA is
+unchanged. Measured 17.00 s against 16.11 s, i.e. the prediction's 2.00x became ~0.95x.
+**The premise of the whole `BK` direction was that shared loads were the only cost of a
+score term. After round 42 that was no longer true.**
+
+Reverted to fp16 `BK = 16`, which remains the best measured configuration.
+
+**One implementation note worth keeping.** The first version of the nine-accumulator loop
+produced *zero output* (`rms rel` exactly 1.000e0, even at `ntok = 1`, which the previous
+build passed exactly). The cause was reducing the accumulators through a pointer:
+
+```cuda
+float* dd = (a == 0) ? &d00 : (a == 1 ? &d10 : &d20);
+dd[0] += __shfl_xor_sync(0xffffffffu, dd[0], 1);
+```
+
+Taking the address of the accumulators defeated their register allocation, and the
+shuffle then operated on the wrong values. Writing the nine shuffles out explicitly
+fixed it and reproduced the `BK = 16` numbers exactly. The same "correct output, no
+error, silently wrong speed" failure mode as the bank conflicts, and the same lesson:
+in this kernel the accumulator form is not a stylistic choice.
+
+**Where the attention work actually stands.** The load-ratio lever is spent: `BK` cannot
+help while conversions are in the path, and 2 blocks/SM is full speed per round 42's
+saturation curve. The remaining lever is to remove the conversions by doing the score
+products in **packed half arithmetic** -- `__half2` loads with `__hfma2`, two FMAs per
+instruction, which halves the loads *and* the converts at once, and would need the
+pairing re-derived for 2-wide lanes. That is a larger change than this round's and has not
+been attempted.
