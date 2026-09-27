@@ -253,7 +253,24 @@ fn prefill_shape(args: &Args) -> Result<()> {
             t0.elapsed().as_secs_f64()
         );
     }
-    println!("  total {:.2}s", t_all.elapsed().as_secs_f64());
+    let wall = t_all.elapsed().as_secs_f64();
+    println!("  total {:.2}s", wall);
+    {
+        let (ms, n) = gb10_model::weights::gemm_event_snapshot();
+        println!(
+            "  [diag] cuBLAS GPU {:.1} ms over {} calls = {:.1} TFLOPS effective; \
+{:.1}% of the {:.2}s prefill",
+            2.0 * 22.3e9 * 2048.0 * 0.0 + ms,
+            n,
+            if ms > 0.0 {
+                2.0 * (args.limit as f64) * 44.6 / (ms / 1e3) / 1e12
+            } else {
+                0.0
+            },
+            100.0 * (ms / 1e3) / wall,
+            wall
+        );
+    }
     Ok(())
 }
 

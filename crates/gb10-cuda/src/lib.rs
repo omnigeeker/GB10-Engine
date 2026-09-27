@@ -15,6 +15,7 @@ use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub use cudarc::driver::sys::CUevent_flags;
 pub use cudarc::driver::{CudaEvent, CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits};
 pub use kernels::Kernels;
 pub use ops::Ops;

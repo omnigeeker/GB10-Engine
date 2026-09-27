@@ -2221,3 +2221,62 @@ measurement rounds 53-56 named and none performed.
 Rounds 54-55's CPU-time evidence for launch overhead was retracted in round 56. With the
 allocation hypothesis now also closed, **no mechanism for `G`'s 2.4-3.5x is established**,
 and the event measurement is the only remaining route to one.
+
+### MEASURED: the GEMMs are 30% of the prefill and run at 84% of peak (round 58)
+
+Rounds 53-57 named in-model per-phase GPU timing as the only remaining route to a cause
+and never performed it. It is now implemented: `Linear::forward_prefill_tensor_core`
+records a `CudaEvent` pair around the cuBLAS call when `GB10_GEMM_EVENTS=1` is set, pushes
+the pair into a global `Vec`, and `prefill_shape` drains it with `elapsed_ms` at the end
+(never inside the op -- `elapsed_ms` synchronizes). Gated so the server path, which shares
+this function, records nothing and is unchanged: verified at 0 events and 18.87 s against an
+18.83 s baseline.
+
+| quantity | value |
+|---|---|
+| cuBLAS GPU time, 4 chunks / 8225 tokens | **5.567 s** (5.776 s with instrumentation) |
+| prefill wall, same run | 18.83 s |
+| **cuBLAS share of the prefill** | **29.6%** |
+| calls | 2000 (500 per chunk, ~8 per layer) |
+| FLOPs moved (8225 tok x 44.6 GFLOP/token) | 366.8 TFLOP |
+| **in-model GEMM throughput** | **65.9 TFLOP/s** |
+| isolated throughput, same shapes | 74.8-89.2 TFLOP/s |
+| **in-model vs isolated** | **84%** |
+
+**The GEMMs are not the problem.** In the model they run at 65.9 TFLOP/s against 74.8-89.2
+measured in isolation -- 84% of their benchmarked rate, which is ordinary for a real
+interleaved workload. And they account for **under a third** of the prefill.
+
+This is the decisive result the last five rounds were circling. `G`'s 3.5x is **70% non-GEMM
+time**, and it was never going to be found in FLOP counts, shape efficiency, the allocator or
+the GEMM's own rate, because none of those is where the time goes. Reconstructing the
+budget for the 18.83 s prefill at 8K:
+
+| component | share | source |
+|---|---|---|
+| cuBLAS GEMM | **29.6%** | this measurement |
+| attention kernels | ~22% | fitted attention slab, round 45 |
+| weight dequantization | ~12% | `GB10_SKIP_DEQUANT` probe, round 50 |
+| **remainder** | **~36%** | f32_to_bf16 cast, bf16_to_f32 epilogue, DeltaNet kernels, norms |
+
+**So the target is the ~36% remainder plus the dequant**, i.e. the staging and epilogue
+kernels that run once per linear op -- four extra kernel launches per GEMM, each moving
+`t*k` or `t*n` elements -- together with the DeltaNet's own kernels. That is a kernel-count
+and small-kernel-efficiency problem, and it is now localised rather than guessed.
+
+What this measurement also retroactively settles:
+
+- **Rounds 49-52 were chasing the wrong thing.** They were all implicitly about making the
+  GEMM faster. It is already at 84% of its ceiling and is 30% of the time; even doubling it
+  would buy under 15% of the prefill.
+- **Round 54-55's launch-overhead story was retracted in round 56 and stays retracted**, but
+  the *shape* of the answer it pointed at survives: the cost is in the many small
+  non-GEMM kernels, not in the arithmetic.
+- **Round 57's `tc-phase` scaling was close**: it predicted ~1.68 s per chunk against 4.02 s
+  measured, and this measurement shows why -- `tc-phase` times a pipeline whose GEMM is 42%
+  of it, while in the model the GEMM is 30% and the rest is larger than any isolated
+  pipeline suggests.
+
+Next: extend the same event instrumentation to the other three phases of the op
+(`dequant`/`u16_to_bf16`, `f32_to_bf16`, `bf16_to_f32_scaled`) plus the attention and
+DeltaNet launches, which is now a small, mechanical change to a mechanism that works.

@@ -7,8 +7,31 @@
 
 use anyhow::{bail, Context, Result};
 use gb10_core::safetensors::{DType, ShardedSafeTensors, TensorInfo};
-use gb10_cuda::{CudaSlice, Device, TcScratch};
+use gb10_cuda::{CudaEvent, CUevent_flags, CudaSlice, Device, TcScratch};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// DIAGNOSTIC (round 58): GPU time of the cuBLAS calls in the prefill path.
+/// Rounds 53-57 named this measurement and never performed it: the model moves
+/// 44.6 GFLOP/token over shapes that measure 74.8-89.2 TFLOP/s in isolation, yet
+/// takes 2.4-3.5x longer than that implies, and every other candidate has been
+/// eliminated. Events are recorded asynchronously and read once at the end --
+/// `elapsed_ms` synchronizes, so it must never be called inside the op.
+pub static GEMM_EVENTS: Mutex<Vec<(CudaEvent, CudaEvent)>> =
+    Mutex::new(Vec::new());
+
+/// Drain the recorded events and return (total GPU ms, call count).
+pub fn gemm_event_snapshot() -> (f64, usize) {
+    let mut v = GEMM_EVENTS.lock().unwrap();
+    let n = v.len();
+    let mut sum = 0.0f64;
+    for (a, b) in v.drain(..) {
+        if let Ok(ms) = a.elapsed_ms(&b) {
+            sum += ms as f64;
+        }
+    }
+    (sum, n)
+}
 
 /// A weight matrix plus the scales its format needs.
 pub enum LinearData {
@@ -136,7 +159,33 @@ impl Linear {
             }
         }
         kern.f32_to_bf16(dev, x, xb, t * k)?;
+        // Gated: the server also calls this path, and the Vec is only drained by
+        // gemm_event_snapshot(), so recording unconditionally would retain events
+        // for every request.
+        let ev_ctx = dev.stream().context().clone();
+        let want_ev = std::env::var("GB10_GEMM_EVENTS").is_ok();
+        let ev_a = if want_ev {
+            ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).ok()
+        } else {
+            None
+        };
+        let ev_b = if want_ev {
+            ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).ok()
+        } else {
+            None
+        };
+        if let Some(a) = &ev_a {
+            let _ = a.record(dev.stream());
+        }
         kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;
+        if let Some(b) = &ev_b {
+            let _ = b.record(dev.stream());
+        }
+        if let (Some(a), Some(b)) = (ev_a, ev_b) {
+            if want_ev {
+                GEMM_EVENTS.lock().unwrap().push((a, b));
+            }
+        }
 
         // Only NVFP4 defers a scale to the epilogue; the others pass one.
         let one = one.as_ref().unwrap();
