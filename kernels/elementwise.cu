@@ -418,17 +418,43 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         // S[i][j] = Qs[i] . Ks[j] * scale. BQ*BK pairs over `nt` threads: two
         // threads per pair, each covering half of head_dim, combined with a
         // lane-adjacent shuffle.
+        //
+        // A thread-pair owns three pairs, and they share a K row. Adding
+        // `nt >> 1` to the pair index advances `i` by `(nt >> 1) / PREFILL_BK`
+        // and leaves `j` alone because PREFILL_BK divides `nt >> 1`; with
+        // nt == 256, PREFILL_BK == 16 and PREFILL_BQ == 24 the three are
+        // (i0, j), (i0 + 8, j), (i0 + 16, j). Holding the K value in a register
+        // across the three makes the inner loop four shared reads per three fma
+        // instead of six, and the score loop is ~80% of the per-tile cycles
+        // (3072 of ~3840, at 32 floats/cycle/SM): this is the 1.5x.
+        // `attn_prefill_tiled` on the host refuses any launch where
+        // PREFILL_BQ * PREFILL_BK != 3 * (nt >> 1).
         const int half = HD / 2;
-        for (int p = tid >> 1; p < PREFILL_BQ * PREFILL_BK; p += nt >> 1) {
-            const int i = p / PREFILL_BK, j = p % PREFILL_BK;
-            const int sub = tid & 1;
-            float dot = 0.0f;
-            const float* qrow = Qs + i * HD + sub * half;
-            const float* krow = Ks + j * HD + sub * half;
-            for (int d = 0; d < half; ++d) dot = fmaf(qrow[d], krow[d], dot);
-            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
-            if (sub == 0) {
-                const int s = s0 + j;
+        const int sub = tid & 1;
+        const int q = tid >> 1;
+        const int j = q % PREFILL_BK;
+        const int i0 = q / PREFILL_BK;
+        const int step = (nt >> 1) / PREFILL_BK;
+        const float* krow = Ks + j * HD + sub * half;
+        const float* qr0 = Qs + i0 * HD + sub * half;
+        const float* qr1 = Qs + (i0 + step) * HD + sub * half;
+        const float* qr2 = Qs + (i0 + 2 * step) * HD + sub * half;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+        for (int d = 0; d < half; ++d) {
+            const float kv = krow[d];
+            d0 = fmaf(qr0[d], kv, d0);
+            d1 = fmaf(qr1[d], kv, d1);
+            d2 = fmaf(qr2[d], kv, d2);
+        }
+        d0 += __shfl_xor_sync(0xffffffffu, d0, 1);
+        d1 += __shfl_xor_sync(0xffffffffu, d1, 1);
+        d2 += __shfl_xor_sync(0xffffffffu, d2, 1);
+        if (sub == 0) {
+            const int s = s0 + j;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const float dot = (k == 0) ? d0 : (k == 1 ? d1 : d2);
+                const int i = i0 + k * step;
                 const bool ok = (i < rows) && (s <= start + t0 + i);
                 S[i * PREFILL_BK + j] = ok ? dot * scale : -INFINITY;
             }

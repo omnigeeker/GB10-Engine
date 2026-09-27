@@ -18,7 +18,7 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| cold TTFT | 85.7 s | **10.58 s** | 8.1× slower |
+| cold TTFT | 65.2 s | **10.58 s** | 6.2× slower |
 | **warm TTFT** | **0.03 s** | 0.237 s | **7.9× faster** |
 | **OTPS** | **8.69** | 7.32 | **1.19× faster** |
 
@@ -27,7 +27,7 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| cold TTFT | 757.7 s | **44.55 s** | 17.0× slower |
+| cold TTFT | 437.1 s | **44.55 s** | 9.8× slower |
 | **warm TTFT** | **0.05 s** | 0.29 s | **5.8× faster** |
 | **OTPS** | **7.15** | 6.865 | **1.04× faster** |
 
@@ -458,3 +458,44 @@ attacks the quadratic term: fitting `t = 5.1072e-3*T + 5.9269e-7*T^2`, the
 quadratic coefficient falls from 5.93e-7 to about 5.30e-7 while the linear one
 is untouched. So it is a real improvement in the right place, but an 11% cut on
 the quadratic term against a 17x gap at 32K.
+
+## The score loop's K row was being read three times: 1.31x at 8K, 1.73x at 32K
+
+Last round I priced the prefill attention and found the score loop was ~80% of
+the per-tile cycles (3072 of ~3840, at 32 floats/cycle/SM), and that the reads
+were redundant. Working out the pair mapping showed the redundancy was worse
+than "Q is read BK times and K is read BQ times" -- it was being paid *within a
+single thread*.
+
+A thread-pair owns three pairs, `p`, `p + (nt>>1)`, `p + 2*(nt>>1)`. Since
+`PREFILL_BK` divides `nt >> 1`, adding `nt >> 1` to the pair index advances `i`
+by `(nt >> 1) / PREFILL_BK` and **leaves `j` unchanged**. With `nt == 256`,
+`PREFILL_BK == 16` and `PREFILL_BQ == 24` the three pairs are `(i0, j)`,
+`(i0 + 8, j)`, `(i0 + 16, j)`: one K row, three Q rows. The code was reading that
+K row from shared three times.
+
+Holding it in a register across the three turns six shared reads per three fma
+into four. The host now refuses any launch where
+`PREFILL_BQ * PREFILL_BK != 3 * (nt >> 1)`, so the layout the kernel assumes
+cannot silently stop holding. Numerically identical -- same dot products, same
+accumulation order -- and `attn-tile` and `generate` (16/16 token-exact) both
+still pass.
+
+| | before | after | |
+|---|---|---|---|
+| 8K cold TTFT | 85.71 s | **65.21 s** | 1.31x |
+| 32K cold TTFT | 757.68 s | **437.10 s** | 1.73x |
+| `attn-tile` 65536 tokens | 139.77 s | **69.75 s** | 2.00x |
+| `attn-tile` 16384 tokens | 8.73 s | 6.39 s | 1.37x |
+| `attn-tile` 4096 tokens | 0.55 s | 0.24 s | 2.29x |
+
+I predicted 1.5x from the shared-read arithmetic and got 2.0x on the pure
+attention benchmark, so the hoist bought more than the read ratio alone -- the
+three explicit row pointers also let the compiler drop per-`d` address
+arithmetic that the `p`-indexed loop had been recomputing.
+
+This is the first change that moves cold TTFT by more than a few percent, and
+unlike every tiling change tried before it, the gain **grows** with context
+(1.31x at 8K, 1.73x at 32K) because it attacks the quadratic term. It also
+confirms the diagnosis from last round was right: the attention was bound by
+redundant shared reads in the score loop, not by the tile size.

@@ -1128,6 +1128,14 @@ impl Ops {
                 "attn_prefill_tiled needs head_dim a multiple of 32 and <= 1024, got {head_dim}"
             )));
         }
+        // The score loop in the kernel gives each thread-pair three pairs that
+        // share one K row, which requires PREFILL_BQ * PREFILL_BK to be exactly
+        // 3 * (blockDim.x / 2), i.e. three uniform passes.
+        if BQ * BK != 3 * (head_dim / 2) {
+            return Err(CudaError::InvalidArgument(format!(
+                "attn_prefill_tiled needs BQ * BK == 3 * (head_dim / 2), got {BQ} * {BK} against head_dim {head_dim}"
+            )));
+        }
         let smem = (BQ * head_dim + BK * head_dim + BQ * BK + 3 * BQ) * 4;
         if smem > 48 * 1024 {
             return Err(CudaError::InvalidArgument(format!(
