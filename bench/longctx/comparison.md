@@ -1040,3 +1040,52 @@ The larger tile also has to be checked against the guard at
 finding that `BQ = 24, BK = 11` was ~5x slower for shuffle-uniformity reasons --
 `BK = 64` is even and a multiple of the warp width, so it should be clear of that
 particular trap, but the guard exists because the trap is real.
+
+### Feasibility check: every larger BK costs half the occupancy (round 34)
+
+Round 33 settled on `BK = 64` with 12 accumulators for ~2.3x. That plan has a
+constraint I had not costed, and it is the kind that decides the change: shared
+memory. Using the host's own formula, `(BQ*(HD+2) + BK*(HD+2) + BQ*BK + 3*BQ) * 4`:
+
+| BK | Qs | Ks | S | red | total | **blocks/SM** | FMA/load | gain |
+|---|---|---|---|---|---|---|---|---|
+| **16 (now)** | 24768 | 16512 | 1536 | 288 | 43104 | **2** | 0.75 | 1.0x |
+| 32 | 24768 | 33024 | 3072 | 288 | 61152 | **1** | 1.20 | 1.6x |
+| 48 | 24768 | 49536 | 4608 | 288 | 79200 | **1** | 1.50 | 2.0x |
+| 64 | 24768 | 66048 | 6144 | 288 | 97248 | **1** | 1.71 | 2.3x |
+| 128 | 24768 | 132096 | 12288 | 288 | 169440 | 0 | -- | over the 99 KB opt-in limit |
+
+**`BK = 16` is the only size that fits two blocks per SM** (43104 * 2 = 86208 <=
+101376). Every size that improves the load ratio drops to **one** block, i.e. 8
+warps instead of 16 per SM. The whole gain in this change comes from feeding each
+shared load more FMAs, and the whole cost is halving the warps available to hide the
+latency of those loads. Those are the same resource.
+
+**So the 2.3x is not a prediction, it is a bet**, and it can lose: at `BK = 64` the
+ratio improves 2.3x while the resident warps halve, and there is no measurement yet
+that says which effect wins. What can be said now is only that the change cannot be
+justified by the load-ratio arithmetic alone, which is what rounds 32-33 did. It
+needs an A/B, and the honest expectation should be stated as "somewhere between
+1.0x and 2.3x, or worse than 1.0x if the occupancy loss dominates".
+
+Two ways out, both with their own cost:
+
+1. **Stage Q and K in shared as bf16 instead of fp32.** That halves `Qs` and `Ks`:
+   at `BK = 64`, `12384 + 33024 + 6144 + 288 = 51840`, which is within a whisker of
+   the 50688 that two blocks would need -- close enough that trimming the padding or
+   `BQ` slightly gets there. The cost is a precision change in the score matrix,
+   which feeds a softmax, so it would need the needle and perplexity gates rather
+   than just `generate`. This is the only route that gets both the ratio and the
+   occupancy.
+2. **Shrink `BQ` to buy shared memory.** This does not work: `BQ = 12, BK = 32`
+   fits two blocks at 47088 bytes, but the pair count falls with it (768 work items,
+   3.0 per thread) and the thread is back to 3 accumulators and 0.75 FMA/load. The
+   extra accumulators need extra pairs to be spread over; that is the same coupling
+   round 33 found and it does not go away by shrinking the tile.
+
+Recommendation, given that: test `BK = 32` first, not 64. It is the smallest change
+that moves the ratio at all (1.6x), it already pays the full occupancy cost, and it
+therefore answers the actual question -- whether the load-ratio effect or the
+occupancy effect dominates -- with the least work and the least shared-memory risk.
+If 32 wins, 48 and 64 are worth trying; if 32 loses, the whole direction is dead and
+no amount of further tiling will rescue it.
