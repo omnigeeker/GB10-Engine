@@ -161,11 +161,16 @@ impl Linear {
         if self.n < 256 || t <= 16 {
             return self.forward(dev, x, y, t);
         }
-        // Opt-in bf16 tensor-core GEMM (see `forward_prefill_tensor_core`).
-        // Default off so the committed default stays on the verified fp32 path;
-        // the measurement that decides the default is `prefill-shape`, whose
-        // per-chunk constant should fall from ~12.4 s to ~1.3 s.
-        if std::env::var("GB10_TC_GEMM").map(|v| v == "1").unwrap_or(false) {
+        // bf16 tensor-core GEMM (see `forward_prefill_tensor_core`). Default on:
+        // it measured 2.48x on 8K cold TTFT (54.88 -> 22.15 s) and holds both
+        // token-exact gates -- `generate` 16/16 against the oracle and
+        // `batch-parity` 16/16 over 16 sequences. Set `GB10_TC_GEMM=0` to fall
+        // back to the fp32 CUDA-core GEMM, which is still the reference for
+        // `forward-cost`.
+        //
+        // Warm TTFT and OTPS are untouched by this, by construction: the decode
+        // path still runs the NVFP4 GEMV, so its roofline is unchanged.
+        if std::env::var("GB10_TC_GEMM").map(|v| v != "0").unwrap_or(true) {
             return self.forward_prefill_tensor_core(dev, x, y, t);
         }
         let kern = dev.ops();

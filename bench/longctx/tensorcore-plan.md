@@ -265,7 +265,10 @@ consequential number in the whole plan turned out to be 2x off, and it cost one
 ## Implemented and measured (rounds 22)
 
 The dispatch is in: `Linear::forward_prefill` calls `forward_prefill_tensor_core`
-when `GB10_TC_GEMM=1`. The three scratch buffers are per-call rather than a shared
+by default (set `GB10_TC_GEMM=0` to fall back to the fp32 path). It was landed
+opt-in and flipped to default-on once the suite cleared it: `generate` 16/16
+against the oracle and `batch-parity` 16/16 over 16 sequences, **both with the
+tensor-core path active** -- those are the two gates `loop/run_round.sh` runs. The three scratch buffers are per-call rather than a shared
 persistent scratch, which relies on cudarc's caching allocator to make the repeat
 allocations cheap; that kept the change local instead of threading a scratch
 through 17 call sites.
