@@ -2108,3 +2108,51 @@ the kernels compute.
 At ~7.5 s of CPU per chunk feeding a GPU that needs ~2 s, even a 2x reduction in launch
 count would take the 32K prefill from 107.89 s toward the 60 s range, which is the first
 step that would put the objective in reach. Recorded as the next implementation target.
+
+### RETRACTION: rounds 54-55's "the prefill is CPU-bound" is not supported (round 56)
+
+Round 54 read a 1:1 `user`:`wall` ratio during prefill as proof that the process was
+CPU-saturated, and round 55 read the scaling context-switch count as the fingerprint of
+per-launch blocking. Both readings are void, for a reason one control run exposes.
+
+`attn-tile` is a pure GPU-kernel benchmark: it launches the attention kernel and nothing
+else. Its 65536 case is 23.26 s of GPU kernel time by its own report.
+
+| workload | wall | user | sys | CPU/wall |
+|---|---|---|---|---|
+| `prefill-shape` 4 chunks (TC) | 59.85 s | 53.53 s | 6.78 s | 1.007 |
+| `prefill-shape` 4 chunks (fp32) | 94.06 s | 88.42 s | 6.42 s | 1.008 |
+| **`attn-tile` (pure kernel)** | **42.73 s** | **39.91 s** | **3.11 s** | **1.007** |
+
+**The pure-kernel benchmark shows the same 1.007 ratio.** 23.26 s of that run is the
+attention kernel executing on the GPU, and it cannot appear in the process's user time --
+yet the user time matches the wall time. So `user` on this platform is not a measure of
+CPU work; it tracks *GPU* time. The CUDA driver is spinning while the GPU runs, which is
+standard behaviour for a spin-configured driver and is exactly what a 1:1 ratio with
+`cpu 100%` on one core looks like.
+
+Consequences, stated plainly:
+
+- **The prefill is not shown to be CPU-bound.** Rounds 54 and 55 concluded it was, and
+  used that to redirect the whole cold-TTFT effort to launch-count reduction. That
+  redirection rests on nothing.
+- Round 55's scaling voluntary-context-switch count is equally consistent with a spinning
+  driver and no longer discriminates anything.
+- The fp32-vs-TC comparison above, which round 56 first read as "fp32 uses more CPU so it
+  is slower", shows only that `user` tracks wall in both paths -- a tautology under
+  spin-waiting, not a finding.
+
+**What still stands.** The gap itself is unchanged and is a plain FLOP/time measurement,
+independent of any CPU accounting: the prefill moves 44.6 GFLOP/token over shapes that
+measure 74.8-89.2 TFLOP/s in isolation, and takes 3.5x longer than that implies. Every
+GPU-side elimination from rounds 50-53 also stands, because those were measurements of
+GPU work (dequant share, DeltaNet FLOPs, `n_seq` flatness, absent synchronization), not
+inferences from CPU time. The one thing that is now known is that **the cause of the 3.5x
+is not established**, and that the CPU-time evidence for launch overhead does not exist.
+
+The measurement that would settle it is the one this document has now named for four
+rounds and never performed: **per-phase GPU timing inside the model** -- CUDA events
+around the staging, GEMM and epilogue of a linear op, summed over a chunk, printed at the
+end. Everything short of that has produced either a wrong conclusion (rounds 49, 50, 54,
+55) or an incomplete one (round 51). Until it exists, no fix should be attempted on the
+strength of a mechanism story, including the CUDA-graphs plan round 55 recommended.
