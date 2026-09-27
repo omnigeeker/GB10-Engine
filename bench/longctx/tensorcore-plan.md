@@ -100,10 +100,32 @@ re-test of this question if anything downstream changes the numerics.
          bit-exact against dequant_nvfp4_row: 131072 / 131072
        dequant-parity: OK
 
-   Two things that cost a rebuild each and are worth knowing for the FP8 kernel:
+   **DONE for FP8 and the activation cast too (round 18).**
+   `dequant_fp8_to_bf16_kernel` and `f32_to_bf16_kernel` are in, wired, and the
+   same gate now covers all three:
+
+       dequant fp8   -> bf16   256 x 512  (131072 elements)
+         bit-exact against e4m3_to_f32 * scale: 131072 / 131072
+       f32 -> bf16 cast: OK
+       dequant nvfp4 -> bf16   256 x 512  (256 rows, 131072 elements)
+         bit-exact against dequant_nvfp4_row: 131072 / 131072
+       dequant-parity: OK
+
+   Note the asymmetry that had to be respected: fp8's single per-tensor scale is
+   applied *inside* the dequantise (matching `stage_wtile_fp8`), while nvfp4's
+   `s2` must not be.
+
+   Three things that each cost a rebuild and are worth knowing:
    the entry point needs `extern "C"` (the other gemm kernels carry a comment
-   explaining that C++ mangling otherwise makes the name unloadable), and
-   appending to a `.cu` file does not always invalidate the PTX -- `touch` it.
+   explaining that C++ mangling otherwise makes the name unloadable); appending
+   to a `.cu` file does not always invalidate the PTX -- `touch` it; and a bf16
+   output must be compared against a bf16-*rounded* reference. The nvfp4 check
+   passed without rounding only because E2M1 x E4M3 has 7 mantissa bits and so is
+   exact in bf16; E4M3 x an arbitrary fp32 scale is not, and the unrounded
+   comparison showed 130002/131072 "failures" that were entirely the harness. The
+   residual 1039/131072 = 1/128 after that was exactly the two E4M3 NaN encodings
+   (0x7F, 0xFF), which the CUDA and host decoders disagree on and which no real
+   weight contains.
  Each takes the same packed weight/scales and writes bf16 to a
    **global** scratch buffer instead of shared:
    - `dequant_nvfp4_to_bf16` — copy the index math from `stage_wtile`

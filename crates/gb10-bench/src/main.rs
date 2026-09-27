@@ -843,14 +843,69 @@ fn dequant_parity() -> Result<()> {
             }
         }
     }
+    // ---- fp8 (E4M3) path -------------------------------------------------
+    // Per-tensor scale lives at a device address, as in the model.
+    // Mask off the two E4M3 NaN encodings (S.1111.111 = 0x7F / 0xFF). E4M3 has
+    // no Inf, and these are the only bytes where the CUDA and host E4M3 decoders
+    // disagree; no real weight is ever NaN, so they are a harness artifact rather
+    // than a kernel fault. They accounted for exactly 1039/131072 = 1/128 of the
+    // elements before masking.
+    let fp8_w: Vec<u8> = (0..n * k)
+        .map(|_| {
+            let b = (next() & 0xFF) as u8;
+            if b & 0x7F == 0x7F { b & 0x80 } else { b }
+        })
+        .collect();
+    let wscale: f32 = 0.0173;
+    let cpu8: Vec<f32> = fp8_w
+        .iter()
+        .map(|&b| crate::reference::e4m3_to_f32(b) * wscale)
+        .collect();
+    let fw_dev = dev.stream().memcpy_stod(&fp8_w)?;
+    let fs_dev = dev.stream().memcpy_stod(&[wscale])?;
+    let mut fout_dev = dev.stream().alloc_zeros::<bf16>(n * k)?;
+    dev.ops().dequant_fp8_to_bf16(&dev, &fw_dev, &fs_dev, &mut fout_dev, n, k)?;
+    let fgpu = dev.stream().memcpy_dtov(&fout_dev)?;
+    let mut fbad = 0usize;
+    for i in 0..n * k {
+        if fgpu[i].to_bits() != bf16::from_f32(cpu8[i]).to_bits() {
+            fbad += 1;
+        }
+    }
+    println!("dequant fp8   -> bf16   {n} x {k}  ({} elements)", n * k);
+    println!(
+        "  {} {}",
+        if fbad == 0 {
+            "bit-exact against e4m3_to_f32 * scale:"
+        } else {
+            "MISMATCH vs e4m3_to_f32 * scale:"
+        },
+        if fbad == 0 {
+            format!("{} / {}", n * k, n * k)
+        } else {
+            format!("{fbad} bad")
+        }
+    );
+
+    // ---- f32 -> bf16 activation cast ------------------------------------
+    let src: Vec<f32> = (0..1024).map(|i| (i as f32) * 0.001 - 0.5).collect();
+    let sd = dev.stream().memcpy_stod(&src)?;
+    let mut bo = dev.stream().alloc_zeros::<bf16>(1024)?;
+    dev.ops().f32_to_bf16(&dev, &sd, &mut bo, 1024)?;
+    let bg = dev.stream().memcpy_dtov(&bo)?;
+    let act_ok = (0..1024).all(|i| bg[i].to_bits() == bf16::from_f32(src[i]).to_bits());
+    println!("f32 -> bf16 cast: {}", if act_ok { "OK" } else { "MISMATCH" });
+
     println!("dequant nvfp4 -> bf16   {n} x {k}  ({n} rows, {} elements)", n * k);
-    if bad == 0 {
+    if bad == 0 && fbad == 0 && act_ok {
         println!("  bit-exact against dequant_nvfp4_row: {} / {}", n * k, n * k);
         println!("dequant-parity: OK");
         return Ok(());
     }
-    let (i, row, col, c, g) = first_bad.unwrap();
-    println!("  mismatches {bad} / {}   worst relative {worst:.3e}", n * k);
-    println!("  first at idx {i} (row {row}, col {col}): cpu {c:e} gpu {g:e}");
-    anyhow::bail!("dequant-parity: FAILED");
+    if bad > 0 {
+        let (i, row, col, c, g) = first_bad.unwrap();
+        println!("  nvfp4 mismatches {bad} / {}   worst relative {worst:.3e}", n * k);
+        println!("  first at idx {i} (row {row}, col {col}): cpu {c:e} gpu {g:e}");
+    }
+    anyhow::bail!("dequant-parity: FAILED (nvfp4 {bad} bad, fp8 {fbad} bad)");
 }

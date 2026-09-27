@@ -535,3 +535,30 @@ extern "C" __global__ void dequant_nvfp4_to_bf16_kernel(const uint8_t* __restric
         out[idx] = __float2bfloat16_rn(e2m1_to_float(nib) * s);
     }
 }
+
+// ---- FP8 (E4M3) -> bf16 whole-matrix dequantise --------------------------
+//
+// Unlike the NVFP4 path there is no per-tensor post-scale to defer: fp8 carries
+// a single per-tensor scale which `stage_wtile_fp8` applies *in staging*
+// (`wscale = __ldg(s1)`), so the same scale belongs in this kernel.
+extern "C" __global__ void dequant_fp8_to_bf16_kernel(const uint8_t* __restrict__ w,
+                                                      const float* __restrict__ s1,
+                                                      __nv_bfloat16* __restrict__ out,
+                                                      int N, int K) {
+    const size_t total = (size_t)N * (size_t)K;
+    const float wscale = __ldg(s1);
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (size_t)gridDim.x * blockDim.x)
+        out[idx] = __float2bfloat16_rn(e4m3_to_float(__ldg(w + idx)) * wscale);
+}
+
+// ---- fp32 -> bf16 activation cast ----------------------------------------
+//
+// The tensor cores need bf16 activations. `generate` stays 16/16 token-exact
+// with this rounding applied (see the -DGB10_SIM_BF16_ACT harness in
+// gemm2d_outer_bf16), which is what cleared this path to proceed.
+extern "C" __global__ void f32_to_bf16_kernel(const float* __restrict__ x,
+                                              __nv_bfloat16* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16_rn(__ldg(x + i));
+}

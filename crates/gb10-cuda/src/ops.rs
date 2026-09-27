@@ -50,6 +50,8 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "concat2_kernel",
     "nvfp4_gemm_kernel",
     "dequant_nvfp4_to_bf16_kernel",
+    "dequant_fp8_to_bf16_kernel",
+    "f32_to_bf16_kernel",
     "fp8_gemm_kernel",
     "bf16_gemm_kernel",
 ];
@@ -101,6 +103,8 @@ pub struct Ops {
     concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
     dequant_nvfp4_to_bf16: CudaFunction,
+    dequant_fp8_to_bf16: CudaFunction,
+    f32_to_bf16: CudaFunction,
     fp8_gemm: CudaFunction,
     bf16_gemm: CudaFunction,
 }
@@ -162,6 +166,8 @@ impl Ops {
             concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
             dequant_nvfp4_to_bf16: take(map, "dequant_nvfp4_to_bf16_kernel")?,
+            dequant_fp8_to_bf16: take(map, "dequant_fp8_to_bf16_kernel")?,
+            f32_to_bf16: take(map, "f32_to_bf16_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
             bf16_gemm: take(map, "bf16_gemm_kernel")?,
         })
@@ -722,6 +728,64 @@ impl Ops {
                 .arg(out)
                 .arg(&n_i)
                 .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize a whole FP8 (E4M3) matrix `[N, K]` to row-major bf16 `[N, K]`.
+    /// `s1` is the per-tensor scale, applied here exactly as staging does.
+    pub fn dequant_fp8_to_bf16(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<u8>,
+        s1: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::bf16>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        need(out.len() >= n * k, "dequant_fp8_to_bf16")?;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let grid = cdiv(n * k, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.dequant_fp8_to_bf16)
+                .arg(w)
+                .arg(s1)
+                .arg(out)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Cast `n` fp32 values to bf16 (the tensor-core activation format).
+    pub fn f32_to_bf16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::bf16>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && out.len() >= n, "f32_to_bf16")?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.f32_to_bf16)
+                .arg(x)
+                .arg(out)
+                .arg(&n_i)
                 .launch(LaunchConfig {
                     grid_dim: (grid, 1, 1),
                     block_dim: (256, 1, 1),
