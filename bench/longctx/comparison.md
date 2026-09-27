@@ -1327,3 +1327,57 @@ part is dropped the change is not worth making at all.** That reorders the work:
 the precision question is the prerequisite, not the follow-up, and the score matrix
 feeds a softmax, so it needs the needle and perplexity gates rather than just
 `generate`.
+
+### The `BK` direction was the wrong path: staging Q/K as bf16 at the *current* tile is better and much cheaper (round 40)
+
+Round 39 concluded the route was `BK = 64` plus bf16 `Qs`/`Ks`, at 2.30x. Recomputing the
+shared budget while actually searching the space found two things.
+
+**First, a correction to round 39.** bf16 at `BK = 64` is
+`12384 + 33024 + 6144 + 288 = 51840 B`, which is **1,152 B over the 50,688 B that two
+blocks per SM require**. Round 39 said this configuration "returns to two blocks"; it
+does not. It stays at one block, so the correct figure for it is
+`2.30 / 1.64 = 1.40x`, not 2.30x -- the same as `BK=64` with no bf16 at all. The bf16
+staging was doing *no* work in that configuration.
+
+**Second, and this is the useful part: the search says the best option is the smallest
+change.** For each `(BQ, BK)` that satisfies the `BQ*BK % 128` guard, with bf16 `Qs`/`Ks`:
+
+| BQ | BK | bytes | blocks/SM | j per thread | load gain | **net** |
+|---|---|---|---|---|---|---|
+| **24** | **16** | 22,464 | **4** | 1 | 1.00x | **2.69x** |
+| 12 | 32 | 24,384 | 4 | 1 | 1.00x | 2.69x |
+| **24** | **32** | 32,256 | **3** | 2 | 1.60x | **2.62x** |
+| 32 | 48 | 47,808 | 2 | 4 | 2.29x | 2.29x |
+| 24 | 48 | 42,048 | 2 | 3 | 2.00x | 2.00x |
+| 32 | 16 | 27,200 | 3 | 1 | 1.00x | 1.64x |
+| 16 | 64 | 45,568 | 2 | 2 | 1.60x | 1.60x |
+
+**`BQ = 24, BK = 16` with bf16 `Qs`/`Ks` is the best row, and it needs no thread-mapping
+change at all.** Halving the staging drops shared from 43,104 B to 22,464 B, which takes
+the kernel from two blocks per SM to **four** -- and the load ratio is untouched, because
+this does not alter the pair mapping, only how Q and K are stored and read.
+
+Every `BK` increase trades occupancy for load ratio at roughly par, and the best of them
+(`BK=48`) nets 2.00x against the 2.69x that comes free from staging alone. **The whole
+`BK` rewrite direction -- three rounds of it -- was attacking the wrong term.** The
+lever is occupancy, which is what the round-39 probe measured, and bf16 staging is the
+cheapest way to buy it.
+
+**The extrapolation this rests on, stated plainly.** The 2.69x applies the measured
+1.64x-per-halving twice (`1.64^2`) to get from 2 blocks to 4. I have only ever measured
+the *downward* direction (2 -> 1 block). The upward direction is assumed symmetric, and
+it need not be: if the kernel is already latency-limited at 2 blocks, a third and fourth
+block may add little. So the honest range for this change is **1.0x to 2.69x**, with the
+`BK=32`-style rows as the fallback if the doubling saturates.
+
+That is testable with the same probe infrastructure, in the same way and at the same
+cost: `GB10_ATTN_SMEM_PROBE` can be set *below* the computed request to admit more
+blocks, once the staging is bf16. The measurement should come before the rewrite for the
+third time in this document, and this time the rewrite is small enough that the
+measurement is the larger half of the work.
+
+**Precision is still the gate either way.** bf16 `Qs`/`Ks` changes what the score matrix
+is computed from, and it feeds a softmax, so the needle and perplexity gates are
+required -- `generate` alone does not cover it. That requirement is unchanged from
+round 39; only its size changed.
