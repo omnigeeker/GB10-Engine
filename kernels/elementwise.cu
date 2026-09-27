@@ -13,6 +13,7 @@
 //     normalisation happens BEFORE the gate.
 //   * The attention output gate is sigmoid, not swish.
 
+#include <cuda_fp16.h>
 #include "gemv_common.cuh"
 
 using namespace gb10;
@@ -372,11 +373,31 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     // 16 `j` values and 2 `sub` values of a warp now span
     // `(2 * j + sub + d) % 32` = all 32 banks, so the K read is a single
     // transaction instead of the 2-way conflict left by plain padding.
-    const int PADH = HD / 2 + 1;
+    // Q and K are staged in fp16 (not bf16: bf16's 8 mantissa bits failed the
+    // attn-tile gate at ~1.2e-4 rms relative, and the failure pattern -- ntok=1
+    // exact, ntok>=7 all wrong -- is pure score precision, not a layout bug.
+    // fp16 has 11 mantissa bits for the same 2 bytes). That halves their shared
+    // footprint, which is
+    // what takes this kernel from two blocks per SM to four -- and the round-39
+    // probe measured this kernel to be occupancy-sensitive (halving the blocks
+    // cost 1.64x on the context-dependent term, with the GEMM's constant term
+    // unchanged at 0.975x).
+    //
+    // the same 2-byte bank arithmetic applies to fp16, so:
+    // PADH is 130, not 129, and that is not cosmetic. The bank of the element at
+    // index i is (i * width / 4) % 32, so with 2-byte elements two neighbours
+    // share a 4-byte bank and the `sub` offset has half the bank resolution it
+    // has for fp32. PADH = 129 gives floor(129/2) = 64, and 64 % 32 = 0, so both
+    // halves land in the same bank class: a 2-way conflict in the score loop.
+    // PADH = 130 gives 65, and 65 % 32 = 1, which restores the odd shift that
+    // spreads (j, sub) across all 32 banks -- the same property PADH = 129
+    // provides for fp32. The intra-row gap below is 2 for the same reason.
+    // See bench/longctx/comparison.md, round 41.
+    const int PADH = HD / 2 + 2;
     const int PS = 2 * PADH;
-    float* Qs = smem;                              // BQ * PS
-    float* Ks = Qs + PREFILL_BQ * PS;              // BK * PS
-    float* S = Ks + PREFILL_BK * PS;               // BQ * BK  (running p, then probabilities)
+    __half* Qs = reinterpret_cast<__half*>(smem);  // BQ * PS fp16
+    __half* Ks = Qs + PREFILL_BQ * PS;                    // BK * PS fp16
+    float* S = reinterpret_cast<float*>(Ks + PREFILL_BK * PS);   // BQ * BK fp32
     float* red = S + PREFILL_BQ * PREFILL_BK;      // 3 * BQ  (m, l, correction)
 
     const int h = blockIdx.x;
@@ -391,8 +412,8 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     // Q tile. Rows past `rows` are zero-filled and masked out below.
     for (int idx = tid; idx < PREFILL_BQ * HD; idx += nt) {
         const int i = idx / HD, d = idx % HD;
-        Qs[i * PS + d + (d >= HD / 2 ? 1 : 0)] =
-            (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f;
+        Qs[i * PS + d + (d >= HD / 2 ? 2 : 0)] = __float2half(
+            (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f);
     }
     if (tid < PREFILL_BQ) {
         red[tid] = -INFINITY;                  // m
@@ -416,10 +437,10 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            Ks[j * PS + d + (d >= HD / 2 ? 1 : 0)] =
+            Ks[j * PS + d + (d >= HD / 2 ? 2 : 0)] = __float2half(
                 (s <= win_max)
                     ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
-                    : 0.0f;
+                    : 0.0f);
         }
         // This thread's column of V, held in registers. Consecutive threads read
         // consecutive addresses, so each of the BK loads is one 128-byte
@@ -454,16 +475,16 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         const int j = q % PREFILL_BK;
         const int i0 = q / PREFILL_BK;
         const int step = (nt >> 1) / PREFILL_BK;
-        const float* krow = Ks + j * PS + sub * PADH;
-        const float* qr0 = Qs + i0 * PS + sub * PADH;
-        const float* qr1 = Qs + (i0 + step) * PS + sub * PADH;
-        const float* qr2 = Qs + (i0 + 2 * step) * PS + sub * PADH;
+        const __half* krow = Ks + j * PS + sub * PADH;
+        const __half* qr0 = Qs + i0 * PS + sub * PADH;
+        const __half* qr1 = Qs + (i0 + step) * PS + sub * PADH;
+        const __half* qr2 = Qs + (i0 + 2 * step) * PS + sub * PADH;
         float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
         for (int d = 0; d < half; ++d) {
-            const float kv = krow[d];
-            d0 = fmaf(qr0[d], kv, d0);
-            d1 = fmaf(qr1[d], kv, d1);
-            d2 = fmaf(qr2[d], kv, d2);
+            const float kv = __half2float(krow[d]);
+            d0 = fmaf(__half2float(qr0[d]), kv, d0);
+            d1 = fmaf(__half2float(qr1[d]), kv, d1);
+            d2 = fmaf(__half2float(qr2[d]), kv, d2);
         }
         d0 += __shfl_xor_sync(0xffffffffu, d0, 1);
         d1 += __shfl_xor_sync(0xffffffffu, d1, 1);

@@ -1427,3 +1427,78 @@ original conflict: correct output, no error, just slower.
 occupancy actually rises to 4 blocks/SM and measure the gain against the 1.0x-2.69x
 range, using the probe to check the saturation question; (3) only then the precision
 gates, which are required either way because the score matrix feeds a softmax.
+
+### fp16 Q/K staging: implemented, gated, and it falsifies round 40's 2.69x (round 42)
+
+I implemented the staging change. `Qs`/`Ks` are now `__half`, converted on store and
+read back with `__half2float` in the score loop, with `PADH = 130` and an intra-row gap
+of 2 exactly as round 41 derived, and the host budget is
+`(BQ*(HD+4) + BK*(HD+4))*2 + (BQ*BK + 3*BQ)*4 = 22,624 B`, down from 43,104 B.
+
+**bf16 was tried first and failed the `attn-tile` gate**, at `max|abs| 1.19e-4` /
+`rms rel 1.03e-4` (MISMATCH). The failure pattern identified it as precision rather
+than a layout bug: `ntok = 1` passed *exactly* (0.0) while every `ntok >= 7` failed, and
+with a single key the score error cannot reach the output at all. bf16 carries 8
+mantissa bits; **fp16 carries 11 for the same 2 bytes, and it passes cleanly** --
+`max|abs|` falls to `2.3e-5` and every row is `ok`:
+
+| staging | `max|abs|` (ntok 7) | gate |
+|---|---|---|
+| fp32 | 1.19e-7 | ok |
+| bf16 | 1.191e-4 | MISMATCH |
+| **fp16** | **2.279e-5** | **ok** |
+
+The 5x improvement over bf16 is the 3 extra mantissa bits, as expected. Note that
+`PADH = 130` was derived for 2-byte elements generally, so it applies to fp16 unchanged.
+
+**Then the measurement falsified the round-40 prediction.** In situ, at the model's
+operating point:
+
+| term | round-39 fp32, 2 blk | round-42 fp16, 4 blk | ratio |
+|---|---|---|---|
+| constant `G` | 4.018 s | 3.947 s | 0.98x |
+| per-key slope `k` | 2.1240e-4 | 2.1631e-4 | **1.02x** |
+
+**1.02x, not 2.69x.** Round 40 assumed the occupancy effect was symmetric and applied
+the measured 1.64x-per-halving twice. It is not symmetric. The curve, now measured at
+three points:
+
+| blocks/SM | relative attention cost | how known |
+|---|---|---|
+| 1 | 1.64x slower than 2 | round 39, measured downward |
+| 2 | 1.00x | reference |
+| 4 | **0.98x** | **round 42, measured upward** |
+
+**It saturates at 2.** Going 2 -> 1 costs 1.64x, but 2 -> 4 buys 1.02x: the kernel stops
+being occupancy-limited once two blocks are resident. The round-40 caveat ("if the kernel
+is already latency-limited at 2 blocks, a third and fourth block may add little") was the
+right one, and it landed at the bottom of the 1.0x-2.69x range I gave.
+
+**So the value of fp16 staging is not the occupancy -- it is the shared budget it frees.**
+With `Qs`/`Ks` at 2 bytes, a much larger `BK` now fits *without* dropping below the
+2-block saturation point, where before it could not:
+
+| config | bytes | blocks/SM | load gain | net |
+|---|---|---|---|---|
+| `BK=16` fp16 (shipped now) | 22,624 | 4 | 1.00x | 1.00x |
+| `BK=32` fp16 | 32,256 | 3 | 1.60x | ~1.60x |
+| **`BK=48` fp16** | **42,048** | **2** | **2.00x** | **~2.00x** |
+| `BQ=32, BK=48` fp16 | 47,808 | 2 | 2.29x | ~2.29x |
+
+Compare round 39, where `BK=48` in fp32 was 79,200 B, i.e. **1** block, and the 1.64x
+penalty cut its 2.00x load gain to 1.22x. fp16 staging is what makes `BK=48` reach
+2.00x. **The staging is an enabler, not a win** -- its own contribution is 1.02x, and
+everything it is worth comes from what it lets `BK` do:
+
+| option | net | 32K cold TTFT | vs llama.cpp |
+|---|---|---|---|
+| `BK=16` fp16 (now) | 1.00x | 129.1 s | 2.90x |
+| `BK=48` fp16 | 2.00x | 96.6 s | 2.17x |
+| `BQ=32, BK=48` fp16 | 2.29x | 92.5 s | 2.08x |
+
+The next step is therefore the score-loop restructure at `BK=48` (3 rows x 3 `j` = 9
+accumulators per thread, generalising the `BQ*BK == 3*(nt>>1)` guard), and it is now
+known to be affordable: 42,048 B leaves it at 2 blocks, which the curve says is full
+speed. It also needs the fp16 precision gates, which `attn-tile` plus the round gate's
+`generate`/`batch-parity` cover at this stage; needle and perplexity remain required
+before the change is called done.

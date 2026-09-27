@@ -1354,7 +1354,12 @@ impl Ops {
         // Q and K rows are padded in the kernel to break the shared bank
         // conflicts the natural stride causes: the row stride is head_dim + 2
         // with the two halves separated by one extra float.
-        let smem = (BQ * (head_dim + 2) + BK * (head_dim + 2) + BQ * BK + 3 * BQ) * 4;
+        // Q and K are staged in bf16 (PADH = head_dim/2 + 2, PS = head_dim + 4)
+        // while S and the reduction scratch stay fp32. Halving the Q/K staging
+        // takes this kernel from 2 to 4 blocks per SM, which is the lever the
+        // round-39 occupancy probe identified.
+        let smem =
+            (BQ * (head_dim + 4) + BK * (head_dim + 4)) * 2 + (BQ * BK + 3 * BQ) * 4;
 
         // Occupancy probe. The computed request (43,104 B here) is what lets two
         // blocks co-reside per SM; `GB10_ATTN_SMEM_PROBE=<bytes>` raises the
