@@ -256,20 +256,33 @@ fn prefill_shape(args: &Args) -> Result<()> {
     let wall = t_all.elapsed().as_secs_f64();
     println!("  total {:.2}s", wall);
     {
-        let (ms, n) = gb10_model::weights::gemm_event_snapshot();
-        println!(
-            "  [diag] cuBLAS GPU {:.1} ms over {} calls = {:.1} TFLOPS effective; \
-{:.1}% of the {:.2}s prefill",
-            2.0 * 22.3e9 * 2048.0 * 0.0 + ms,
-            n,
-            if ms > 0.0 {
-                2.0 * (args.limit as f64) * 44.6 / (ms / 1e3) / 1e12
-            } else {
-                0.0
-            },
-            100.0 * (ms / 1e3) / wall,
-            wall
-        );
+        let (ph, n) = gb10_model::weights::gemm_event_snapshot();
+        if n > 0 {
+            let tot: f64 = ph.iter().sum();
+            let mut line = String::new();
+            for (i, name) in gb10_model::weights::PHASES.iter().enumerate() {
+                line.push_str(&format!(
+                    "{} {:.0}ms ({:.1}%)  ",
+                    name,
+                    ph[i],
+                    100.0 * ph[i] / (wall * 1e3)
+                ));
+            }
+            println!(
+                "  [diag] n={} | {}| op phases total {:.2}s of {:.2}s ({:.1}%)",
+                n,
+                line,
+                tot / 1e3,
+                wall,
+                100.0 * tot / (wall * 1e3)
+            );
+            println!(
+                "  [diag] cublas {:.1} TFLOP/s in-model; op phases {:.1}% of prefill, remainder {:.1}%",
+                (args.limit as f64) * 44.6 / (ph[2] / 1e3) / 1e12,
+                100.0 * tot / (wall * 1e3),
+                100.0 - 100.0 * tot / (wall * 1e3)
+            );
+        }
     }
     Ok(())
 }

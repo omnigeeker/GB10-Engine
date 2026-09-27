@@ -17,20 +17,26 @@ use std::sync::Mutex;
 /// takes 2.4-3.5x longer than that implies, and every other candidate has been
 /// eliminated. Events are recorded asynchronously and read once at the end --
 /// `elapsed_ms` synchronizes, so it must never be called inside the op.
-pub static GEMM_EVENTS: Mutex<Vec<(CudaEvent, CudaEvent)>> =
-    Mutex::new(Vec::new());
+pub static GEMM_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
 
-/// Drain the recorded events and return (total GPU ms, call count).
-pub fn gemm_event_snapshot() -> (f64, usize) {
+/// Phase names, in the order `gemm_event_snapshot` returns their totals.
+/// The epilogue is not bracketed here; it is the remainder to the op total.
+pub const PHASES: [&str; 3] = ["weight stage", "activ cast", "cublas gemm"];
+
+/// Drain the recorded events and return (per-phase GPU ms, call count). Four
+/// events per op bracket three phases so no two phases share a boundary.
+pub fn gemm_event_snapshot() -> ([f64; 3], usize) {
     let mut v = GEMM_EVENTS.lock().unwrap();
     let n = v.len();
-    let mut sum = 0.0f64;
-    for (a, b) in v.drain(..) {
-        if let Ok(ms) = a.elapsed_ms(&b) {
-            sum += ms as f64;
+    let mut acc = [0.0f64; 3];
+    for ev in v.drain(..) {
+        for i in 0..3 {
+            if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
+                acc[i] += ms as f64;
+            }
         }
     }
-    (sum, n)
+    (acc, n)
 }
 
 /// A weight matrix plus the scales its format needs.
@@ -147,6 +153,31 @@ impl Linear {
             sy.as_mut().unwrap(),
         );
 
+        // Gated: the server shares this path and only `gemm_event_snapshot`
+        // drains the Vec, so unconditional recording would retain events for
+        // every request. Four events bracket the three per-op phases.
+        let ev_ctx = dev.stream().context().clone();
+        let want_ev = std::env::var("GB10_GEMM_EVENTS").is_ok();
+        let mut evs: Option<Vec<CudaEvent>> = None;
+        if want_ev {
+            let mut t = Vec::with_capacity(4);
+            let mut ok = true;
+            for _ in 0..4 {
+                match ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+                    Ok(e) => t.push(e),
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            if ok { evs = Some(t); }
+        }
+        macro_rules! mark {
+            ($i:expr) => {
+                if let Some(t) = &evs {
+                    let _ = t[$i].record(dev.stream());
+                }
+            };
+        }
+        mark!(0);
         match &self.data {
             LinearData::NvFp4 { w: qw, wscale, .. } => {
                 kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
@@ -158,33 +189,13 @@ impl Linear {
                 kern.u16_to_bf16(dev, qw, wb, n * k)?;
             }
         }
+        mark!(1);
         kern.f32_to_bf16(dev, x, xb, t * k)?;
-        // Gated: the server also calls this path, and the Vec is only drained by
-        // gemm_event_snapshot(), so recording unconditionally would retain events
-        // for every request.
-        let ev_ctx = dev.stream().context().clone();
-        let want_ev = std::env::var("GB10_GEMM_EVENTS").is_ok();
-        let ev_a = if want_ev {
-            ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).ok()
-        } else {
-            None
-        };
-        let ev_b = if want_ev {
-            ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).ok()
-        } else {
-            None
-        };
-        if let Some(a) = &ev_a {
-            let _ = a.record(dev.stream());
-        }
+        mark!(2);
         kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;
-        if let Some(b) = &ev_b {
-            let _ = b.record(dev.stream());
-        }
-        if let (Some(a), Some(b)) = (ev_a, ev_b) {
-            if want_ev {
-                GEMM_EVENTS.lock().unwrap().push((a, b));
-            }
+        mark!(3);
+        if let Some(t) = evs.take() {
+            GEMM_EVENTS.lock().unwrap().push(t);
         }
 
         // Only NVFP4 defers a scale to the epilogue; the others pass one.

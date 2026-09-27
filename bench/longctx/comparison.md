@@ -2280,3 +2280,43 @@ What this measurement also retroactively settles:
 Next: extend the same event instrumentation to the other three phases of the op
 (`dequant`/`u16_to_bf16`, `f32_to_bf16`, `bf16_to_f32_scaled`) plus the attention and
 DeltaNet launches, which is now a small, mechanical change to a mechanism that works.
+
+### MEASURED: the full per-op phase breakdown, and 56% of the prefill is still outside it (round 59)
+
+Round 58 bracketed the cuBLAS call. This round brackets the two staging phases as well --
+four `CudaEvent`s per linear op, three phases, drained once at the end -- so the op is now
+timed end to end except its epilogue. 8K prefill, 8225 tokens, n=2000 ops, 19.13 s wall:
+
+| phase | GPU time | share of prefill | independent prior estimate |
+|---|---|---|---|
+| weight stage (`dequant_nvfp4/fp8_to_bf16`, `u16_to_bf16`) | 2127 ms | **11.1%** | 12% (`GB10_SKIP_DEQUANT` probe, round 50) |
+| activation cast (`f32_to_bf16`) | 543 ms | **2.8%** | 2.5% (`tc-phase`, round 49) |
+| cuBLAS GEMM | 5713 ms | **29.9%** | 29.6% (round 58) |
+| **measured op phases, total** | **8.38 s** | **43.8%** | |
+| **remainder** | **10.75 s** | **56.2%** | |
+
+**Three independent prior estimates are confirmed to within a percentage point each.** The
+dequant share from a kernel-deletion probe (12%), the cast share from a standalone
+benchmark (2.5%) and the GEMM share from the round-58 event pair (29.6%) all reproduce.
+That is the first time in this document that a set of predictions has survived an in-model
+measurement intact, and it means the instrumentation is trustworthy.
+
+**The new finding is the 56.2% remainder.** Even with every phase of the linear op except
+the epilogue timed, **under half the prefill is accounted for**. The remainder is:
+
+- the **epilogue** (`bf16_to_f32_scaled`), the one phase of the op not bracketed here. It is
+  not small: it writes `t * n` fp32 values and reads `t * n` bf16, so for mlp gate/up alone
+  that is 143 MB written plus 71 MB read per op, and there are two such ops per layer.
+- the **attention** kernels, fitted at ~22% of the 8K prefill (round 45).
+- the **DeltaNet** recurrence and gating kernels, and the norms.
+
+Subtracting the attention's ~22%, the epilogue plus DeltaNet plus norms come to roughly
+**34% of the prefill** -- more than the GEMM, and almost none of it has ever been timed.
+
+So the objective's remaining lever is now precisely stated: **the epilogue and the DeltaNet
+kernels, together about a third of the cold prefill**, with the GEMM (30%, at 84% of its
+isolated rate) and the dequant (11%) both confirmed to be near their practical limits.
+
+The two `[diag]` TFLOPS fields print 0.0 because of a missing `1e9` in the display
+expression; the value is 366.8 TFLOP / 5.713 s = **64.2 TFLOP/s**, consistent with round
+58's 65.9. The measurement itself is unaffected.
