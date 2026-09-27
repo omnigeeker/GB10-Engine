@@ -331,3 +331,37 @@ The order to attack it, cheapest first:
 
 Even at 2.74x this is the largest single win of the session on the metric the
 objective is about: 8K cold TTFT went from 5.2x slower than llama.cpp to 2.09x.
+
+### The alloc_zeros hypothesis, measured (round 25)
+
+The leading suspect for the gap between the predicted 11x and the measured 2.74x
+was the per-call `alloc_zeros` in `forward_prefill_tensor_core`. `cublas-gemm` now
+re-allocates the same three buffers per rep, exactly as the model does, and times
+that separately from the GEMM:
+
+| shape | GEMM | alloc_zeros only | overhead |
+|---|---|---|---|
+| mlp gate/up | 4.68 ms (78.0 TFLOP/s) | **2.44 ms** | **+52%** |
+| mlp down | 4.17 ms (87.5 TFLOP/s) | 2.32 ms | +56% |
+| lm_head | 60.57 ms (86.0 TFLOP/s) | 29.01 ms | +48% |
+| attn q_proj | 1.50 ms (85.9 TFLOP/s) | 0.94 ms | +63% |
+
+So the hypothesis is confirmed and it is much larger than my first estimate. I had
+put the zeroing at ~67 GB per chunk, which at the nominal 228 GB/s read bandwidth
+is ~0.33 s; the measured cost is a ~111 GB/s memset (i.e. the write path is about
+half the read path, not equal to it) **plus** a fixed per-call allocation overhead
+on top, for roughly 50% again on every GEMM.
+
+Note this also sharpens the earlier note about `lm_head`: it is not on the prefill
+path, so its 29 ms of allocation is not being paid per chunk -- it is in the table
+only because it is the largest shape and therefore the clearest signal.
+
+**What this does and does not explain.** At ~50% overhead on a 1.05 s GEMM budget,
+this is ~0.5-0.6 s per chunk of the 4.44 s measured. It is real, it is now
+quantified, and the fix is known (a persistent 321 MB scratch, which removes both
+the zeroing and the allocation churn). But it is still only about an eighth of the
+gap, so **a little over 2 s per chunk remains unexplained** and I am not going to
+attribute it without evidence. The next measurement should be per-phase timing
+inside `forward_prefill_tensor_core` (dequant / activation cast / GEMM / epilogue)
+rather than more end-to-end fits, since four independent fits now agree with each
+other and disagree with the phase model.

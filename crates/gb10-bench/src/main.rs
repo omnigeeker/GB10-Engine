@@ -773,6 +773,26 @@ fn cublas_gemm() -> Result<()> {
             "{:<22} {:>8.2} {:>8.1} {:>9.3} {:>10.0} {:>8.1}x",
             label, secs * 1e3, tflops, gbytes, gbytes / secs, tflops / fp32_tflops
         );
+
+        // How much of the model's in-situ cost is the allocation rather than the
+        // GEMM? The prefill path allocates its three scratch buffers per matrix
+        // with `alloc_zeros`, which zeroes ~67 GB per 2048-token chunk across the
+        // whole model. That is the leading suspect for the gap between the
+        // 11x this benchmark predicts and the 2.74x `prefill-shape` measured.
+        // Re-allocating the same three buffers per rep, exactly as the model
+        // does, isolates it.
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let _w = dev.stream().alloc_zeros::<bf16>(n * k)?;
+            let _x = dev.stream().alloc_zeros::<bf16>(t * k)?;
+            let _y = dev.stream().alloc_zeros::<bf16>(n * t)?;
+        }
+        dev.synchronize()?;
+        let alloc_s = t0.elapsed().as_secs_f64() / reps as f64;
+        println!(
+            "{:<22} {:>8.2} {:>8} {:>9.3} {:>10.0} {:>8}   <- alloc_zeros only",
+            "  (same buffers)", alloc_s * 1e3, "-", "-", "-", "-"
+        );
     }
     println!("\nreference: the current fp32 CUDA-core GEMM measures ~7 TFLOP/s, {:.1}x below this", 43.0/7.0);
     Ok(())
