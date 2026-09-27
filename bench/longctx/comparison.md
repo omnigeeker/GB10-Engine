@@ -1847,3 +1847,44 @@ anything derived from it should be read with that in mind.
 
 Reverted the probe; the tree is back to the round-45 kernel, which remains the best
 measured configuration.
+
+### `G` is flat in sequence count, so it is not the DeltaNet state (round 51)
+
+Round 50 left `G`'s 3.5 s per chunk (3.2x its GEMM floor, with the dequant already
+deleted) unexplained, and named the Gated-DeltaNet recurrence as the prime suspect on the
+grounds that 48 of the 64 layers run it and it keeps 3.1 MB of state per layer *per
+sequence*, which the linear-projection FLOP count does not include. That is testable
+without any instrumentation: if the dominant term were per-sequence state work, then
+changing the sequence count would move `G`, while the GEMM pipeline is shared across the
+batch and would not.
+
+`prefill_shape` had `n_seq = 10` hardcoded; wiring it to `--n-seq` and running three
+values:
+
+| `n_seq` | chunk 3 | total (8225 tok) |
+|---|---|---|
+| 1 | 4.95 s | 18.66 s |
+| 4 | 4.93 s | 18.49 s |
+| 10 | 5.07 s | 18.83 s |
+
+**Flat to within 2%.** Ten times the sequence count, and hence ten times the DeltaNet
+state to carry, costs nothing measurable. **The hypothesis is refuted: `G` is per-token
+work, not per-sequence state work.**
+
+That narrows the 3.2x to per-token, batch-independent work. With the dequant deleted
+(round 50) and the state ruled out here, what remains is the linear projections
+themselves -- and the only way they can be 3.2x off the 80 TFLOPS figure used as the
+floor is that **the 80 TFLOPS is not what these shapes achieve**. That figure was
+measured on large single shapes (mlp gate/up, n=17408, k=5120). The model's actual GEMM
+mix includes many small ones -- the k/v projections (n=1024), and the DeltaNet layers'
+own small projections -- whose efficiency is necessarily lower, plus a per-call staging
+and launch cost that a single-shape benchmark does not see. So the 1.12 s "floor" was
+never a floor: it is the time the same FLOPs would take if every projection in the model
+had the shape of the one that was benchmarked.
+
+Two lessons that have now both occurred twice in this document: a bench-internal
+single-shape number is not a model-level bound (rounds 22-27 vs 49-50), and a plausible
+structural story is worth one cheap parameter sweep before it is written down as a cause
+(round 37 vs here).
+
+Reverted the diagnostic change; `prefill_shape` keeps its hardcoded `n_seq = 10`.
