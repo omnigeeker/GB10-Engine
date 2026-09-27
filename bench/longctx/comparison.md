@@ -18,7 +18,7 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| cold TTFT | 65.2 s | **10.58 s** | 6.2× slower |
+| cold TTFT | 54.5 s | **10.58 s** | 5.2× slower |
 | **warm TTFT** | **0.03 s** | 0.237 s | **7.9× faster** |
 | **OTPS** | **8.69** | 7.32 | **1.19× faster** |
 
@@ -27,7 +27,7 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| cold TTFT | 437.1 s | **44.55 s** | 9.8× slower |
+| cold TTFT | 272.6 s | **44.55 s** | 6.1× slower |
 | **warm TTFT** | **0.05 s** | 0.29 s | **5.8× faster** |
 | **OTPS** | **7.15** | 6.865 | **1.04× faster** |
 
@@ -499,3 +499,43 @@ unlike every tiling change tried before it, the gain **grows** with context
 (1.31x at 8K, 1.73x at 32K) because it attacks the quadratic term. It also
 confirms the diagnosis from last round was right: the attention was bound by
 redundant shared reads in the score loop, not by the tile size.
+
+## The real cost was shared bank conflicts, not reads
+
+The hoist above cut the score loop's reads by a third and won 1.3-1.7x, which is
+what the read arithmetic predicts. But the reads themselves were far more
+expensive than "one transaction each", and that was the actual problem.
+
+Every row of Q and K started on the same shared bank, because the stride was
+`HD == 256` floats and 256 is a multiple of 32. In the score loop a warp reads
+`Ks[j * HD + sub * half + d]` for 16 different `j` and 2 `sub` values: 32
+*distinct words*, all at bank `d % 32`. That is a **32-way conflict** -- 32
+transactions for every single load instruction, on the hottest loop in the
+kernel. The `sub` offset (`half == 128`) is itself a multiple of 32, so it did
+not spread them either.
+
+Padding the rows to `HD + 1` floats makes the bank `(row + d) % 32`, so the 16
+rows land on 16 different banks and only the 2-way `sub` conflict remains: 32
+transactions become 2. This only changes addresses, so it is numerically
+identical, and `attn-tile` and `generate` (16/16 token-exact) both still pass.
+
+| `attn-tile` case | BQ=8 | +BQ=24 | +hoist | **+pad** | total |
+|---|---|---|---|---|---|
+| 65536 tokens | 139.77 s | 139.77 s | 69.75 s | **28.46 s** | **4.9x** |
+| 16384 tokens | 8.73 s | 8.73 s | 6.39 s | **1.09 s** | **8.0x** |
+| 4096 tokens | 0.55 s | 0.55 s | 0.24 s | **0.07 s** | **7.9x** |
+| start 20480, 2048 tokens | 2.94 s | 2.94 s | 1.57 s | **0.36 s** | **8.2x** |
+
+End to end:
+
+| | original | after hoist | **after pad** | total |
+|---|---|---|---|---|
+| 8K cold TTFT | 88.81 s | 65.21 s | **54.49 s** | **1.63x** |
+| 32K cold TTFT | 826.09 s | 437.10 s | **272.62 s** | **3.03x** |
+
+Three rounds ago I concluded the attention was "a from-scratch rewrite, not a
+tuning problem". That was wrong, and the way it was wrong is worth recording:
+the 333 GFLOPS figure (1.4% of fp32 peak) was real, but I attributed it to the
+algorithm's structure rather than to a one-character addressing bug. A stride
+that is a multiple of 32 is the single most common way to destroy a shared
+memory kernel, and it had been sitting in the hottest loop the whole time.

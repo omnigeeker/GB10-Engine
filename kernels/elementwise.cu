@@ -357,9 +357,19 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     float scale, int start, int kv_base) {
     extern __shared__ float smem[];
     const int HD = head_dim;
-    float* Qs = smem;                              // BQ * HD
-    float* Ks = Qs + PREFILL_BQ * HD;              // BK * HD
-    float* S = Ks + PREFILL_BK * HD;               // BQ * BK  (running p, then probabilities)
+    // Rows are padded to HD + 1. With the natural HD stride every row of Q and K
+    // starts on the same shared bank (HD is a multiple of 32), and the score loop
+    // reads `Ks[j * HD + sub * half + d]` for 16 different j and 2 sub values at
+    // the same d -- 32 distinct words, all in bank d % 32. That is a 32-way
+    // conflict, i.e. 32 transactions per load instruction. The +1 makes the bank
+    // (row + d) % 32, so the 16 rows spread across 16 banks and the only
+    // remaining conflict is the 2-way one between the two `sub` halves, whose
+    // offset (half == 128) is itself a multiple of 32. Numerically identical:
+    // this only changes addresses.
+    const int PS = HD + 1;
+    float* Qs = smem;                              // BQ * PS
+    float* Ks = Qs + PREFILL_BQ * PS;              // BK * PS
+    float* S = Ks + PREFILL_BK * PS;               // BQ * BK  (running p, then probabilities)
     float* red = S + PREFILL_BQ * PREFILL_BK;      // 3 * BQ  (m, l, correction)
 
     const int h = blockIdx.x;
@@ -374,7 +384,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     // Q tile. Rows past `rows` are zero-filled and masked out below.
     for (int idx = tid; idx < PREFILL_BQ * HD; idx += nt) {
         const int i = idx / HD, d = idx % HD;
-        Qs[idx] = (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f;
+        Qs[i * PS + d] = (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f;
     }
     if (tid < PREFILL_BQ) {
         red[tid] = -INFINITY;                  // m
@@ -398,9 +408,9 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            Ks[idx] = (s <= win_max)
-                          ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
-                          : 0.0f;
+            Ks[j * PS + d] = (s <= win_max)
+                                 ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
+                                 : 0.0f;
         }
         // This thread's column of V, held in registers. Consecutive threads read
         // consecutive addresses, so each of the BK loads is one 128-byte
@@ -435,10 +445,10 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         const int j = q % PREFILL_BK;
         const int i0 = q / PREFILL_BK;
         const int step = (nt >> 1) / PREFILL_BK;
-        const float* krow = Ks + j * HD + sub * half;
-        const float* qr0 = Qs + i0 * HD + sub * half;
-        const float* qr1 = Qs + (i0 + step) * HD + sub * half;
-        const float* qr2 = Qs + (i0 + 2 * step) * HD + sub * half;
+        const float* krow = Ks + j * PS + sub * half;
+        const float* qr0 = Qs + i0 * PS + sub * half;
+        const float* qr1 = Qs + (i0 + step) * PS + sub * half;
+        const float* qr2 = Qs + (i0 + 2 * step) * PS + sub * half;
         float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
         for (int d = 0; d < half; ++d) {
             const float kv = krow[d];
