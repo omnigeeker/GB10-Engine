@@ -1261,3 +1261,69 @@ is smaller, the `BK = 32` net improves from 1.14x; if the bimodality is itself a
 symptom of occupancy pressure, it could be worse. Either way the rewrite decision
 should not be made on the current evidence, and the cost of getting the evidence is one
 small dedicated benchmark rather than a kernel change.
+
+### The occupancy penalty measured in situ, at the model's own operating point (round 39)
+
+Round 38 concluded that `attn-tile` cannot resolve the occupancy question at 2,048
+tokens (19x within-config spread, bimodal). The fix is not a new benchmark but the
+instrument discipline from round 27: measure it **in the model**, where the chunking,
+the warmup and the cache state are the real ones. `prefill-shape --limit 8225` with
+and without the probe:
+
+| chunk | start | baseline | 1 block/SM |
+|---|---|---|---|
+| 0 | 0 | 4.29 s | 4.33 s |
+| 1 | 2048 | 4.58 s | 4.90 s |
+| 2 | 4096 | 5.12 s | 5.70 s |
+| 3 | 6144 | 5.56 s | 6.44 s |
+| | **total** | **20.31 s** | **22.15 s (1.09x)** |
+
+Fitting the usual `t = G + k * (start + 1024)` separates the two terms, and the
+separation is the point:
+
+| term | baseline | 1 block/SM | ratio | is |
+|---|---|---|---|---|
+| constant `G` | 4.018 s | 3.916 s | **0.975x** | the GEMM -- **unaffected** |
+| per-key slope `k` | 2.124e-4 | 3.481e-4 | **1.64x** | the attention |
+
+**The probe touched nothing but the attention, and the fit says exactly that**: `G`
+moves by 2.5% (noise) while the context-dependent slope moves 1.64x. That is both the
+result and its own validation -- a probe that had perturbed the GEMM would have moved
+`G` too.
+
+So the occupancy penalty at the model's real operating point is **1.64x**, confined to
+the attention, and larger than the 1.40x measured in `attn-tile` at 16K/64K tokens.
+The direction of that discrepancy is the opposite of what round 37 guessed (I had
+suggested the in-situ penalty would be *smaller* because per-tile fixed costs amortise
+worse at 2,048 tokens). It is larger.
+
+**What it does to the `BK` plan:**
+
+| BK | load gain | / 1.64 occupancy | net |
+|---|---|---|---|
+| 16 (now) | 1.00x | 1.64x | 0.61x |
+| 32 | 1.60x | 1.64x | **0.98x -- a loss** |
+| 48 | 2.00x | 1.64x | 1.22x |
+| 64 | 2.30x | 1.64x | 1.40x |
+
+**`BK = 32` is now a measured regression, not merely a weak option.** Round 34
+recommended testing it first; round 36 called it the worst choice; this confirms it
+would actively make the prefill slower.
+
+And the projections show that **bf16 Q/K staging is not a refinement but the whole
+game**:
+
+| option | net | 32K cold TTFT | vs llama.cpp |
+|---|---|---|---|
+| `BK=64`, no bf16 | 0.99x | 129.9 s | 2.92x |
+| `BK=64` + bf16 Q/K | **2.30x** | **92.4 s** | **2.07x** |
+| `BK=48` + bf16 | 2.00x | 96.6 s | 2.17x |
+| `BK=32` + bf16 | 1.60x | 104.7 s | 2.35x |
+
+Without bf16 the entire `BK` direction nets at most 1.40x, and `BK=64` without it
+comes to 0.99x -- because the load-ratio gain and the occupancy loss very nearly
+cancel at that point. **The route is `BK = 64` plus bf16 `Qs`/`Ks`, and if the bf16
+part is dropped the change is not worth making at all.** That reorders the work:
+the precision question is the prerequisite, not the follow-up, and the score matrix
+feeds a softmax, so it needs the needle and perplexity gates rather than just
+`generate`.
