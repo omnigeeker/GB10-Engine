@@ -704,3 +704,52 @@ Reproduce with:
     python bench/longctx/ttft.py --port 8080 --reps 263 --trials 2 --max-tokens 200
 
 for 8K, and `--ctx 36864 --reps 1054` for 32K.
+
+## The same fit at 32K, and what it says the two fixes are worth
+
+The per-chunk breakdown at 32K (16 chunks, 32,747 tokens, total 269.60 s against
+the server's 269.41 s) fits `t = G + k * (start + chunk/2)` with **G = 12.67 s per
+chunk and k = 2.49e-4 s per key**, to a mean absolute error of 0.21 s across all
+16 chunks:
+
+| chunk | start | measured | model |
+|---|---|---|---|
+| 0 | 0 | 12.92 s | 12.92 s |
+| 3 | 6144 | 14.16 s | 14.19 s |
+| 7 | 14336 | 16.38 s | 16.65 s |
+| 11 | 22528 | 18.87 s | 18.73 s |
+| 15 | 30720 | 20.82 s | 20.51 s |
+
+So the decomposition is:
+
+| | GEMM | attention |
+|---|---|---|
+| 8K | 49.6 s (93%) | 4.4 s (7%) |
+| 32K | **202.6 s (75%)** | **65.2 s (24%)** |
+
+This is the first time the attention's share has been measured rather than
+inferred, and it moves in the direction that makes the objective reachable. Both
+of the two remaining fixes are now costed against a measured baseline:
+
+| | 8K cold TTFT | 32K cold TTFT |
+|---|---|---|
+| now | 54 s | 268 s |
+| + tensor-core GEMM (6.1x, 43 TFLOPS) | 12.5 s | 102.4 s |
+| + GQA-fused attention (6x) | **8.9 s** | **44.1 s** |
+| vs llama.cpp | 10.58 s -> **1.19x faster** | 44.55 s -> **1.01x faster** |
+
+That is the whole remaining objective in two lines: a bf16 tensor-core GEMM buys
+almost all of it at 8K and about three quarters of it at 32K, and the GQA fusion
+closes the rest at both.
+
+**One caveat on the attention number, because it cuts against the projection.**
+17.6 TB of estimated key/value traffic divided by the measured 65.2 s attention
+term is **270 GB/s**, which is *above* the 228 GB/s DRAM peak this machine
+measures. The traffic model must therefore be over-counting, and the most likely
+reason is L2: neighbouring query blocks read heavily overlapping key ranges, so
+part of what I counted as a DRAM read is served from cache. That means a 6x cut in
+*logical* traffic will not be a 6x cut in time. At 32K it is probably a 3-4x, and
+the 1.01x column above is the optimistic end of the range -- the pessimistic end,
+at 3x, is 55.7 s, still 0.8x (i.e. 1.25x slower than llama.cpp). So 8K is the
+context where the objective is most clearly winnable, and 32K is a coin flip that
+depends on how much of that traffic is really coming from DRAM.
