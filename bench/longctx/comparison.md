@@ -18,18 +18,18 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| cold TTFT | 88.8 s | **10.58 s** | 8.4× slower |
+| cold TTFT | 85.7 s | **10.58 s** | 8.1× slower |
 | **warm TTFT** | **0.03 s** | 0.237 s | **7.9× faster** |
-| **OTPS** | **8.65** | 7.32 | **1.18× faster** |
+| **OTPS** | **8.69** | 7.32 | **1.19× faster** |
 
 ## 32K
 
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| cold TTFT | 826.1 s | **44.55 s** | 18.5× slower |
+| cold TTFT | 757.7 s | **44.55 s** | 17.0× slower |
 | **warm TTFT** | **0.05 s** | 0.29 s | **5.8× faster** |
-| **OTPS** | **7.065** | 6.865 | **1.03× faster** |
+| **OTPS** | **7.15** | 6.865 | **1.04× faster** |
 
 llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
 cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
@@ -442,3 +442,19 @@ cost is evidently dominated by something that does not shrink with the tile --
 the K and V staging and the four barriers per tile are all still there, and the
 score-loop shared reads per thread (3 pairs x 256 floats) actually grew. Tiling
 alone will not close a gap that is now 8.1x at 8K.
+
+### The 32K re-measurement after the tile change
+
+The 8K number alone understated it, so the 32K cold TTFT was re-run on the
+current binary:
+
+| | BQ=8, BK=16 | BQ=24, BK=16 |
+|---|---|---|
+| 8K cold TTFT | 88.81 s | 85.71 s (**-3.5%**) |
+| 32K cold TTFT | 826.09 s | **757.68 s** (**-8.3%**) |
+
+The gain roughly doubles from 8K to 32K, which is the signature of a change that
+attacks the quadratic term: fitting `t = 5.1072e-3*T + 5.9269e-7*T^2`, the
+quadratic coefficient falls from 5.93e-7 to about 5.30e-7 while the linear one
+is untouched. So it is a real improvement in the right place, but an 11% cut on
+the quadratic term against a 17x gap at 32K.
