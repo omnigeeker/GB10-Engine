@@ -1089,3 +1089,42 @@ therefore answers the actual question -- whether the load-ratio effect or the
 occupancy effect dominates -- with the least work and the least shared-memory risk.
 If 32 wins, 48 and 64 are worth trying; if 32 loses, the whole direction is dead and
 no amount of further tiling will rescue it.
+
+### A cheaper decisive probe than `BK = 32` (round 35)
+
+Round 34 recommended testing `BK = 32` first. That test is still confounded: raising
+`BK` changes the load ratio *and* the occupancy *and* the pair count all at once, and
+the kernel rewrite needed to express 3 rows x 2 `j` is not small. There is a smaller
+experiment that isolates the one variable in doubt.
+
+**The question is only whether the attention is occupancy-sensitive.** If it is not,
+no tiling change that costs occupancy can ever win, and the whole `BK` direction is
+dead regardless of its load-ratio arithmetic. If it is, the trade is live and worth
+the rewrite.
+
+**Probe: pad the kernel's dynamic shared-memory request and change nothing else.**
+`attn_prefill_tiled` currently asks for 43,104 B, which is what lets two blocks
+co-reside per SM. Raising the request past 50,688 B -- without touching a single line
+of kernel arithmetic -- forces one block per SM, which is exactly the cost that
+`BK = 32/48/64` would pay. The launch is numerically identical, so `generate` must
+still be 16/16 exact and nothing about the result changes; only the occupancy does.
+
+Then:
+
+| probe result | reading | next step |
+|---|---|---|
+| attention slows a lot (approaching 2x) | occupancy is the binding resource | the `BK` direction is dead; stop pursuing it |
+| attention is roughly unchanged | the load ratio is the binding resource | `BK = 32` then 64 is worth the rewrite |
+
+One API detail to settle first, and it is the only thing standing between this probe
+and an answer: the request exceeds the 48 KB default, so the launch needs
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` set on the function first, and
+`crates/gb10-cuda` does not currently set it anywhere. Round 264 hit the same wall
+from the other side -- `BQ = 16, BK = 16` needed 50,368 B and was rejected for being
+1,216 B over the default -- so wiring that attribute is worth doing regardless, since
+it is a prerequisite for every larger-tile experiment in this document.
+
+This is the same instrument-plus-control discipline that rounds 30-34 kept
+re-learning: measure the variable in isolation before paying for the rewrite. The
+probe is a host-side change of a few lines with no kernel edit, which is why it is
+worth doing before `BK = 32` rather than after.
