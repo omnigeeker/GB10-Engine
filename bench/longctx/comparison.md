@@ -323,3 +323,41 @@ The OTPS win is real but modest at 32K, and the two distributions do not
 overlap: llama.cpp's **best** sample at 32K is 6.94 against gb10's **worst** of
 7.06, and at 8K llama's best is 7.39 against gb10's worst of 8.63. The warm
 TTFT and cold TTFT gaps are far outside the noise in opposite directions.
+
+## Correcting the cold-TTFT model: prefill is compute-bound, not bandwidth-bound
+
+I had been reasoning as though a prefill forward pass is dominated by streaming
+the weights. llama.cpp's own timing log refutes that outright. From
+`/tmp/longctx/llama-8k.log`, same server, same session:
+
+| prompt | prompt eval time |
+|---|---|
+| 4 tokens | 207.40 ms |
+| 8,221 tokens | 10,330.91 ms |
+| 8,221 tokens | 10,376.80 ms |
+
+A linear fit through the 4-token and 8,221-token points gives a **fixed cost of
+about 202 ms** and a **marginal cost of 1.23 ms per token**. The weights are read
+once per forward pass, so that ~202 ms *is* the weight streaming: 28.23 GB in
+202 ms is ~139 GB/s, which is exactly the DRAM speed this box does. The
+remaining ~10.1 s at 8K is **compute**.
+
+The consequence is that the cold-TTFT gap is a FLOPS gap, not a bytes gap, and
+the arithmetic says so from both sides:
+
+| | 8K prefill | FLOP | effective |
+|---|---|---|---|
+| llama.cpp | 10.58 s (10.14 s of it compute) | 4.6e14 | ~45 TFLOPS |
+| gb10 | 88.8 s (~88.7 s compute) | 4.5e14 | **~10.7 TFLOPS** |
+
+That is the whole story: llama.cpp runs the prefill GEMMs on bf16 tensor cores
+at ~45 TFLOPS, and `kernels/gemm.cu` has no tensor-core instruction at all
+(`grep -cE "mma\.sync|wgmma"` is 0), so it does fp32 `fmaf` on CUDA cores at
+~10.7 TFLOPS -- 46% of this part's ~23 TFLOPS fp32 peak.
+
+This does not change the conclusion that cold TTFT needs tensor cores, but it
+does change where to look. The 17.6 GB of per-token weight streaming that
+dominates *decode* is a ~120 ms rounding error during prefill, so nothing about
+the prefill is helped by shrinking or re-laying-out weights. Only raising FLOPS
+helps the linear term, and only cutting the attention's redundant work helps the
+quadratic one.
