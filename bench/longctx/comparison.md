@@ -2156,3 +2156,68 @@ around the staging, GEMM and epilogue of a linear op, summed over a chunk, print
 end. Everything short of that has produced either a wrong conclusion (rounds 49, 50, 54,
 55) or an incomplete one (round 51). Until it exists, no fix should be attempted on the
 strength of a mechanism story, including the CUDA-graphs plan round 55 recommended.
+
+### The alloc hypothesis is dead in-model, and the event API for the real measurement is located (round 57)
+
+Round 56 said the only justified next step was per-phase GPU timing inside the model. This
+round first re-examined whether `tc-phase`'s largest phase was even present in the model,
+and located the API needed to measure the rest.
+
+**Allocation: not per-op, hypothesis dead.** `tc-phase` puts `alloc_zeros` at 39% of the
+mlp gate/up pipeline, which made it the leading candidate after the dequant was measured
+at 12%. But the prefill path does not allocate per op. `weights.rs:104-111` guards every
+buffer:
+
+```rust
+if sc.w.as_ref().map_or(true, |b| b.len() < n * k) {
+    sc.w = Some(stream.alloc_zeros::<bf16>(n * k)?);
+}
+```
+
+`alloc_zeros` runs only while a buffer is still growing. Once the largest shape of each of
+the three buffers has been seen -- which is the first chunk -- nothing allocates again, and
+the `Mutex<TcScratch>` is simply re-lent. So `tc-phase`'s 39% is an artifact of its own
+per-rep allocation and is **not** a cost the model pays. That is consistent with round 27,
+where making the scratch persistent bought only 1.10x: there was almost nothing to win
+because the model was already not allocating.
+
+**A pipeline accounting still does not close the gap.** Taking `tc-phase`'s phases, deleting
+the bench-only `alloc`, and scaling by the model's real per-layer op mix:
+
+| op | isolated pipeline (no alloc) |
+|---|---|
+| mlp gate/up (x2 per layer) | 13.9 ms |
+| mlp down | 6.0 ms |
+| attn q / o | 2.3 ms each |
+| attn k / v | 0.4 ms each |
+| DeltaNet q/k/v/out + gates | ~6.6 ms |
+| **full-attention layer (x16)** | ~25.3 ms |
+| **DeltaNet layer (x48)** | ~26.5 ms |
+| **per chunk** | **~1.68 s** |
+
+Against `G` = 4.02 s measured (3.53 s with the dequant deleted), that leaves a further
+**2.4x** unexplained even after every phase `tc-phase` knows about is accounted for. So the
+answer is not in the phase list either; it has to be measured, not enumerated.
+
+**The API for measuring it is available, in safe cudarc, with no raw FFI** (cudarc 0.19.9):
+
+| item | location |
+|---|---|
+| `CudaEvent` | `src/driver/safe/core.rs:532` |
+| `CudaContext::new_event` | `src/driver/safe/core.rs:551` |
+| `CudaEvent::record(&self, stream)` | `src/driver/safe/core.rs:587` |
+| `CudaEvent::synchronize` | `src/driver/safe/core.rs:596` |
+| `CudaEvent::elapsed_ms(&self, end) -> f32` | `src/driver/safe/core.rs:603` |
+| re-export | `src/driver/safe/mod.rs:11` (`cudarc::driver::CudaEvent`) |
+
+The recipe, so the next round does not have to re-derive it: in
+`Linear::forward_prefill_tensor_core`, create an event pair, `record` the start on
+`dev.stream()` before the staging call and the end after the epilogue, push the pair into a
+thread-local `Vec`, and **do not synchronize inside the op** -- events can be recorded
+asynchronously and read later. At the end of `prefill_shape`, synchronize once and sum
+`elapsed_ms` per phase. That gives GPU time per phase, summed over a chunk, which is the
+measurement rounds 53-56 named and none performed.
+
+Rounds 54-55's CPU-time evidence for launch overhead was retracted in round 56. With the
+allocation hypothesis now also closed, **no mechanism for `G`'s 2.4-3.5x is established**,
+and the event measurement is the only remaining route to one.
