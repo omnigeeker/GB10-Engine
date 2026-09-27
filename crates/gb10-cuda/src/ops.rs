@@ -514,7 +514,9 @@ impl Ops {
         // to the serial reference.
         let warp_ok = head_dim == 256;
         let (func, block) = if warp_ok {
-            (&self.attn_decode_multi, 256u32)
+            // Must match NW in `attn_decode_multi_kernel`: the block is
+            // NW warps, and each warp owns a strided slice of the keys.
+            (&self.attn_decode_multi, 1024u32)
         } else {
             (&self.attn_decode_multi_serial, block_for(head_dim, 256))
         };

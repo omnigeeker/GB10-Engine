@@ -971,7 +971,13 @@ extern "C" __global__ void attn_decode_multi_kernel(
     const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int base_stride) {
     constexpr int DPL = 8;   // dims per lane
-    constexpr int NW = 8;    // warps per block
+    // Warps per block, i.e. how many key streams are in flight per SM. The
+    // grid is only (n_q_heads, n_seq) = 24 blocks for a single sequence, so at
+    // NW = 8 a 256-thread block left just 4 warps resident per SM and the
+    // kernel ran at 328 GB/s. Raising NW raises the resident warps without
+    // changing the grid: 32 warps x 24 blocks is 4x the in-flight work for the
+    // same traffic. See `NW_MAX` for the shared-memory ceiling.
+    constexpr int NW = 32;   // warps per block
     const int h = blockIdx.x;
     const int s = blockIdx.y;
     const int warp = threadIdx.x >> 5;

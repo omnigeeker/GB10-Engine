@@ -18,18 +18,18 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| **cold TTFT** | **88.2 s** | **10.45 s** | 8.4× slower |
-| **warm TTFT** | **0.035 s** | **0.24 s** | **6.9× faster** |
-| **OTPS** | **7.81** | **7.43** | **1.05× faster** |
+| **cold TTFT** | **88.1 s** | **10.45 s** | 8.4× slower |
+| **warm TTFT** | **0.03 s** | **0.24 s** | **8.0× faster** |
+| **OTPS** | **8.65** | **7.43** | **1.16× faster** |
 
 ## 32K
 
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| **cold TTFT** | **821.9 s** | **44.3 s** | 18.6× slower |
+| **cold TTFT** | **826.1 s** | **44.3 s** | 18.6× slower |
 | **warm TTFT** | **0.05 s** | **0.27 s** | **5.4× faster** |
-| **OTPS** | **5.31** | **7.0** | 1.32× slower |
+| **OTPS** | **7.06** | **7.0** | **1.01× faster** |
 
 llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
 cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
@@ -242,3 +242,36 @@ uniform passes but needs 50,368 B, which is 1,216 B over the limit; it would fit
 under the 99 KB opt-in ceiling if the kernel were given
 `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which nothing in
 `crates/gb10-cuda` currently sets.
+
+## Why the decode attention was slow: warps, not bytes
+
+The warp-parallel decode kernel was already free of barriers inside the key
+loop, and at `--n-seq 4` it sustained ~1030 GB/s. At `--n-seq 1` the same kernel
+managed only ~344 GB/s. Same kernel, same bytes per sequence -- the difference
+is that the grid is `(n_q_heads, n_seq)`, so one sequence is **24 blocks**, and
+with an 8-warp block that is 4 resident warps per SM. There was nothing to hide
+the key-load latency with.
+
+`NW = 8 -> 32` (block 256 -> 1024 threads) fixes it without touching the grid:
+
+| keys | n_seq 1, warp kernel before | after | speedup |
+|---|---|---|---|
+| 32,768 | 4.884 ms | **1.912 ms** | 2.55× |
+| 32,768 bandwidth | ~344 GB/s | **842 GB/s** | |
+
+`decode-bench` still agrees with the serial reference (rms rel 4.16e-6) and
+`generate` is still token-exact 16/16, so widening the merge from 8 to 32 warps
+did not move any token. End to end:
+
+| context | metric | before | after |
+|---|---|---|---|
+| 8K | OTPS | 7.81 | **8.65** |
+| 32K | OTPS | 5.31 | **7.06** |
+
+At 32K the step is now 141.6 ms: ~95 ms of weight streaming at the measured
+185 GB/s, 30.6 ms of decode attention, ~16 ms of everything else. The attention
+is back to being L2-bound rather than occupancy-bound -- 1.6 GB of L2 traffic for
+268 MB of unique data, because each of the 6 query heads in a GQA group reads its
+KV head's cache independently. Fusing the group (split the keys across blocks,
+merge the online-softmax partials in a second pass) is the next lever; it should
+take the attention to the ~19 ms DRAM floor.
