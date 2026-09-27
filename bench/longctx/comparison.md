@@ -1560,3 +1560,58 @@ products in **packed half arithmetic** -- `__half2` loads with `__hfma2`, two FM
 instruction, which halves the loads *and* the converts at once, and would need the
 pairing re-derived for 2-wide lanes. That is a larger change than this round's and has not
 been attempted.
+
+### Isolation experiment: the score loop is 66% of the attention, but no resource model predicts it (round 44)
+
+Round 43's explanation for `BK=48` not helping was that fp16 conversions had become the
+bottleneck. That explanation does not survive its own numbers -- fp16 adds four `cvt` per
+three FMAs and is still *faster* than fp32 with none -- so this round measured what the
+score loop is actually worth, by halving its `d` range (`d < half / 2`), which produces
+wrong results but correct timing, and fitting the model end to end as usual:
+
+| term | fp16 `BK=16` | score loop halved | ratio |
+|---|---|---|---|
+| constant `G` | 3.947 s | 3.913 s | **0.992x -- untouched** |
+| per-key slope `k` | 2.1631e-4 | 1.4453e-4 | **0.668x** |
+
+`G` not moving is the control: the probe touches only the score loop, and only the
+context-dependent term responds. Halving the loop removed **33.2%** of the attention
+slope, so the score loop is about **66% of the attention term** -- and since the attention
+is roughly half of the 32K prefill, **the score loop alone is about a third of the entire
+32K cold TTFT.** It is by a wide margin the largest single target in the model, and
+focusing on it was the right call.
+
+**But no single-resource model explains its cost**, and the three configurations measured
+across rounds 42-43 disagree with all of them:
+
+| config | shared reqs/d | bytes/d | `cvt`/d | FMA/d | req/FMA | instr/FMA | measured |
+|---|---|---|---|---|---|---|---|
+| fp32 `BK=16` | 4 | 16 | 0 | 3 | 1.33 | 2.33 | 17.16 s |
+| fp16 `BK=16` | 4 | 8 | 4 | 3 | 1.33 | 3.67 | **15.95 s** |
+| fp16 `BK=48` | 6 | 12 | 6 | 9 | **0.67** | **2.33** | 17.00 s |
+
+| if the loop were bound by | prediction | measured |
+|---|---|---|
+| shared requests | `BK=48` ~2x faster than `BK=16` | 0.94x |
+| shared bytes | `BK=48` ~4x faster than fp32 | 1.01x |
+| instructions | fp16 1.57x *slower* than fp32 | 1.08x **faster** |
+
+Every resource we have been counting moves in the wrong direction. The one model that
+survives all three rows is that the loop is **latency-bound on the load-to-FMA dependency
+chain**, not throughput-bound on any counted resource: `BK=48` issues fewer loads and
+fewer instructions per FMA but each FMA still waits on its own load, so nothing improves.
+That is consistent with the bank-conflict fix having been worth 8.05x -- a 32-way conflict
+inflates each request's *latency* by 32 cycles, which is exactly what a latency-bound loop
+is sensitive to, and halving a *count* is not.
+
+**What this means for the next attempt.** The lever is not fewer loads per FMA; it is
+**fewer dependent steps or more independent work per load**. `__half2` loads with
+`__hfma2` are the natural candidate for the opposite reason than round 43 gave: not to cut
+instruction count, but to make one load feed two independent FMAs *that do not need the
+converted values first*, removing the `cvt` from the dependency chain entirely. The
+precision question is real (accumulating in fp16), so it needs the needle and perplexity
+gates, and the pairing has to be re-derived for 2-wide lanes because the `sub` split
+currently relies on lane-adjacent `__shfl_xor` over single elements.
+
+Reverted the isolation probe; the tree is back to fp16 `BK=16`, the best measured
+configuration.
