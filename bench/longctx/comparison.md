@@ -2320,3 +2320,49 @@ isolated rate) and the dequant (11%) both confirmed to be near their practical l
 The two `[diag]` TFLOPS fields print 0.0 because of a missing `1e9` in the display
 expression; the value is 366.8 TFLOP / 5.713 s = **64.2 TFLOP/s**, consistent with round
 58's 65.9. The measurement itself is unaffected.
+
+### MEASURED: the linear op is 46% of the prefill; the other 54% is DeltaNet and attention (round 60)
+
+Adding the fifth event (for the epilogue) completes the per-op breakdown. First attempt
+reported the epilogue as 0 ms, which was a real bug and worth recording: `evs.take()` ran
+immediately after `mark!(3)`, so the `Vec` was already drained when `mark!(4)` executed and
+the macro silently did nothing. Moving the push past the epilogue fixed it. 8K prefill,
+8225 tokens, n=2000 ops, 18.82 s:
+
+| phase | GPU time | share of prefill | standalone prediction |
+|---|---|---|---|
+| weight stage (`dequant_*`, `u16_to_bf16`) | 2083 ms | **11.1%** | 12% (round 50 probe) |
+| activation cast (`f32_to_bf16`) | 548 ms | **2.9%** | 2.5% (`tc-phase`) |
+| cuBLAS GEMM | 5532 ms | **29.4%** | 29.6% (round 58) |
+| epilogue (`bf16_to_f32_scaled`) | 569 ms | **3.0%** | 5.0% (`tc-phase`) |
+| **whole linear op** | **8.73 s** | **46.4%** | |
+| **everything else** | **10.09 s** | **53.6%** | |
+
+**All four phases now reproduce their independent predictions** (11.1 vs 12, 2.9 vs 2.5,
+29.4 vs 29.6, 3.0 vs 5.0). The linear op is fully accounted for and is **under half** the
+prefill.
+
+**And the epilogue was not the missing block.** After round 59 it looked like the obvious
+candidate for the 56% remainder -- it writes `t*n` fp32 values per op -- but it measures
+569 ms, 3.0%. It was in the remainder only because it had not been bracketed.
+
+**So the remaining 53.6% is attention plus the DeltaNet**, and the split follows from the
+round-45 attention fit: the attention slab is ~22% of the 8K prefill, leaving roughly
+
+| block | share of cold prefill |
+|---|---|
+| cuBLAS GEMM (at 84% of its isolated rate) | 29.4% |
+| **DeltaNet recurrence + gating + conv + norms + embed** | **~32%** |
+| attention kernels | ~22% |
+| weight dequant (near the 228 GB/s limit) | 11.1% |
+| activation cast + epilogue | 5.9% |
+
+**The single largest block in the cold prefill is now the DeltaNet at ~32%, and it has never
+been timed.** That is the finding this diagnostic campaign was for. Rounds 49-57 chased the
+GEMM (29%, near its ceiling), the dequant (11%, near the bandwidth limit), the allocator
+(not per-op) and the DeltaNet's *state* (0.17% of FLOPs) -- none of which is the target. The
+target is the DeltaNet's *kernels*: 48 of 64 layers, each with its conv, gating and
+recurrence launches, which no measurement in this document covers.
+
+Next: bracket the DeltaNet's forward the same way, which is now a mechanical extension of a
+mechanism validated four times over.

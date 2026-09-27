@@ -21,16 +21,16 @@ pub static GEMM_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
 
 /// Phase names, in the order `gemm_event_snapshot` returns their totals.
 /// The epilogue is not bracketed here; it is the remainder to the op total.
-pub const PHASES: [&str; 3] = ["weight stage", "activ cast", "cublas gemm"];
+pub const PHASES: [&str; 4] = ["weight stage", "activ cast", "cublas gemm", "epilogue"];
 
 /// Drain the recorded events and return (per-phase GPU ms, call count). Four
 /// events per op bracket three phases so no two phases share a boundary.
-pub fn gemm_event_snapshot() -> ([f64; 3], usize) {
+pub fn gemm_event_snapshot() -> ([f64; 4], usize) {
     let mut v = GEMM_EVENTS.lock().unwrap();
     let n = v.len();
-    let mut acc = [0.0f64; 3];
+    let mut acc = [0.0f64; 4];
     for ev in v.drain(..) {
-        for i in 0..3 {
+        for i in 0..4 {
             if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
                 acc[i] += ms as f64;
             }
@@ -160,9 +160,9 @@ impl Linear {
         let want_ev = std::env::var("GB10_GEMM_EVENTS").is_ok();
         let mut evs: Option<Vec<CudaEvent>> = None;
         if want_ev {
-            let mut t = Vec::with_capacity(4);
+            let mut t = Vec::with_capacity(5);
             let mut ok = true;
-            for _ in 0..4 {
+            for _ in 0..5 {
                 match ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
                     Ok(e) => t.push(e),
                     Err(_) => { ok = false; break; }
@@ -194,9 +194,6 @@ impl Linear {
         mark!(2);
         kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;
         mark!(3);
-        if let Some(t) = evs.take() {
-            GEMM_EVENTS.lock().unwrap().push(t);
-        }
 
         // Only NVFP4 defers a scale to the epilogue; the others pass one.
         let one = one.as_ref().unwrap();
@@ -205,6 +202,10 @@ impl Linear {
                 kern.bf16_to_f32_scaled(dev, yb, y, scale2, true, t * n)?
             }
             _ => kern.bf16_to_f32_scaled(dev, yb, y, one, false, t * n)?,
+        }
+        mark!(4);
+        if let Some(t) = evs.take() {
+            GEMM_EVENTS.lock().unwrap().push(t);
         }
         Ok(())
     }
