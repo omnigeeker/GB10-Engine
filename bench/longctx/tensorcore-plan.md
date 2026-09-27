@@ -453,5 +453,11 @@ of the ~20.2 s):
 
 | | session start | round 24 | now |
 |---|---|---|---|
-| 8K cold TTFT | 88.81 s | 22.15 s | **~20.1 s** |
-| vs llama.cpp 10.58 s | 8.4x | 2.09x | **~1.90x** |
+| 8K cold TTFT | 88.81 s | 22.15 s | **20.21 s** |
+| vs llama.cpp 10.58 s | 8.4x | 2.09x | **1.91x** |
+
+The ~20.1 s in the previous version of this table was extrapolated from
+`prefill-shape`; it is now measured through the server (`run_8k.sh`, reps=263,
+two trials): **20.17 / 20.24 s**, so the extrapolation was accurate to 0.1%.
+Warm TTFT (0.03 s) and OTPS (8.67-8.71) are unchanged, as they must be -- the
+scratch change is entirely inside the prefill GEMM.

@@ -806,7 +806,7 @@ was never touched.
 
 | context | metric | gb10 | llama.cpp | result |
 |---|---|---|---|---|
-| 8K | cold TTFT | **22.15 s** | 10.58 s | 2.09x slower (was 5.2x) |
+| 8K | cold TTFT | **20.21 s** | 10.58 s | 1.91x slower (was 5.2x) |
 | 8K | warm TTFT | **0.03 s** | 0.237 s | **7.9x faster** |
 | 8K | OTPS | **8.6** | 7.32 | **1.18x faster** |
 | 32K | cold TTFT | **134.73 s** | 44.55 s | 3.02x slower (was 6.0x) |
@@ -817,7 +817,7 @@ Progress on the one metric that is still behind, over this session:
 
 | | start of session | now | |
 |---|---|---|---|
-| 8K cold TTFT | 88.81 s (8.4x slower) | **22.15 s (2.09x slower)** | **4.0x** |
+| 8K cold TTFT | 88.81 s (8.4x slower) | **20.21 s (1.91x slower)** | **4.4x** |
 | 32K cold TTFT | 826.09 s (18.5x slower) | **134.73 s (3.02x slower)** | **6.1x** |
 
 The 32K number also checks the decomposition: 134.73 s against the fitted
