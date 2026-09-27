@@ -328,6 +328,16 @@ extern "C" __global__ void attn_prefill_kernel(
 // its dimension across all BQ rows and keeps those BQ accumulators in
 // registers.
 // ---------------------------------------------------------------------------
+// PREFILL_BQ * PREFILL_BK MUST divide evenly into the score loop's passes.
+// That loop uses two threads per (query, key) pair through
+// __shfl_xor_sync(0xffffffff), so every lane of a warp must execute the same
+// NUMBER of passes; the block is head_dim = 256 threads, so one pass consumes
+// 128 pairs. 8 * 16 = 128 is exactly one pass, which is why this blocking was
+// chosen. Retuning to 24 * 11 = 264 was measured at roughly 5x SLOWER for
+// exactly this reason: lanes 0-15 ran a third pass while 16-255 did not, and
+// the shuffle named lanes that were not executing. Raise BQ * BK only to a
+// multiple of 128, and re-check the 48 KB shared-memory budget in
+// gb10_cuda::ops::attn_prefill_tiled.
 #define PREFILL_BQ 8
 #define PREFILL_BK 16
 

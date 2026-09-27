@@ -214,3 +214,31 @@ block, so all 24 query heads stream the same K/V and the GQA group is read 6x
 over from L2 (344 GB/s of L2 traffic against 268 MB of unique DRAM data). Fusing
 the group so one block serves all 6 query heads is worth ~6x on that traffic and
 is what the next round is for.
+
+## A blocking change that had to be reverted
+
+The prefill attention kernel's query/key blocking looked like free performance.
+Shared memory is `(BQ + 2*BK) * head_dim`, so the host caps `BQ + 2*BK` at 48,
+and the kernel is latency-bound on the four `__syncthreads` per key tile rather
+than on arithmetic or bandwidth. Total time therefore goes as `1/(BQ * BK)`, and
+the shipped `8 / 16` gives only 128 of a possible ~264.
+
+Retuning to `BQ=24, BK=11` (264, and 48,448 B of the 49,152 B limit) passed the
+token-exact gate with the error unchanged at `attn_gated err/scale=4.350e-7`,
+but made an 8K prefill take **over 7 minutes** instead of 88 seconds. It was
+reverted.
+
+The constraint that was missed: the score loop assigns **two threads per
+(query, key) pair** and joins them with `__shfl_xor_sync(0xffffffff, dot, 1)`.
+One pass therefore consumes `blockDim.x / 2` = 128 pairs, and every lane of a
+warp must execute the same *number* of passes. `8 * 16 = 128` is exactly one
+pass; `24 * 11 = 264` is 2.06 passes, so lanes 0-15 run a third pass while
+16-255 do not, and the shuffle names lanes that are not executing the
+instruction. The result is both wrong and enormously slow.
+
+Anyone raising `BQ * BK` must keep it a multiple of 128 and re-check the 48 KB
+budget in `gb10_cuda::ops::attn_prefill_tiled`. `BQ=16, BK=16` is exactly two
+uniform passes but needs 50,368 B, which is 1,216 B over the limit; it would fit
+under the 99 KB opt-in ceiling if the kernel were given
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which nothing in
+`crates/gb10-cuda` currently sets.

@@ -1105,6 +1105,8 @@ impl Ops {
         start: usize,
         kv_base: usize,
     ) -> Result<()> {
+        // Must match PREFILL_BQ / PREFILL_BK in kernels/elementwise.cu. BQ * BK
+        // must also divide evenly into the score loop's passes there.
         const BQ: usize = 8;
         const BK: usize = 16;
         need(
