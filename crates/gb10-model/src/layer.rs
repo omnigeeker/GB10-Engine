@@ -221,6 +221,23 @@ impl Layer {
     }
 }
 
+/// Copy the first `n` floats of `src` into `dst`.
+///
+/// `CudaStream::memcpy_dtod` copies `src.num_bytes()` -- the whole allocation,
+/// not the live part. `Scratch` is sized for a full prefill chunk of tokens, so
+/// `sc.conv` is `conv_dim * 2048 * 4` bytes; copying it whole moved 84 MB per
+/// DeltaNet layer to produce a 40 KB result, which at 48 layers was ~34 ms of
+/// every decode token -- a quarter of the step, and the largest single cost in
+/// the layer after the GEMMs. This copies only the `conv_dim * batch` floats
+/// that the layer actually goes on to read.
+fn copy_live(dev: &Device, src: &CudaSlice<f32>, dst: &mut CudaSlice<f32>, n: usize) -> Result<()> {
+    let n = n.min(src.len()).min(dst.len());
+    let s = src.slice(..n);
+    let mut d = dst.slice_mut(..n);
+    dev.stream().memcpy_dtod(&s, &mut d)?;
+    Ok(())
+}
+
 impl DeltaNetLayer {
     /// Batched prefill over `t` prompt tokens. `x` is `[t, hidden]`.
     ///
@@ -269,7 +286,7 @@ impl DeltaNetLayer {
             conv_base,
         )?;
 
-        dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
+        copy_live(dev, &sc.conv, &mut sc.conv_ln, conv_dim * t)?;
         let q_scale = 1.0 / (kd as f32).sqrt();
         ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, 0, nk, kd, t, q_scale, 1e-6)?;
         ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, qk_dim, nk, kd, t, 1.0, 1e-6)?;
@@ -346,27 +363,52 @@ impl DeltaNetLayer {
         let conv_dim = qk_dim * 2 + cfg.linear_value_dim();
         let group = nv / nk;
 
+        // DIAGNOSTIC: GB10_OP_TIMING prints a per-op device-time breakdown for
+        // the first DeltaNet layer of the first step. Device events, not host
+        // clocks, so this is real execution time and not queueing.
+        static OP_TIMED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let prof = std::env::var_os("GB10_OP_TIMING").is_some()
+            && !OP_TIMED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let mut marks: Vec<(&'static str, gb10_cuda::CudaEvent)> = Vec::new();
+        macro_rules! mark {
+            ($n:expr) => {
+                if prof {
+                    let e = gb10_cuda::timing_event(dev)?;
+                    e.record(dev.stream())?;
+                    marks.push(($n, e));
+                }
+            };
+        }
+        mark!("start");
+
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, n_seq, hidden, eps)?;
         self.in_proj_qkv.forward(dev, &sc.hidden, &mut sc.qkv, n_seq)?;
         self.in_proj_z.forward(dev, &sc.hidden, &mut sc.z, n_seq)?;
         self.in_proj_a.forward(dev, &sc.hidden, &mut sc.a, n_seq)?;
         self.in_proj_b.forward(dev, &sc.hidden, &mut sc.b, n_seq)?;
+        mark!("proj qkv/z/a/b");
 
         let conv_stride = state.conv_stride();
         ops.conv1d_step_silu_multi(
             dev, &sc.qkv, &self.conv1d, &mut state.conv_hist, &mut sc.conv,
             conv_dim, conv_stride, n_seq,
         )?;
+        mark!("conv1d");
 
-        dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
+        copy_live(dev, &sc.conv, &mut sc.conv_ln, conv_dim * n_seq)?;
+        mark!("  copy_live");
         let q_scale = 1.0 / (kd as f32).sqrt();
         ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, 0, nk, kd, n_seq, q_scale, 1e-6)?;
+        mark!("  l2norm q");
         ops.l2norm_scale_batched(dev, &mut sc.conv_ln, conv_dim, qk_dim, nk, kd, n_seq, 1.0, 1e-6)?;
+        mark!("  l2norm k");
 
         ops.delta_gate_batched(
             dev, &sc.a, &sc.b, &self.a_log, &self.dt_bias,
             &mut sc.decay, &mut sc.beta, nv, n_seq,
         )?;
+        mark!("delta_gate");
 
         let rec_stride = state.rec_stride();
         ops.gated_delta_rule_step_multi(
@@ -374,15 +416,30 @@ impl DeltaNetLayer {
             &sc.decay, &sc.beta, &mut state.rec, &mut sc.attn,
             nv, nk, group, rec_stride, n_seq,
         )?;
+        mark!("delta_step");
 
         ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, n_seq * nv, vd, eps)?;
         self.out_proj.forward(dev, &sc.gnorm, &mut sc.proj, n_seq)?;
+        mark!("rmsnorm_gated+out_proj");
 
         ops.add(dev, x, &sc.proj, &mut sc.res, n_seq * hidden)?;
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, n_seq, hidden, eps)?;
+        mark!("add+rmsnorm");
+
         self.mlp
             .forward(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, n_seq)?;
+        mark!("mlp");
         ops.add(dev, &sc.res, &sc.down, out, n_seq * hidden)?;
+        mark!("add out");
+
+        if prof {
+            let mut line = String::new();
+            for w in marks.windows(2) {
+                let ms = w[0].1.elapsed_ms(&w[1].1).unwrap_or(f32::NAN);
+                line.push_str(&format!("{}={:.3} ", w[1].0, ms));
+            }
+            eprintln!("  op breakdown (ms): {line}");
+        }
         Ok(())
     }
 }
@@ -798,7 +855,7 @@ impl DeltaNetLayer {
         // QUERY ONLY (`query = query / query.shape[-1]**0.5` in
         // torch_recurrent_gated_delta_rule); the key is normalised and left
         // alone. Scaling both is a silent 1/sqrt(128) error on every key.
-        dev.stream().memcpy_dtod(&sc.conv, &mut sc.conv_ln)?;
+        copy_live(dev, &sc.conv, &mut sc.conv_ln, conv_dim)?;
         let q_scale = 1.0 / (kd as f32).sqrt();
         ops.l2norm_scale(dev, &mut sc.conv_ln, 0, nk, kd, q_scale, 1e-6)?;
         ops.l2norm_scale(dev, &mut sc.conv_ln, qk_dim, nk, kd, 1.0, 1e-6)?;

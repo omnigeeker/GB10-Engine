@@ -18,18 +18,18 @@ model answering in two tokens and makes OTPS an average over ~198 intervals.
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 8,225 | 8,263 | — |
-| **cold TTFT** | **88.9 s** | **10.45 s** | 8.5× slower |
+| **cold TTFT** | **88.3 s** | **10.45 s** | 8.4× slower |
 | **warm TTFT** | **0.035 s** | **0.24 s** | **6.9× faster** |
-| **OTPS** | **2.34** | **7.43** | 3.2× slower |
+| **OTPS** | **5.94** | **7.43** | 1.25× slower |
 
 ## 32K
 
 | metric | gb10-server | llama.cpp | ratio |
 |---|---|---|---|
 | prompt tokens | 32,747 | 32,785 | — |
-| **cold TTFT** | **821.0 s** | **44.3 s** | 18.5× slower |
+| **cold TTFT** | **822.1 s** | **44.3 s** | 18.6× slower |
 | **warm TTFT** | **0.05 s** | **0.27 s** | **5.4× faster** |
-| **OTPS** | **3.13** | **7.0** | 2.2× slower |
+| **OTPS** | **4.43** | **7.0** | 1.58× slower |
 
 llama.cpp's 32K numbers are the mean of three trials (43.55 / 44.85 / 44.46
 cold, 0.29 / 0.28 / 0.25 warm). gb10's cold TTFT is unchanged by the prefix
@@ -37,8 +37,33 @@ cache, which is the point of it: a cold request has nothing to resume from.
 
 **Warm TTFT is won.** It was 821 s at 32K — byte-identical to cold, because the
 server wiped its own cache every request — and is now 0.05 s, faster than
-llama.cpp's 0.27 s. At 8K it is 0.035 s against 0.24 s. The two numbers below
-are what the two mechanisms bought, separately.
+llama.cpp's 0.27 s. At 8K it is 0.035 s against 0.24 s.
+
+## The batch-size bug
+
+`step_batch` returned `memcpy_dtov(&state.idx)` unchanged, and `state.idx` is
+`state.n_seq` entries long — not the `n_seq` the caller actually passed in. The
+server's decode loop feeds that result straight back in as the next step's
+tokens, so a group of 1 was promoted to a group of `state.n_seq` on its second
+step and stayed there.
+
+The answers were unaffected, because the extra slots are idle and nothing reads
+them, which is exactly why it survived: `batch-parity` passes 16 real sequences,
+so it always exercised the correct path. What it broke was the cost.
+
+`GB10_STEP_TIMING=1` prints the split, and it is unambiguous:
+
+| | submit | drain | total | slots |
+|---|---|---|---|---|
+| before | 100.4 ms | 324.5 ms | 424.8 ms | 16 |
+| after | 33.2 ms | 106.3 ms | 139.6 ms | 1 |
+
+A lone request was doing **16× the work**, which is why its per-token cost was
+flat against both context length and batch size, and why starting the server
+with a larger `--concurrency` made OTPS *worse* (16 slots at 8K measured 2.34
+tok/s, 8 slots at 32K measured 3.13). After the fix the drain is 106 ms against
+the 94.8 ms that `gb10-bench stream` measures for streaming all the weights at
+185 GB/s — the decode step is now within 12% of its bandwidth roofline.
 
 ## The prefix cache
 
@@ -99,19 +124,31 @@ spends its time. Working back from the measured numbers at 8K:
 
 * all 21.9 GB of weights, streamed once per token at the measured 228 GB/s, is
   **96 ms** — a hard floor of ~10.4 tok/s;
-* attention, at the warp kernel's 1.58 ms per layer × 16, is **~25 ms**;
-* measured is ~430 ms/token.
+* attention, at the warp kernel's 1.17 ms per layer × 16, is **~19 ms**;
+* `gb10-bench stream` measures the whole weight set streaming in **94.8 ms at
+  185 GB/s (81% of peak)**;
+* after the batch-size fix the full step is **140 ms**, of which 106 ms is
+  device drain — within 12% of that streaming floor.
 
-So most of the decode step is neither weights-at-peak nor attention, and that is
-why OTPS is 3.2× off rather than 6×. Note also that the server decodes a single
-request through a 24-block grid — one block per query head — on a GPU with 48
-SMs, so the decode kernels are running at half occupancy before anything else is
-considered. Sizing that grid to the work is the next thing to look at.
+So at 8K the decode step is essentially at its bandwidth roofline, and the
+remaining 45 ms is the non-GEMM kernels plus host submission. At 32K attention
+is no longer negligible — 4.88 ms per layer × 16 = **78 ms** of a 226 ms step —
+and that is where OTPS's remaining 1.58× lives.
 
 ## Cold TTFT
 
-Prefill cost is `≈5.11 ms·T + 5.93e-7·T²`, so the 8.5× at 8K and 18.5× at 32K
-are both dominated by kernels that are behind llama.cpp's, in the projections as
-well as in attention: short-context prefill runs at ~7.2 TFLOPS against
-llama.cpp's ~40. The tiled attention kernel is the other half, and it still
-reads K/V once per query head and keeps the cache in f32.
+Prefill cost is `≈5.11 ms·T + 5.93e-7·T²`. The quadratic term is not attention
+*arithmetic* — it is attention *traffic*. The tiled kernel runs one block per
+query head, so all 24 query heads independently stream the same K/V, and the
+cache is f32:
+
+* at 8K the quadratic term is 40 s of the 88 s total;
+* at 32K it is 636 s of 822 s.
+
+Against a 6× GQA redundancy (24 query heads over 4 KV heads) and 2× from f32,
+the same K/V is being read about 12× more than it needs to be. llama.cpp sits at
+~40 TFLOPS on prefill against gb10's ~7, and no amount of fp32 CUDA-core
+tuning can close that: `gemm.cu` uses no tensor cores at all — no `mma.sync`, no
+`wgmma`, no `__hfma2`, just scalar `fmaf`. Reaching llama.cpp's prefill rate
+means bf16 or tf32 tensor cores, which is a numerical change, not just a
+scheduling one.

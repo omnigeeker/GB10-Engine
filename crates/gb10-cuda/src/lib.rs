@@ -14,9 +14,21 @@ use cudarc::nvrtc::Ptx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub use cudarc::driver::{CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits};
+pub use cudarc::driver::{CudaEvent, CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits};
 pub use kernels::Kernels;
 pub use ops::Ops;
+
+/// A CUDA event with timing enabled.
+///
+/// `CudaContext::new_event` defaults to `CU_EVENT_DISABLE_TIMING`, and under
+/// that flag `CudaEvent::elapsed_ms` returns a meaningless number rather than
+/// failing. Anything that reports a duration must get its events from here.
+pub fn timing_event(dev: &Device) -> std::result::Result<CudaEvent, CudaError> {
+    Ok(dev
+        .stream()
+        .context()
+        .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?)
+}
 
 /// PTX files produced by `build.rs`, colon separated.
 const KERNEL_PTX: &str = env!("GB10_KERNEL_PTX");

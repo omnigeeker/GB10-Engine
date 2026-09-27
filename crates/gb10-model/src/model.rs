@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use gb10_core::config::ModelConfig;
-use gb10_cuda::{CudaSlice, Device};
+use gb10_cuda::{timing_event, CudaEvent, CudaSlice, Device};
 
 use crate::layer::{Layer, LayerState, Scratch};
 use crate::weights::{Linear, Store};
@@ -286,6 +286,19 @@ impl Model {
         // GPU then takes to finish it. If submit dominates, the step is
         // launch-bound and no kernel optimisation will help.
         let submit_t0 = std::time::Instant::now();
+        // CUDA events bracket the same region as `submit_t0`, so the pair
+        // separates "host spent this long issuing work" from "the device spent
+        // this long executing it". Without the device number the two cannot be
+        // told apart: a step that is 25% host time and one that is entirely
+        // device time look identical from the outside.
+        let ev = if std::env::var_os("GB10_STEP_TIMING").is_some() {
+            Some((timing_event(dev)?, timing_event(dev)?))
+        } else {
+            None
+        };
+        if let Some((a, _)) = &ev {
+            a.record(dev.stream())?;
+        }
         dev.stream().memcpy_htod(&ids, &mut state.tokens_dev)?;
         dev.ops().embed_gather_batched(
             dev,
@@ -296,8 +309,23 @@ impl Model {
             n_seq,
         )?;
 
+        // Per-layer device events, so the two layer kinds can be compared in
+        // bytes-per-second rather than in milliseconds. DIAGNOSTIC ONLY: it
+        // creates 65 events per step, which is why it is behind its own flag.
+        let layer_timing = std::env::var_os("GB10_LAYER_TIMING").is_some();
+        let mut evs: Vec<CudaEvent> = Vec::new();
+        if layer_timing {
+            let e = timing_event(dev)?;
+            e.record(dev.stream())?;
+            evs.push(e);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             layer.forward_batch(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, n_seq)?;
+            if layer_timing {
+                let e = timing_event(dev)?;
+                e.record(dev.stream())?;
+                evs.push(e);
+            }
             std::mem::swap(&mut state.a, &mut state.b);
         }
 
@@ -316,15 +344,38 @@ impl Model {
 
         state.n_tokens += 1;
         let submit = submit_t0.elapsed().as_secs_f64();
+        if let Some((_, b)) = &ev {
+            b.record(dev.stream())?;
+        }
         let v = dev.stream().memcpy_dtov(&state.idx)?;
         dev.check_err()?;
-        if std::env::var_os("GB10_STEP_TIMING").is_some() {
-            let total = submit_t0.elapsed().as_secs_f64();
+        if layer_timing && evs.len() == self.layers.len() + 1 {
+            let (mut d, mut f, mut nf) = (0.0f32, 0.0f32, 0usize);
+            for i in 0..self.layers.len() {
+                let ms = evs[i].elapsed_ms(&evs[i + 1]).unwrap_or(f32::NAN);
+                if (i + 1) % 4 == 0 {
+                    f += ms;
+                } else {
+                    d += ms;
+                    nf += 1;
+                }
+            }
             eprintln!(
-                "  step: submit {:.1} ms, drain {:.1} ms, total {:.1} ms (n_seq {n_seq})",
+                "  layers: {nf} delta {:.1} ms (avg {:.2}), {} full {:.1} ms (avg {:.2})",
+                d,
+                d / nf as f32,
+                self.layers.len() - nf,
+                f,
+                f / (self.layers.len() - nf) as f32
+            );
+        }
+        if let Some((a, b)) = &ev {
+            let gpu = a.elapsed_ms(b).unwrap_or(f32::NAN);
+            eprintln!(
+                "  step: host {:.1} ms, device {:.1} ms, wall {:.1} ms (n_seq {n_seq})",
                 submit * 1e3,
-                (total - submit) * 1e3,
-                total * 1e3
+                gpu,
+                submit_t0.elapsed().as_secs_f64() * 1e3,
             );
         }
         // Truncate to the batch. `state.idx` is `state.n_seq` long, so returning
