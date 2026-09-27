@@ -740,6 +740,14 @@ fn cublas_gemm() -> Result<()> {
         ("mlp down", 5120, 17408, 2048),
         ("lm_head", 248320, 5120, 2048),
         ("attn q_proj", 6144, 5120, 2048),
+        // The model's small projections. Round 51 concluded that G's 3.2x gap is
+        // the difference between this benchmark's shapes and the model's real mix,
+        // so the small ones have to be measured rather than assumed.
+        ("attn o_proj", 5120, 6144, 2048),
+        ("attn k_proj", 1024, 5120, 2048),
+        ("attn v_proj", 1024, 5120, 2048),
+        ("small n, short t", 1024, 5120, 256),
+        ("mlp gate/up t=256", 17408, 5120, 256),
     ] {
         let w = dev.stream().alloc_zeros::<bf16>(n * k)?;
         let x = dev.stream().alloc_zeros::<bf16>(t * k)?;

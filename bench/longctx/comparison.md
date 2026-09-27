@@ -1888,3 +1888,58 @@ structural story is worth one cheap parameter sweep before it is written down as
 (round 37 vs here).
 
 Reverted the diagnostic change; `prefill_shape` keeps its hardcoded `n_seq = 10`.
+
+### The model's real GEMM shapes are efficient, so `G` is 6.5 ms/op of per-call overhead (round 52)
+
+Round 51 concluded the 3.2x gap in `G` was "small-shape GEMM efficiency plus per-call
+overhead", and that the first half needed the model's actual shapes measured. `cublas-gemm`
+had only four shapes, all with large `n`; it now also sweeps the model's small projections
+and a short-`t` case:
+
+| shape | n | t | TFLOP/s |
+|---|---|---|---|
+| mlp gate/up | 17408 | 2048 | 77.7 |
+| mlp down | 5120 | 2048 | 85.0 |
+| attn q_proj | 6144 | 2048 | 80.9 |
+| attn o_proj | 5120 | 2048 | 81.8 |
+| **attn k_proj** | **1024** | 2048 | **74.8** |
+| **attn v_proj** | **1024** | 2048 | **82.0** |
+| mlp gate/up | 17408 | **256** | **42.8** |
+| attn k_proj | 1024 | **256** | 55.9 |
+
+**Small `n` is fine** -- the k/v projections at n=1024 reach 74.8-82.0 TFLOP/s, so the
+"many small GEMMs" half of round 51's explanation is wrong. What actually costs is short
+`t`: the same large shape drops to 42.8 TFLOP/s at t=256.
+
+**But that does not explain `G` either, and this is the decisive number.** `G`'s 4.014 s
+per chunk against 89.3 TFLOP of prefill FLOPs implies **22.3 TFLOP/s effective -- and the
+worst shape measured, 42.8 TFLOP/s, is 1.9x better than that.** Nothing about shape
+efficiency can produce 22.3 TFLOP/s from shapes that never go below 42.8.
+
+So the elimination is now complete:
+
+| candidate | status |
+|---|---|
+| GEMM arithmetic (89.3 TFLOP/chunk) | 1.12 s at 80 TFLOP/s -- the floor |
+| dequantization | 12% of `G` (round 50, measured) |
+| Gated-DeltaNet per-sequence state | flat in `n_seq` (round 51, measured) |
+| small-`n` shapes | 74.8-82.0 TFLOP/s (measured above) |
+| short-`t` shapes | 42.8 TFLOP/s worst case (measured above) |
+| **the remainder** | **2.90 s per chunk = 6.5 ms per linear op** |
+
+There are ~448 linear ops per chunk (64 layers x 7 projections: q, k, v, o, gate, up,
+down; the DeltaNet layers' own projections add to that). Dividing the unexplained time by
+them gives **6.5 ms of non-GEMM cost per linear op**. Per-call allocation and staging is
+the only thing left that scales that way, and it is also the one thing the code makes
+obvious: `forward_prefill_tensor_core` grows its scratch, dequantizes into it, converts
+the activations, calls cuBLAS, then converts back -- per op, per chunk.
+
+Note this contradicts the conclusion drawn in round 27, where a persistent 321 MB scratch
+bought only 1.10x and I inferred that `tc-phase`'s allocation pattern was overstating the
+model's cost. The measurement here says the per-op overhead is still there in full. One of
+those two readings is wrong, and the way to settle it is to time the staging phases
+**inside the model** rather than in either benchmark -- the same distinction that has now
+caught this document out three times.
+
+**The `cublas-gemm` shape sweep is kept** -- it is a permanent record of the shape
+efficiency curve, and it is what turned this from a guess into an elimination.
