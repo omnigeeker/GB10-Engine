@@ -5648,3 +5648,28 @@ numbers (delta 70.1%, attn 29.0%) are `prefill-shape` output, so the 8K split is
 this is not an extrapolation between contexts. **The projection that is an extrapolation is round
 66's 17x**, which has never been measured; the point here is only that the *requirement* is 1.71x,
 so a rewrite that delivers even a quarter of round 66's projection still wins 8K.
+
+### Round 126: the DeltaNet prefill path is the chunked kernel, with no fallback to check
+
+Round 125 put the chunked DeltaNet rewrite first on cost grounds (1.71x needed at 8K against
+round 66's 17x projection). The same cheap check that round 121 ran on the prefill attention --
+**is the slow path a dispatch problem?** -- applies here, and for the same reason: several of this
+session's wins have been of that shape.
+
+**It is not.** `crates/gb10-model/src/layer.rs:307` calls `ops.gated_delta_rule_chunk` with the full
+token count for the prefill path, and there is no size-dependent branch back to
+`gated_delta_rule_step_multi` (decode, `layer.rs:414`) or `gated_delta_rule_step` (`:870`), both of
+which are per-token. **So prefill already uses the chunked kernel at every length, and the measured
+DeltaNet cost is that kernel's real cost.**
+
+**That closes the cheap alternatives for DeltaNet as well**, and leaves the work itself. It is worth
+recording that both of the two remaining items have now had their dispatch checked and are not
+falling through to a slower kernel: **the remaining work on this objective is genuinely kernel
+optimization in both cases, not configuration.**
+
+**Its shape is also known from this session's own history.** All three accepted DeltaNet
+improvements were traffic removals rather than arithmetic changes -- 4-way chains, `Sc[D]` held in
+registers, `qh` moved to shared memory -- so the next increment should be looked for in the same
+place: a redundant load or a redundant shared-memory round trip in the chunk kernel's inner loops,
+not a change to the recurrence itself. **And the bar is low: 1.71x wins 8K outright, which is a
+quarter of what round 66 projected the rewrite at.**
