@@ -2759,3 +2759,46 @@ becomes the second target.
 along `T`, costing 31.5 us per token per layer with perfect linearity, and worth 12.4 s of
 the 8K prefill and ~47 s of the 32K prefill. The chunked rewrite is not one option among
 several -- it is the only measurement that has ever moved.
+
+### WIN: the state column belongs in registers -- DeltaNet -17%, whole prefill -12% (round 69)
+
+Rounds 65, 67 and 68 rejected the block count, the within-token chains and any per-chunk
+overhead, leaving the 2048 sequential steps as the cost. But those steps are 100 GFLOP/s
+while doing only 3.15 MFLOP of arithmetic each -- so the question was what the block is
+waiting on *inside* a step.
+
+The answer was in the data layout. Each thread owns exactly one column `j` of the state, and
+a column is exactly `D` floats -- but the state lived in 66 KB of shared memory
+(`__shared__ float S[D][D+1]`), so **every fma in both hot loops did a shared load and a
+shared store**. Per thread per token that is 512 shared accesses for 256 fmas, and the two
+loops are the entire cost of the kernel.
+
+Since a column is per-thread private and exactly `D` floats, it fits in registers. Moving it
+there (`float Sc[D]`, unrolled load and store, `sk` left in shared because every column
+needs it) removes every shared access from both inner loops.
+
+**Correctness is exact** -- `generate --oracle` reports `exact match`.
+
+| | round 63/65 | round 67 (4-way chains) | **round 69 (registers)** |
+|---|---|---|---|
+| DeltaNet layers | 13.29 / 13.17 s | 12.80 / 12.65 s | **10.56 / 10.55 s** |
+| full-attention layers | 5.50 / 5.53 s | 5.49 / 5.41 s | 5.53 / 5.51 s |
+| **total prefill** | 18.87 / 18.96 s | 18.44 / 18.22 s | **16.26 / 16.22 s** |
+
+**-17% on the DeltaNet, -12% on the whole prefill**, reproduced in both runs.
+
+The per-token cost falls from **31.5 to 26.4 us per token per layer** (2.6 s per 2048-token
+chunk, against 3.10 s in round 68's sweep). Still 0.75% of fp32 peak, so most of the cost
+remains -- but for the first time in this document a *change* to the recurrence has moved
+the number by more than a few percent, and it confirms that the kernel's cost is memory
+traffic, not arithmetic and not the number of blocks.
+
+This also re-orders the remaining work, and it is worth stating plainly:
+
+- The two cheap structural fixes together took the 8K prefill from 18.87 s to 16.24 s, i.e.
+  from 1.79x slower than llama.cpp to **1.53x slower**.
+- The chunked rewrite is still the big one -- at the original 2 TFLOP/s target it is worth
+  ~12 s of this prefill -- but the gap it has to close is now smaller, and the register
+  change is evidence about *why* the current kernel is slow (traffic per step), which is
+  also the reason a chunked form will win: it does `C` tokens per pass over the state
+  instead of one.

@@ -845,12 +845,19 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     const int j = threadIdx.x;
     const int kh = hv / group;
 
-    __shared__ float S[D][D + 1];
+    // Thread `j` reads and writes only column `j` of the state, and the column is
+    // exactly D floats -- so it fits in registers and never needs shared memory.
+    // The old form put S in 66 KB of shared and touched it twice per fma (one
+    // load, one store) in both hot loops; the kernel then ran at 0.6% of fp32
+    // peak (round 66) with no per-chunk overhead to trim (round 68). Holding the
+    // column in registers removes all of that traffic from the inner loops.
+    // `sk` stays shared: it is the one input every column needs.
     __shared__ float sk[D];
 
     float* __restrict__ sh = state + base + ((size_t)b * n_v_heads + hv) * D * D;
-    for (int i = threadIdx.x; i < D * D; i += blockDim.x) S[i / D][i % D] = sh[i];
-    __syncthreads();
+    float Sc[D];
+#pragma unroll
+    for (int i = 0; i < D; ++i) Sc[i] = sh[(size_t)i * D + j];
 
     for (int t = 0; t < T; ++t) {
         const float* __restrict__ row = qkv + (size_t)(b * T + t) * row_stride;
@@ -872,14 +879,14 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
         // Only the summation order changes; the result is equal to fp32 rounding.
         float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
         for (int i = 0; i < D; i += 4) {
-            const float s0 = S[i][j] * dec;
-            const float s1 = S[i + 1][j] * dec;
-            const float s2 = S[i + 2][j] * dec;
-            const float s3 = S[i + 3][j] * dec;
-            S[i][j] = s0;
-            S[i + 1][j] = s1;
-            S[i + 2][j] = s2;
-            S[i + 3][j] = s3;
+            const float s0 = Sc[i] * dec;
+            const float s1 = Sc[i + 1] * dec;
+            const float s2 = Sc[i + 2] * dec;
+            const float s3 = Sc[i + 3] * dec;
+            Sc[i] = s0;
+            Sc[i + 1] = s1;
+            Sc[i + 2] = s2;
+            Sc[i + 3] = s3;
             kv0 = fmaf(s0, sk[i], kv0);
             kv1 = fmaf(s1, sk[i + 1], kv1);
             kv2 = fmaf(s2, sk[i + 2], kv2);
@@ -890,14 +897,14 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
 
         float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
         for (int i = 0; i < D; i += 4) {
-            const float s0 = fmaf(sk[i], delta, S[i][j]);
-            const float s1 = fmaf(sk[i + 1], delta, S[i + 1][j]);
-            const float s2 = fmaf(sk[i + 2], delta, S[i + 2][j]);
-            const float s3 = fmaf(sk[i + 3], delta, S[i + 3][j]);
-            S[i][j] = s0;
-            S[i + 1][j] = s1;
-            S[i + 2][j] = s2;
-            S[i + 3][j] = s3;
+            const float s0 = fmaf(sk[i], delta, Sc[i]);
+            const float s1 = fmaf(sk[i + 1], delta, Sc[i + 1]);
+            const float s2 = fmaf(sk[i + 2], delta, Sc[i + 2]);
+            const float s3 = fmaf(sk[i + 3], delta, Sc[i + 3]);
+            Sc[i] = s0;
+            Sc[i + 1] = s1;
+            Sc[i + 2] = s2;
+            Sc[i + 3] = s3;
             o0 = fmaf(s0, qh[i], o0);
             o1 = fmaf(s1, qh[i + 1], o1);
             o2 = fmaf(s2, qh[i + 2], o2);
@@ -908,7 +915,8 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
         __syncthreads();
     }
 
-    for (int i = threadIdx.x; i < D * D; i += blockDim.x) sh[i] = S[i / D][i % D];
+#pragma unroll
+    for (int i = 0; i < D; ++i) sh[(size_t)i * D + j] = Sc[i];
 }
 
 // Batched `deinterleave_heads`: src is [T, n_heads * 2 * head_dim].
