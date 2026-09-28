@@ -3722,3 +3722,52 @@ this document still predates this change and must be re-run before any of its nu
 quoted again. The prediction recorded in round 85 was 128K decode 290 -> ~212 ms against
 llama.cpp's 207; the kernel number above is consistent with that, but **it is not the
 measurement.** That re-run is the next step.
+
+### THE fp16 KV CACHE WAS REVERTED: it passed every gate and still lost 22% on cold TTFT (round 87)
+
+The round-86 change was correct and measured faster at the kernel level, and it made the
+objective's numbers worse. Both statements are true, and the second one decides.
+
+**The measurement.** The 32K server run, same harness, same request, two independent runs
+after the change:
+
+| 32K | fp32 KV (round 74) | **fp16 KV (rounds 87, two runs)** | change |
+|---|---|---|---|
+| cold TTFT | 90.54 s | **109.89 / 110.32 s** | **+22%** |
+| warm TTFT | 0.05 s | 0.06 / 0.06 s | unchanged |
+| OTPS | 7.14 | **6.45 / 6.46** | **-10%** |
+
+The two runs agree to 0.4% on cold TTFT and 0.2% on OTPS, so this is not noise -- and it is
+reproducible in the opposite direction from the round-85 prediction (which said 290 -> 212 ms
+at 128K, i.e. a win). **The change has been reverted** (`git revert` of the code commit; all
+gates re-run on the fp32 code).
+
+**Why the kernel bench misled, and this is the part worth keeping.** `decode-bench` showed a
+clean 1.64x kernel speedup (1.677 -> 1.024 ms, 961 -> 1572 GB/s). Two things were wrong with
+reading that as a win:
+
+1. **The bench's working set is L2-resident.** At 8192 keys the fp16 cache is
+   8192 x 4 x 256 x 2 B x 2 = 33.5 MB, so the bench measures L2 bandwidth, not DRAM. Halving
+   the bytes halves *L2* traffic too, which is why the kernel looks 1.64x faster there. The
+   real 128K case is DRAM-bound, where the ratio is different.
+2. **The conversion is not free, and the prefill is not bandwidth-bound.** Every cache read is
+   now a 2-byte load plus a `__half2float`. Round 75 measured the prefill attention at 5.0
+   TFLOP/s -- 13.5% of fp16 peak -- so it is latency- and instruction-bound, not byte-bound.
+   **Removing bytes it was not waiting on, while adding an instruction to every load, makes it
+   slower, and it does so at 32K where attention is only ~26% of the prefill.** At 128K, where
+   attention is 77%, the same mechanism should hurt more, not less -- which is the opposite of
+   what the round-85 arithmetic assumed.
+
+**The lesson generalises and is the third instance of it in this document.** Round 55 inferred
+"CPU-bound" from process user time; round 76 sized the KV traffic in fp16 when the cache was
+fp32; and now round 85 predicted a win from a bandwidth bound that the kernel was not sitting
+against. **In each case the error was reasoning from a bound instead of measuring the thing,
+and in each case the fix was to measure in the model.** The rule this document should have
+been following all along: a standalone kernel bench is evidence about that kernel, not about
+the pipeline, and a 1.64x kernel win is not a 1.64x end-to-end win until the server says so.
+
+**What this leaves standing.** The scorecard values in the table above are the fp32 numbers
+again, since the code is back to fp32 -- so no re-measurement of the other contexts is needed
+and the 8K/32K/128K/256K table is valid as recorded. The remaining gap is unchanged and still
+localized: **cold TTFT and OTPS both lose through the attention term, at every context, and
+the fix has to reduce the attention's *time*, not merely its bytes.**

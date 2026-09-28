@@ -256,7 +256,7 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
 // flash-attention kernel for real prefill throughput (M6).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void attn_prefill_kernel(
-    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int start, int kv_base) {
     const int h = blockIdx.x;
@@ -281,7 +281,7 @@ extern "C" __global__ void attn_prefill_kernel(
     // simple, but quadratic in T. Replaced by a tiled kernel in M6.
     for (int s = 0; s <= win; ++s) {
         const float kv_ = active
-            ? __half2float(k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f;
+            ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kv_) * scale;
         if (d == 0) scores[s] = dot;
         __syncthreads();
@@ -299,7 +299,7 @@ extern "C" __global__ void attn_prefill_kernel(
         float acc = 0.0f;
         for (int s = 0; s <= win; ++s) {
             const float p = __expf(scores[s] - mx) * inv;
-            acc = fmaf(p, __half2float(v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d]), acc);
+            acc = fmaf(p, v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * head_dim + d], acc);
         }
         out[((size_t)t * n_q_heads + h) * head_dim + d] = acc;
     }
@@ -353,7 +353,7 @@ extern "C" __global__ void attn_prefill_kernel(
 #define PREFILL_BK 16
 
 extern "C" __global__ void attn_prefill_tiled_kernel(
-    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int start, int kv_base) {
     extern __shared__ float smem[];
@@ -437,10 +437,10 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            Ks[j * PS + d + (d >= HD / 2 ? 2 : 0)] =
+            Ks[j * PS + d + (d >= HD / 2 ? 2 : 0)] = __float2half(
                 (s <= win_max)
                     ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
-                    : __float2half(0.0f);
+                    : 0.0f);
         }
         // This thread's column of V, held in registers. Consecutive threads read
         // consecutive addresses, so each of the BK loads is one 128-byte
@@ -450,7 +450,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int j = 0; j < PREFILL_BK; ++j) {
             const int s = s0 + j;
             vr[j] = (s <= win_max)
-                        ? __half2float(v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + tid])
+                        ? v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + tid]
                         : 0.0f;
         }
         __syncthreads();
@@ -622,8 +622,8 @@ extern "C" __global__ void deinterleave_heads_kernel(const float* __restrict__ s
 // of weights streamed per token.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
-                                              const __half* __restrict__ k_cache,
-                                              const __half* __restrict__ v_cache,
+                                              const float* __restrict__ k_cache,
+                                              const float* __restrict__ v_cache,
                                               float* __restrict__ out, int n_keys,
                                               int n_q_heads, int n_kv_heads, int head_dim,
                                               float scale, int base, int q_off) {
@@ -640,14 +640,14 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
     float mx = -INFINITY, sum = 0.0f, acc = 0.0f;
     for (int s = 0; s < n_keys; ++s) {
         const float kk =
-            active ? __half2float(k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f;
+            active ? k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kk) * scale;
         const float m_new = fmaxf(mx, dot);
         const float corr = __expf(mx - m_new);
         const float p = __expf(dot - m_new);
         sum = sum * corr + p;
         acc = fmaf(p,
-                   active ? __half2float(v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f,
+                   active ? v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] : 0.0f,
                    acc * corr);
         mx = m_new;
     }
@@ -658,14 +658,14 @@ extern "C" __global__ void attn_decode_kernel(const float* __restrict__ q,
 // Append one token's k/v row into the cache at position `pos`.
 extern "C" __global__ void kv_cache_append_kernel(const float* __restrict__ k,
                                                   const float* __restrict__ v,
-                                                  __half* __restrict__ k_cache,
-                                                  __half* __restrict__ v_cache, int pos,
+                                                  float* __restrict__ k_cache,
+                                                  float* __restrict__ v_cache, int pos,
                                                   int n_kv_heads, int head_dim, int base, int src_off) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = n_kv_heads * head_dim;
     if (i >= n) return;
-    k_cache[base + (size_t)pos * n + i] = __float2half(k[src_off + i]);
-    v_cache[base + (size_t)pos * n + i] = __float2half(v[src_off + i]);
+    k_cache[base + (size_t)pos * n + i] = k[src_off + i];
+    v_cache[base + (size_t)pos * n + i] = v[src_off + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -817,16 +817,16 @@ extern "C" __global__ void rope_neox_batched_kernel(float* __restrict__ q,
 // k/v are [T, n_kv_heads * head_dim]; appended starting at `start_pos`.
 extern "C" __global__ void kv_cache_append_batched_kernel(const float* __restrict__ k,
                                                           const float* __restrict__ v,
-                                                          __half* __restrict__ k_cache,
-                                                          __half* __restrict__ v_cache,
+                                                          float* __restrict__ k_cache,
+                                                          float* __restrict__ v_cache,
                                                           int start_pos, int n_kv_heads,
                                                           int head_dim, int base) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int n = n_kv_heads * head_dim;
     if (i >= n) return;
     const int t = blockIdx.y;
-    k_cache[base + (size_t)(start_pos + t) * n + i] = __float2half(k[(size_t)t * n + i]);
-    v_cache[base + (size_t)(start_pos + t) * n + i] = __float2half(v[(size_t)t * n + i]);
+    k_cache[base + (size_t)(start_pos + t) * n + i] = k[(size_t)t * n + i];
+    v_cache[base + (size_t)(start_pos + t) * n + i] = v[(size_t)t * n + i];
 }
 
 // The Gated DeltaNet recurrence is the one part of prefill that cannot be
@@ -1092,8 +1092,8 @@ extern "C" __global__ void gated_delta_rule_step_multi_kernel(
 
 // Append each sequence's k/v row at its own position.
 extern "C" __global__ void kv_cache_append_multi_kernel(
-    const float* __restrict__ k, const float* __restrict__ v, __half* __restrict__ k_cache,
-    __half* __restrict__ v_cache, const int* __restrict__ positions, int n_kv_heads,
+    const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ k_cache,
+    float* __restrict__ v_cache, const int* __restrict__ positions, int n_kv_heads,
     int head_dim, int base_stride) {
     const int s = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1101,8 +1101,8 @@ extern "C" __global__ void kv_cache_append_multi_kernel(
     if (i >= n) return;
     const size_t src = (size_t)s * n;
     const size_t dst = (size_t)s * base_stride + (size_t)positions[s] * n;
-    k_cache[dst + i] = __float2half(k[src + i]);
-    v_cache[dst + i] = __float2half(v[src + i]);
+    k_cache[dst + i] = k[src + i];
+    v_cache[dst + i] = v[src + i];
 }
 
 // Decode attention for every sequence, warp-parallel over the keys.
@@ -1123,8 +1123,8 @@ extern "C" __global__ void kv_cache_append_multi_kernel(
 // `attn_decode_multi_serial_kernel` for any other head width; that one is also
 // the independent implementation the batch-parity gate compares against.
 extern "C" __global__ void attn_decode_multi_kernel(
-    const float* __restrict__ q, const __half* __restrict__ k_cache,
-    const __half* __restrict__ v_cache, float* __restrict__ out,
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out,
     const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int base_stride) {
     constexpr int DPL = 8;   // dims per lane
@@ -1158,10 +1158,10 @@ extern "C" __global__ void attn_decode_multi_kernel(
 
     for (int t = warp; t < n_keys; t += NW) {
         const size_t off = cb + ((size_t)t * n_kv_heads + kh) * head_dim + d0;
-        const __half* kp = k_cache + off;
+        const float* kp = k_cache + off;
         float dot = 0.0f;
 #pragma unroll
-        for (int j = 0; j < DPL; ++j) dot = fmaf(qv[j], __half2float(kp[j]), dot);
+        for (int j = 0; j < DPL; ++j) dot = fmaf(qv[j], kp[j], dot);
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
         dot *= scale;
@@ -1170,9 +1170,9 @@ extern "C" __global__ void attn_decode_multi_kernel(
         const float corr = __expf(mx - m_new);
         const float p = __expf(dot - m_new);
         sum = sum * corr + p;
-        const __half* vp = v_cache + off;
+        const float* vp = v_cache + off;
 #pragma unroll
-        for (int j = 0; j < DPL; ++j) acc[j] = fmaf(p, __half2float(vp[j]), acc[j] * corr);
+        for (int j = 0; j < DPL; ++j) acc[j] = fmaf(p, vp[j], acc[j] * corr);
         mx = m_new;
     }
 
@@ -1219,8 +1219,8 @@ extern "C" __global__ void attn_decode_multi_kernel(
 // online-softmax recurrence keeps the running state in two registers instead,
 // so the context length no longer affects shared memory at all.
 extern "C" __global__ void attn_decode_multi_serial_kernel(
-    const float* __restrict__ q, const __half* __restrict__ k_cache,
-    const __half* __restrict__ v_cache, float* __restrict__ out,
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out,
     const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int base_stride) {
     const int h = blockIdx.x;
@@ -1238,14 +1238,14 @@ extern "C" __global__ void attn_decode_multi_serial_kernel(
     float mx = -INFINITY, sum = 0.0f, acc = 0.0f;
     for (int i = 0; i < n_keys; ++i) {
         const float kk =
-            active ? __half2float(k_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d]) : 0.0f;
+            active ? k_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d] : 0.0f;
         const float dot = block_reduce_sum(qv * kk) * scale;
         const float m_new = fmaxf(mx, dot);
         const float corr = __expf(mx - m_new);
         const float p = __expf(dot - m_new);
         sum = sum * corr + p;
         acc = fmaf(p,
-                   active ? __half2float(v_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d]) : 0.0f,
+                   active ? v_cache[cb + ((size_t)i * n_kv_heads + kh) * head_dim + d] : 0.0f,
                    acc * corr);
         mx = m_new;
     }

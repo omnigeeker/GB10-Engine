@@ -338,38 +338,6 @@ fn lcg(seed: &mut u64) -> f32 {
 ///
 /// Timed with a sync after the loop because CUDA launches are asynchronous; a
 /// timer stopped without one reads back the launch cost, not the kernel.
-/// f32 -> fp16 bit pattern, round-to-nearest-even. Local so the bench does not
-/// need the `half` crate just to build test caches.
-fn to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let mut exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
-    let mut man = b & 0x7f_ffff;
-    if exp >= 0x1f {
-        return sign | 0x7c00; // overflow -> inf
-    }
-    if exp <= 0 {
-        if exp < -10 {
-            return sign; // underflow -> zero
-        }
-        man |= 0x80_0000;
-        let shift = (14 - exp) as u32;
-        let half = man >> shift;
-        let rem = man & ((1u32 << shift) - 1);
-        let tie = 1u32 << (shift - 1);
-        let round = rem > tie || (rem == tie && (half & 1) == 1);
-        return sign | ((half + round as u32) as u16);
-    }
-    let half = (man >> 13) as u32;
-    let rem = man & 0x1fff;
-    let round = rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1);
-    let mut out = (exp as u32) << 10 | half;
-    out += round as u32;
-    if out & 0x7c00 == 0x7c00 { exp = 0; } // mantissa carry into inf is fine as-is
-    let _ = exp;
-    sign | (out as u16)
-}
-
 fn decode_bench(args: &Args) -> Result<bool> {
     let cfg = load_config(&args.model)?;
     let t = cfg.text_config.clone();
@@ -396,14 +364,12 @@ fn decode_bench(args: &Args) -> Result<bool> {
         let pos: Vec<i32> = (0..n_seq).map(|_| keys as i32).collect();
 
         let mut qd = dev.stream().alloc_zeros::<f32>(n_seq * nh * hd)?;
-        let mut kd = dev.stream().alloc_zeros::<u16>(n_seq * cap * nkv * hd)?;
-        let mut vd = dev.stream().alloc_zeros::<u16>(n_seq * cap * nkv * hd)?;
+        let mut kd = dev.stream().alloc_zeros::<f32>(n_seq * cap * nkv * hd)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(n_seq * cap * nkv * hd)?;
         let mut pd = dev.stream().alloc_zeros::<i32>(n_seq)?;
         dev.stream().memcpy_htod(&qh, &mut qd)?;
-        let kh16: Vec<u16> = kh.iter().map(|v| to_f16_bits(*v)).collect();
-        let vh16: Vec<u16> = vh.iter().map(|v| to_f16_bits(*v)).collect();
-        dev.stream().memcpy_htod(&kh16, &mut kd)?;
-        dev.stream().memcpy_htod(&vh16, &mut vd)?;
+        dev.stream().memcpy_htod(&kh, &mut kd)?;
+        dev.stream().memcpy_htod(&vh, &mut vd)?;
         dev.stream().memcpy_htod(&pos, &mut pd)?;
 
         let mut a = dev.stream().alloc_zeros::<f32>(n_seq * nh * hd)?;
@@ -520,13 +486,11 @@ fn attn_tile(args: &Args) -> Result<bool> {
         let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
 
         let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
-        let mut kd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
-        let mut vd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
+        let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
         dev.stream().memcpy_htod(&qh, &mut qd)?;
-        let kh16: Vec<u16> = kh.iter().map(|v| to_f16_bits(*v)).collect();
-        let vh16: Vec<u16> = vh.iter().map(|v| to_f16_bits(*v)).collect();
-        dev.stream().memcpy_htod(&kh16, &mut kd)?;
-        dev.stream().memcpy_htod(&vh16, &mut vd)?;
+        dev.stream().memcpy_htod(&kh, &mut kd)?;
+        dev.stream().memcpy_htod(&vh, &mut vd)?;
         let mut a = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
         let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
 
@@ -589,13 +553,11 @@ fn attn_tile(args: &Args) -> Result<bool> {
             let kh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
             let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
             let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
-            let mut kd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
-            let mut vd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
+            let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
             dev.stream().memcpy_htod(&qh, &mut qd)?;
-            let kh16: Vec<u16> = kh.iter().map(|v| to_f16_bits(*v)).collect();
-            let vh16: Vec<u16> = vh.iter().map(|v| to_f16_bits(*v)).collect();
-            dev.stream().memcpy_htod(&kh16, &mut kd)?;
-            dev.stream().memcpy_htod(&vh16, &mut vd)?;
+            dev.stream().memcpy_htod(&kh, &mut kd)?;
+            dev.stream().memcpy_htod(&vh, &mut vd)?;
             let mut a = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
             let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
             ops.attn_prefill(&dev, &qd, &kd, &vd, &mut a, nt, nh, nkv, hd, scale, start, 0)?;
@@ -645,13 +607,11 @@ fn attn_tile(args: &Args) -> Result<bool> {
             let kh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
             let vh: Vec<f32> = (0..keys * nkv * hd).map(|_| lcg(&mut seed)).collect();
             let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
-            let mut kd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
-            let mut vd = dev.stream().alloc_zeros::<u16>(keys * nkv * hd)?;
+            let mut kd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
+            let mut vd = dev.stream().alloc_zeros::<f32>(keys * nkv * hd)?;
             dev.stream().memcpy_htod(&qh, &mut qd)?;
-            let kh16: Vec<u16> = kh.iter().map(|v| to_f16_bits(*v)).collect();
-            let vh16: Vec<u16> = vh.iter().map(|v| to_f16_bits(*v)).collect();
-            dev.stream().memcpy_htod(&kh16, &mut kd)?;
-            dev.stream().memcpy_htod(&vh16, &mut vd)?;
+            dev.stream().memcpy_htod(&kh, &mut kd)?;
+            dev.stream().memcpy_htod(&vh, &mut vd)?;
             let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
             let t0 = std::time::Instant::now();
             ops.attn_prefill_tiled(
@@ -688,8 +648,8 @@ fn attn_tile(args: &Args) -> Result<bool> {
         let max_seq = 32768usize;
         let n_seq = 10usize;
         let stride = max_seq * nkv * hd;
-        let mut kd = dev.stream().alloc_zeros::<u16>(stride * n_seq)?;
-        let mut vd = dev.stream().alloc_zeros::<u16>(stride * n_seq)?;
+        let mut kd = dev.stream().alloc_zeros::<f32>(stride * n_seq)?;
+        let mut vd = dev.stream().alloc_zeros::<f32>(stride * n_seq)?;
         for &(start, nt) in &[(0usize, 2048usize), (10240, 2048), (20480, 2048)] {
             let mut qd = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
             let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
@@ -700,7 +660,7 @@ fn attn_tile(args: &Args) -> Result<bool> {
             let el = t0.elapsed().as_secs_f64();
             println!(
                 "  start {start:>6} ntok {nt:>5}  cache {:.2} GB  {el:>7.2} s",
-                (2 * stride * n_seq * 2) as f64 / 1e9
+                (2 * stride * n_seq * 4) as f64 / 1e9
             );
         }
     }
