@@ -3270,3 +3270,47 @@ only if the 6x is shown to matter, which the corrected numbers say it does not o
 checked** (the first was round 55's "CPU-bound" inference from process user time). The
 corrected figure is recorded rather than the original edited away, because the retraction is
 the more useful artifact.
+
+### The decode kernel bench says the kernel is not the problem -- but it benchmarks 4 sequences (round 79)
+
+Rounds 75-78 reasoned about the decode attention from the model-level numbers (3.45 OTPS at
+128K, 290 ms/token, 19.3 GB of fp32 KV per token). `gb10-verify decode-bench` measures the
+kernel itself, and it says something that contradicts the "bad kernel" reading:
+
+```
+q heads 24, kv heads 4, head_dim 256, n_seq 4
+     keys   serial ms     warp ms  speedup     rms rel
+     2048       2.824       0.434    6.51x     1.17e-6   (143 GB/s serial, 928 GB/s warp)
+     8192      11.183       1.677    6.67x     2.10e-6   (144 GB/s serial, 961 GB/s warp)
+    32768      44.271       6.658    6.65x     4.20e-6   (146 GB/s serial, 968 GB/s warp)
+```
+
+Three things stand out, and the third changes the plan:
+
+1. **The warp kernel is 6.5-6.7x faster than the serial reference and flat across key
+   counts** (6.51x, 6.67x, 6.65x) -- so its efficiency does not decay with context length,
+   which is exactly what the online-softmax rewrite was for.
+2. **The "GB/s" figures are logical, not DRAM.** 968 GB/s is four times this part's measured
+   228 GB/s, so the number must be counting bytes per *query* head (24 of them) rather than
+   per KV head (4) -- i.e. it is measuring the 6x-redundant traffic of round 76 at L2 speed.
+   That is consistent with round 78's correction: the redundancy is largely absorbed by L2,
+   not DRAM.
+3. **The bench runs `n_seq 4`, but real 128K decode runs one sequence.** The grid is
+   `(n_q_heads, n_seq)`, so the bench launches 96 blocks and the real case launches **24** --
+   **on 48 SMs, and 32 warps per block means half the GPU is idle in the real case.** Every
+   number in the table above is therefore measured under conditions the real 128K decode
+   never sees.
+
+**So the honest reading is: in isolation, with enough sequences to fill the machine, the
+decode attention kernel performs well and scales flat to 32K keys. What has not been measured
+is the same kernel at `n_seq = 1`**, which is the case that matters for the 128K
+single-stream OTPS number. The 290 ms/token at 128K is therefore *not yet* attributable to
+the kernel, and the round-76/77 split-K plan is better re-justified as an **occupancy** fix
+for `n_seq = 1` (24 blocks, half the SMs idle) than as a traffic fix -- which is what round
+78 already concluded from the corrected numbers.
+
+**The immediate next measurement is therefore cheap and specific:** run `decode-bench` at
+`n_seq = 1` and compare the per-sequence rate against the `n_seq = 4` column. If per-sequence
+throughput collapses at `n_seq = 1`, the fix is the key-split grid (more blocks), which is a
+far smaller change than the two-phase softmax combine; if it does not, then the 128K decode
+cost is elsewhere and the attention rewrite should wait.
