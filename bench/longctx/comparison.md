@@ -2711,3 +2711,51 @@ makes the third one worth the effort: 12.4 s of an 18.9 s prefill, and the diffe
 between 8K cold TTFT at 1.79x slower and 1.63x faster than llama.cpp.
 
 The 4-way split is kept -- it is exact, verified, and worth ~3% of the prefill.
+
+### The DeltaNet cost is exactly linear in T: 31.5 us per token per layer, no per-chunk overhead (round 68)
+
+Rounds 65 and 67 eliminated the block count and the within-token chains. Before accepting
+the chunked rewrite as the only remaining lever, one cheap question was still open: is the
+13.17 s a *per-token* cost, or is some of it a per-chunk fixed cost (a launch, a state
+load/store, a one-time setup) that a smaller change could remove? Sweeping the token count
+answers it with no code change, because the layer diagnostic already reports the total
+across whatever chunks were run.
+
+| `--limit` | chunks | DeltaNet layers | DeltaNet time | **per 2048-token chunk** | attention |
+|---|---|---|---|---|---|
+| 2048 | 1 | 48 | 3.14 s | **3.14 s** | 0.79 s |
+| 4096 | 2 | 96 | 6.20 s | **3.10 s** | 1.92 s |
+| 6144 | 3 | 144 | 9.31 s | **3.10 s** | 3.42 s |
+
+**3.14, 3.10, 3.10.** The cost is exactly proportional to `T` -- there is **no per-chunk
+fixed overhead at all**. The linear model also predicts the 8225-token run:
+`8225/2048 x 3.10 = 12.45 s` against 12.65-12.80 s measured.
+
+So the recurrence costs **31.5 us per token per layer** (3.10 s / 2048 tokens / 48 layers),
+for 1.57M FMAs = 3.15 MFLOP per token per layer -- **~100 GFLOP/s, the same 0.6% of fp32
+peak**. There is nothing to trim around the edges: every microsecond is in the 2048
+sequential steps, and the only way to remove them is to stop doing one token at a time.
+
+The same sweep also exposes the attention's shape, which matters for the 32K target:
+
+| `--limit` | attention | per chunk |
+|---|---|---|
+| 2048 | 0.79 s | 0.79 s |
+| 4096 | 1.92 s | 0.96 s |
+| 6144 | 3.42 s | 1.14 s |
+
+Mildly super-linear in the chunk count (0.79 -> 0.96 -> 1.14 per chunk), as expected for
+attention that is quadratic within a chunk and grows with the carried context.
+
+**And it corrects the 32K arithmetic upward.** At 31.5 us per token per layer the recurrence
+is `32768 x 48 x 3.15 MFLOP = 4.95 TFLOP` at 32K, which takes **~49.5 s of the 107.89 s
+prefill -- 46%, not the 35-39% estimated earlier.** Taking it to 2 TFLOP/s would give
+32K cold prefill of about **61 s against llama.cpp's 44.55 s: 1.37x slower** (from 2.42x).
+Better, but still short -- at 32K the attention slab, now measured at ~26% and growing,
+becomes the second target.
+
+**The ordering is now fully evidence-based.** Three hypotheses have been tested and rejected
+(block count, within-token chains, per-chunk overhead); what remains is the serial dependency
+along `T`, costing 31.5 us per token per layer with perfect linearity, and worth 12.4 s of
+the 8K prefill and ~47 s of the 32K prefill. The chunked rewrite is not one option among
+several -- it is the only measurement that has ever moved.
