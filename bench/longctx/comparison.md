@@ -13,6 +13,43 @@ Two definitions, because "TTFT" hides a real question:
 The prompt is repeated filler plus "list the integers 1 to 300", which stops the
 model answering in two tokens and makes OTPS an average over ~198 intervals.
 
+## Current scorecard (rounds 130-147; the sections below are the history)
+
+**Every number here is server-side, measured with `PREFILL_CHUNK = 8192`, `--ctx 262144` for
+128K/256K, and pairs taken in the same session** (the session's rule: only same-session pairs are
+comparable -- round 90 measured 23% drift on this box).
+
+| context | cold TTFT | warm TTFT | OTPS |
+|---|---|---|---|
+| 8K | 10.35 / 9.50 s = **1.09x slower** | 0.03 / 0.223 s = **7.4x faster** | 8.91 / 7.26 = **1.23x faster** |
+| 32K | 80.00 / 44.55 s = **1.80x slower** | 0.05 / 0.29 s = **5.8x faster** | 7.14 / 6.865 = **1.04x faster** |
+| 128K | 890.54 / 275.04 s = **3.24x slower** | 0.14 / 0.48 s = **3.4x faster** | 5.29 / 4.75 = **1.11x faster** |
+| 256K | 3298.83 / 726.22 s = **4.54x slower** | 0.28 / 0.66 s = **2.4x faster** | 3.66 / 3.86 = **1.05x slower** |
+
+**Warm TTFT 4 of 4 won. OTPS 3 of 4 won. Cold TTFT 0 of 4.**
+
+The 8K numbers are the mean of 3 trials per side (gb10 spread 0.8%, llama 3.2%), so the 0.85 s gap
+is real. The 8K OTPS and warm figures are from the same 3-trial runs; 32K/128K/256K cold and warm
+are single-trial pairs.
+
+**What is left, and what it costs:**
+
+| cold cell | speedup needed on attention | cheapest available lever |
+|---|---|---|
+| 8K | **1.29x** | none -- see rounds 145-147 |
+| 32K | 5.98x | mma prefill attention |
+| 128K | 8.40x | mma prefill attention |
+| 256K | 8.82x | mma prefill attention |
+
+**Rounds 145-147 walked back the one apparent shortcut.** The `GB10_ATTN_SMEM_PROBE` occupancy probe
+(cost of forcing 1 block/SM: 3.77 -> 5.55 s, i.e. 1.47x) looked like a cheap way to win 8K, but it
+measures *sensitivity*, not headroom: the kernel already runs at 2 blocks/SM, and 3 would need a 22%
+cut in its 43,104 B shared-memory request. **So all four cold cells need the same work** -- the mma
+rewrite, or (for a possible 8K-only win) an fp8 staging rederivation that carries a bank-layout
+rederivation and a likely `attn-tile` precision rejection.
+
+**Still owed:** a repeat of 256K OTPS, which is 1.05x away and needs ~111 minutes for two trials.
+
 ## 8K — with the new decode kernel
 
 | metric | gb10-server | llama.cpp | ratio |
