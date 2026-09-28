@@ -4773,3 +4773,73 @@ is evidence about that kernel and not about the pipeline.
 
 **Not implemented.** It is the next thing to do, ahead of the decode GQA work, because it is
 larger in effect, broader in scope (every context, not just the long ones), and smaller in risk.
+
+### CORRECTION to round 106: the streaming path is instruction-bound, and its loads are already wide (round 107)
+
+Round 106 attributed the weight-streaming path's 66.8% of peak (152.4 GB/s against 228) to
+narrow loads and a wasted sector on the scale array, and proposed widening them. **Both halves
+of that were wrong, and checking the actual kernel shows why.**
+
+**First, the kernel I read was not the streaming path.** Round 106 quoted
+`dequant_nvfp4_to_bf16_kernel` (gemm.cu:522), which writes dequantized bf16 to a global `out`
+buffer -- 2 bytes per parameter, which for a 27B model would be ~54 GB of writes per token and
+is obviously not what a 115 ms/token path does. **The decode path is `stage_wtile`**
+(gemm.cu:65), which stages the dequantized tile into shared memory. I read the wrong function.
+
+**Second, `stage_wtile` already has the widening I proposed, and its comment says so:**
+
+```cuda
+// 16 consecutive NVFP4 elements per thread instead of 8: one 8-byte load
+// and one group scale cover the pair, so the staging loop runs half as many
+// iterations and issues half as many loads for the same bytes.
+...
+pk[p] = *reinterpret_cast<const uint2*>(w + (size_t)n * (K >> 1) + (kbase >> 1));
+scl[p] = e4m3_to_float(__ldg(sc + (size_t)n * (K >> 4) + (kbase >> 4)));
+```
+
+**And the sector arithmetic now comes out clean**, so the waste I blamed does not exist:
+
+| array | per warp (32 lanes, `uint2` = 16 elements) | sectors |
+|---|---|---|
+| `w` | 32 x 8 B = 256 B | 8 |
+| `sc` | 32 x 1 B = 32 B (one scale per 16 elements) | 1 |
+| | **288 B fetched for 288 useful B** | **100%** |
+
+**So it is not a bandwidth problem at all, and it never was.** An instruction count explains the
+measurement instead:
+
+| | value |
+|---|---|
+| parameters per token | 27.0e9 |
+| time | 115.19 ms |
+| SMs x clock | 48 x 1.5 GHz |
+| **parameters per SM per cycle** | **3.3** |
+| instructions per parameter (shift, extract, convert, multiply) | ~3-4 |
+| **instructions per SM per cycle required** | **9.8 - 13.0** |
+| instructions per SM per cycle available | ~4 |
+
+**The dequant needs 2.5-3.3x more issue slots than the SM has.** The kernel is not waiting for
+memory; it is saturating the instruction issue units, and 152 GB/s is what that costs. **This is
+the same conclusion round 98 reached for the prefill attention and round 44 reached for the
+tile loop: gb10's decode and prefill are both limited by what its CUDA cores can issue, not by
+what its memory system can deliver.**
+
+**What that means for the next attempt, stated so it is not repeated:**
+
+- **Widening loads cannot help the streaming path.** It is already 100% sector-efficient; there
+  is no bandwidth to recover.
+- **The lever is instructions per weight.** Either the dequant must be done with fewer
+  instructions per element -- vectorised bf16 conversion processing two elements at a time is
+  the obvious candidate -- or the arithmetic has to leave the CUDA cores entirely.
+- **And the arithmetic leaving the CUDA cores has a very specific form here: the weights are
+  NVFP4, and this part has native FP4 tensor cores.** Feeding them the quantized weights is the
+  structural version of the fix, and it is the same shape of change the prefill GEMM already
+  went through (round 98) -- except that the GEMM moved to *bf16* tensor cores and this would
+  need FP4 ones, which is a larger step.
+
+**The revised priority.** Round 106 put "widen the streaming loads" first. That is withdrawn.
+What survives from round 106 is the *measurement* -- 115.19 ms against a 77.0 ms roofline, 38.2 ms
+per token, at every context -- and it is still the largest single inefficiency in this document.
+**What changes is the fix: not bytes, but instructions.** The decode GQA work (rounds 99-103)
+remains the better-understood option because it removes real redundant traffic rather than
+fighting an issue-rate wall.
