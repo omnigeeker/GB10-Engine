@@ -635,8 +635,8 @@ impl FullAttnLayer {
 pub struct LayerState {
     pub conv_hist: CudaSlice<f32>,
     pub rec: CudaSlice<f32>,
-    pub k_cache: CudaSlice<f32>,
-    pub v_cache: CudaSlice<f32>,
+    pub k_cache: CudaSlice<u16>,
+    pub v_cache: CudaSlice<u16>,
     /// Number of sequences this state is sliced into.
     pub n_seq: usize,
     /// Decoded length of each sequence. A `Vec` rather than a counter because
@@ -662,6 +662,11 @@ impl LayerState {
         let zeros = |n: usize| -> Result<CudaSlice<f32>> {
             Ok(dev.stream().alloc_zeros::<f32>(n)?)
         };
+        // The KV cache is stored fp16: it is the dominant traffic term in both
+        // prefill and decode attention, and halving it halves that traffic.
+        let zeros_h = |n: usize| -> Result<CudaSlice<u16>> {
+            Ok(dev.stream().alloc_zeros::<u16>(n)?)
+        };
         match layer {
             Layer::Delta(_) => {
                 let conv_dim = cfg.linear_qk_dim() * 2 + cfg.linear_value_dim();
@@ -673,8 +678,8 @@ impl LayerState {
                             * DELTA_VALUE_HEAD_DIM
                             * n_seq,
                     )?,
-                    k_cache: zeros(n_seq)?,
-                    v_cache: zeros(n_seq)?,
+                    k_cache: zeros_h(n_seq)?,
+                    v_cache: zeros_h(n_seq)?,
                     n_seq,
                     n_keys: vec![0; n_seq],
                     positions: dev.stream().alloc_zeros::<i32>(n_seq)?,
@@ -685,8 +690,8 @@ impl LayerState {
                 Ok(Self {
                     conv_hist: zeros(n_seq)?,
                     rec: zeros(n_seq)?,
-                    k_cache: zeros(n)?,
-                    v_cache: zeros(n)?,
+                    k_cache: zeros_h(n)?,
+                    v_cache: zeros_h(n)?,
                     n_seq,
                     n_keys: vec![0; n_seq],
                     positions: dev.stream().alloc_zeros::<i32>(n_seq)?,
@@ -717,12 +722,11 @@ impl LayerState {
     }
 
     pub fn reset(&mut self, dev: &Device) -> Result<()> {
-        for b in [
-            &mut self.conv_hist,
-            &mut self.rec,
-            &mut self.k_cache,
-            &mut self.v_cache,
-        ] {
+        for b in [&mut self.conv_hist, &mut self.rec] {
+            dev.stream().memset_zeros(b)?;
+        }
+        // The KV cache is fp16, so it cannot share the f32 array above.
+        for b in [&mut self.k_cache, &mut self.v_cache] {
             dev.stream().memset_zeros(b)?;
         }
         self.n_keys.iter_mut().for_each(|k| *k = 0);
