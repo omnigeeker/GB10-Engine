@@ -6116,3 +6116,51 @@ session would win**, and it needs no algorithm rewrite at all.
 
 **In the tree: `crates/gb10-server/src/main.rs` `PREFILL_CHUNK = 8192` and the harness's matching
 `chunk = 8192`, correctness-gated by `chunked-prefill`.**
+
+### Round 136: chunk=8192 measured on the SERVER -- 1.43x at 8K, gap 1.41x -> 1.11x, cell NOT won
+
+Round 135 projected the 8K cell as won (~9.95 s vs llama's recorded 10.58 s). **This round measured
+both sides on the server in the same session, and the projection does not survive -- but the
+underlying win is real and larger than the projection suggested.**
+
+**Same-session pair, `reps 231` (~7230 gb10 / 7268 llama tokens), `max-tokens 128`:**
+
+| | gb10 (chunk 8192) | llama.cpp | result |
+|---|---|---|---|
+| **cold TTFT** | **10.43 / 10.44 s** | **9.08 / 9.66 s** | **gb10 1.11x SLOWER** |
+| **warm TTFT** | **0.03 s** | 0.23 / 0.24 s | **gb10 7.8x faster** |
+| **OTPS** | **8.91 / 8.94** | 7.24 / 7.27 | **gb10 1.23x faster** |
+
+**And the 32K pair, same session, `reps 1054` (32743 tokens):**
+
+| 32K cold TTFT | value |
+|---|---|
+| baseline in the scorecard | 90.54 s |
+| **now, chunk 8192** | **79.65 / 80.38 s** |
+| improvement | **1.13x** |
+| llama (scorecard, not re-measured this session) | 44.55 s |
+
+**What this establishes:**
+
+1. **The chunk change is a real server-side win: 8K cold 14.93 -> 10.43 s = 1.43x; 32K cold
+   90.54 -> 80.0 s = 1.13x.** Both are measured end-to-end through HTTP with the ttft harness,
+   not projected.
+2. **The 8K cold-TTFT cell is NOT won: 10.43 vs 9.37 = 1.11x slower.** Round 135's "projected
+   ~1.06x faster" was wrong **because llama.cpp also measures faster in this session than its
+   recorded figure: 9.08-9.66 s now against 10.58 s in the scorecard.** That is round 90's machine
+   drift applying to the *other* side of the comparison, and it is exactly why round 135 wrote that
+   a projection is not a result.
+3. **But the gap closed from 1.41x to 1.11x** (cold, same-session pairs both times:
+   14.93/10.58 = 1.41x then, 10.43/9.37 = 1.11x now). **The 8K cold cell went from comfortably lost
+   to marginal, and it is now the closest cold cell in the whole scorecard.**
+4. **The 1.50x the harness showed at 7168 tokens overstates what the server gets (1.43x at 8K,
+   1.13x at 32K).** The harness runs `n_seq = 10` and its own driver; **the server number is the
+   one that counts, and it is consistently a little lower.**
+
+**So the honest 8K row is now: cold 1.11x slower, warm 7.8x faster, OTPS 1.23x faster -- two of
+three won, and the third is the narrowest cold margin anywhere in the scorecard.** For the first
+time in this session, a cold-TTFT cell is close enough that a modest further gain would flip it.
+
+**Twenty-ninth self-correction, and the second one that reverses a same-session projection of the
+previous round** (round 135's 1.06x win). **The error was again single-sided: the projection applied
+the measured gb10 improvement while assuming llama's recorded number was still current.**
