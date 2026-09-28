@@ -4611,3 +4611,43 @@ recording as a banked result -- the kernel being discussed is the good one, and 
 claim that the residual is entirely attention should be read as ~102 ms of attention plus ~65 ms
 of other work. **The recommendation is unchanged and better supported, because it now rests on a
 direct kernel measurement rather than a subtraction.**
+
+### The 6-head decode fix has a register cost, and it is avoidable (round 102)
+
+Round 100 unblocked the GQA fix by showing the decode accumulators live in registers rather than
+shared memory. That cuts both ways: **the fix multiplies exactly those registers by six.**
+`attn_decode_multi_kernel` holds `float acc[DPL]` = 8 floats per lane today; serving 6 query
+heads per block needs `acc[6][DPL]` = 48, plus `m`/`l` per head, plus the per-head query vector.
+With `NW = 32` warps (1024 threads) per block and 65536 registers per SM:
+
+| arrangement | regs/lane | resident threads | occupancy |
+|---|---|---|---|
+| NW=32, `qv` in registers | ~136 | 481 | **47%** |
+| NW=32, `qv` in shared memory | ~88 | 744 | 73% |
+| **NW=16, `qv` in shared memory** | **~88** | **512** | **100%** |
+| NW=8, `qv` in shared memory | ~88 | 256 | 100% |
+
+**Two design choices remove the cost:**
+
+1. **Keep the per-head query vector in shared memory.** Six heads x 256 dims x 4 B = **6 KB**,
+   against the same 99 KB opt-in budget that round 77 worried about. It is read once per key
+   sweep and is the obviously shared quantity, so it belongs in shared memory and not in 48
+   registers.
+2. **Halve NW, from 32 warps to 16.** `NW` exists to raise resident warps (the kernel's own
+   comment records that `NW = 8`, a 256-thread block, "left just 4 warps resident per SM and the
+   kernel ran at 328 GB/s"). But the fix's whole point is that far fewer blocks are needed --
+   **one block per KV head instead of six** -- so the per-block warp count is the right knob to
+   trade against it, and `NW = 16` keeps a full block resident while `NW = 8` is the shape the
+   comment already measured as too small.
+
+**So the fix is: one block per (KV head, sequence), 16 warps, the 6 query heads' q in shared
+memory, `acc[6][8]` in registers, and each warp sweeping `t = warp; t < n_keys; t += NW` while
+updating all six heads from one K/V load.** The existing per-warp partial-softmax reduction is
+reused, per head.
+
+**And the acceptance target stays the measured one:** the kernel is at 2.71x its 2.35 ms-per-layer
+memory floor (round 101), and gb10 needs 128K attention below ~82 ms of 102 ms to beat llama.cpp's
+210 ms. **Judged by a same-session 128K server pair, never by `decode-bench` alone.**
+
+**Not implemented.** It is a real kernel change with a now-complete design, a measured target, and
+an identified register hazard.
