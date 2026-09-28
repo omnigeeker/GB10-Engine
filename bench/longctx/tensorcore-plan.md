@@ -1,5 +1,21 @@
 # Prefill GEMM on bf16 tensor cores — implementation spec
 
+> **STALE — THIS SPEC IS ALREADY IMPLEMENTED (marked round 98). Do not implement it again.**
+>
+> The change this document proposes is in the tree: `kern.cublas_gemm_bf16(...)` is called from
+> `crates/gb10-model/src/weights.rs:195`, and `cublas gemm` is one of the four entries in
+> `PHASES` in that same file, i.e. it is on the timed prefill path. Rounds 22-27 below are the
+> implementation and its measurements.
+>
+> **The opening table is therefore historical, not current.** It reports the GEMM at 75-93% of
+> the prefill and sums to 267.8 s at 32K against a prefill total now measured at 110.56 s
+> (round 88). The current four-phase instrumentation puts `cublas gemm` at **23.4%** of the 32K
+> prefill, with **attention at 61.0%** -- the opposite ordering.
+>
+> The reasoning in the opening section is still the right reasoning, and it now applies to a
+> different kernel: the attention kernel runs at 3.12 TFLOP/s against a ~37 TFLOP/s CUDA-core
+> ceiling while llama.cpp does this workload at ~32 TFLOP/s. See `comparison.md` round 98.
+
 ## Why this is the whole remaining gap
 
 Measured per-chunk decomposition of the prefill (see `comparison.md`):
