@@ -5180,3 +5180,67 @@ for the 6-head sharing as well, and the two can share one implementation of it.
 **Not implemented.** This round measures the opportunity and rules out the cheaper wrong version
 of it. The change itself -- S=2, a partial-state buffer, and a merge pass -- is the next thing to
 build, and it now has a measured target instead of a projected one.
+
+### Concretely how to implement split-K for the decode attention (round 116)
+
+Round 115 measured that filling the grid is worth 1.64x and settled that split-K is the right
+axis. This round writes out the mechanism, because the merge is the one part that does not exist
+in the code yet and is the reason this is not a small edit.
+
+**Why a single kernel cannot do it.** Online softmax folds each new key in against a running max
+`m`. A block that has only seen half the keys knows only *its* local max, so it cannot rescale its
+accumulator into the global one -- the global max is not known until every split has finished.
+That is why flash-decoding uses two passes, and why a second kernel is needed here.
+
+**Pass 1 -- `attn_decode_split_kernel`**, one block per `(query head, key slice)`. It is the
+existing `attn_decode_multi_kernel` with `t` starting at the slice offset and stepping `NW * S`,
+and instead of normalising at the end it writes its **raw partial state**:
+
+```
+part[s, h, split, 0]     = m_split      (the local max)
+part[s, h, split, 1]     = l_split      (its sum of exp)
+part[s, h, split, 2..]   = acc_split    (unnormalised, head_dim floats)
+```
+
+Scratch size: `n_seq * n_q_heads * S * (2 + head_dim)` floats. For one sequence at 128K that is
+`1 * 24 * 2 * 258 * 4 B = 49.5 KB` -- negligible, and independent of context length.
+
+**Pass 2 -- `attn_decode_merge_kernel`**, one block per `(sequence, query head)`, `head_dim`
+threads. Each thread `d` reads the `S` partials, computes the global max
+`M = max_split m_split`, then
+
+```
+l = sum_split l_split * exp(m_split - M)
+a = sum_split acc_split[d] * exp(m_split - M)
+out[d] = l > 0 ? a / l : 0
+```
+
+**and it must keep the same `l > 0` guard as the existing kernel**, which the current code
+comments on explicitly: an empty cache leaves `l` at zero and the old form returned 0 there, so
+the guard is what stops an empty cache becoming NaN. A merge that loses it would reintroduce a
+bug the tree already fixed once.
+
+**Host plumbing**, in `crates/gb10-cuda/src/ops.rs` `pub fn attn_decode_multi` (:504): it needs a
+scratch buffer and the split count threaded through, the grid's y axis becomes `n_seq * S`, and
+the merge launch follows. The existing `need(...)` guards should be extended to the scratch rather
+than added beside them.
+
+**Correctness gate, and it is not the usual one.** `attn-tile` does not cover this kernel. The
+checks that do are `generate --oracle` (16/16), `batch-parity` -- which compares against
+`attn_decode_multi_serial`, the independent implementation that exists for exactly this purpose --
+and **`decode-bench`'s own `rms rel` column**, which is the tightest of the three: it reported
+`8.24e-6` at n_seq=1 and `8.52e-6` at n_seq=2, so a merge error has nowhere to hide.
+
+**Then the measurement is already set up: `decode-bench --kv-keys 131072`.** The number to beat is
+**6.375 ms at n_seq=1**, and round 115's 1.64x says the target is ~3.9 ms. **Only after that
+should a same-session server pair be run** (round 87's rule), where the expected 128K result is
+5.64 OTPS against llama's 4.75.
+
+**A caution from this session's own history.** Rounds 100-103 produced a 6-head design that was
+sized, register-checked and written out line by line -- and rounds 114-115 found it would have
+collapsed the grid to 4 blocks and probably regressed. **Split-K is the smaller change and it is
+the one with a measured target, but the same discipline applies: check the resulting launch
+against the 48-SM device before writing the kernel, not after.**
+
+**Not implemented.** This round adds no code and no new measurement; it removes the last
+undesigned part of the next change.
