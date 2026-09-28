@@ -5516,3 +5516,49 @@ does not need inventing:** `attn-tile` compares the tiled kernel against `attn_p
 split, and `generate --oracle` is the end-to-end check.
 
 **Not implemented.** This round closes the last cheap alternative and states the job size.
+
+### Round 122: tensor cores are provably necessary for the prefill attention, not merely better
+
+Round 121 established that a ~15x attention speedup is needed to win 128K and 256K cold TTFT, and
+that the existing kernel has nothing left to tune. This round closes the CUDA-core design space
+with arithmetic rather than another experiment, because the arithmetic is decisive.
+
+The tiled kernel's instruction census (round 95 PTX, 2218 instructions):
+
+| class | count | share |
+|---|---|---|
+| fma | 475 | 21.4% |
+| add | 263 | 11.9% |
+| ld | 257 | 11.6% |
+| mov | 212 | 9.6% |
+| cvt | 196 | 8.8% |
+| setp | 144 | 6.5% |
+| mad | 131 | 5.9% |
+| shl | 101 | 4.6% |
+| mul | 71 | 3.2% |
+| (rest) | 368 | 16.6% |
+
+- **Arithmetic (fma+add+mad+mul) is 940 instructions = 42.4%.** The kernel is **not fma-bound**;
+  it is issue-bound across a broad mix, with 29.4% of the stream in conversion and control
+  (`cvt`+`mov`+`setp`+`shl`).
+- **The required 15x is 46.8 TFLOP/s. The fp16 CUDA-core peak on this part is 37 TFLOP/s.**
+
+**46.8 > 37. So the required speedup exceeds the entire fp16 CUDA-core peak of the hardware.**
+This is not a claim about tuning difficulty -- **it is a bound. No CUDA-core kernel, however
+well-written, can reach 15x, because 15x does not exist on the CUDA cores.** And the gap is worse
+than that number suggests, because only 42.4% of the current instruction stream is arithmetic at
+all: even hitting the fp16 CUDA-core peak exactly would require eliminating essentially every
+`ld`, `mov`, `cvt`, `setp` and `shl` in the kernel.
+
+**This is the cleanest conclusion this session has produced**, and it is worth stating in the
+form it takes:
+
+> The prefill attention needs 15x. The CUDA cores can supply at most 37 TFLOP/s against the
+> 46.8 TFLOP/s required, while currently delivering 3.12. **Tensor cores are therefore necessary,
+> not an optimization.** The only open question is whether an mma formulation can be written that
+> keeps the softmax off the CUDA cores too (round 121's `ex2.approx.f16x2` point) -- because if
+> `exp` stays on the CUDA cores, it becomes the new ceiling and the 15x will not materialise.
+
+**It also means the cheaper alternatives are not merely unattempted but ruled out**, so no future
+round need spend a measurement on fp16x2 accumulation, on instruction shaving, or on further tile
+geometry. **The remaining work is one job, and it is the mma kernel.**
