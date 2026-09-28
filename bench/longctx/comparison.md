@@ -4557,3 +4557,57 @@ a 22% end-to-end loss.
 **Not implemented.** The design is now unblocked and sized; the implementation is a real kernel
 change and the next session should open with it, because it is the only item on the board with a
 measured target (1.27x OTPS at 128K and 256K) that does not require new arithmetic.
+
+### Measured directly: the decode amplification is 2.71x, and the OTPS win survives (round 101)
+
+Round 99 derived the decode attention's inefficiency from server residuals (~167 ms of a
+290 ms/token budget) and got 4.43x above the memory floor. That was an inference, not a
+measurement, and the inference was too pessimistic. `decode-bench` at 128K keys -- which
+allocates the cache in the true GQA layout (`nkv = 4`, not `nh = 24`, so 537 MB per layer and
+therefore **not** L2-resident) -- measures the kernel directly:
+
+```
+q heads 24, kv heads 4, head_dim 256, n_seq 1
+     keys   serial ms     warp ms  speedup     rms rel
+   131072     169.235       6.375   26.55x     8.24e-6
+```
+
+**Two findings, one of which corrects round 99 and one of which confirms it.**
+
+**1. The amplification is 2.71x, not 4.43x.**
+
+| | value |
+|---|---|
+| KV per layer at 128K (K+V, `nkv = 4`) | 537 MB |
+| DRAM memory floor per layer at 228 GB/s | **2.35 ms** |
+| **measured warp kernel** | **6.375 ms** |
+| ratio | **2.71x** |
+| implied DRAM traffic per layer | 1.45 GB |
+| x16 attention layers | 102 ms measured, 37.7 ms floor |
+
+The 4.43x came from attributing the whole 167 ms residual to attention. **The direct figure is
+102 ms for 16 layers, and it reconciles with the server**: 128 ms weight floor + 102 ms
+attention = 230 ms = 4.35 OTPS, against the measured 4.25 OTPS (235 ms) at 128K. The residual
+the earlier rounds called "attention" therefore contained ~65 ms of something else.
+
+**2. The opportunity is real anyway, and this was the point of measuring.** Round 99 projected a
+1.27x OTPS win by reaching the floor; that projection used the wrong multiple but lands in the
+same place, because the *measured* multiple is still 2.71x:
+
+| 128K decode | attention | ms/token | OTPS | vs llama 4.75 |
+|---|---|---|---|---|
+| today | 102 ms | 235 ms | 4.25 | 1.12x short |
+| half the amplification removed | ~70 ms | 198 ms | **5.05** | **1.06x WIN** |
+| amplification fully removed | 37.7 ms | 166 ms | **6.04** | **1.27x WIN** |
+
+**gb10 needs attention below ~82 ms to beat llama's 210 ms, and the headroom is 102 -> 37.7 ms.**
+The fix does not have to be perfect: removing half of the 2.71x is enough to win.
+
+**3. `attn_decode_multi` is already 26.55x faster than the serial kernel**, which is worth
+recording as a banked result -- the kernel being discussed is the good one, and the remaining
+2.71x is the residual GQA read amplification that rounds 76-82 and round 100 describe.
+
+**The correction to carry forward:** round 99's "4.43x" should be read as 2.71x, and round 99's
+claim that the residual is entirely attention should be read as ~102 ms of attention plus ~65 ms
+of other work. **The recommendation is unchanged and better supported, because it now rests on a
+direct kernel measurement rather than a subtraction.**
