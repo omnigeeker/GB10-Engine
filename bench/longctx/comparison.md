@@ -5348,3 +5348,56 @@ at 128K goes 102 ms -> 62 ms and the token 217 -> 177 ms = **5.64 OTPS against l
 **Retained:** the split-D change is left in place -- it is verified correct by both gates and is a
 real if small improvement -- but the document should be read as treating it as a stepping stone,
 not as the fix. **The fix is split-K.**
+
+### Split-K implemented and measured: no gain at all, and round 115's 1.64x does not transfer (round 119)
+
+Round 118 concluded from two separate measurements -- +64% from doubling the grid, -33% from 1.5x
+traffic -- that a split doubling the grid at flat traffic should collect close to the full 1.64x,
+and named split-K as the way to get it. **It was implemented, verified, and measured. It does not
+work, and the inference from those two numbers was wrong.**
+
+**Implemented:** `attn_decode_partial_kernel` (the warp kernel with `gridDim.z` dividing the key
+range and each block writing its raw `(m, l, acc)` state instead of normalising) plus
+`attn_decode_merge_kernel` (one block per `(sequence, head, dim half)`, applying the global max,
+with the `l > 0` empty-cache guard carried over). Grid becomes
+`(n_q_heads, n_seq * dim_split, n_split)` = 96 blocks, a scratch buffer of 49.5 KB.
+
+**Correctness passed:** `generate --oracle` **16/16, exact match**, and `rms rel` 8.21e-6 against
+8.24e-6 before. So the kernels are right and the measurement is meaningful.
+
+| variant | blocks | warp ms | vs baseline |
+|---|---|---|---|
+| baseline | 24 | 6.375 | -- |
+| **split-D** | 48 | **6.031 - 6.164** | **1.04 - 1.06x** |
+| split-K (S=2, + split-D -> 96) | 96 | **6.442** | **0.99x** |
+
+**Four times the blocks of the baseline, and it is slower.** The 1.64x did not appear.
+
+**Why the inference failed.** Round 115's 1.64x was measured with `--n-seq 2`, where the extra 24
+blocks process **a second, independent sequence**. Split-K's extra blocks process **the same
+sequence's other key half**. Those are not the same thing:
+
+- With two sequences, the added blocks carry genuinely new work with their own independent
+  softmax, and the per-block fixed cost (loading `q`, the 32-warp shared-memory merge, the block
+  setup) is amortised over it.
+- With split-K, the same fixed cost is **duplicated** while each block's key loop is halved, and
+  the merge adds a second launch plus a global round trip. At 6 ms of real work those extras are
+  small but the halved key loops are smaller still.
+
+**So "filling the grid is worth 1.64x" was an over-generalisation from a sequence-parallel
+measurement to a key-parallel design.** The grid was idle in the `n_seq = 1` case, but **the
+idleness was not the binding constraint** -- adding blocks that split an existing sequence's work
+does not recover it. Only adding blocks with independent work does.
+
+**This closes the split-K line, and it retires the "+64% available" claim.** The remaining
+measured position on decode attention is split-D's ~1.04-1.06x, which is kept (it is committed,
+verified, and the best of the three). **The 128K and 256K OTPS gap therefore stands at 1.12x and
+1.29x; there is no longer a measured path to closing it on the attention side.**
+
+**And it is the third time in this session that a projection from a plausible mechanism was
+refuted by a cheap measurement** (rounds 106-109 on the streaming path, round 117-118 on split-D's
+L2 assumption, now split-K's parallelism transfer). The pattern is consistent: **the measurements
+have been reliable and the extrapolations between them have not.**
+
+**Reverted.** The split-K kernels and host plumbing were removed; the tree is back to the
+committed split-D state, re-measured at 6.031 ms to confirm the revert.
