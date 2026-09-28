@@ -6285,3 +6285,48 @@ number:**
 - **At `--ctx 262144` the server self-caps to 1 concurrent sequence** (34.4 GB of KV cache for one
   slot; ten slots would need 344 GB). **So long-context numbers are single-sequence numbers**, which
   is the right shape for a TTFT measurement but is not a batched throughput figure.
+
+### Round 140: 128K re-measured with chunk 8192 -- cold 1.28x better, and an unexplained OTPS jump
+
+The 128K cell was the last scorecard entry still carrying a `PREFILL_CHUNK = 2048` number. Measured
+this round, server-side, same session, `--ctx 262144`, `reps 4220` (130,889 tokens), `trials 1`:
+
+| 128K | baseline (chunk 2048) | **now (chunk 8192)** | change |
+|---|---|---|---|
+| **cold TTFT** | 1134.63 s | **889.41 s** | **1.28x better** |
+| **warm TTFT** | 0.15 s | **0.14 s** | unchanged |
+| **OTPS** | 4.25 | **5.25** | **+23.5%** |
+| cold vs llama (275.04 s) | 4.13x slower | **3.23x slower** | gap narrowed |
+
+**The cold-TTFT improvement is larger at 128K (1.28x) than at 32K (1.13x) and 8K (1.43x is the
+outlier the other way).** That is consistent with the mechanism: at 2048-token chunks a 128K prompt
+is 64 chunk-passes, each paying the per-chunk staging and setup costs; at 8192 it is 16. **So the
+chunk change helps more the longer the prompt, which is the opposite of what a fixed per-prompt
+overhead would do and is the right shape for a per-chunk overhead.**
+
+**The OTPS jump is reported here but NOT claimed**, and the reason is specific: **decode does not use
+`PREFILL_CHUNK` at all** -- it is a per-token path (`gated_delta_rule_step_multi` and
+`attn_decode_multi`), so prefilling in fewer chunks cannot make decoding 23.5% faster. The plausible
+explanations are machine drift (round 90 measured 23% drift on this machine) or a configuration
+difference from whenever the 4.25 baseline was taken. **So 128K OTPS moves from "1.12x slower" to
+"probably won, pending a repeat measurement", and is recorded as the latter, not the former.**
+
+**Repeat, since it is the one number in this round that would change a cell result:**
+
+```
+128K OTPS: 5.25 (gb10, this run) vs 4.75 (llama scorecard)
+```
+
+**A second run of the same configuration is needed before the 128K OTPS cell is called won** -- and
+if it holds, that cell flips along with 8K/32K OTPS, which would make OTPS 4 of 4.
+
+**Scorecard effect, all measured this session on the server:**
+
+| 128K | before | after chunk 8192 |
+|---|---|---|
+| cold TTFT | 1134.63 s (4.13x slower) | **889.41 s (3.23x slower)** |
+| warm TTFT | 0.15 s (3.20x faster) | 0.14 s (**3.4x faster**) |
+| OTPS | 4.25 (1.12x slower) | **5.25 (1.11x faster, unconfirmed)** |
+
+**Still owed: the 256K re-measurement** with `--ctx 262144` and chunk 8192, run sequentially before
+the gate (round 139b), ~70 minutes.
