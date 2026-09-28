@@ -3162,3 +3162,56 @@ attention needs (round 75: 5.0 TFLOP/s, 13.5% of fp16 peak).
 **This is the highest-value remaining change in the document**, because it is the only one
 aimed at a metric gb10 currently loses, it has a measured cause (6x redundant traffic), and
 the fix is a known pattern rather than research.
+
+### The naive GQA fix does not fit in shared memory -- split-K is required, not optional (round 77)
+
+Round 76 identified the 6x GQA redundancy and proposed moving the grid to one block per KV
+head so K and V are read once and reused by the six query heads that share them. Before
+anyone writes it, the merge stage was checked for feasibility, and it settles the design.
+
+`attn_decode_multi_kernel` merges its `NW = 32` per-warp partials through shared memory:
+
+```cuda
+// One merge of the NW per-warp partials. `sm_acc` is sized for the 256-wide
+// head this kernel requires, so it is 8 KB, not one entry per key.
+__shared__ float sm_m[NW], sm_l[NW], sm_acc[NW][256];
+```
+
+**`sm_acc[NW][head_dim]` is 32 x 256 x 4 = 32 KB on its own** (the comment's "8 KB" predates
+the `NW` raise from 8 to 32 recorded in round 76). A block that serves all six query heads of
+a KV head at once needs six such merge buffers:
+
+| | shared memory |
+|---|---|
+| today: one head per block | 32 KB + 0.25 KB = **~32 KB** |
+| naive 6-head block | 6 x 32 KB = **192 KB** |
+| GB10 sharedMemPerBlockOptin | **99 KB** |
+| default sharedMemPerBlock | 48 KB |
+
+**192 KB is double the opt-in ceiling, so the one-block-per-KV-head form cannot be built this
+way at all.** And processing the six heads *sequentially* inside the block would not help:
+one head's keys occupy 130K x 256 x 4 B = 133 MB, far beyond L2, so the second pass would
+re-read from DRAM and the 6x traffic would come straight back.
+
+**That leaves exactly one viable shape, and it is the one round 76 named: a two-phase
+flash-decoding split.** Write each block's partial online-softmax triple `(m, l, acc)` to a
+small global scratch, then combine the partials in a second pass whose working set is
+`key_splits x (1 + 1 + head_dim)` floats per (head, sequence) rather than anything
+context-sized. With `key_splits = 8`:
+
+- **traffic:** `grid = (n_kv_heads, key_splits, n_seq)` = 4 x 8 = 32 blocks per sequence, each
+  block reading only its slice of the key range **once** across all six query heads -- one
+  sixth of today's bytes.
+- **parallelism:** 32 blocks per sequence, *more* than today's 24, and with `NW` warps each,
+  so the occupancy that round 76's comment says is needed for bandwidth is preserved.
+- **shared memory:** unchanged at ~32 KB per block, because each block still merges only its
+  own warps' partials.
+
+**So the check changed the plan from "move the grid" to "two-phase split-K", with the reason
+written down: the merge buffer alone is 32 KB per head, and six heads do not fit.** That is
+the difference between a change that gets implemented and one that gets started and abandoned
+on the third compile error.
+
+Targets are unchanged from round 76: decode attention 290 ms/token -> ~42-60 ms, i.e. 128K
+OTPS from 3.45 past llama.cpp's 4.82; and the same split-K scratch/combine structure serves
+the 128K prefill attention, which measured 5.0 TFLOP/s against llama's ~32.
