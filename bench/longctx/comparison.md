@@ -3360,3 +3360,53 @@ DRAM-limited part, not the 6x that rounds 75/76 implied.
    not infer from a standalone kernel.
 3. The two-phase split-K redesign is **demoted**: the occupancy case for it is refuted here,
    and the traffic case is now sized at ~2x rather than 6x.
+
+### The 128K decode budget is now fully attributed -- and ~40% of it is a context-independent floor (round 80)
+
+Round 79 left ~123 ms/token of the 128K decode with no measured owner and named attributing it
+as the next step. One cheap run answers it: `generate` at a 16-token prompt reports
+
+```
+decoded 16 tokens in 2.051s -> 7.80 tok/s
+```
+
+**7.80 tok/s at a 16-token context is 128 ms per token** -- essentially the same per-token
+cost as at 8K (8.72 OTPS = 115 ms) and 32K (7.14 OTPS = 140 ms). Laid out:
+
+| context | OTPS | ms/token | attention (from round 79's 70.7 ns/key) |
+|---|---|---|---|
+| ~16 tokens | 7.80 | **128 ms** | ~0 |
+| 8K | 8.72 | 115 ms | ~2 ms |
+| 32K | 7.14 | 140 ms | ~9 ms |
+| 128K | 3.45 | **290 ms** | **~167 ms** |
+
+**The decode has a floor of roughly 115-128 ms per token that does not depend on context at
+all**, and it accounts for essentially all of the 8K and 32K numbers and for 128 of the 290 ms
+at 128K. The attention term then closes the budget almost exactly: 128 + 167 = 295 ms against
+290 ms measured.
+
+**So the 290 ms/token at 128K decomposes as ~128 ms of context-independent per-token work
+plus ~167 ms of attention**, and attention is *not* the largest single item -- it is 58% at
+128K and nearly nothing at 8K.
+
+**And that floor is itself unexplained by a wide margin.** One token through 64 layers does
+~22.3B MACs (round 53), which is 44.6 GFLOP; at 128 ms that is **0.35 TFLOP/s, or 2% of fp32
+peak.** Even allowing that an M=1 GEMM cannot use tensor cores well, a factor of fifty is not
+an arithmetic shortfall -- it is per-token overhead, launch cost, or synchronisation. This is
+the same shape of finding as the DeltaNet recurrence (round 66: 0.64% of peak) and it is the
+same lesson: a rate two orders of magnitude below the ceiling means something is waiting, not
+computing.
+
+**This reorders the OTPS work.** At 128K the attention rewrite is worth ~167 ms and the floor
+is worth ~128 ms; but at 8K and 32K -- where gb10 currently *wins* OTPS -- the floor is
+essentially the entire cost, so improving it widens the margins that are already held rather
+than closing the one that is lost. To beat llama at 128K (needs < 207 ms) both must move:
+167 -> ~100 ms of attention would do it alone, and 128 -> ~60 ms of floor would too.
+
+**Next, and it is a measurement before a fix:** the floor is per-layer work repeated 64 times,
+and `GB10_LAYER_TIMING` already exists in the decode path (model.rs:343, "Per-layer device
+events, so the two layer kinds can be compared in bytes-per-second rather than in
+milliseconds") to split it by layer kind. `GB10_STEP_TIMING` (model.rs:322) records a
+device-side step timer for the same purpose. Neither printed under `generate`, so whichever
+harness is meant to consume them needs to be found or the two events read directly -- but the
+machinery is already in the tree and does not need to be written.
