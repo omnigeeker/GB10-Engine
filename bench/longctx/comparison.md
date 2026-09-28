@@ -3771,3 +3771,75 @@ again, since the code is back to fp32 -- so no re-measurement of the other conte
 and the 8K/32K/128K/256K table is valid as recorded. The remaining gap is unchanged and still
 localized: **cold TTFT and OTPS both lose through the attention term, at every context, and
 the fix has to reduce the attention's *time*, not merely its bytes.**
+
+### Measured at 32K: attention is now 61% of the prefill and runs at 8.4% of peak (round 88)
+
+Round 63 split the prefill by layer kind at 8K only, and every plan since has been argued from
+that one data point. Round 87's lesson -- measure the pipeline, not the boundary -- says to
+split it at a second length. Same instrumentation, `prefill-shape --max-seq 36864 --limit 32747`:
+
+```
+[diag] layers tried=1024 made=1024 measured=1024 errs=0
+[diag] LAYER GPU: delta 42.63s / 768 = 38.6%   attn 67.48s / 256 = 61.0%
+[diag] n=6400 | weight stage 8188ms (7.4%)  activ cast 2709ms (2.5%)
+             | cublas gemm 25850ms (23.4%)  epilogue 3002ms (2.7%)
+             | op phases total 39.75s of 110.56s (36.0%)
+```
+
+**The split inverts between 8K and 32K:**
+
+| | 8K | **32K** |
+|---|---|---|
+| DeltaNet layers | 70.1% | **38.6%** |
+| full-attention layers | 29.0% | **61.0%** |
+| total prefill | 18.87 s | 110.56 s |
+
+**And the per-token costs explain why, which is more useful than the percentages:**
+
+| per 1,000 tokens | 8K | 32K | change |
+|---|---|---|---|
+| DeltaNet | 1.62 s | **1.30 s** | **improves 1.25x** |
+| attention | 0.67 s | **2.06 s** | **worsens 3.1x** |
+
+**DeltaNet gets *cheaper* per token as the context grows** -- its recurrence is linear in T and
+the fixed per-chunk work amortizes -- while **attention gets 3.1x more expensive per token**
+over the same range, which is the quadratic term asserting itself. So attention is not merely
+the majority at 32K; it is the only term that grows, and it is the only one that needs to be
+fixed for the long contexts the objective names.
+
+**Its efficiency, computed from this measurement:**
+
+```
+causal prefill attention FLOPs = 2 * T^2 * n_heads * head_dim * n_layers
+  T = 32,747, heads = 24, head_dim = 256, layers = 16
+  = 211 TFLOP
+measured 67.48 s
+  = 3.12 TFLOP/s
+  = 8.4% of the 37 TFLOP/s fp16 peak
+```
+
+Cross-checked against round 75's independent 128K figure: 211 TFLOP scaled by
+(131072/32747)^2 = 3,378 TFLOP, against the 4,275 TFLOP measured there -- the same order, so
+the two measurements agree on the shape.
+
+**llama.cpp's implied rate is ~32 TFLOP/s (round 75), so gb10's prefill attention is running
+about 10x below what the hardware demonstrably does on this workload.** That is the single
+largest number in this document, and it is a *time* gap, not a bytes gap -- which is why
+round 87's byte-halving change could pass every gate and still lose 22% on cold TTFT.
+
+**What this settles:**
+
+- **The chunked DeltaNet rewrite is no longer the priority for the objective's contexts.**
+  DeltaNet is 38.6% at 32K and its per-token cost is *falling*; even a perfect rewrite caps out
+  at a 38.6% saving at 32K and less beyond. It remains the right fix for 8K cold TTFT, where it
+  is 70.1%.
+- **The prefill attention is the objective.** It is 61.0% at 32K, 77% at 128K (round 75), running
+  at 8.4% of fp16 peak, with a 10x gap to what llama.cpp achieves on the identical workload.
+- **And the fix must reduce time, not bytes**, because at 3.12 TFLOP/s the kernel is nowhere
+  near a bandwidth bound and round 87 proved adding per-element work to it is a net loss.
+
+The tile geometry is the natural suspect: `PREFILL_BQ 24` / `PREFILL_BK 16` were tuned in rounds
+41-48 for shared-memory bank conflicts, and the score loop is unrolled around `BQ = 24`
+specifically (`i0 = q / PREFILL_BK`, `step = (nt >> 1) / PREFILL_BK`, three rows per step), so
+the constants cannot be swept without touching that loop. **That is the next thing to change,
+and it must be judged by the server number, not by `attn-tile`.**
