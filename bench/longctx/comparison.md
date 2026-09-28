@@ -2993,3 +2993,54 @@ Two caveats recorded honestly:
 rewrite is the whole story. At 128K it would recover ~118 s of 1119 s (11%), while the
 attention kernel -- the objective's other named item, and the one the round-45/48 work only
 began -- holds ~860 s.
+
+### 128K comparison: cold 4.10x slower and OTPS now LOST -- attention dominates both (round 74)
+
+Round 73 measured gb10 at 128K and flagged that no `llama-server` number existed, so no ratio
+was claimed. This round ran the llama side through the same harness and the same request.
+
+```
+# llama-128k  reps=4218 trials=1 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   130870     273.17       0.48      4.82      4.78  198
+```
+
+against gb10's `130832 prompt, cold 1119.40, warm 0.14, otps 3.45`.
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | cold TTFT | 14.93 s | 10.58 s | 1.41x slower |
+| 8K | warm TTFT | **0.035 s** | 0.237 s | **6.8x faster** |
+| 8K | OTPS | **8.72** | 7.32 | **1.19x faster** |
+| 32K | cold TTFT | 90.54 s | 44.55 s | 2.03x slower |
+| 32K | warm TTFT | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | OTPS | **7.14** | 6.865 | **1.04x faster** |
+| **128K** | cold TTFT | 1119.40 s | **273.17 s** | **4.10x slower** |
+| **128K** | warm TTFT | **0.14 s** | 0.48 s | **3.4x faster** |
+| **128K** | OTPS | 3.45 | **4.82** | **1.40x SLOWER** |
+
+**Two things changed at 128K, and both are recorded rather than smoothed over.**
+
+**First, the cold-TTFT gap widens again: 1.41x -> 2.03x -> 4.10x.** It is not that gb10 got
+worse; both parts scale super-linearly, and llama.cpp scales better because `-fa on` gives it
+a flash-attention kernel while gb10's attention is the hand-written tile kernel of rounds
+41-48. At 128K, attention is ~860 s of gb10's 1119 s (round 73) -- and llama's 273 s total
+means its attention is several times cheaper per key.
+
+**Second, and more importantly, gb10 loses OTPS for the first time.** At 8K and 32K decoding
+won (1.19x, 1.04x); at 128K it loses by 1.40x, because every decoded token attends over
+130K cached keys and that is now the dominant per-token cost on both sides. **Warm TTFT
+remains gb10's one clear win at 128K (3.4x), and it is a real one -- 0.14 s against 0.48 s.**
+
+So the objective's own ordering was right, and the measurements now say so explicitly: the
+prefix cache (the easy half) is done and wins everywhere; **the attention kernel is the
+remaining blocker, and at 128K it is the blocker for prefill *and* decode simultaneously.**
+That also means the attention work cannot be deferred behind the chunked DeltaNet rewrite --
+at 8K the DeltaNet is 62% and the rewrite is the whole story, but at 128K the DeltaNet is
+only 11% and attention is 77%.
+
+Two targets, ordered by context:
+
+- **8K / 32K:** chunked gated-delta-rule rewrite (DeltaNet 62% / ~47%).
+- **128K / 256K:** the attention kernel, for both prefill and decode, against llama.cpp's
+  flash attention. 256K has no baseline on either side yet.
