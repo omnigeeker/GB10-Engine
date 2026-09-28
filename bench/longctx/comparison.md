@@ -5847,3 +5847,48 @@ per-call. **That is the cheapest way to localise this without a profiler, and it
 v-head per token (outer-product update plus `S^T q` output). If the real recurrence does less work
 than that model, the stall factor is smaller -- **but the 0.61%-of-peak measurement itself does not
 depend on the model, only on the time, and the 25 us per token is measured.**
+
+### Round 131: a third of the DeltaNet cost is a per-call fixed cost, and call count is a cheap lever
+
+Round 130's ablation was flawed and this round fixes it. It varied `--limit` and concluded the cost
+was per-token -- but **`PREFILL_CHUNK` is 2048, so varying `--limit` only changes the number of
+calls, never `T` inside a call.** The test that actually separates the two is a **small** chunk, so
+this round measured `--limit 255`:
+
+| T (tokens per call) | per-call time | per-token |
+|---|---|---|
+| **255** | **20.83 ms** | 81.7 us |
+| 2047 | 58.96 ms | 28.8 us |
+| 2048 | 50.57 ms | 24.7 us |
+
+Fitting `T = 255` and `T = 2048`:
+
+```
+slope     = 0.01659 ms/token  = 16.6 us per token
+intercept = 16.60 ms          FIXED PER CALL
+```
+
+**So there is a ~16.6 ms fixed cost per kernel call, and at 8K/7168 tokens (192 calls) it accounts
+for 3.19 s of the 9.71 s measured -- 33% of the entire DeltaNet term.** The other 6.52 s is the
+per-token part.
+
+**That makes call count a cheap, testable lever.** If the state update ran once per layer instead of
+once per (layer, chunk), the fixed part would fall from 3.19 s to 0.80 s:
+
+> **2.38 s saved of 9.71 s = the DeltaNet term 25% faster, ~1.33x.**
+
+**Honest about what that is and is not: 1.33x is not the 1.83x the cell needs**, so this does not
+win 8K on its own. But it is the largest lever found so far on this kernel, it is cheap (it is a
+chunking parameter, not an algorithm change), it applies to the attention path's chunking as well,
+and it compounds with whatever the per-token half yields.
+
+**And the per-token half has moved from "unexplained" to "bounded":** 16.6 us per token against
+~256 cycles (0.17 us) of arithmetic is still a ~97x stall, so the round-130 finding stands -- the
+per-token mechanism is unidentified and `ncu` is unavailable. **The difference now is that the two
+halves are separated and the cheap half is actionable.**
+
+**Caveat, stated plainly: the fit rests on two single runs**, and its prediction for `T = 2047`
+(50.6 ms) misses the measured 58.96 ms by 8 ms. **The 33%/25% split should be treated as
+approximately right, not exact, and re-derived from repeated runs before anything is built on it.**
+What is not in doubt is the shape: **per-call cost is far from negligible, and the `--limit`
+ablations of round 130 could not have seen it.**
