@@ -3843,3 +3843,79 @@ The tile geometry is the natural suspect: `PREFILL_BQ 24` / `PREFILL_BK 16` were
 specifically (`i0 = q / PREFILL_BK`, `step = (nt >> 1) / PREFILL_BK`, three rows per step), so
 the constants cannot be swept without touching that loop. **That is the next thing to change,
 and it must be judged by the server number, not by `attn-tile`.**
+
+### The prefill attention gap is a 64-deep dependent fma chain, and the kernel says so itself (round 89)
+
+Round 88 localized the objective to the prefill attention: 61.0% of the 32K prefill, running at
+3.12 TFLOP/s = 8.4% of the fp16 peak, a ~10x gap to llama.cpp's implied ~32. Reading the score
+loop finds the mechanism, and the kernel's own comments had already identified it in round 44:
+
+```
+// Two elements per load. Round 44 showed this loop is latency-bound on
+// the load-to-fma chain rather than limited by any counted resource:
+// BK=48 cut loads and instructions per fma and changed nothing, while a
+// 32-way bank conflict (which inflates each request's *latency* 32x) was
+// worth 8.05x. So the lever is fewer dependent steps, not fewer loads:
+// one __half2 fetch feeds two independent fmas and halves the chain length.
+```
+
+The loop body is:
+
+```cuda
+float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+for (int d = 0; d < half / 2; ++d) {          // half = 128, so 64 iterations
+    const float2 k  = __half22float2(krow2[d]);
+    const float2 a0 = __half22float2(qr02[d]);
+    const float2 a1 = __half22float2(qr12[d]);
+    const float2 a2 = __half22float2(qr22[d]);
+    d0 = fmaf(a0.x, k.x, d0);  d0 = fmaf(a0.y, k.y, d0);
+    d1 = fmaf(a1.x, k.x, d1);  d1 = fmaf(a1.y, k.y, d1);
+    d2 = fmaf(a2.x, k.x, d2);  d2 = fmaf(a2.y, k.y, d2);
+}
+```
+
+**Each of `d0`, `d1`, `d2` is a single serial chain 64 fma deep**, and round 44 had already
+tried the other lever: cutting *loads* and *instructions* (BK=48) changed nothing.
+
+**The numbers agree with the diagnosis.** Per thread per tile the loop is 64 iterations of
+4 loads, 8 converts and 6 fma = 256 loads, 512 converts, 384 fma. The same comment records the
+score loop as **3072 of ~3840 cycles per tile**, and:
+
+```
+3072 cycles / 384 fma = 8.0 cycles per fma per thread
+```
+
+Eight cycles per fma is not a throughput figure -- with three independent chains a throughput
+bound would show ~1-2. **It is the signature of a dependent-fma chain of ~4-cycle latency that
+the thread cannot fill**, which is exactly what round 44 said it was.
+
+**So the lever is to shorten the chain, and the loop structure makes that mechanical.** Split
+each accumulator across `d` into P partials:
+
+| partials per accumulator | chain depth | chain-bound cycles |
+|---|---|---|
+| 1 (today) | 64 | 256 |
+| **2** | **32** | **128** |
+| 4 | 16 | 64 |
+
+The instruction count, the loads and the converts are all unchanged -- only the dependency depth
+moves -- so this is the one change round 44's evidence says should work, and the one that does
+not repeat round 87's mistake of trading instructions for bytes.
+
+**Two constraints the next implementer needs, both stated in the code:**
+
+1. **The tile constants cannot be swept independently.** The host refuses any launch where
+   `PREFILL_BQ * PREFILL_BK != 3 * (nt >> 1)`, and the score loop is unrolled around that
+   identity specifically (`i0 = q / PREFILL_BK`, `step = (nt >> 1) / PREFILL_BK`, three rows per
+   thread-pair). With `PREFILL_BQ 24`, `PREFILL_BK 16`, `nt 256`: 24 x 16 = 384 = 3 x 128.
+2. **The bank-conflict padding must be preserved.** `PS == 260` and `sub * PADH == 130` are both
+   even, which is what makes the `__half2` reinterpret 4-byte aligned; round 44 measured an
+   8.05x penalty for getting the padding wrong.
+
+**And the judge must be the server, not `attn-tile`** -- round 87 is the standing proof that a
+1.64x kernel win can be a 22% end-to-end loss. The 32K cold TTFT run (two trials, ~4 minutes) is
+the smallest honest test.
+
+**This is not implemented.** It is a change to the hot loop of the kernel that carries 61% of
+the 32K prefill, and it needs the server measurement to judge; starting it without the budget to
+validate it would leave the tree in a worse state than the current fp32 baseline.
