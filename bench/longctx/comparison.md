@@ -5056,3 +5056,61 @@ never by `decode-bench` alone (round 87's rule).**
 **Not implemented.** This round adds no code. It removes the last unknown in a design that has
 been sized, register-checked, de-risked against its documentation and now written out
 line-by-line.
+
+### The 6-head design has a fatal flaw, and the real missing piece is a split-K (round 114)
+
+Rounds 100-103 designed the 6-head decode block and round 111 wrote it out line by line. Working
+out how to size its register arrays this round turned up a structural problem that invalidates
+the design as specified.
+
+**The problem is the grid.** The whole point of the change is one block per KV head instead of one
+per query head, so that the K/V line is fetched once and used for all six heads. But for a single
+sequence that takes the grid from `n_q_heads = 24` blocks to `n_kv_heads = 4`:
+
+| | current | 6-head design |
+|---|---|---|
+| blocks (n_seq = 1) | 24 | **4** |
+| shared memory per block (`sm_acc[NW][256]` + `sm_m`/`sm_l`) | NW=32 -> 32.2 KB -> **1 block/SM** | NW=16 -> 16.1 KB -> 2 blocks/SM |
+| SMs actually used | 24 of 48 | **4 of 48** |
+| warps in flight | 24 x 32 = **768** | 4 x 16 = **64** |
+| DRAM traffic per layer | 3.2 GB (K/V read 6x) | 537 MB (read once) |
+
+**Warps in flight fall 12x while traffic falls 6x.** The kernel is *documented* as latency-bound,
+not bandwidth-bound -- its own comment records that at `NW = 8` it managed only 328 GB/s because
+too few warps were resident, and that raising `NW` to 32 is what fixed it. **Halving the
+warps-per-byte of a latency-bound kernel is expected to make it slower, not faster.** Round 102's
+register analysis sized the fix for occupancy and never checked that the grid still had enough
+blocks to occupy the machine.
+
+**And checking that turned up something larger: the current kernel already wastes half the GPU.**
+At `NW = 32` the shared-memory request is 32.2 KB, so only one block fits per SM; with 24 blocks
+for a single sequence, **24 of 48 SMs sit idle.** Every decode-attention measurement in this
+document -- including round 101's 6.375 ms and 2.71x amplification -- was taken on half the
+machine.
+
+**Both problems have the same missing piece: a k-split.** Splitting the key range into `S`
+chunks:
+
+- restores the block count, so the grid can fill all 48 SMs (the current kernel's `S = 2` would
+  take 24 blocks to 48);
+- and for the 6-head design it is *required*, not optional, because the grid collapse would
+  otherwise cost more parallelism than the traffic saving is worth.
+
+**The cost is a cross-block merge.** A split-K decode attention has to combine partial
+online-softmax states `(m, l, acc)` from `S` blocks per head -- either a second small reduction
+kernel over an `(n_q_heads, S)` buffer, or atomics. That is real work this document has not
+designed, and it is the same shape as FlashDecoding's second pass.
+
+**So the revised next step is bigger than round 111 implied, and better founded.** The order
+should be:
+
+1. **A k-split on the current per-query-head kernel first**, with the cross-block merge, because
+   it is the smaller change, it touches no register budget, and it addresses a defect that is
+   visible right now -- half the GPU idle. **Expected effect is up to ~2x on the decode attention,
+   which alone would take 128K from 4.25 to well past llama's 4.75.**
+2. Only then consider fusing the 6-head sharing on top of the split grid, where the block count is
+   restored and the sharing becomes a pure traffic reduction with parallelism preserved.
+
+**This is a correction to rounds 100-103 and 111.** The 6-head design is not wrong in its
+arithmetic; it is incomplete, because it was designed without checking that the resulting grid
+still occupies the device. Round 111's line-by-line spec should not be implemented as written.
