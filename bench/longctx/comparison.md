@@ -2891,3 +2891,53 @@ traffic *inside* a step (-30% on the DeltaNet) and one fix removed spill *inside
 (0%). Nothing that keeps one token per step has much left to give. **The chunked rewrite is
 the remaining change, and it is the only one that alters the number of steps rather than
 what happens inside one.**
+
+### Official scorecard re-measured through the server, 8K and 32K (round 72)
+
+The four kernel fixes were measured with `prefill-shape`'s in-process diagnostics. This
+round re-ran the real thing -- `bench/longctx/ttft.py` against the streaming HTTP endpoint,
+identical request twice per trial so that cold and warm differ only in what the server
+already holds -- to confirm the wins survive the whole server path.
+
+**8K** (`--ctx 16384`, reps=263, 2 trials, max-tokens 200):
+
+```
+# gb10-8k  reps=263 trials=2 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0     8225      14.81       0.04      8.75      8.69  200
+    1     8225      15.04       0.03      8.70      8.68  200
+```
+
+**32K** (`--ctx 36864`, reps=1054, 1 trial, max-tokens 200):
+
+```
+# gb10-32k  reps=1054 trials=1 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0    32747      90.54       0.05      7.14      7.15  200
+```
+
+The 8K cold TTFT predicted from the in-process diagnostics was 14.90 s; the server measures
+**14.81 and 15.04 s**. The prediction from the kernel work transfers to the full path.
+
+**The scorecard, against the same NVFP4 GGUF on `llama-server`:**
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | cold TTFT | **14.93 s** | 10.58 s | 1.41x slower (was 1.79x) |
+| 8K | **warm TTFT** | **0.035 s** | 0.237 s | **6.8x faster** |
+| 8K | **OTPS** | **8.72** | 7.32 | **1.19x faster** |
+| 32K | cold TTFT | **90.54 s** | 44.55 s | 2.03x slower (was 2.42x) |
+| 32K | **warm TTFT** | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | **OTPS** | **7.14** | 6.865 | **1.04x faster** |
+
+Warm TTFT (prefix cache hit) and OTPS win at both contexts. Cold TTFT is still behind, and
+the remaining margin is now almost entirely the DeltaNet recurrence: 9.26 s of the 14.93 s
+at 8K, and at 31.5 us/token/layer scaled to 32K it is roughly 47 s of the 90.54 s.
+
+**Session cumulative cold TTFT: 8K 88.81 -> 14.93 s (5.95x), 32K 826.09 -> 90.54 s (9.12x).**
+
+The four rejected hypotheses (block count, within-token chains, per-chunk overhead, register
+spill) plus the three accepted fixes (-30% on the DeltaNet: shared-state to registers, global
+`qh` to shared, and the 4-way chain split) are all recorded above. The chunked rewrite
+remains the one change that alters the number of sequential steps rather than the cost of
+one, and it is what stands between cold TTFT and the objective.
