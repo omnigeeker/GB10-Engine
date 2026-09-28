@@ -6554,3 +6554,45 @@ not as a quick test.**
 plan.** The recurring shape across rounds 123/133/134/146: **a measurement is sound, the mechanism
 inferred from it is plausible, and the cost of acting on it is estimated without reading the code
 that would have to change.**
+
+### Round 147: occupancy is NOT an available lever at 8K either -- it is a measured sensitivity
+
+Rounds 145 and 146 treated the 1.47x occupancy probe as a live lever for the 8K cell, with round 146
+only qualifying the *cost* of the fp8 route. **The co-residency arithmetic shows the lever itself was
+misread.**
+
+`attn_prefill_tiled` requests **43,104 B** of shared memory per block, and the opt-in ceiling is
+**101,376 B** per SM:
+
+| blocks/SM | shared memory | against 101,376 B |
+|---|---|---|
+| 1 | 43,104 B | fits |
+| **2 (today)** | **86,208 B** | **fits -- this is the current point** |
+| 3 | 129,312 B | **exceeds** |
+| 4 | 172,416 B | **exceeds** |
+
+**So the kernel runs at 2 blocks per SM, limited by shared memory, and reaching 3 would require
+cutting the request by 9,312 B -- 22% -- from 43,104 B.**
+
+**And the round-145 probe moved 2 -> 1, not 1 -> 2.** It forced one block per SM and cost 1.47x
+(3.77 -> 5.55 s). **That measures the kernel's sensitivity to occupancy; it is not evidence that
+occupancy can be raised.** Going *up* from 2 requires the 22% smem cut, and round 146 established that
+the only available source of that cut is the fp8 staging rederivation, which carries a bank-layout
+rederivation and a likely `attn-tile` precision rejection.
+
+**Corrected conclusion: at 8K there is no cheap lever.** The options are the same two as everywhere
+else on the scorecard -- the fp8 rederivation (which is a piece of work, and may fail precision) or
+the mma rewrite. **The distinction between "8K is cheap" and "128K/256K are expensive" that rounds
+137-147 built up does not survive: all four cold cells need the same two pieces of work.**
+
+**Thirty-second self-correction, and the fifth in seven rounds to revise the previous round's own
+plan.** The pattern has been consistent enough to name: **a probe result is read as a lever rather
+than as a sensitivity, and the direction of the change is assumed rather than checked against the
+resource arithmetic.**
+
+**Attempted and not completed this round: the 256K OTPS confirmation.** Two trials of the 256K
+configuration need about 111 minutes (two cold prefills at ~3,300 s each), which did not fit the
+remaining budget. **The single-trial 256K OTPS of 3.66 s (round 142) therefore stands as recorded,
+still 1.05x behind llama's 3.86, and the re-measurement remains owed.** It was launched and
+deliberately stopped rather than left running into the gate, since round 139b showed the gate's
+`pkill` on port 8080 destroys an in-flight measurement.
