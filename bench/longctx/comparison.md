@@ -4308,3 +4308,46 @@ runs -- and not by `attn-tile`, for the reason round 87 established.**
 **This is not implemented.** It is written down as the next concrete step because it is the
 only direction the cumulative evidence has not yet excluded: bytes (no), tile geometry (pinned
 and tested), chain depth (measured neutral), and now chain *count*.
+
+### Cold TTFT is the only lost metric, and it splits into two jobs of different size (round 96)
+
+The validated scorecard says three of six cells are won (warm TTFT at all four contexts, OTPS at
+8K/32K) and that every lost cell is cold TTFT. Placing the measured layer split against the
+remaining margin gives an ordering that the percentages alone do not:
+
+| context | prefill total | DeltaNet share | attention share | cold TTFT margin to close |
+|---|---|---|---|---|
+| 8K | 14.93 s | **10.47 s (70.1%)** | 4.33 s (29.0%) | **1.41x** |
+| 32K | 90.54 s | 34.95 s (38.6%) | **55.23 s (61.0%)** | 2.03x |
+| 128K | 1134.63 s | ~23% | **~77%** (round 75) | 4.13x |
+| 256K | 4138.39 s | less | more | 5.70x |
+
+**The 8K row is the cheapest win on the board and it is a DeltaNet win, not an attention win.**
+To beat llama.cpp's 10.58 s at 8K, gb10 must remove 4.35 s from a 14.93 s prefill in which
+**10.47 s is DeltaNet**. The chunked-DeltaNet rewrite was sized in round 66 at 2 TFLOP/s as
+taking the 8K DeltaNet term from 13.17 s to ~0.77 s -- i.e. it removes about 12.4 s of a term
+that only needs 4.35 s removed. **Its projected 8K prefill is ~6.5 s against llama's 10.58 s, a
+1.63x win**, which would convert the narrowest cold-TTFT loss (1.41x) into the objective's
+fourth won cell.
+
+**The 32K/128K/256K rows are the attention job**, and get harder as the context grows: the
+DeltaNet share falls while attention rises, and attention is the term whose per-token cost grows
+3.1x from 8K to 32K (round 88) while the kernel sits at 8.4% of fp16 peak. The identified lever
+is the K=6 score loop (round 95), whose magnitude is unmeasured.
+
+**So the two implementations now on the table, with their evidence:**
+
+| | A. chunked DeltaNet rewrite | B. K=6 score loop (BQ 48 / BK 16) |
+|---|---|---|
+| addresses | the 8K term (70.1% of it) | the 32K+ term (61-77%) |
+| expected effect | **1.63x win at 8K, sized in r66** | unknown, latency-bound hypothesis |
+| implementation size | large (new chunk kernel + state layout) | moderate (6-way unroll in the score loop) |
+| correctness gate | `generate --oracle` + `batch-parity` (**`attn-tile` does not cover it**) | `generate --oracle` |
+| validation | same-session 8K server pair (llama 10.58 s) | same-session 32K server pair |
+| this session's budget | not available | not available with the required server validation |
+
+**Both are unimplemented, and neither should be committed on a compile-and-oracle pass alone** --
+round 87 is the standing proof that a kernel change which passes every gate can still lose on the
+server, and rounds 90-94 are the proof that only same-session pairs can tell. **The next session
+should start with A, because it is the only one of the two with a sized, quantified projection
+(1.63x at 8K) and because 8K needs 12.4 s removed against the 4.35 s it requires.**
