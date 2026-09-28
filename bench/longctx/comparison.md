@@ -3314,3 +3314,49 @@ for `n_seq = 1` (24 blocks, half the SMs idle) than as a traffic fix -- which is
 throughput collapses at `n_seq = 1`, the fix is the key-split grid (more blocks), which is a
 far smaller change than the two-phase softmax combine; if it does not, then the 128K decode
 cost is elsewhere and the attention rewrite should wait.
+
+### n_seq=1 is FASTER per sequence: the kernel is efficient, the traffic is not (round 79 cont.)
+
+The measurement round 79 called for -- `decode-bench` at `n_seq = 1` -- answers the question
+in the opposite direction from the guess:
+
+| keys | `n_seq 4` warp ms | **`n_seq 1` warp ms** | speedup vs serial at `n_seq 1` |
+|---|---|---|---|
+| 2048 | 0.434 | **0.162** | **11.73x** |
+| 8192 | 1.677 | **0.588** | **17.87x** |
+| 32768 | 6.658 | **2.312** | **18.18x** |
+
+**One sequence is 2.7-2.9x faster per sequence than four.** Fitting the per-key cost through
+the origin gives **70.7 ns/key**, flat from 2K to 32K keys. So:
+
+- **Half the SM count idle does not hurt.** 24 blocks x 32 warps = 768 warps already
+  saturates the 24 SMs that get a block, and the speedup over the serial reference rises from
+  6.65x to **18.18x** when the sequences are removed. The split-K-for-occupancy plan of round
+  77 is **not** justified by this data.
+- **The kernel is not the problem.** It scales linearly to 32K keys with no efficiency decay,
+  which is what the online-softmax rewrite was for, and it beats its own serial reference by
+  18x.
+- **Extrapolated to 128K, attention costs 10.42 ms per launch.** If a launch is one layer,
+  that is **167 ms/token across 16 layers -- 58% of the measured 290 ms/token.** The other
+  42% is the GEMM (~1.07 ms/token) plus the DeltaNet step (~0.9 ms/token), which together are
+  nowhere near 123 ms, so a large part of the 128K decode remains unattributed and is the next
+  thing to measure rather than assume.
+
+**What survives from round 76 is the traffic argument, not the occupancy one.** At
+`n_seq 1` and 32K keys the bench reports **697 GB/s logical**, and 697 GB/s is three times
+this part's 228 GB/s DRAM -- so the logical figure counts the 24-query-head traffic, and the
+implied DRAM rate is roughly a sixth of it, about **116 GB/s against the 228 GB/s bound**.
+That leaves real but modest headroom: removing the GQA redundancy is worth up to ~2x on the
+DRAM-limited part, not the 6x that rounds 75/76 implied.
+
+**So the plan changes again, and this time toward less work:**
+
+1. **Store the KV cache in fp16/bf16.** Still the single cheapest real win: it halves bytes,
+   halves KV memory, and helps 128K prefill at the same time -- and needs no kernel
+   restructuring.
+2. **Attribute the missing ~123 ms/token of 128K decode** with an in-model measurement before
+   optimising anything else, because at present more than a third of the decode budget has no
+   measured owner. The same discipline that fixed round 55 applies: measure in the model, do
+   not infer from a standalone kernel.
+3. The two-phase split-K redesign is **demoted**: the occupancy case for it is refuted here,
+   and the traffic case is now sized at ~2x rather than 6x.
