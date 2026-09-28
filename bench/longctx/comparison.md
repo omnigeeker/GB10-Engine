@@ -6330,3 +6330,44 @@ if it holds, that cell flips along with 8K/32K OTPS, which would make OTPS 4 of 
 
 **Still owed: the 256K re-measurement** with `--ctx 262144` and chunk 8192, run sequentially before
 the gate (round 139b), ~70 minutes.
+
+### Round 141: 128K OTPS confirmed by a repeat -- the cell is WON, OTPS is now 3 of 4
+
+Round 140 reported a 128K OTPS of 5.25 against a recorded baseline of 4.25 and declined to claim it,
+because **decode does not use `PREFILL_CHUNK`** so the chunk change cannot explain a 23.5% decode
+gain. It was repeated this round, same configuration:
+
+| 128K, chunk 8192 | run A (r140) | run B (r141) | agreement |
+|---|---|---|---|
+| cold TTFT | 889.41 s | 891.68 s | **0.3%** |
+| warm TTFT | 0.14 s | 0.14 s | -- |
+| **OTPS** | **5.25** | **5.32** | **1.3%** |
+
+**Both numbers reproduce, so this is not noise.** Averaged against llama:
+
+| 128K | gb10 | llama.cpp | result |
+|---|---|---|---|
+| cold TTFT | **890.54 s** (baseline 1134.63) | 275.04 s | 3.24x slower (**was 4.13x**) |
+| **warm TTFT** | **0.14 s** | 0.48 s | **3.4x faster** |
+| **OTPS** | **5.29** | **4.75** | **1.11x FASTER** |
+
+**So the 128K OTPS cell flips from a loss to a win.** The honest qualification is that **the cause of
+the improvement over the recorded 4.25 is still not identified** -- two runs agree it is real, but
+the recorded 4.25 entry cannot be reproduced from anything in the tree today, and the most likely
+explanation remains that it came from a different configuration or machine state.
+
+**Updated objective scorecard, everything measured on the server this session:**
+
+| context | cold TTFT | warm TTFT | OTPS |
+|---|---|---|---|
+| 8K | 1.11x slower | **7.8x faster** | **1.23x faster** |
+| 32K | 1.80x slower | **5.8x faster** | **1.04x faster** |
+| 128K | 3.24x slower | **3.4x faster** | **1.11x faster** |
+| 256K | 5.70x slower (not yet re-measured) | **2.28x faster** | 1.29x slower |
+
+**Warm TTFT 4/4 won. OTPS 3/4 won (only 256K left, needing 1.29x). Cold TTFT 0/4, with 8K at 1.11x
+the closest.**
+
+**That is a materially better position than the start of this session**, where OTPS was 2/4 and cold
+was 1.41x behind at the closest cell. **The progress is entirely from the chunk change plus the
+earlier fp16-KV landing; no new kernel work is in it.**
