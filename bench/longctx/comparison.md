@@ -3516,3 +3516,38 @@ off, which is inside the noise of a floor that itself moves by 13 ms between the
 below ~79 ms for gb10 to reach llama.cpp's 207 ms/token.** Two independent measurements agree
 on the size of the prize, which is the condition that has been missing from every plan
 rejected in this document so far -- and it is why this one is worth starting.
+
+### 256K: the llama.cpp baseline exists, gb10's does not yet (round 83)
+
+256K was the last context named by the objective with no data on either side. The cheaper half
+is now measured, through the same harness and the same request shape:
+
+```
+# llama-256k  reps=8420 trials=1 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   261132     703.94       0.68      4.08      4.09  200
+```
+
+With the 128K figures alongside, the llama.cpp scaling is:
+
+| llama.cpp | prompt | cold TTFT | warm TTFT | OTPS |
+|---|---|---|---|---|
+| 32K | 32,747 | 44.55 s | 0.29 s | 6.865 |
+| 128K | 130,870 | 273.17 s | 0.48 s | 4.82 |
+| **256K** | **261,132** | **703.94 s** | **0.68 s** | **4.08** |
+
+- **Cold TTFT is super-linear on both servers**: 32K -> 128K is 4.0x the tokens for 6.13x the
+  time, and 128K -> 256K is 2.0x the tokens for 2.58x the time. The quadratic attention term
+  is visible in llama.cpp too, just weaker than in gb10 (gb10's 32K -> 128K was 4.0x tokens for
+  12.4x time).
+- **OTPS decays with context** (6.865 -> 4.82 -> 4.08) for the same reason: every decoded
+  token attends over the whole cache.
+- **Warm TTFT stays sub-second** (0.68 s at 256K), so llama.cpp's prefix cache is holding at
+  this length as well.
+
+**gb10's 256K number is not yet measured, and it is the expensive one.** Extrapolating from
+its own 128K figure (1119 s) with the observed super-linear exponent gives something in the
+range of 2,900-5,000 s -- 50 to 85 minutes for a single trial -- which is why it was not run
+in this round. That extrapolation is recorded as an estimate and must not be quoted as a
+measurement; the objective's third context is therefore **half complete**, with the reference
+side done and the gb10 side pending.
