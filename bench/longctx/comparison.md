@@ -6223,3 +6223,37 @@ critical path for any cell except 32K.**
 **Thirty-first open thread closed in this session** (rounds 133-137 each closed the previous round's
 open question); **the remaining unexplained term is now only the ~97x per-token stall, which no
 current cell depends on.**
+
+### Round 139: the server defaults to a 32K context, so every long-context run must pass --ctx
+
+A reproducibility note that cost a failed 128K run to find, and belongs in the method section.
+
+`gb10-server` takes `--ctx` (`crates/gb10-server/src/main.rs:113`) and **defaults to 32768 tokens**.
+Starting it without the flag and sending a ~130K-token prompt does not error visibly on the server
+side -- the log shows a healthy server, and the request simply produces no content:
+
+```
+gb10-server: loading models/Qwen3.8-27B-NVFP4
+context 32768 tokens, 10 concurrent sequence(s), KV cache 42.9 GB (4295 MB per sequence)
+gb10-server: ready in 38.7s
+...
+ttft.py: RuntimeError: no content deltas received
+```
+
+**The failure mode is silent and looks like a harness bug rather than a configuration error**, so it
+is worth writing down: **`--ctx 262144` is required for 128K and 256K runs**, and the startup line to
+check is the `context ... tokens` one, not the readiness line.
+
+With the flag the server reports what the long-context scorecard needs:
+
+```
+context 262144 tokens, 1 concurrent sequence(s), KV cache 34.4 GB (34360 MB per sequence)
+gb10-server: ready in 39.7s
+```
+
+Note the concurrency: **10 slots at `--ctx 262144` would need 344 GB of KV cache, so the server
+self-caps to 1 concurrent sequence** (34.4 GB). That is the right configuration for a TTFT
+measurement anyway -- the harness sends one request at a time -- **but it does mean the 128K/256K
+numbers are single-sequence numbers and are not comparable to a batched throughput figure.**
+
+**The 128K re-measurement with chunk 8192 is in flight**; its result is not in this round.
