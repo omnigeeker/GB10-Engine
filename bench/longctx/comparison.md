@@ -4084,3 +4084,56 @@ reverted, since it measured 0.9% -- inside noise.
 which were 1.40x and 1.86x. It does not close them, and it does nothing for the cold TTFT gaps
 (1.41x / 2.03x / 4.10x / 5.66x), which remain the larger and harder problem. **The requirement
 is unchanged: cold TTFT needs the prefill attention to get faster in time, not in bytes.**
+
+### 128K: fp16 KV cuts the OTPS gap from 1.40x to 1.12x (round 92)
+
+Same-session pairs at 128K, both servers measured back to back:
+
+| 128K | gb10 (fp16 KV) | llama.cpp | ratio |
+|---|---|---|---|
+| cold TTFT | 1134.63 s | 275.04 s | **4.13x slower** |
+| warm TTFT | **0.15 s** | 0.48 s | **3.20x faster** |
+| OTPS | **4.25** | 4.75 | **1.12x slower** |
+
+Against the recorded round-74 pair -- gb10 fp32 `1119.40 / 0.14 / 3.45`, llama
+`273.17 / 0.48 / 4.82`, ratios `4.10x / 3.43x / 1.40x` -- and with the drift worth noting
+because it behaves differently here than at 32K:
+
+| 128K | recorded (r74) | today | change |
+|---|---|---|---|
+| llama.cpp cold | 273.17 s | 275.04 s | **+0.7%** |
+| llama.cpp OTPS | 4.82 | 4.75 | **-1.5%** |
+| gb10 cold | 1119.40 s (fp32) | 1134.63 s (fp16) | +1.4% |
+| gb10 OTPS | 3.45 (fp32) | **4.25 (fp16)** | **+23.2%** |
+
+**llama.cpp is stable at 128K within 1.5%**, so no drift correction is needed and the fp16 KV
+effect is isolated cleanly:
+
+- **OTPS +23.2%**, from 3.45 to 4.25.
+- **Cold TTFT unchanged** (+1.4%, inside noise).
+- **The 128K OTPS gap narrows from 1.40x to 1.12x.**
+
+**This is the first change in this document that has moved a metric the objective is actually
+losing**, and it is verified by a same-session paired measurement on both arms -- the standard
+round 90 established and rounds 87 was missing.
+
+**And it sharpens the mechanism story.** Earlier rounds assumed cold TTFT and OTPS must be
+fixed by the same attention work, because both loss curves share a cause. The fp16 KV result
+separates them:
+
+| metric | what dominates it | does halving KV bytes help? |
+|---|---|---|
+| **cold TTFT** (prefill) | attention at 8.4% of fp16 peak, instruction/latency-bound | **no** (+1.4%, and -0.7% at 32K) |
+| **OTPS** (decode) | streaming the whole KV cache every token, byte-bound | **yes, +23.2%** |
+
+**One change, two metrics, opposite responses -- because the two kernels are bound by
+different things.** The prefill attention has room in time (it is at 8.4% of peak) and no room
+in bytes (it is not waiting on them); the decode attention is the reverse. That is why round 87
+was right that the prefill is instruction-bound and round 91 was right that halving bytes wins
+OTPS, and why both readings had to be measured separately rather than reasoned about together.
+
+**Where the objective now stands.** OTPS: won at 8K and 32K, and at 128K the loss is down to
+1.12x. Cold TTFT: lost at every context by 1.41x / 2.05x / 4.13x, and untouched by every change
+attempted so far -- because the one lever that has worked (bytes) is not the lever the prefill
+attention responds to. **The remaining problem is exactly one kernel: the prefill attention, on
+time rather than bytes, at 61% of the 32K prefill and 77% of the 128K prefill.**
