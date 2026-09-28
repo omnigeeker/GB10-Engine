@@ -3215,3 +3215,58 @@ on the third compile error.
 Targets are unchanged from round 76: decode attention 290 ms/token -> ~42-60 ms, i.e. 128K
 OTPS from 3.45 past llama.cpp's 4.82; and the same split-K scratch/combine structure serves
 the 128K prefill attention, which measured 5.0 TFLOP/s against llama's ~32.
+
+### CORRECTION: the KV cache is fp32, so round 76's "88% of bandwidth" was wrong (round 78)
+
+Rounds 75 and 76 both sized the decode attention's memory traffic assuming an **fp16** KV
+cache: 9.66 GB per decoded token at 128K. Checking the type before building anything on that
+number shows it is wrong by a factor of two.
+
+```rust
+// crates/gb10-model/src/layer.rs:638
+pub k_cache: CudaSlice<f32>,
+```
+
+and the append kernel writes it as `float*`, and both attention kernels read
+`const float* __restrict__ k_cache`. **The cache is fp32.** The corrected arithmetic:
+
+| | fp16 (what rounds 75/76 assumed) | **fp32 (what the code does)** |
+|---|---|---|
+| KV per decoded token at 128K | 9.66 GB | **19.3 GB** |
+| measured 290 ms/token | 33 GB/s | **66.6 GB/s** |
+| share of the 228 GB/s bound | 15% | **29%** |
+| if 6x GQA redundancy reaches DRAM | 200 GB/s | **400 GB/s -- above DRAM** |
+
+**So round 76's conclusion -- that the decode kernel "is already running at ~88% of memory
+bandwidth" and that only reducing bytes can help -- is retracted. It is at 29% of DRAM
+bandwidth, and there is a lot of headroom.** That also explains an inconsistency round 76
+glossed over: 6x redundancy at DRAM would demand 400 GB/s, which the part does not have, so
+the redundancy must be substantially absorbed by L2 rather than DRAM.
+
+**The revised diagnosis is different, and it is the one the kernel's own comment already
+pointed at.** That comment raised `NW` from 8 to 32 for a stated reason -- "4x the in-flight
+work for the same traffic" -- which is a *latency-hiding* argument, not a bytes argument. A
+kernel at 29% of bandwidth with plenty of independent work available is **memory-latency
+bound, not bandwidth bound**: it is not issuing enough concurrent loads to cover DRAM
+latency. That reframes the fix, and it makes a much cheaper change viable:
+
+1. **Store the KV cache in fp16 or bf16.** Halves the bytes outright (19.3 -> 9.7 GB/token),
+   halves KV memory, and helps the 128K *prefill* attention at the same time. If the kernel
+   keeps its present efficiency, 290 ms becomes ~145 ms, i.e. **OTPS ~6.9 against
+   llama.cpp's 4.82** -- which would flip the one metric gb10 currently loses. llama.cpp
+   itself keeps its KV cache in fp16, so this is also what the comparison is measuring
+   against. The cost is a quality question, gated by perplexity and needle.
+2. **Raise memory-level parallelism** rather than reduce bytes -- more in-flight loads per
+   thread, or a key-split grid purely for occupancy. Worth trying first because it needs no
+   dtype change and is measured by the same harness.
+
+The two-phase split-K design of rounds 76/77 is still the right shape if the fix turns out to
+be parallelism -- but note that it is no longer justified by "the traffic is 6x too high and
+we are at the bandwidth wall", because that was based on the fp16 figure. It is justified
+only if the 6x is shown to matter, which the corrected numbers say it does not obviously do
+(400 GB/s of DRAM demand is impossible, so L2 is already absorbing most of it).
+
+**This is the second time in this document that a number was used before its assumption was
+checked** (the first was round 55's "CPU-bound" inference from process user time). The
+corrected figure is recorded rather than the original edited away, because the retraction is
+the more useful artifact.
