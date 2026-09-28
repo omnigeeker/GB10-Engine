@@ -6418,3 +6418,43 @@ measurement with an unidentified cause, not as a mechanism.**
 progress is the chunk change plus fp16 KV.** The remaining gap is cold TTFT, and rounds 120-137
 established that closing it requires the mma prefill attention (needing 1.4x at 8K, 5.98x at 32K,
 8.40x at 128K, 8.82x at 256K).
+
+### Round 144: the 8K cell confirmed with 3 trials per side -- 1.09x away, and 1.29x on attention closes it
+
+The 8K cold margin was 1.06 s on a 10.43 s measurement from single runs, so it was re-measured with
+**3 trials on each side, same session**:
+
+| 8K, `reps 231` | trial 0 | trial 1 | trial 2 | mean | spread |
+|---|---|---|---|---|---|
+| **gb10 cold** | 10.39 | 10.34 | 10.31 | **10.347 s** | **0.08 s (0.8%)** |
+| **llama cold** | 9.31 | 9.61 | 9.57 | **9.497 s** | **0.30 s (3.2%)** |
+
+**The gap is real: 10.347 / 9.497 = 1.090x slower**, and both sides are tight enough that 0.85 s is
+not noise -- gb10 varies by 0.8%, llama by 3.2%, and the gap is 9% of the prefill.
+
+| 8K | gb10 | llama | result |
+|---|---|---|---|
+| cold TTFT | **10.35 s** | 9.50 s | **1.09x slower** |
+| **warm TTFT** | **0.03 s** | 0.223 s | **7.4x faster** |
+| **OTPS** | **8.91** | 7.26 | **1.23x faster** |
+
+**And the requirement to flip it is now measured exactly: 0.85 s of a 10.35 s prefill = 8.2%.** At
+8K the attention term is ~3.77 s (round 137), so:
+
+> **attention needs only 1.29x to win the 8K cold cell.**
+
+**That is the smallest requirement anywhere on the scorecard** -- against 5.98x at 32K, 8.40x at
+128K, 8.82x at 256K, and the 1.83x that DeltaNet would need at 8K. **So an mma attention that lands
+anywhere near its 9x target does not merely win 8K, it wins it with an enormous margin**, and the
+same implementation is what the other three cold cells need.
+
+**This is the cleanest statement of the remaining work the session can make:**
+
+| cold cell | requirement | on what |
+|---|---|---|
+| **8K** | **1.29x** | attention |
+| 32K | 5.98x | attention |
+| 128K | 8.40x | attention |
+| 256K | 8.82x | attention |
+
+**One implementation, four cells, and the cheapest of them needs 1.29x.**
