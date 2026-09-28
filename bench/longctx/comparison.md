@@ -3609,3 +3609,61 @@ concrete defect behind both:** it doubles every attention byte, in prefill and i
 **So the objective is unmet, and the evidence now says the remaining work is one thing, not
 three.** Warm TTFT is already won and needs defending; cold TTFT and OTPS are lost by the same
 attention term, in the same contexts, for the same reason.
+
+### Sizing the fp32 -> fp16 KV cache change: it is nearly sufficient on its own (round 85)
+
+Round 78 identified the fp32 KV cache as the one concrete defect behind both lost metrics. It
+is worth sizing before writing it, because the arithmetic says it is close to sufficient by
+itself -- which decides whether the more complex split-K work is needed at all.
+
+The decode attention at 128K moves `T x n_kv_heads x head_dim x 2 (K and V) x n_layers` bytes
+per token, once per query pass:
+
+| KV dtype | bytes/token at 128K | DRAM time at 228 GB/s |
+|---|---|---|
+| **fp32 (today)** | **19.33 GB** | **84.8 ms** |
+| fp16 | 9.66 GB | 42.4 ms |
+
+The measured 128K attention is ~167 ms, so it runs at **51% of the fp32 DRAM bound** (84.8 /
+167). Holding that efficiency constant -- reasonable, since halving the dtype is a linear
+change to the same access pattern -- fp16 gives 42.4 / 0.51 = **84 ms** of attention instead of
+167 ms. Against the round-81 attribution of 128 ms floor + attention:
+
+```
+today:  128 + 167 = 295 ms   (measured 290 ms)
+fp16:   128 +  84 = 212 ms   vs llama.cpp's 207 ms
+```
+
+**That is 98% of parity from a dtype change alone** -- not a win, but within 2%, where the
+current figure is a 40% loss. And the same change halves the bytes the *prefill* attention
+reads, which round 75 measured at 5.0 TFLOP/s against llama.cpp's implied ~32 and which is 77%
+of the 128K cold prefill (860 s of 1119 s). **So one change attacks both lost metrics at once**,
+which is what makes it the right next step rather than the split-K redesign:
+
+| change | 128K decode OTPS | 128K cold TTFT | cost |
+|---|---|---|---|
+| **KV -> fp16/bf16** | 290 -> ~212 ms (**98% of llama**) | attacks the 77% attention term | moderate |
+| GQA redundancy removal | L2 pressure only (round 79: ~2x, L2-absorbed) | small | large (split-K) |
+| two-phase split-K | (demoted, rounds 79/82) | -- | large |
+
+**Scope, measured rather than guessed** (`grep` across the tree):
+
+- **67 references** to `k_cache`/`v_cache` across three Rust files: `crates/gb10-cuda/src/ops.rs`,
+  `crates/gb10-model/src/mtp.rs`, `crates/gb10-model/src/layer.rs`.
+- **Six kernel signatures** in `kernels/elementwise.cu` take `const float* __restrict__ k_cache`
+  / `v_cache`: the append kernel (line 661, takes non-const `float*`), `attn_prefill_tiled`
+  (820), `attn_decode` (625), `attn_decode_multi` (1095/1126), `attn_decode_multi_serial`
+  (1222). Each needs the loads converted to `__half` and widened to float for the arithmetic,
+  which is the same pattern the round-67..71 work already used for `Qs`/`Ks` in the chunk
+  kernel.
+
+**It is a real change -- six kernels and 67 call sites -- but it is mechanical, it is fully
+specified, and the correctness gate already covers every one of those kernels**
+(`generate --oracle` for the append and prefill paths, `batch-parity` for the decode parity,
+`attn-tile` for the prefill tile kernel). The quality question is separable and gated by
+perplexity (`7.0988` today) and needle (32K 3/3, 128K 1/1, 256K 1/1); llama.cpp keeps its KV
+in fp16, so the comparison is against a server making the same choice.
+
+**This is the next thing to write, and it is not started.** The plan in this section is
+recorded rather than executed because it is a six-kernel change and a half-finished version of
+it would be worse than the fp32 code.
