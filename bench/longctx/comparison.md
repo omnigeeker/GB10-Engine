@@ -2802,3 +2802,52 @@ This also re-orders the remaining work, and it is worth stating plainly:
   change is evidence about *why* the current kernel is slow (traffic per step), which is
   also the reason a chunked form will win: it does `C` tokens per pass over the state
   instead of one.
+
+### WIN 2: `qh` was a global load inside the hot loop -- DeltaNet -12%, prefill -9% more (round 70)
+
+Round 69's register change was verified with `ptxas -v` rather than trusted, and the check
+paid for itself twice.
+
+**First, it showed the register change had spilled.** Compiling the emitted PTX for sm_121:
+
+```
+ptxas info : Function properties for gated_delta_rule_chunk_kernel
+    280 bytes stack frame, 276 bytes spill stores, 308 bytes spill loads
+ptxas info : Used 255 registers, used 1 barriers, 280 bytes cumulative stack size, 512 bytes smem
+```
+
+**255 registers** -- the hardware maximum -- with 280 bytes of stack and real spill traffic.
+That is inherent, not a tuning miss: `Sc[128]` is live across the whole 2048-step token loop,
+so 128 registers are unavoidable and the token loop's own state pushes the rest over. Partial
+unrolling cannot help, because the unroll factor is not what makes the array live.
+
+**Second -- and this is what won the round -- the same check showed where the remaining cost
+was.** With the state in registers, `sk[i]` came from shared memory but **`qh[i]` was still a
+global load inside the second hot loop**: 128 of them per thread per token, on the same
+address for every thread in the block. Hoisting it into shared memory beside `sk`, loaded
+once per token, drops the spill too (280 -> 96 bytes stack):
+
+```
+    96 bytes stack frame, 140 bytes spill stores, 144 bytes spill loads
+```
+
+**Correctness is exact** (`generate --oracle`: `exact match`), and the effect is large:
+
+| | round 63/65 | r67 chains | r69 registers | **r70 qh in shared** |
+|---|---|---|---|---|
+| DeltaNet layers | 13.29 / 13.17 s | 12.80 / 12.65 s | 10.56 / 10.55 s | **9.31 / 9.26 s** |
+| full-attention layers | 5.50 / 5.53 s | 5.49 / 5.41 s | 5.53 / 5.51 s | 5.45 / 5.36 s |
+| **total prefill** | 18.87 / 18.96 s | 18.44 / 18.22 s | 16.26 / 16.22 s | **14.92 / 14.79 s** |
+
+**Three changes to one kernel have now taken the DeltaNet from 13.29 s to 9.26 s (-30%) and
+the whole 8K prefill from 18.87 s to 14.79 s (-22%).** The per-token cost is down from
+31.5 us to **18.8 us per token per layer** (1.8 s per 2048-token chunk, against 3.10 s in
+round 68's sweep).
+
+**The lesson generalises:** all three wins came from removing memory traffic from the inner
+loops -- twice shared-memory traffic, once global -- and none came from changing the
+parallel structure. The same measurement also says what to do next: `ptxas` still reports 255
+registers and 140 spill stores, and spill traffic goes to local memory, which is global
+memory. **Splitting each state column across two threads (64 floats, ~64 registers) would
+hold the column without spilling**, at the cost of one `__shfl_xor_sync` pair per reduction
+-- and every previous reduction in inner-loop traffic has paid 9-17%.

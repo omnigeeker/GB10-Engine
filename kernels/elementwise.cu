@@ -853,6 +853,11 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     // column in registers removes all of that traffic from the inner loops.
     // `sk` stays shared: it is the one input every column needs.
     __shared__ float sk[D];
+    // `qh[i]` was a *global* load inside the second hot loop -- 128 of them per
+    // thread per token, and that loop is half the kernel's cost. Every thread in
+    // the block reads the same address, so it belongs in shared memory beside
+    // `sk`, loaded once per token the same way.
+    __shared__ float sq[D];
 
     float* __restrict__ sh = state + base + ((size_t)b * n_v_heads + hv) * D * D;
     float Sc[D];
@@ -865,7 +870,10 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
         const float* __restrict__ khp = row + k_off + (size_t)kh * D;
         const float* __restrict__ vh = row + v_off + (size_t)hv * D;
 
-        for (int i = threadIdx.x; i < D; i += blockDim.x) sk[i] = khp[i];
+        for (int i = threadIdx.x; i < D; i += blockDim.x) {
+            sk[i] = khp[i];
+            sq[i] = qh[i];
+        }
         __syncthreads();
 
         const float dec = decay[(size_t)(b * T + t) * n_v_heads + hv];
@@ -905,10 +913,10 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
             Sc[i + 1] = s1;
             Sc[i + 2] = s2;
             Sc[i + 3] = s3;
-            o0 = fmaf(s0, qh[i], o0);
-            o1 = fmaf(s1, qh[i + 1], o1);
-            o2 = fmaf(s2, qh[i + 2], o2);
-            o3 = fmaf(s3, qh[i + 3], o3);
+            o0 = fmaf(s0, sq[i], o0);
+            o1 = fmaf(s1, sq[i + 1], o1);
+            o2 = fmaf(s2, sq[i + 2], o2);
+            o3 = fmaf(s3, sq[i + 3], o3);
         }
         const float o = (o0 + o1) + (o2 + o3);
         out[(size_t)(b * T + t) * n_v_heads * D + (size_t)hv * D + j] = o;
