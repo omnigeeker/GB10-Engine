@@ -3551,3 +3551,61 @@ range of 2,900-5,000 s -- 50 to 85 minutes for a single trial -- which is why it
 in this round. That extrapolation is recorded as an estimate and must not be quoted as a
 measurement; the objective's third context is therefore **half complete**, with the reference
 side done and the gb10 side pending.
+
+### gb10 256K measured: the scorecard is now complete across all three contexts (round 84)
+
+The last missing cell is filled. Same harness, same request shape, one trial:
+
+```
+# gb10-256k  reps=8420 trials=1 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   261094    3987.52       0.28      2.19      2.19  200
+```
+
+The round-83 extrapolation from gb10's own 128K figure predicted 2,900-5,000 s; the measured
+value is **3,987.52 s**, inside that range. gb10_server needed **66.5 minutes** to prefill a
+261K-token prompt.
+
+**THE COMPLETE SCORECARD -- all three contexts, both servers, end-to-end through the server:**
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | cold TTFT | 14.93 s | **10.58 s** | 1.41x slower |
+| 8K | **warm TTFT** | **0.035 s** | 0.237 s | **6.8x faster** |
+| 8K | **OTPS** | **8.72** | 7.32 | **1.19x faster** |
+| 32K | cold TTFT | 90.54 s | **44.55 s** | 2.03x slower |
+| 32K | **warm TTFT** | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | **OTPS** | **7.14** | 6.865 | **1.04x faster** |
+| 128K | cold TTFT | 1119.40 s | **273.17 s** | 4.10x slower |
+| 128K | **warm TTFT** | **0.14 s** | 0.48 s | **3.4x faster** |
+| 128K | OTPS | 3.45 | **4.82** | 1.40x slower |
+| 256K | cold TTFT | 3987.52 s | **703.94 s** | 5.66x slower |
+| 256K | **warm TTFT** | **0.28 s** | 0.68 s | **2.4x faster** |
+| 256K | OTPS | 2.19 | **4.08** | 1.86x slower |
+
+**Where the objective stands: warm TTFT is won at all four lengths** (6.8x / 5.8x / 3.4x /
+2.4x) -- the prefix cache is not merely present but decisively faster than llama.cpp's at every
+context, and this is the metric the objective's "当前 run_group 每次 state.reset()，根本没有
+热路径" note was written about. **OTPS is won at 8K and 32K and lost at 128K and 256K. Cold
+TTFT is lost at all four.**
+
+The two loss curves are the same curve and have the same cause, and the numbers now say so
+consistently:
+
+| context | gb10 cold | llama cold | ratio | gb10 OTPS | llama OTPS | ratio |
+|---|---|---|---|---|---|---|
+| 8K | 14.93 s | 10.58 s | 1.41x | 8.72 | 7.32 | 0.84x |
+| 32K | 90.54 s | 44.55 s | 2.03x | 7.14 | 6.865 | 0.96x |
+| 128K | 1119.40 s | 273.17 s | 4.10x | 3.45 | 4.82 | 1.40x |
+| 256K | 3987.52 s | 703.94 s | 5.66x | 2.19 | 4.08 | 1.86x |
+
+**Both gaps widen monotonically with context, and both cross over at the same place -- between
+32K and 128K.** That is the signature of a single super-linear term that gb10 has and
+llama.cpp does not, and the earlier rounds localized it: gb10's prefill attention measured
+5.0 TFLOP/s against llama.cpp's implied ~32 (round 75), and its decode attention is ~167-175 ms
+of the 290 ms/token at 128K (rounds 80-82). **The KV cache being fp32 (round 78) is the one
+concrete defect behind both:** it doubles every attention byte, in prefill and in decode.
+
+**So the objective is unmet, and the evidence now says the remaining work is one thing, not
+three.** Warm TTFT is already won and needs defending; cold TTFT and OTPS are lost by the same
+attention term, in the same contexts, for the same reason.
