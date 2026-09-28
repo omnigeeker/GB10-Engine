@@ -3044,3 +3044,53 @@ Two targets, ordered by context:
 - **8K / 32K:** chunked gated-delta-rule rewrite (DeltaNet 62% / ~47%).
 - **128K / 256K:** the attention kernel, for both prefill and decode, against llama.cpp's
   flash attention. 256K has no baseline on either side yet.
+
+### The attention gap, quantified: 5.0 TFLOP/s prefill, 33 GB/s decode (round 75)
+
+Round 74 established that attention is the 128K blocker for prefill *and* decode. This round
+put numbers on how far the kernel is from its own ceilings, so the work has a target rather
+than a direction.
+
+**Prefill attention at 128K.** The flash-attention work is `2 x 2 x n_heads x head_dim x
+avg_keys` MACs per (token, layer) -- QK^T plus PV -- over 130,832 tokens, 16 full-attention
+layers, 24 query heads and head_dim 256:
+
+| quantity | value |
+|---|---|
+| total attention FLOPs at 128K | **4,275 TFLOP** |
+| gb10 attention time (round 73 decomposition) | ~860 s |
+| **gb10 effective rate** | **5.0 TFLOP/s** |
+| fp16 peak on this part (~2x the 18.43 TFLOP/s fp32) | ~37 TFLOP/s |
+| **gb10 share of fp16 peak** | **~13.5%** |
+| llama.cpp total at 128K | 273 s (of which ~130 s is the linear/DeltaNet work) |
+| **llama implied attention rate** | **~32 TFLOP/s, ~86% of peak** |
+
+**So llama.cpp's flash attention is roughly 6.4x more efficient per FLOP than gb10's tile
+kernel.** That single factor is the whole of the 4.10x cold-TTFT gap at 128K: take gb10's
+attention from 860 s to llama's ~130 s and the two prefill totals are nearly equal.
+
+**Decode attention at 128K.** Per decoded token the whole KV cache must be read: 147,456
+keys x 4 KV heads (GQA) x 256 head_dim x 2 (K and V) x 2 bytes fp16 x 16 layers.
+
+| | ms/token | KV read per token | effective bandwidth | vs 228 GB/s bound |
+|---|---|---|---|---|
+| gb10 (3.45 OTPS) | 290 ms | 9.66 GB | **33 GB/s** | **15% of bound** |
+| llama (4.82 OTPS) | 207 ms | 9.66 GB | 46.6 GB/s | 20% of bound |
+| memory bound | 42 ms | 9.66 GB | 228 GB/s | 24 tok/s |
+
+**gb10's decode attention uses 15% of the available bandwidth** -- it is a streaming
+reduction over 9.66 GB and it runs 7x slower than the memory system allows. llama is also
+far from the bound (20%), so neither is purely bandwidth-limited, but gb10's gap is the
+larger one and it is what turns the 1.04x OTPS lead at 32K into a 1.40x loss at 128K.
+
+**Two concrete targets, both measured:**
+
+1. **Prefill attention: 5.0 -> ~30 TFLOP/s** (llama's rate). Worth ~730 s of the 1119 s at
+   128K, and it is the only path to competing at this context.
+2. **Decode attention: 33 -> ~150 GB/s.** Worth roughly 5x on OTPS at 128K.
+
+Both point the same way -- the rounds 41-48 tile kernel has a layout tuned for shared-memory
+bank conflicts (`PADH = 130`, fp16 `Qs`/`Ks`, `BK = 16`, `BQ = 24`, 22,624 B smem) rather
+than for streaming the KV cache, and at 128K the streaming is the dominant cost. A GQA-aware
+kernel that streams K and V once per token and reuses each block across all 24 query heads
+(they share only 4 KV heads) is the shape both targets need.
