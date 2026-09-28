@@ -5562,3 +5562,46 @@ form it takes:
 **It also means the cheaper alternatives are not merely unattempted but ruled out**, so no future
 round need spend a measurement on fp16x2 accumulation, on instruction shaving, or on further tile
 geometry. **The remaining work is one job, and it is the mma kernel.**
+
+### CORRECTION to round 122: the "provably necessary" bound does not hold; the requirement is 8-10x, not 15x (round 123)
+
+Round 122 concluded with a bound: the prefill attention needs 15x, 15x is 46.8 TFLOP/s, the fp16
+CUDA-core peak is 37 TFLOP/s, so **tensor cores are provably necessary**. **The arithmetic in that
+argument is right and the conclusion drawn from it is wrong, because 15x is not the requirement.**
+
+15x came from round 120's table, which asked what a **15x** speedup would be worth -- a *sufficient*
+figure chosen to show a clear win (128K -> 243 s against llama's 275.04), **not the minimum needed
+to win.** Round 122 then treated it as the requirement and compared it against the peak. Solving
+for the actual threshold instead:
+
+| context | measured prefill | attention share | DeltaNet | attention must fall below | **required k** | at 3.12 TFLOP/s today |
+|---|---|---|---|---|---|---|
+| 128K | 1134.6 s | 86% (980 s) | 155 s | 120 s | **8.1x** | **25.4 TFLOP/s** |
+| 256K | 4138.4 s | 93% (3836 s) | 303 s | 423 s | **9.1x** | **28.3 TFLOP/s** |
+
+**The requirement is ~8-10x, i.e. 25-28 TFLOP/s -- which is BELOW the 37 TFLOP/s fp16 CUDA-core
+peak.** So the bound "46.8 > 37, therefore no CUDA-core kernel can do it" **is not sound**, and the
+word "provably" must come out.
+
+**What survives, and it is the honest form of the conclusion:** the tensor-core route is still the
+right one, but for a weaker reason than a hard bound. **Arithmetic is only 42.4% of the current
+instruction stream** (round 122's own census: `cvt` 8.8%, `mov` 9.6%, `setp` 6.5%, `shl` 4.6%,
+plus `ld` 11.6%), so a CUDA-core kernel reaching 25-28 TFLOP/s would need to be near the fp16 peak
+**while eliminating almost every non-arithmetic instruction** -- not impossible in principle, but
+not something this session has any evidence is reachable, and the kernel is already at 80
+registers with 0 spill and 3 blocks/SM, so there is no headroom left to buy it with occupancy.
+
+**Why the correction matters beyond bookkeeping:**
+
+- **It changes the target.** A ~9x requirement is a materially easier job than a 15x one, and the
+  round-121 design notes (mma QK^T, softmax in the mma layout, `ex2.approx.f16x2`) should be sized
+  against 9x, not 15x.
+- **It removes a false prohibition.** As written, round 122 told a future round that *no*
+  CUDA-core attempt could ever work. That is not established, and stating it that way risks
+  discarding a cheaper route on the strength of a bad bound -- which is the same failure mode as
+  rounds 106-119, where confident extrapolations were refuted by cheap measurements.
+
+**This is the twenty-fourth self-correction in this session**, and it is the second one of the
+session's own *reasoning* rather than of a measurement (round 114's grid collapse was the first).
+**The pattern both times: an inference that was sound step by step, extended one step past what
+the numbers supported.**
