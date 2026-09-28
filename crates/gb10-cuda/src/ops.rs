@@ -528,6 +528,10 @@ impl Ops {
         // the full eight warps of a 256-thread block; any other head width goes
         // to the serial reference.
         let warp_ok = head_dim == 256;
+        // Split-D doubles the grid: `blockIdx.y` now packs (sequence, dim half),
+        // so one query head's 256 dims are produced by two blocks that compute
+        // identical softmax weights and never communicate.
+        let dim_split: usize = if warp_ok { 2 } else { 1 };
         let (func, block) = if warp_ok {
             // Must match NW in `attn_decode_multi_kernel`: the block is
             // NW warps, and each warp owns a strided slice of the keys.
@@ -549,7 +553,7 @@ impl Ops {
                 .arg(&scale)
                 .arg(&bs)
                 .launch(LaunchConfig {
-                    grid_dim: (n_q_heads as u32, n_seq as u32, 1),
+                    grid_dim: (n_q_heads as u32, (n_seq * dim_split) as u32, 1),
                     block_dim: (block, 1, 1),
                     // No dynamic shared memory: the scores stream through
                     // registers, so this no longer scales with the cache. The

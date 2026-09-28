@@ -1127,7 +1127,8 @@ extern "C" __global__ void attn_decode_multi_kernel(
     const __half* __restrict__ v_cache, float* __restrict__ out,
     const int* __restrict__ positions, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int base_stride) {
-    constexpr int DPL = 8;   // dims per lane
+    constexpr int DPL = 8;   // dims per lane, for the q.k dot product
+    constexpr int DV  = 4;   // dims per lane, for the v accumulation (split-D)
     // Warps per block, i.e. how many key streams are in flight per SM. The
     // grid is only (n_q_heads, n_seq) = 24 blocks for a single sequence, so at
     // NW = 8 a 256-thread block left just 4 warps resident per SM and the
@@ -1136,7 +1137,11 @@ extern "C" __global__ void attn_decode_multi_kernel(
     // same traffic. See `NW_MAX` for the shared-memory ceiling.
     constexpr int NW = 32;   // warps per block
     const int h = blockIdx.x;
-    const int s = blockIdx.y;
+    // Split-D: blockIdx.y packs (sequence, dim half). Both halves compute the
+    // same softmax weights over ALL keys -- the dot product needs every dim --
+    // but each accumulates only its own half of v. No cross-block merge.
+    const int s = blockIdx.y >> 1;
+    const int half = blockIdx.y & 1;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int d0 = lane * DPL;
@@ -1151,10 +1156,11 @@ extern "C" __global__ void attn_decode_multi_kernel(
 #pragma unroll
     for (int j = 0; j < DPL; ++j) qv[j] = q[qb + (size_t)h * head_dim + d0 + j];
 
+    const int d0v = half * (head_dim / 2) + lane * DV;
     float mx = -INFINITY, sum = 0.0f;
-    float acc[DPL];
+    float acc[DV];
 #pragma unroll
-    for (int j = 0; j < DPL; ++j) acc[j] = 0.0f;
+    for (int j = 0; j < DV; ++j) acc[j] = 0.0f;
 
     for (int t = warp; t < n_keys; t += NW) {
         const size_t off = cb + ((size_t)t * n_kv_heads + kh) * head_dim + d0;
@@ -1170,25 +1176,25 @@ extern "C" __global__ void attn_decode_multi_kernel(
         const float corr = __expf(mx - m_new);
         const float p = __expf(dot - m_new);
         sum = sum * corr + p;
-        const __half* vp = v_cache + off;
+        const __half* vp = v_cache + cb + ((size_t)t * n_kv_heads + kh) * head_dim + d0v;
 #pragma unroll
-        for (int j = 0; j < DPL; ++j) acc[j] = fmaf(p, __half2float(vp[j]), acc[j] * corr);
+        for (int j = 0; j < DV; ++j) acc[j] = fmaf(p, __half2float(vp[j]), acc[j] * corr);
         mx = m_new;
     }
 
     // One merge of the NW per-warp partials. `sm_acc` is sized for the 256-wide
     // head this kernel requires, so it is 8 KB, not one entry per key.
-    __shared__ float sm_m[NW], sm_l[NW], sm_acc[NW][256];
+    __shared__ float sm_m[NW], sm_l[NW], sm_acc[NW][128];
     if (lane == 0) {
         sm_m[warp] = mx;
         sm_l[warp] = sum;
     }
 #pragma unroll
-    for (int j = 0; j < DPL; ++j) sm_acc[warp][d0 + j] = acc[j];
+    for (int j = 0; j < DV; ++j) sm_acc[warp][lane * DV + j] = acc[j];
     __syncthreads();
 
     const int d = threadIdx.x;
-    if (d < head_dim) {
+    if (d < head_dim / 2) {
         float m = -INFINITY, l = 0.0f, a = 0.0f;
 #pragma unroll
         for (int w = 0; w < NW; ++w) {
@@ -1204,7 +1210,7 @@ extern "C" __global__ void attn_decode_multi_kernel(
         // An empty cache leaves `l` at zero; the old form returned 0 here
         // because its accumulation loop never ran, so keep that rather than
         // emitting NaN.
-        out[qb + (size_t)h * head_dim + d] = (l > 0.0f) ? a / l : 0.0f;
+        out[qb + (size_t)h * head_dim + half * (head_dim / 2) + d] = (l > 0.0f) ? a / l : 0.0f;
     }
 }
 

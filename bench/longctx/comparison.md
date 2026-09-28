@@ -5300,3 +5300,51 @@ question rather than assuming it.
 
 **Not implemented.** Target unchanged: `decode-bench --kv-keys 131072` from 6.375 ms toward
 ~3.9 ms, then a same-session server pair for the 128K claim.
+
+### Split-D implemented and measured: 3.4%, and the traffic bound after all (round 118)
+
+Round 117 proposed split-D as the cheap way to double the grid, on the argument that the L2 --
+measured sustaining 1661 GB/s through a 6x GQA redundancy -- would absorb split-D's 1.5x traffic
+increase. **It was implemented, verified, and measured. The argument was wrong.**
+
+**Implemented** (kernels/elementwise.cu, `attn_decode_multi_kernel`): `blockIdx.y` now packs
+`(sequence, dim half)`; the dot product still runs over all 256 dims with `DPL = 8`, while the
+accumulator uses `DV = 4` at `d0v = half * 128 + lane * 4`. `sm_acc` halves to `[NW][128]` and
+each block stores only `d < head_dim / 2`. Host: `dim_split = 2` and the grid's y axis becomes
+`n_seq * dim_split`.
+
+**Correctness passed cleanly:** `generate --oracle` **16/16, exact match**, and `decode-bench`'s
+`rms rel` is **8.24e-6 -- identical to the pre-change value**, so the two halves agree with the
+single-block result to the last measured digit.
+
+**The measurement:**
+
+| | warp kernel, 131072 keys, n_seq=1 |
+|---|---|
+| baseline (24 blocks) | 6.375 ms |
+| **split-D (48 blocks)** | **6.164 ms** |
+| gain | **1.034x** |
+
+**The model had predicted 1.09x** (1.64x from parallelism over 1.5x from traffic), and the
+measurement is 1.034x -- **within 5% of the prediction, and nowhere near the 1.64x that a
+traffic-free split would have given.** The achieved bandwidth also falls from 1661 to 1045 GB/s,
+consistent with genuinely moving more bytes.
+
+**So the traffic does bind, and round 117's L2 argument was wrong.** The 6x GQA redundancy was
+being absorbed, but that is not evidence that *any* increase is free; 1.5x was enough to consume
+almost the whole 1.64x. **This is the same shape of error as rounds 106-109: an argument from a
+plausible mechanism rather than a measurement** -- and here the measurement was cheap, which is
+the lesson.
+
+**What it establishes, which is worth more than the 3.4%.** The two quantities are now separately
+known: **+64% from doubling the grid** (round 115, measured with n_seq=2) and **-33% from 1.5x
+traffic** (this round, by difference). **A split that doubles the grid with unchanged traffic
+should therefore capture close to the full 1.64x -- and that is exactly what split-K is.**
+
+**Split-K's merge, which rounds 116-117 treated as a cost to avoid, is now the price of the
+1.64x rather than an expensive alternative to a cheaper design.** At 1.64x the decode attention
+at 128K goes 102 ms -> 62 ms and the token 217 -> 177 ms = **5.64 OTPS against llama's 4.75**.
+
+**Retained:** the split-D change is left in place -- it is verified correct by both gates and is a
+real if small improvement -- but the document should be read as treating it as a stepping stone,
+not as the fix. **The fix is split-K.**
