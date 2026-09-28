@@ -4251,3 +4251,60 @@ conflicts, 8.05x, round 44) is already in.
 
 **Three of the six cells the objective names are won, three are lost, and the three that are
 lost are all the same quantity.** That is the honest state after 94 rounds.
+
+### PTX and ptxas evidence on the prefill attention, and the one lever left (round 95)
+
+With tile geometry closed off (round 93) and the fma-chain split measured neutral (round 90),
+this round took static evidence from the compiler rather than guessing. Two facts, both new:
+
+**1. The kernel has large register headroom and does not spill.**
+
+```
+ptxas info : Compiling entry function 'attn_prefill_tiled_kernel' for 'sm_121'
+ptxas info : Used 80 registers, used 1 barriers
+             0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+```
+
+**2. The emitted PTX is fma-dominated with heavy address arithmetic** -- 2,218 instructions in
+the tiled kernel:
+
+| opcode | count | |
+|---|---|---|
+| fma | 475 | the score loop |
+| add | 263 | largely address arithmetic |
+| ld | 257 | shared loads |
+| mov | 212 | |
+| cvt | 196 | `__half22float2` |
+| setp | 144 | bounds/mask tests |
+| mad | 131 | address arithmetic |
+| shl | 101 | address arithmetic |
+| mul | 71 | address arithmetic |
+
+**Together these two facts point at one specific, untried lever.** The kernel's constraint is
+`BQ * BK == K * (nt >> 1)` where **K is the number of dot products each thread-pair computes**
+-- K = 3 today, which is exactly what fixes the product at 384 and nt at 256. That K is the
+*independent-chain count per thread*, and round 44 established this loop is latency-bound, and
+round 90 showed that making one chain shallower (splitting by x/y) buys nothing. **Widening the
+number of independent chains is the different, untried direction:**
+
+| K (dots per thread-pair) | `BQ*BK` | BQ | BK | Qs smem | feasible? |
+|---|---|---|---|---|---|
+| **3 (today)** | 384 | 24 | 16 | 12.2 KB | -- |
+| **6** | **768** | **48** | **16** | **24.4 KB** | **yes: smem 32.7 KB total, ~9 more registers against a 255 limit with 0 spill at 80** |
+| 12 | 1536 | 96 | 16 | 48.8 KB | no: exceeds the 48 KB default smem |
+| 6 | 768 | 96 | 8 | 48.8 KB | no: Qs alone |
+
+**K = 6 is the only doubling that fits**, and it doubles the independent dot products in flight
+per thread-pair while leaving every load and convert per fma unchanged -- which is precisely the
+shape a latency-bound loop responds to, and the opposite of what was tried in rounds 44 and 90
+(both of which *narrowed or held constant* the chain population).
+
+**It is a real code change, not a constant flip**: the score loop's three-row unroll
+(`i0`, `i0 + step`, `i0 + 2*step`) becomes a six-row unroll, the store path and the `S`/`red`
+sizing follow `BQ = 48`, and the host's `3 * (head_dim / 2)` check becomes `K * (head_dim / 2)`.
+**It should be validated by a same-session 32K server pair (round 90's rule) -- two ~4-minute
+runs -- and not by `attn-tile`, for the reason round 87 established.**
+
+**This is not implemented.** It is written down as the next concrete step because it is the
+only direction the cumulative evidence has not yet excluded: bytes (no), tile geometry (pinned
+and tested), chain depth (measured neutral), and now chain *count*.
