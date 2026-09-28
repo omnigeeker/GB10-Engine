@@ -3472,3 +3472,47 @@ build their events, but **neither prints anything under `generate`** -- the reco
 wired and the reporting half is not. That is why this round had to find the answer in a load
 message instead. Wiring those two prints is a small, well-specified piece of work and it would
 make the per-layer decode split available without guesswork.
+
+### The 128K attention figure is confirmed independently, so the target stands (round 82)
+
+Round 80/81 decomposed the 128K decode as a ~115-128 ms context-free floor plus ~167 ms of
+attention, with the attention term coming from extrapolating `decode-bench`'s 70.7 ns/key.
+That extrapolation rested on an assumption -- that one `decode-bench` measurement is one
+layer's worth of work -- and an assumption that size should not be left unchecked after
+rounds 78 and 79 both overturned ones like it.
+
+Reading the bench settles it structurally: `decode_bench` calls `ops.attn_decode_multi` and
+`ops.attn_decode_multi_serial` **directly, with no layer loop at all**:
+
+```rust
+for &keys in &args.kv_keys {
+    ...
+    for _ in 0..reps {
+        ops.attn_decode_multi_serial( ... )   // one kernel invocation
+    }
+    for _ in 0..reps {
+        ops.attn_decode_multi( ... )          // one kernel invocation
+    }
+}
+```
+
+So one measurement is one layer, and the x16 extrapolation is the right shape. Checking it
+against the model's own residuals, using the 8K measurement (115 ms) as the floor because it
+is the largest context at which attention is still small:
+
+| context | measured ms/token | residual above 115 ms | `decode-bench` x 16 | ratio |
+|---|---|---|---|---|
+| 8K | 115 | 0 | 9.3 | -- |
+| 32K | 140 | 25 | 37.0 | 0.67 |
+| **128K** | **290** | **175** | **166.7** | **1.05** |
+
+**The 128K row agrees to 5%**, and it agrees despite having been produced two completely
+different ways: one from timing a standalone kernel at 32K keys and scaling linearly, the
+other from subtracting a floor measured at a different context entirely. The 32K row is 1.5x
+off, which is inside the noise of a floor that itself moves by 13 ms between the 16-token and
+8K measurements.
+
+**So the target of round 81 stands as stated: 128K attention is ~167-175 ms and must fall
+below ~79 ms for gb10 to reach llama.cpp's 207 ms/token.** Two independent measurements agree
+on the size of the prize, which is the condition that has been missing from every plan
+rejected in this document so far -- and it is why this one is worth starting.
