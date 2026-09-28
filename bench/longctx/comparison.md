@@ -4402,3 +4402,60 @@ prefill attention kernel has now been excluded on every axis this document can r
 occupancy), and its share is 29% at 8K where the loss is smallest. **The 8K loss is 70.1%
 DeltaNet, and the chunked DeltaNet rewrite is the only remaining change with a quantified
 projection (1.63x at 8K). That is where the next session should work.**
+
+### `tensorcore-plan.md` is stale, and its headline premise no longer holds (round 98)
+
+`bench/longctx/tensorcore-plan.md` opens with a claim that contradicts the measurements taken in
+rounds 88-96, so the contradiction had to be resolved before either document is trusted:
+
+| source | 8K | 32K |
+|---|---|---|
+| `tensorcore-plan.md` | GEMM 49.6 s (93%) / attn 4.4 s (7%) | GEMM **202.6 s (75%)** / attn 65.2 s (24%) |
+| round 88 measurement | delta 70.1% / attn 29.0% | **attn 61.0% (67.48 s)** / delta 38.6% (42.63 s), total 110.56 s |
+
+**They cannot both be right**, and the plan's 32K row sums to 267.8 s against a measured prefill
+total of 110.56 s.
+
+**The plan is stale, and it says so itself.** Its own section list shows the work it proposed was
+carried out: `## Implemented and measured (rounds 22)`, `### Per-phase timing: the residual is
+the allocator, not the GEMM (round 26)`, `### Persistent scratch: landed ... (round 27)`. And the
+code confirms it:
+
+```rust
+// crates/gb10-model/src/weights.rs
+pub const PHASES: [&str; 4] = ["weight stage", "activ cast", "cublas gemm", "epilogue"];
+...
+kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;   // line 195
+```
+
+**The prefill GEMM already runs on bf16 tensor cores through cuBLAS**, which is exactly what the
+plan's headline asked for ("Getting to llama.cpp's ~43 TFLOPS needs tensor cores; there is no
+fp32 tuning that reaches it"). The premise "the prefill GEMM is ~7 TFLOPS of fp32 on CUDA cores"
+described the code *before* that change.
+
+**The current decomposition confirms the switch took effect.** Round 88's four-phase instrumentation
+-- the same four phases named in `PHASES` above -- reports `cublas gemm 25850ms (23.4%)` at 32K,
+not 75%. The GEMM is no longer the majority of the prefill; **attention is** (61.0%), which is
+the round-88 conclusion, and it stands.
+
+**Why this matters for the next session, which is the point of writing it down:**
+
+- **Do not implement `tensorcore-plan.md`.** Its central change is already in the tree. Reading
+  its opening table without checking the code would send the next session to redo rounds 22-27.
+- **The largest remaining term is still the prefill attention** at 61.0% of 32K (round 88) and
+  ~77% of 128K (round 75), running at 8.4% of the *CUDA-core* half2 rate -- the score loop
+  converts fp16 to fp32 (`196 cvt`) and issues fp32 fma (`475 fma`), so it never uses half2
+  arithmetic and cannot exceed the CUDA-core rate however it is tiled.
+- **The genuinely open question is whether that kernel should move to tensor cores the way the
+  GEMM did.** The GEMM's own history is the evidence: it sat at ~7 TFLOP/s of fp32 (76% of a
+  9.2 TFLOP/s ceiling, i.e. already well-tuned) and was still 11-13x short; swapping the
+  arithmetic to bf16 tensor cores is what fixed it. **The attention kernel is in the same
+  position today** -- 3.12 TFLOP/s against a ~37 TFLOP/s CUDA-core ceiling, well short of what
+  llama.cpp's ~32 TFLOP/s implies, with the same fix available.
+
+**That reframes path B.** Round 95/97 debated tiling and chain counts inside a CUDA-core FMA
+kernel whose arithmetic ceiling is ~37 TFLOP/s while llama.cpp demonstrably runs this workload
+at ~32 TFLOP/s. **Those are the same order, which means llama.cpp is near ITS ceiling and gb10
+is at 8% of its own** -- the gap is arithmetic, not scheduling, and no tiling sweep closes it.
+The one precedent in this repo where that gap was closed is the GEMM, and it was closed with
+tensor cores.
