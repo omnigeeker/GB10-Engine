@@ -6458,3 +6458,62 @@ same implementation is what the other three cold cells need.
 | 256K | 8.82x | attention |
 
 **One implementation, four cells, and the cheapest of them needs 1.29x.**
+
+### Round 145: the prefill attention is partly OCCUPANCY-bound, worth 1.47x -- a cheaper lever than mma
+
+Rounds 121-122 concluded that only tensor cores could speed up the prefill attention, on the grounds
+that its instruction stream is broad (42.4% arithmetic) and that 15x was needed. **This round ran the
+occupancy probe that was already built into the launch path and found the kernel is partly
+latency-bound, not purely issue-bound.**
+
+`crates/gb10-cuda/src/ops.rs:1368` documents `GB10_ATTN_SMEM_PROBE=<bytes>`, which raises the
+shared-memory request past what co-residency needs and thereby forces **one block per SM** without
+changing a line of kernel arithmetic. Measured at 7168 tokens, same session, `prefill-shape`:
+
+| occupancy | attention |
+|---|---|
+| **4 blocks/SM (current)** | **3.77 s** |
+| **1 block/SM (probe, `GB10_ATTN_SMEM_PROBE=52000`)** | **5.55 s** |
+| | **occupancy is worth 1.47x** |
+
+**And that matters because of what the 8K cell needs: only 1.29x** (round 144: 0.85 s of a 10.35 s
+prefill, on a ~3.77 s attention term). **Occupancy alone delivered 1.47x across 1 -> 4 blocks per SM,
+so occupancy is a live lever at 8K and a cheaper one than the mma rewrite.**
+
+**This refines rather than contradicts rounds 121-122.** Those rounds were about reaching 9x at
+128K/256K, where arithmetic throughput genuinely is the wall and mma genuinely is required. **But for
+the 8K cell -- the closest one on the scorecard -- the wall is latency, and the lever is occupancy.**
+
+**Where more occupancy could come from, and the obstacle.** The shared-memory model is
+
+```
+smem = (BQ + BK) * (head_dim + 4) * 2   +   (BQ*BK + 3*BQ) * 4
+```
+
+With `BQ*BK == 3*(head_dim/2) == 384` fixed by the kernel's contract, **`BQ + BK` is minimised at 40,
+which the current `(24,16)` already achieves** (12+32=44, 48+8=56 are both worse). **So the smem
+cannot be reduced by tile geometry** -- that is a second, independent reason `(24,16)` was chosen,
+beyond the register count of round 97.
+
+**The remaining cut is the staging type.** Q and K are staged in **bf16** today, which
+ops.rs:1362-1365 records as the change that took the kernel "from 2 to 4 blocks per SM". Staging them
+in **fp8 (E4M3)** would halve the dominant term again and roughly double co-residency.
+
+**The obstacle is precision, and it is a real one:** fp8 carries about two significant digits, and
+the `attn-tile` gate currently checks agreement against `attn_prefill_legacy` at ~1e-7. **An fp8
+staging would very likely fail that gate.** That is not a reason not to try it -- **it is a cheap
+experiment whose correctness gate already exists and will decide** -- but it should be attempted with
+the expectation of failure, and the fallback is the mma path.
+
+**Revised statement of the remaining work, per cold cell:**
+
+| cold cell | requirement | cheapest lever |
+|---|---|---|
+| **8K** | **1.29x** | **occupancy** (worth 1.47x, probe-measured) |
+| 32K | 5.98x | mma |
+| 128K | 8.40x | mma |
+| 256K | 8.82x | mma |
+
+**This is the thirtieth self-correction of the session, and like rounds 123/133/134 it revises a
+mechanism the session had previously settled on** -- rounds 121-122 said the attention's problem was
+arithmetic and only tensor cores could fix it; the probe says it is partly latency and occupancy can.
