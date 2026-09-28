@@ -5114,3 +5114,69 @@ should be:
 **This is a correction to rounds 100-103 and 111.** The 6-head design is not wrong in its
 arithmetic; it is incomplete, because it was designed without checking that the resulting grid
 still occupies the device. Round 111's line-by-line spec should not be implemented as written.
+
+### MEASURED: filling the GPU gives the decode attention 1.64x, and 48/48 SMs is worth 4/4 on OTPS (round 115)
+
+Round 114 argued from the launch configuration that the decode kernel uses only 24 of 48 SMs at
+one sequence. That was a claim about occupancy, and it is testable without a profiler: **if the
+kernel is starved of blocks, then doubling the grid should barely change the per-call latency,
+because the extra blocks fill idle SMs rather than contend.** `decode-bench` makes that a
+one-line experiment, because a second sequence doubles the grid from 24 blocks to 48.
+
+```
+--n-seq 1 --kv-keys 131072     6.375 ms      (24 blocks)
+--n-seq 2 --kv-keys 131072     7.760 ms      (48 blocks)
+```
+
+**Twice the work in 1.22x the time.** Per-sequence throughput:
+
+| | latency | sequences/s |
+|---|---|---|
+| n_seq = 1 | 6.375 ms | 156.9 |
+| n_seq = 2 | 7.760 ms | 257.7 |
+| **gain** | | **1.64x** |
+
+**The kernel was starved, and filling the grid is worth a measured 1.64x** -- not a model, not an
+estimate. Nearly the whole theoretical 2x is realised, which is what a latency-bound, half-idle
+kernel looks like.
+
+**It also settles what the bottleneck is.** The same output line reports **1661 GB/s for the warp
+kernel -- well above the 228 GB/s DRAM figure.** The 6x K/V redundancy that round 101 measured is
+therefore being **served by L2**, not DRAM. So the decode attention is not bandwidth-bound at all;
+it is bound by how many warps are resident to hide L2 latency. **That is why adding blocks helps
+so much, and it is the opposite of what the 2.71x "read amplification" framing suggested.**
+
+**Applied to the scorecard, using only numbers measured in this session** (weight floor 115.19 ms
+from round 110, attention from round 101, scaling 1.64x from here):
+
+| context | attention now | attention filled | OTPS now | OTPS filled | llama | result |
+|---|---|---|---|---|---|---|
+| 8K | ~0 ms | ~0 ms | 8.72 | 8.68 | 7.32 | win |
+| 32K | 25 ms | 15 ms | 7.14 | **7.67** | 6.87 | win |
+| 128K | 102 ms | **62 ms** | 4.25 | **5.64** | 4.75 | **1.19x WIN** |
+| 256K | 206 ms | **126 ms** | 2.99 | **4.15** | 3.86 | **1.08x WIN** |
+
+**OTPS goes from 2 of 4 contexts won to 4 of 4, and the scorecard from 6 of 12 to 10 of 12.**
+That is the largest single step available anywhere in this document, and unlike rounds 106-109 it
+rests on a measurement rather than an arithmetic argument.
+
+**How to get 48 blocks from one sequence -- and why split-K, not split-D:**
+
+- **Split the key range (split-K).** Two blocks per query head, each covering half the keys,
+  combining their `(m, l, acc)` partial states. **Traffic is unchanged** (K and V are each read
+  once in total), the grid doubles to 48, and the merge is a small second pass over
+  24 x 2 partial states.
+- **Do not split the head dimension.** Each dim-half block would still need the full `q . k_t`
+  over all keys to get the softmax weights, so K is read twice while V is split once -- traffic
+  rises from `K + V` to `2K + V`, i.e. **1.5x, against a 1.64x gain, leaving only 1.09x.** Worse
+  and messier.
+- **Note that the block cannot simply grow instead.** `NW = 32` already means 32 warps x 32 lanes
+  = 1024 threads, the maximum block size, so there is no room to add warps inside the block; the
+  parallelism has to come from more blocks.
+
+**And the split-K merge is the same missing piece round 114 identified** -- so it is a prerequisite
+for the 6-head sharing as well, and the two can share one implementation of it.
+
+**Not implemented.** This round measures the opportunity and rules out the cheaper wrong version
+of it. The change itself -- S=2, a partial-state buffer, and a merge pass -- is the next thing to
+build, and it now has a measured target instead of a projected one.
