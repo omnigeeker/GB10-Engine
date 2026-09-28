@@ -4459,3 +4459,50 @@ at ~32 TFLOP/s. **Those are the same order, which means llama.cpp is near ITS ce
 is at 8% of its own** -- the gap is arithmetic, not scheduling, and no tiling sweep closes it.
 The one precedent in this repo where that gap was closed is the GEMM, and it was closed with
 tensor cores.
+
+### The decode attention is 4.43x above its memory floor, and OTPS at 128K/256K is winnable (round 99)
+
+Every recent round has aimed at cold TTFT, and the attention kernel has resisted on every axis.
+The same kernel serves a second, *different* metric that is also still lost, and there the
+arithmetic is much more favourable. Decode reads the whole KV cache every token; with fp16 KV
+that traffic is exactly countable:
+
+| context | KV read per token | at 228 GB/s (measured) | measured attention | gap |
+|---|---|---|---|---|
+| 128K | 8.59 GB | **37.7 ms** | ~167 ms (rounds 80-82) | **4.43x** |
+| 256K | 17.18 GB | **75.4 ms** | ~334 ms | 4.43x |
+
+**What closing that gap is worth, using the measured decode budget** (128K = 290 ms/token =
+~128 ms weight-streaming floor + ~167 ms attention):
+
+| | today | at the memory floor | llama.cpp | result |
+|---|---|---|---|---|
+| 128K OTPS | 4.25 | **6.0** (166 ms/token) | 4.75 | **1.27x WIN** |
+| 256K OTPS | 2.99 | **4.9** (204 ms/token) | 3.86 | **1.27x WIN** |
+
+**So OTPS at the two long contexts the objective names is winnable, and the target is a
+bandwidth problem rather than an arithmetic one** -- the opposite of the prefill situation
+(round 98). That matters because it is the cheaper of the two: the decode kernel is already
+reading the minimal bytes, it is just reading them 4.43x more times than necessary.
+
+**The likely cause is the GQA redundancy that rounds 76-82 identified.** `attn_decode_multi_kernel`
+launches a grid of `(n_q_heads, n_seq)` = 24 blocks -- **one per query head** -- so the 6 query
+heads that share a KV head each traverse the full KV cache independently. The L2 cannot absorb
+it: at 128K one layer's KV is `131072 * 4 * 256 * 2 * 2 B = 537 MB`, far beyond L2, so a
+read-amplification factor near 6 at the DRAM level is the natural explanation for a measured
+4.43x.
+
+**And the earlier sizing does not contradict this.** Rounds 79/82 sized the *naive*
+one-block-per-KV-head fix at ~2x traffic and refuted the occupancy argument. But 4.43x is what
+is *measured*, and it is the target: the fix does not have to be the naive one. **A split-KV /
+flash-decoding shape that assigns several blocks to one KV head and combines partial
+softmaxes would reduce redundant DRAM traffic without needing the 192 KB of `sm_acc` that the
+one-block-per-KV-head version required** (round 77's finding: `sm_acc[NW][256]` = 32 KB per head
+against a 99 KB optin limit).
+
+**Why this should be attempted before the tensor-core prefill work:** the prefill attention must
+get 10x faster in *arithmetic efficiency* and needs a new HMMA kernel; the decode attention needs
+~4x less *redundant traffic* in a kernel that already exists and is already byte-minimal per
+pass. **The measured target is a 1.27x OTPS win at both long contexts, versus a cold-TTFT gap
+that no available lever has moved.** It is validated the same way as everything else in this
+document: a same-session server pair at 128K (one ~19-minute gb10 run against llama's ~4.6).
