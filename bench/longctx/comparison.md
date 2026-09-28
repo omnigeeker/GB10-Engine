@@ -4998,3 +4998,61 @@ floor is ~115 ms/token and there is no measured, demonstrated way to reduce it.*
 budget in this document should use 115 ms, as round 109's table does. The remaining OTPS levers
 are therefore all on the attention side, and the 6-head GQA decode fix is the one with a
 measured target.
+
+### Concretely how to implement the 6-head decode fix (round 111)
+
+Round 111 read `attn_decode_multi_kernel` (kernels/elementwise.cu:1125) line by line, so the
+design of rounds 100-103 can be written as an edit rather than a sketch. **This is the exact
+shape; nothing about it is still unknown.**
+
+**What it does today** (one query head per block, six blocks per KV head):
+
+```cuda
+const int h = blockIdx.x;                    // query head -- grid.x = n_q_heads (24)
+const int group = n_q_heads / n_kv_heads;    // 6
+const int kh = h / group;                    // KV head
+float qv[DPL], acc[DPL];                     // 8 + 8 registers
+for (int t = warp; t < n_keys; t += NW) {
+    const size_t off = cb + ((size_t)t * n_kv_heads + kh) * head_dim + d0;
+    const __half* kp = k_cache + off;        // <-- read once per block, re-read by 6 blocks
+    ...dot, shuffle-reduce, online softmax...
+    const __half* vp = v_cache + off;        // <-- same
+    for (int j = 0; j < DPL; ++j) acc[j] = fmaf(p, __half2float(vp[j]), acc[j] * corr);
+}
+__shared__ float sm_m[NW], sm_l[NW], sm_acc[NW][256];   // 8 KB, one head
+```
+
+**The edit, in four parts:**
+
+1. **Grid: one block per KV head, not per query head.** `blockIdx.x` becomes `kh` directly, so
+   the launch's `grid.x` goes from `n_q_heads` to `n_kv_heads` (24 -> 4). The 6 heads become an
+   in-block loop.
+2. **Registers: six partial-softmax sets, one per head.** `float qv[G][DPL], acc[G][DPL];
+   float mx[G], sum[G];` with `G = group` (6). That is 48 + 48 + 12 floats against a 255-register
+   limit -- and it is the reason `NW` must drop (next).
+3. **The key loop: load K and V once per `t`, then apply them to all six heads.**
+   `float kv[DPL], vv[DPL];` are converted once from `k_cache`/`v_cache` at `off`, and the
+   per-head work becomes a `for (int g = 0; g < G; ++g)` around the dot product, the shuffle
+   reduction and the online-softmax update, reusing `kv`/`vv`. **This is the entire win: the
+   cache line is fetched once per block instead of six times.**
+4. **Merge: loop the existing reduction over the six heads**, reusing the same
+   `sm_m`/`sm_l`/`sm_acc` buffers with a `__syncthreads()` between heads. Do **not** allocate six
+   `sm_acc` copies -- that is the 48 KB that round 77 mistook for a blocker.
+
+**Plus the coupled constant, from round 103:** `NW = 32` is a kernel `constexpr` and the host
+hardcodes the thread count as `1024u32` in `crates/gb10-cuda/src/ops.rs` with the comment
+"Must match NW in `attn_decode_multi_kernel`". Round 102's register table says the six-head
+version needs `NW = 16` (512 threads) to keep a full block resident. **Both sites must change
+together** -- `constexpr int NW = 16;` and `512u32` -- and the grid axis change in part 1 must
+land with them.
+
+**The acceptance test, with the number already measured:** at 128K the decode attention is
+102 ms of a 235 ms token; with the weight floor fixed at 115 ms (round 110) and llama.cpp at
+210 ms, **attention must fall below ~95 ms to win**. This change removes a measured 2.71x read
+amplification (round 101), so the projection is ~70 ms and 5.4 OTPS against llama's 4.75.
+**Judged by a same-session 128K server pair -- one ~19-minute gb10 run against llama's ~4.6 --
+never by `decode-bench` alone (round 87's rule).**
+
+**Not implemented.** This round adds no code. It removes the last unknown in a design that has
+been sized, register-checked, de-risked against its documentation and now written out
+line-by-line.
