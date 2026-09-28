@@ -5244,3 +5244,59 @@ against the 48-SM device before writing the kernel, not after.**
 
 **Not implemented.** This round adds no code and no new measurement; it removes the last
 undesigned part of the next change.
+
+### A simpler way to double the grid: split the head dimension, and skip the merge (round 117)
+
+Round 116 specified split-K with a two-pass merge, treating the merge as unavoidable. It is
+avoidable, and the alternative is a smaller change.
+
+**Why split-D needs no merge.** The output is `out[d] = sum_t p_t * v_t[d]` where
+`p_t = softmax(q . k_t)`. The softmax weights depend on the **full** dot product, so any block
+computing *any* output dimension has to compute the whole thing -- which means **two blocks
+splitting the dimensions compute identical weights and identical `l`**. Each output dimension is
+independent, so block A can write dims `[0,128)` and block B dims `[128,256)` **with no
+communication whatsoever**: no scratch buffer, no second kernel, and no second copy of the
+`l > 0` empty-cache guard whose loss round 116 flagged as a real hazard.
+
+**What it costs:** both blocks must read all of K to form the dot products, while V is split.
+
+| | traffic per layer | vs today |
+|---|---|---|
+| today | K + V = 1074 MB | 1.00x |
+| split-K | K + V = 1074 MB | 1.00x |
+| **split-D** | **2K + V = 1611 MB** | **1.50x** |
+
+**So the two options trade a merge for 1.5x traffic. The measurement says that is the better
+trade**, because the traffic is not what is binding:
+
+| option | net gain |
+|---|---|
+| split-K | 1.64x (traffic flat) |
+| split-D, if the 1.5x traffic binds | 1.09x |
+| **split-D, if L2 absorbs it** | **1.64x** |
+
+**And L2 demonstrably has the headroom:** the same round-115 measurement shows the current warp
+kernel sustaining **1661 GB/s** while carrying the 6x GQA redundancy. The 1.5x from split-D is
+smaller than the 6x already being absorbed. **The decode attention is latency-bound on resident
+warps, not bandwidth-bound, which is precisely why adding blocks helps at all** -- so a traffic
+increase that L2 covers should cost close to nothing.
+
+**The kernel edit, stated so it is checkable.** Today `DPL = 8` with 32 lanes maps lane `L` to
+dims `[8L, 8L+8)`, covering all 256. For split-D the *dot* still needs those 8 dims per lane,
+but the *accumulator* only needs 4 per lane:
+
+- dot: `d0_dot = lane * 8`, reading `q` and `k` over all 256 dims exactly as now;
+- accumulator: `DV = 4`, `d0_out = half * 128 + lane * 4`, reading only the block's half of `v`.
+
+Grid becomes `(n_q_heads, n_seq * 2)`. **Full lane utilisation is preserved** -- no lanes idle,
+which is what would have happened if the split had simply masked off half the lanes.
+
+**Recommendation: try split-D first.** It is one kernel modified rather than one kernel plus a
+merge kernel plus a scratch buffer plus host plumbing, and its only risk is the traffic, which is
+the variable least likely to bind. **If `decode-bench` shows split-D landing near 1.64x, split-K
+is unnecessary; if it lands near 1.09x, the traffic did bind and split-K's merge becomes worth
+writing.** Either way the first experiment is cheaper than round 116 assumed, and it answers the
+question rather than assuming it.
+
+**Not implemented.** Target unchanged: `decode-bench --kv-keys 131072` from 6.375 ms toward
+~3.9 ms, then a same-session server pair for the 128K claim.
