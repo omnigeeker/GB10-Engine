@@ -6517,3 +6517,40 @@ the expectation of failure, and the fallback is the mma path.
 **This is the thirtieth self-correction of the session, and like rounds 123/133/134 it revises a
 mechanism the session had previously settled on** -- rounds 121-122 said the attention's problem was
 arithmetic and only tensor cores could fix it; the probe says it is partly latency and occupancy can.
+
+### CORRECTION to round 145: the fp8-staging idea is NOT a bounded experiment (round 146)
+
+Round 145 ended by recommending fp8 (E4M3) staging of Q/K as "a cheap experiment whose correctness
+gate already exists", on the reasoning that halving the dominant shared-memory term would roughly
+double co-residency and the 8K cell needs only 1.29x. **Reading the staging code shows that estimate
+of the cost was wrong.**
+
+`kernels/elementwise.cu:387-397` documents why the staging layout is what it is:
+
+> PADH is 130, not 129, and that is not cosmetic. The bank of the element at index i is
+> `(i * width / 4) % 32`, so with 2-byte elements two neighbours share a 4-byte bank and the `sub`
+> offset has half the bank resolution it has for fp32. PADH = 129 gives `floor(129/2) = 64`, and
+> `64 % 32 = 0`, so both halves land in the same bank class: a 2-way conflict in the score loop.
+> PADH = 130 gives 65, and `65 % 32 = 1`, which restores the odd shift that spreads (j, sub) across
+> all 32 banks ... See bench/longctx/comparison.md, round 41.
+
+**PADH = 130 exists specifically because the staged elements are 2 bytes wide.** With 1-byte fp8
+elements, **four** neighbours share a 4-byte bank instead of two, so the entire derivation changes:
+`PADH`, `PS`, and the intra-row gap all have to be rederived, and the "restores the odd shift"
+property has to be re-proved for the new width rather than assumed.
+
+**So this is not a constant edit.** It is a bank-layout rederivation on top of a precision change that
+is independently likely to fail `attn-tile` -- **and a mis-edit here does not fail loudly**, it
+silently degrades the score loop through bank conflicts. That is the failure mode round 118 warns
+about in a different kernel.
+
+**The round-145 recommendation is therefore withdrawn as stated.** What survives is the *finding* --
+the occupancy probe measured 1.47x, and 8K needs 1.29x -- **and the conclusion that the surviving
+lever for 8K is to raise co-residency by some means; fp8 staging is one candidate, but it carries a
+layout rederivation and a likely precision rejection, so it should be attempted as a piece of work,
+not as a quick test.**
+
+**Thirty-first self-correction, and the fourth in six rounds to revise the previous round's own
+plan.** The recurring shape across rounds 123/133/134/146: **a measurement is sound, the mechanism
+inferred from it is plausible, and the cost of acting on it is estimated without reading the code
+that would have to change.**
