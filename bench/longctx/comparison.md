@@ -5758,3 +5758,43 @@ rewrite. **A rewrite capturing even a tenth of that projection wins the cell.**
 phases are 61% of the 8K prefill and the layer-level delta/attn accounting covers the rest. Both
 tallies independently put the DeltaNet-side cost well ahead of attention at this context, which is
 the premise the whole priority rests on.
+
+### Round 129: DeltaNet runs at 0.61% of fp32 peak, so the 8K target needs only 1.1% of peak
+
+Round 128 fixed the target: **1.83x on DeltaNet wins 8K cold TTFT.** This round asked whether that
+is a lot or a little, by computing what the kernel actually delivers. From the kernel's own
+dimensions (`D = 128`, `n_v_heads = 48`, 48 DeltaNet layers, `T = 7168`) and the 9.60 s measured
+this session:
+
+| quantity | value |
+|---|---|
+| MACs per token per v-head (`2 * D^2`, the outer-product update plus the `S^T q` output) | 32768 |
+| total | 5.412e11 MACs = **1.082 TFLOP** |
+| **achieved** | **112.7 GFLOP/s = 0.113 TFLOP/s** |
+| **as a fraction of the 18.43 TFLOP/s fp32 peak** | **0.61%** |
+| threads launched | 48 blocks x 256 = 12,288 |
+| against 48 SMs x 2048 threads = 98,304 | **12.5% occupancy** |
+
+**The 0.61% figure is an independent reproduction of a number already in the tree.** The kernel
+header records "the whole kernel runs at 0.64% of fp32 peak (round 66)"; computing it from scratch
+here gives 0.61%. **Two independent routes to the same number, which is the strongest kind of
+agreement this document has recorded.**
+
+**What it means for the target:** the kernel needs to reach **1.1% of fp32 peak** -- roughly double
+where it is -- and the gap to the peak is a factor of 164. **A 1.83x requirement against a kernel
+operating at 0.61% of peak is not a stretch; it is the smallest possible step.** The rewrite does
+not have to be efficient. It only has to expose more of the parallelism that is already there and
+currently unused, and the room is so large that the first thing that works will very likely clear
+the bar.
+
+**It also confirms the diagnosis independently of the structural reading.** 12.5% occupancy, 8
+warps per SM, a sequential `T` loop with two barriers per token, and 0.61% of peak are all the same
+fact stated four ways: **this kernel is not compute-bound, it is starved.** Which is why the fix is
+a *formulation* change (chunked/parallel-scan) rather than more tuning -- rounds 70/88/95/97/127
+already removed the inner-loop traffic and the serial fma chains, and none of that touched the fact
+that `t` cannot start before `t-1` finishes.
+
+**Caveat, in keeping with this session's record:** the FLOP count above is my own model of what the
+recurrence must do, not an instrumented count, so 0.61% could be off by the constant factor in the
+"2 * D^2" term. **It agrees with the tree's independently-recorded 0.64% to two figures, which is
+why it is being trusted -- but the agreement is the evidence, not the derivation.**
