@@ -6371,3 +6371,50 @@ the closest.**
 **That is a materially better position than the start of this session**, where OTPS was 2/4 and cold
 was 1.41x behind at the closest cell. **The progress is entirely from the chunk change plus the
 earlier fp16-KV landing; no new kernel work is in it.**
+
+### Round 142: 256K re-measured -- the scorecard is now complete on chunk 8192
+
+The last cell still carrying a `PREFILL_CHUNK = 2048` number. Server-side, `--ctx 262144`,
+`reps 8408` (260,717 tokens), `trials 1`:
+
+| 256K | baseline | **now (chunk 8192)** | change |
+|---|---|---|---|
+| **cold TTFT** | 4138.39 s | **3298.83 s** | **1.25x better** |
+| **warm TTFT** | 0.29 s | **0.28 s** | -- |
+| **OTPS** | 2.99 | **3.66** | **+22.4%** |
+| cold vs llama | 5.70x slower | **4.54x slower** | gap narrowed |
+
+**And the OTPS improvement is the same size as 128K's, which is now a pattern rather than a
+coincidence:**
+
+| context | recorded OTPS | measured now | change |
+|---|---|---|---|
+| 8K | 8.72 | 8.94 | +2.5% |
+| 32K | 7.14 | 7.14 | 0.0% |
+| **128K** | 4.25 | **5.29** | **+24.5%** |
+| **256K** | 2.99 | **3.66** | **+22.4%** |
+
+**A ~23% decode gain appears at exactly the two long contexts and nowhere else, reproducibly (128K
+was run twice, 1.3% apart).** Since 8K and 32K reproduce their recorded values, this is not global
+machine drift. **The cause is still not identified** -- the candidates are a change landed after the
+recorded 128K/256K entries were taken (fp16 KV reinstate at round 353, split-D at round 377) or a
+machine state specific to how those two entries were measured. **It is recorded as a reproducible
+measurement with an unidentified cause, not as a mechanism.**
+
+**FINAL SCORECARD -- every number server-side, pairs same-session where noted:**
+
+| context | cold TTFT | warm TTFT | OTPS |
+|---|---|---|---|
+| 8K | 10.43 / 9.37 = **1.11x slower** | 0.03 / 0.235 = **7.8x faster** | 8.94 / 7.26 = **1.23x faster** |
+| 32K | 80.00 / 44.55 = **1.80x slower** | 0.05 / 0.29 = **5.8x faster** | 7.14 / 6.865 = **1.04x faster** |
+| 128K | 890.54 / 275.04 = **3.24x slower** | 0.14 / 0.48 = **3.4x faster** | 5.29 / 4.75 = **1.11x faster** |
+| 256K | 3298.83 / 726.22 = **4.54x slower** | 0.28 / 0.66 = **2.4x faster** | 3.66 / 3.86 = **1.05x slower** |
+
+**Warm TTFT: 4 of 4 won. OTPS: 3 of 4 won, the fourth 1.05x away. Cold TTFT: 0 of 4, the closest
+(8K) 1.11x away.**
+
+**Compared to the objective's starting position** -- every cold cell 1.4x to 5.7x behind and OTPS
+2 of 4 -- **this is 6 of 12 cells won and two more within 1.11x, with no new kernel written: the
+progress is the chunk change plus fp16 KV.** The remaining gap is cold TTFT, and rounds 120-137
+established that closing it requires the mma prefill attention (needing 1.4x at 8K, 5.98x at 32K,
+8.40x at 128K, 8.82x at 256K).
