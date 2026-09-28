@@ -4886,3 +4886,61 @@ replaced by a passthrough that reads the same bytes and writes the same tile wit
 and compare the times. That isolates the instructions from the traffic with the traffic held
 constant -- which is the one experiment this document has not run, and the one that would settle
 it. (`ncu` is unavailable on this platform: `ERR_NVGPUCTRPERM`.)
+
+### The passthrough control: the dequant is free, and rounds 106-108 are withdrawn (round 109)
+
+Rounds 106-108 built a case that the decode weight-streaming path's 66.8% of peak was wasted and
+recoverable -- first blamed on narrow loads (round 106), then on the sector the scale array costs,
+then on instruction issue (rounds 107-108, "9.8-13.0 instructions per SM per cycle against ~4
+issue slots"). Round 108 named the experiment that would settle it, so this round ran it.
+
+**The experiment:** replace the unpacking loop in `stage_wtile` with a passthrough that performs
+the *identical* `uint2` weight load and the identical scale load, writes the *same number of
+stores* to the same shared-memory tile, but does no nibble extraction and no `e2m1_to_float` at
+all. Traffic is held constant; the dequant instructions go to zero.
+
+```
+  baseline    (full dequant) : 115.19 ms   152.4 GB/s   66.8% of peak
+  passthrough (no unpacking) : 117.26 ms   149.7 GB/s   65.7% of peak
+```
+
+**Removing every dequant instruction made the path 1.8% slower -- that is, no change at all.**
+The dequant is free: it hides completely under the memory latency. The kernel is not
+instruction-bound, not load-width-bound, and not sector-bound.
+
+**So the conclusion of rounds 106-108 is refuted, and all three of its mechanisms are withdrawn:**
+
+| round | claim | status |
+|---|---|---|
+| 106 | narrow loads + a wasted sector on `sc` | **withdrawn** -- `uint2` loads, 100% sector efficiency |
+| 107 | the dequant is instruction-bound | **withdrawn** -- removing it changes nothing |
+| 108 | PTX shows a third of the stream unpacking | **withdrawn** as evidence; consistent with a cost that is simply hidden |
+
+**What the measurement actually says** is that **~152 GB/s is the rate this access pattern
+achieves on this part**, and the 228 GB/s figure the tool prints as "peak" is not reachable by
+this pattern. The implication is the opposite of good news: **the 38.2 ms/token that rounds
+106-108 called the largest inefficiency in this document does not exist.** The weight floor for
+decode is ~115 ms/token, not 77 ms.
+
+**Reconciled against the scorecard**, that makes the decode budgets exact rather than optimistic:
+
+| context | weight | attention | total | OTPS | llama |
+|---|---|---|---|---|---|
+| 8K | 115 ms | ~0 | 115 ms | 8.72 | 7.32 |
+| 32K | 115 ms | ~25 ms | 140 ms | 7.14 | 6.865 |
+| 128K | 115 ms | 102 ms | 217 ms | 4.25 (measured 235 ms) | **4.75** |
+| 256K | 115 ms | 206 ms | 321 ms | 2.99 | **3.86** |
+
+**And it sharpens the remaining target rather than removing one.** With the weight floor fixed at
+115 ms and llama at 210 ms/token at 128K, **attention must fall below ~95 ms** to win; the
+measured figure is 102 ms. **The 6-head GQA decode fix (rounds 99-103) targets exactly that, and
+its projected 102 -> ~70 ms gives 185 ms = 5.4 OTPS against llama's 4.75, a 1.14x win.** The
+decode GQA work is therefore confirmed as the right target for 128K/256K OTPS, and the streaming
+path is confirmed as having no recoverable headroom.
+
+**One caveat worth stating rather than hiding:** "this pattern achieves 152 GB/s" is a statement
+about this implementation, not proof about the hardware. A different access order -- deeper
+memory-level parallelism, a different tile walk, larger per-thread runs -- might still reach
+more. **But that is a new hypothesis with no supporting measurement, and it should not be
+promoted on the strength of the 228 GB/s figure alone**, which is exactly the mistake rounds
+106-108 made.
