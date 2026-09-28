@@ -6633,3 +6633,41 @@ remaining budget. **The single-trial 256K OTPS of 3.66 s (round 142) therefore s
 still 1.05x behind llama's 3.86, and the re-measurement remains owed.** It was launched and
 deliberately stopped rather than left running into the gate, since round 139b showed the gate's
 `pkill` on port 8080 destroys an in-flight measurement.
+
+### Round 149: 256K is highly reproducible, and its OTPS loss is real -- 1.05x, not noise
+
+The 256K cell was the one entry in the scorecard backed by a single trial, so it was repeated with the
+identical configuration (chunk 8192, `--ctx 262144`, `reps 8408`, 260,717 tokens):
+
+| 256K | round 142 | round 149 | agreement |
+|---|---|---|---|
+| cold TTFT | 3298.83 s | 3292.07 s | **0.20%** |
+| warm TTFT | 0.28 s | 0.28 s | -- |
+| **OTPS** | **3.66** | **3.67** | **0.27%** |
+
+**Two independent runs agree to a fifth of a percent on cold and a quarter of a percent on OTPS.**
+Averaged:
+
+| 256K | gb10 | llama.cpp | result |
+|---|---|---|---|
+| cold TTFT | **3295.45 s** | 726.22 s | **4.54x slower** |
+| **warm TTFT** | **0.28 s** | 0.66 s | **2.36x faster** |
+| OTPS | **3.665** | **3.86** | **1.053x slower** |
+
+**This closes the last open question about the 256K row, and the answer is negative:** the OTPS loss is
+**reproducible to 0.3%**, so it is not a measurement artefact and **not a candidate for re-measurement
+luck**. It is a real 5.3% deficit.
+
+**And the headroom that got it this close is already spent.** 256K OTPS went 2.19 -> 2.99 with fp16 KV
+(round 353's reinstate, +36.5%) and 2.99 -> 3.67 across the later measurements, so the remaining 5.3%
+is not sitting behind anything already landed. **Closing it needs a genuine decode-attention
+improvement at 256K, and round 119 closed that line** (split-D landed at 1.04-1.06x, split-K measured
+0.99x and was reverted).
+
+**So the final position on OTPS is 3 of 4, and the fourth is 1.05x behind with no identified lever** --
+which is a different and worse statement than "the fourth is 1.05x behind", and is the one the data
+supports.
+
+**All twelve cells now have at least two independent measurements** (8K at 3 trials per side, 32K and
+128K at two runs each, 256K at two), **so the scorecard is reproducible end to end** -- which is the
+first thing the objective asked for and is the part of it that is fully done.
