@@ -5605,3 +5605,46 @@ registers with 0 spill and 3 blocks/SM, so there is no headroom left to buy it w
 session's own *reasoning* rather than of a measurement (round 114's grid collapse was the first).
 **The pattern both times: an inference that was sound step by step, extended one step past what
 the numbers supported.**
+
+### The cheapest remaining cell is 8K cold TTFT, and it needs only 1.71x (round 125)
+
+Rounds 120-123 established what the long contexts need (8-9x on prefill attention) and that the
+CUDA-core design space is exhausted. This round prices the *whole* remaining scorecard, which
+turns out to reorder the work.
+
+| context | gb10 | llama | gap | attention | DeltaNet | via DeltaNet only | via attention only |
+|---|---|---|---|---|---|---|---|
+| **8K** | 14.93 s | 10.58 s | **4.35 s** | 4.46 s | **10.47 s** | **1.71x** | impossible (39x) |
+| 32K | 90.54 s | 44.55 s | 45.99 s | 55.23 s | 34.95 s | impossible alone | 5.98x |
+| 128K | 1134.63 s | 275.04 s | 859.59 s | 975.78 s | 158.85 s | impossible alone | 8.40x |
+| 256K | 4138.39 s | 726.22 s | 3412.17 s | 3848.70 s | 289.69 s | impossible alone | 8.82x |
+
+**8K cold TTFT is the outlier, and in the good direction.** Its gap is 4.35 s, its DeltaNet term is
+10.47 s, so **a 1.71x DeltaNet improvement closes it.** Every other cell needs 6-9x on a term that
+is already known to require tensor cores to go faster at all.
+
+**And round 66 already sized the fix well past what is needed: the chunked DeltaNet rewrite was
+projected at 13.17 s -> ~0.77 s, i.e. 17x.** That is **ten times the margin 8K requires.**
+
+**So the priority order inverts.** Round 120-124 put the mma prefill attention first on the grounds
+that it addresses the contexts the objective names (32K/128K/256K). That reasoning was about
+*importance*, not *cost*:
+
+- **The chunked DeltaNet rewrite is the cheapest win available anywhere on the scorecard** -- 1.71x
+  needed against 17x projected, on a kernel family this session has already improved three times
+  (all by removing traffic: 4-way chains, `Sc[D]` in registers, `qh` to shared), and with the
+  correctness gate already in place (`generate --oracle` + `batch-parity`; note `attn-tile` does
+  NOT cover it).
+- **The mma attention is still required**, but only for 32K (5.98x), 128K (8.40x) and 256K (8.82x),
+  and it is the harder job of the two.
+
+**So the next round should do DeltaNet first**, and the reason is not that it is more important but
+that **it is the only remaining item with a modest, already-exceeded target** -- and it converts a
+cell from loss to win rather than narrowing a gap that stays a loss.
+
+**One caveat, stated because this session has been burned by it twice.** The 1.71x figure rests on
+the round-88 layer split, which was measured at 32K and applied here at 8K. Round 88's own 8K
+numbers (delta 70.1%, attn 29.0%) are `prefill-shape` output, so the 8K split is measured too --
+this is not an extrapolation between contexts. **The projection that is an extrapolation is round
+66's 17x**, which has never been measured; the point here is only that the *requirement* is 1.71x,
+so a rewrite that delivers even a quarter of round 66's projection still wins 8K.
