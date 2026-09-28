@@ -4651,3 +4651,49 @@ memory floor (round 101), and gb10 needs 128K attention below ~82 ms of 102 ms t
 
 **Not implemented.** It is a real kernel change with a now-complete design, a measured target, and
 an identified register hazard.
+
+### `NW` is a coupled constant with no host knob, and one comment about it is stale (round 103)
+
+Round 102's design calls for `NW = 16` instead of 32 to preserve occupancy once the six query
+heads' accumulators are in registers. Checking whether that is a host-side knob turns up a
+coupling that has to be respected, and a comment that must not be trusted:
+
+```cuda
+// kernels/elementwise.cu:1137
+constexpr int NW = 32;   // warps per block
+```
+
+```rust
+// crates/gb10-cuda/src/ops.rs -- the attn_decode_multi launch
+// Must match NW in `attn_decode_multi_kernel`: the block is
+// NW warps, and each warp owns a strided slice of the keys.
+(&self.attn_decode_multi, 1024u32)
+```
+
+**`NW` is a kernel `constexpr` and the thread count is hardcoded `1024u32` on the host.** They
+are not derived from a shared constant, so **`NW = 16` requires editing both in lockstep** -- the
+kernel's `constexpr` and the host's literal. This is the same class of coupled edit that rounds
+61/62 got wrong (a change in one place silently mismatching another, with the build staying
+quiet), so it should be changed in one commit with both sites visible, and verified by grep
+afterwards rather than assumed.
+
+**A second thing to not trust:** the comment immediately above that launch reads
+
+> The warp kernel covers head_dim == 256 (32 lanes x 8 dims) and wants the full eight warps of a
+> 256-thread block; any other head width goes [to the serial kernel]
+
+**"eight warps of a 256-thread block" contradicts `NW = 32` warps and `1024u32` threads** four
+lines below it. The 32-lanes-x-8-dims part matches `DPL = 8` and the kernel body; the warp and
+thread counts do not. It is a leftover from when `NW` was 8, and the kernel's own later comment
+at line 1136 records that history ("`NW = 8` a 256-thread block left just 4 warps resident per SM
+and the kernel ran at 328 GB/s. Raising NW raises the resident warps without ... same traffic").
+**So the operative facts are `NW = 32`, `DPL = 8`, `1024u32`, and the comment above the launch is
+stale** -- worth knowing before treating it as documentation of the current shape.
+
+**Net effect on the plan:** the register analysis of round 102 stands, and its `NW = 16` step is
+a two-site edit rather than a knob turn. That is the last unknown in the design; everything else
+about it is sized, targeted, and has a stated acceptance test (a same-session 128K server pair,
+gb10's attention below ~82 ms of the measured 102 ms).
+
+**Not implemented.** This round adds no code; it removes the two ways the implementation could
+silently go wrong.
