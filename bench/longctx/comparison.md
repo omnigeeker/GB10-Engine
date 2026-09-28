@@ -5892,3 +5892,50 @@ halves are separated and the cheap half is actionable.**
 approximately right, not exact, and re-derived from repeated runs before anything is built on it.**
 What is not in doubt is the shape: **per-call cost is far from negligible, and the `--limit`
 ablations of round 130 could not have seen it.**
+
+### Round 132: the server chunks at 2048 too, so round 131's lever is real -- and it can be decoupled
+
+Round 131 found a ~16.6 ms fixed cost per DeltaNet kernel call and projected 1.33x from reducing the
+call count. **That projection is only worth acting on if the server pays the same per-call cost the
+verify harness does**, and the two paths are not obviously the same: `prefill-shape` chunks at
+`crates/gb10-verify/src/main.rs:226` (`let chunk = 2048usize`), while `Model::prefill_seq`
+(`crates/gb10-model/src/model.rs:436`) itself only loops layers and does no chunking at all.
+
+**Checked, and the server does chunk:**
+
+```
+crates/gb10-server/src/main.rs:43:  const PREFILL_CHUNK: usize = 2048;
+```
+
+**The server chunks at exactly 2048 -- the same value as the harness.** That is corroborated by the
+objective's own numbers: the 8K server cold TTFT is 14.93 s against the harness's 15.10 s at 7168
+tokens, which is only consistent if the server pays the same per-chunk structure. **So the 192-call
+count (48 DeltaNet layers x 4 chunks) applies to the measured scorecard, and the ~3.19 s of fixed
+cost is inside the numbers this objective is judged on.**
+
+**That makes the lever concrete, and it suggests a better form of it than raising `PREFILL_CHUNK`.**
+`PREFILL_CHUNK` is shared: `Scratch` is sized to one chunk (gb10-server:392, layer.rs:227), and the
+attention path's shared-memory tiling is built around it, so raising it globally is not free.
+
+**But the DeltaNet recurrence does not need that chunk size.** It is sequential in `T` and carries
+its state across chunks anyway (that is what the recurrence *is*), so the kernel is already correct
+for any `T` -- **the 2048 is an attention-motivated choice being imposed on the recurrent path.**
+Giving the DeltaNet path its own, larger chunk while attention keeps 2048 would amortise the fixed
+cost while leaving the attention tiling untouched:
+
+| DeltaNet chunk | calls per 8K prefill | fixed cost | vs 3.19 s today |
+|---|---|---|---|
+| 2048 (today) | 192 | 3.19 s | -- |
+| 4096 | 96 | 1.59 s | -1.59 s |
+| 8192 (whole prompt) | 48 | 0.80 s | **-2.39 s** |
+
+**-2.39 s of the 9.71 s DeltaNet term is ~1.33x on DeltaNet and ~1.19x on the 14.93 s prefill**
+(14.93 -> 12.54 s), against the 10.58 s needed. **Not sufficient alone, but it is the largest single
+identified lever and the cheapest to test**, and it is independent of whatever the per-token stall
+turns out to be.
+
+**Not implemented, and one dependency to check first:** the convolution history and the recurrent
+state are per-chunk boundaries (gb10-server:40-43 explains the design), so the DeltaNet path's
+chunk size is coupled to those buffers. **The test is therefore a real change, not a constant edit
+-- but a smaller one than an algorithm rewrite, and it can be validated with `generate --oracle`
+plus `batch-parity` and measured with `prefill-shape` before any server run.**
