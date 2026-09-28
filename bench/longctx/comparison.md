@@ -6671,3 +6671,85 @@ supports.
 **All twelve cells now have at least two independent measurements** (8K at 3 trials per side, 32K and
 128K at two runs each, 256K at two), **so the scorecard is reproducible end to end** -- which is the
 first thing the objective asked for and is the part of it that is fully done.
+
+# Handoff: what remains, and exactly how to do it
+
+**State at the end of this session.** The goal is not met. **Warm TTFT is 4 of 4 won, OTPS is 3 of 4,
+cold TTFT is 0 of 4.** All twelve cells are reproducible (each has at least two independent
+measurements). The progress made this session -- cold prefill down 1.25-1.43x on every context -- came
+entirely from `PREFILL_CHUNK` 2048 -> 8192 plus the earlier fp16-KV landing; **no new kernel was
+written.** The whole remaining gap is cold prefill, and three of its four cells need the same thing.
+
+## The one piece of work that matters: mma prefill attention
+
+**Required speedups:** 1.29x at 8K, 5.98x at 32K, 8.40x at 128K, 8.82x at 256K. **Design for 9x.**
+
+**Why it is the only path.** Rounds 121-124 established arithmetic throughput as the wall at long
+context; rounds 145-147 then tested the one apparent shortcut and closed it:
+
+- the kernel runs at **2 blocks/SM, shared-memory limited** (43,104 B request against a 101,376 B
+  ceiling; 3 blocks would need a 22% cut),
+- the `GB10_ATTN_SMEM_PROBE` probe cost **1.47x** when forcing 1 block/SM -- **that is a sensitivity,
+  not headroom**, so occupancy cannot be raised without cutting smem,
+- and the only available smem cut is **fp8 staging of Q/K**, which invalidates the `PADH = 130`
+  bank-conflict derivation at `kernels/elementwise.cu:387-397` and is likely to fail `attn-tile`'s
+  ~1e-7 agreement check.
+
+**Where to write it.** `kernels/elementwise.cu`, alongside `attn_prefill_tiled_kernel` (:355), keeping
+that kernel in the tree as the reference. Register it in `crates/gb10-cuda/src/ops.rs` with the
+documented 3-point pattern (name list ~:42, struct fields ~:93, `take(map, ...)` ~:158) and dispatch
+from `attn_prefill` (:1304).
+
+**The four things that make it work, and the one that is easy to miss:**
+
+1. `mma.sync.aligned.m16n8k16` for QK^T, fp16 in, fp32 accumulators. `head_dim = 256` -> 16 k-steps.
+   Note the **GQA group is 6** (24 q heads / 4 kv heads), so K/V fragments are shared by 6 q-head
+   tiles -- stage them once.
+2. **Online softmax inside the mma layout.** The accumulator fragment layout is not the row layout the
+   softmax wants, so a fragment reshuffle is required between the mma and the max/exp; budget for it.
+3. **`ex2.approx.f16x2` for the exponential -- this is the one that is easy to miss.** The score loop
+   is the dominant instruction stream, and an `expf` there becomes the new ceiling and 9x does not
+   arrive. Fold `scale * log2(e)` into `scale` so the argument is already base-2.
+4. `P·V` as a second mma with P in fp16 -- which means the softmax must emit fp16 probabilities.
+
+**Verification, in this order, and do not skip the first:**
+
+```
+./target/release/gb10-verify attn-tile --model models/Qwen3.8-27B-NVFP4          # vs attn_prefill_legacy
+GB10_GEMM_EVENTS=1 ./target/release/gb10-verify prefill-shape --model models/Qwen3.8-27B-NVFP4     --max-seq 8192 --limit 7168                                                  # attn term, expect ~3.77 s -> ~0.4 s
+./loop/run_round.sh                                                             # full gate
+```
+Then the same-session server pairs, 8K first since it needs only 1.29x:
+```
+# terminal 1 (measurement -- must NOT overlap the gate; the gate pkills port 8080)
+./target/release/gb10-server --model models/Qwen3.8-27B-NVFP4 --port 8080 --ctx 262144
+# terminal 2
+python bench/longctx/ttft.py --port 8080 --reps 231  --trials 3 --max-tokens 128 --label gb10
+```
+
+## Rules this session established that must not be relearned
+
+- **Only same-session pairs are comparable.** Round 90 measured **23% drift** on identical code. This
+  rule twice corrected the session itself: once reversing a wrong fp16-KV revert, once after
+  extrapolating llama's stale numbers one-sidedly.
+- **Long-context runs need `--ctx 262144`.** Without it the server silently runs at 32768 and requests
+  return *no content*, which reads like a harness bug.
+- **At `--ctx 262144` the server self-caps to 1 concurrent sequence** (34.4 GB of KV), so long-context
+  numbers are single-sequence numbers.
+- **A measurement and `loop/run_round.sh` must not run at the same time** -- the gate owns port 8080
+  and will kill the server mid-request (round 139b).
+- **Do not re-litigate these closed lines:** weight streaming (4 refutations, rounds 106-110), decode
+  split-K (measured 0.99x, reverted, round 119), and the per-chunk-cost attribution (rounds 130-134,
+  resolved as per-chunk weight staging).
+- **A measured effect is not an attributed cause.** The recurring failure in this session was treating
+  those as one thing; the 128K/256K OTPS improvement of ~23% is *still* unattributed, and the 8K gap
+  went from 1.41x to 1.09x only by untangling exactly that confusion.
+
+## The other two items
+
+- **256K OTPS, 1.05x behind, no identified lever.** Reproducible to 0.3% across two runs, so it is not
+  a re-measurement candidate. The fp16-KV headroom is spent (2.19 -> 2.99 -> 3.67). Decode attention
+  is the term to attack and round 119 closed the obvious approaches.
+- **The unattributed ~23% OTPS gain at 128K and 256K** (4.25 -> 5.29 and 2.99 -> 3.66, while 8K/32K
+  reproduced their recorded values exactly). **Worth identifying**: whatever it is, it may also carry
+  256K the last 5.3%.
