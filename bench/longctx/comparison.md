@@ -3094,3 +3094,71 @@ bank conflicts (`PADH = 130`, fp16 `Qs`/`Ks`, `BK = 16`, `BQ = 24`, 22,624 B sme
 than for streaming the KV cache, and at 128K the streaming is the dominant cost. A GQA-aware
 kernel that streams K and V once per token and reuses each block across all 24 query heads
 (they share only 4 KV heads) is the shape both targets need.
+
+### The 128K decode gap is 6x GQA redundancy: the grid is one block per QUERY head (round 76)
+
+Round 75 left the decode attention at 33 GB/s against a 228 GB/s bound and asked why. The
+answer is in the grid, and it is a factor of exactly `n_q_heads / n_kv_heads` = 24 / 4 = 6.
+
+Reading the decode path finds two kernels, and they are in very different states:
+
+**`attn_decode_kernel`** (elementwise.cu:624) is catastrophic on two counts. Its grid is
+`blockIdx.x = h`, **one block per query head**, and each block loops `for (s = 0; s <
+n_keys; ++s)` calling **`block_reduce_sum` inside the per-key loop**:
+
+```cuda
+for (int s = 0; s < n_keys; ++s) {
+    const float kk = ... k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d] ...;
+    const float dot = block_reduce_sum(qv * kk) * scale;   // full block reduction PER KEY
+    ...
+}
+```
+
+That is 130,000 block reductions per head per token, each with multiple `__syncthreads()`.
+
+**`attn_decode_multi_kernel`** (elementwise.cu:1125) is the one the model actually uses
+(layer.rs:614) and it is much better -- it already fixed the per-key reduction by striding
+keys across warps, and its own comment records an earlier round of work on it:
+
+```cuda
+constexpr int NW = 32;   // warps per block
+// The grid is only (n_q_heads, n_seq) = 24 blocks for a single sequence, so at
+// NW = 8 a 256-thread block left just 4 warps resident per SM and the kernel
+// ran at 328 GB/s. Raising NW raises the resident warps without changing the
+// grid: 32 warps x 24 blocks is 4x the in-flight work for the same traffic.
+for (int t = warp; t < n_keys; t += NW) { ... }
+```
+
+**But the grid is still `(n_q_heads, n_seq)` = 24 blocks, one per QUERY head** -- and
+`kh = h / group` means the **six** query heads of each KV head each traverse the *entire* KV
+cache for that same KV head. The K/V bytes are read six times over:
+
+| | per token | |
+|---|---|---|
+| KV cache actually stored (4 KV heads) | 9.66 GB | minimal |
+| KV bytes read at 24 query heads | **58 GB** | 6x redundant |
+| measured time | 290 ms | |
+| **effective read rate** | **200 GB/s** | **88% of the 228 GB/s bound** |
+
+**So the decode kernel is not slow because it is badly written -- it is already running at
+~88% of memory bandwidth. It is slow because it does six times the memory traffic it needs
+to.** That closes the round-75 question exactly, and it explains why the earlier `NW` tuning
+(cited in the comment) hit a wall: raising warps cannot help once the traffic itself is 6x
+what it should be.
+
+**The fix is the standard one and it is well specified.** Move the grid to one block per *KV*
+head and let each block serve all six query heads that share it, so K and V are read once and
+reused six times. That alone would cut traffic 6x -- but `n_kv_heads = 4` gives only 4 blocks
+for 48 SMs, so it must be combined with the usual **flash-decoding split**: also split the
+key dimension, `grid = (n_kv_heads, key_splits, n_seq)`, and combine the partial online
+softmaxes in a second pass. With `key_splits = 8` that is 32 blocks per sequence with no
+redundancy -- more parallelism than today's 24 blocks *and* one sixth of the traffic.
+
+Predicted effect at 128K: decode attention from 290 ms/token toward the ~42-60 ms the traffic
+actually requires, i.e. **OTPS from 3.45 past llama.cpp's 4.82** -- which would turn the one
+metric gb10 currently loses into a win. The same split-K structure is what the 128K prefill
+attention needs (round 75: 5.0 TFLOP/s, 13.5% of fp16 peak).
+
+**This is the highest-value remaining change in the document**, because it is the only one
+aimed at a metric gb10 currently loses, it has a measured cause (6x redundant traffic), and
+the fix is a known pattern rather than research.
