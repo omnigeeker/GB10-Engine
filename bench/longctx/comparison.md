@@ -3667,3 +3667,58 @@ in fp16, so the comparison is against a server making the same choice.
 **This is the next thing to write, and it is not started.** The plan in this section is
 recorded rather than executed because it is a six-kernel change and a half-finished version of
 it would be worse than the fp32 code.
+
+### LANDED: the KV cache is fp16 (round 86)
+
+The change the previous rounds identified and sized is implemented, gated, committed and
+pushed (round 346 PASS). **The KV cache is no longer fp32.**
+
+**What changed:**
+
+- `kernels/elementwise.cu`: **eight** kernels now take the cache as `__half*` -- both prefill
+  kernels (`attn_prefill_legacy_kernel`, `attn_prefill_tiled_kernel`), `attn_decode`,
+  `attn_decode_multi`, `attn_decode_multi_serial`, and the three append kernels
+  (`kv_cache_append`, `kv_cache_append_batched`, `kv_cache_append_multi`). Reads widen with
+  `__half2float`, writes narrow with `__float2half`.
+- `crates/gb10-model/src/layer.rs`: `k_cache`/`v_cache` are `CudaSlice<u16>`; a `zeros_h`
+  helper allocates them; `reset` splits into an f32 loop and an fp16 loop because the buffers
+  can no longer share one array.
+- `crates/gb10-cuda/src/ops.rs`: 18 signature sites moved to `CudaSlice<u16>`.
+- `crates/gb10-model/src/mtp.rs`: its own KV buffers and a `zh` helper.
+- `crates/gb10-verify/src/main.rs`: the two benches allocate fp16 caches; a local
+  round-to-nearest-even `to_f16_bits` avoids adding the `half` crate just for that.
+
+**A mistake worth recording, because the gate caught it and the compiler did not.** The first
+build passed and the oracle gate then produced *all* token id 0 -- deterministic and completely
+wrong. The cause: the prefill kernels name the cache parameters `k`/`v`, not `k_cache`/`v_cache`,
+so the round-85 `grep` for `k_cache[`/`v_cache[` **missed both prefill kernels entirely**; only
+their *append* sites had been found. The compiler did not object because `__float2half(k[...])`
+on an already-`__half` value is a legal (and silently lossy) conversion. Reading the actual
+staging code found it. **The count of 12 sites in round 85 was wrong; the real figure is 16
+across 8 kernels.**
+
+**Correctness after the fix -- every gate passes:**
+
+```
+generate (64-layer greedy decode vs full-model oracle)   exact match, 16/16
+batch-parity (16 sequences vs one-at-a-time)             OK
+prefix cache A/B (caching vs --no-prefix-cache)          OK
+decode-bench (warp vs serial reference)                  OK
+```
+
+**And the kernel got measurably faster at the same time.** The gate's own `decode-bench`
+against the round-79 baseline on the same bench, same default shape:
+
+| 8192 keys | warp ms | effective GB/s | speedup vs serial |
+|---|---|---|---|
+| fp32 KV (round 79) | 1.677 | 961 | 6.67x |
+| **fp16 KV (round 346)** | **1.024** | **1572** | **12.72x** |
+
+**1.64x faster on the decode attention kernel, and the speedup over the serial reference rises
+from 6.67x to 12.72x**, which is the shape a pure traffic reduction should have.
+
+**What is NOT yet measured: the end-to-end effect.** The 8K/32K/128K/256K server scorecard in
+this document still predates this change and must be re-run before any of its numbers are
+quoted again. The prediction recorded in round 85 was 128K decode 290 -> ~212 ms against
+llama.cpp's 207; the kernel number above is consistent with that, but **it is not the
+measurement.** That re-run is the next step.
