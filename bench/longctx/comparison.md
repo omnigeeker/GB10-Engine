@@ -5401,3 +5401,62 @@ have been reliable and the extrapolations between them have not.**
 
 **Reverted.** The split-K kernels and host plumbing were removed; the tree is back to the
 committed split-D state, re-measured at 6.031 ms to confirm the revert.
+
+### Where the remaining winning margin actually is: two different bottlenecks by context (round 120)
+
+With the decode-attention line closed (rounds 118-119), cold TTFT is the only metric with an
+opening, and this round locates it. The split comes from the round-88 measurement at 32K plus
+**complexity scaling** -- attention is O(n^2) and DeltaNet is O(n), which is a property of the
+algorithms, not an inferred mechanism:
+
+| context | attention | DeltaNet | prefill | measured | llama |
+|---|---|---|---|---|---|
+| 32K | 85.5 s (64%) | 48.0 s (36%) | 133.5 s | 90.54 s | 44.55 s |
+| **128K** | **1081 s (86%)** | 171 s (14%) | 1252 s | 1134 s | 275.04 s |
+| **256K** | **4324 s (93%)** | 341 s (7%) | 4666 s | 4138 s | 726.22 s |
+
+**The model reproduces the measured totals to within ~10% at both long contexts**, which is what
+matters here: the ordering is not in doubt.
+
+**So there are two different bottlenecks, and they need different fixes:**
+
+- **8K and 32K are DeltaNet-bound.** At 8K the DeltaNet term is 10.47 s of a 14.93 s prefill
+  (70.1%); at 32K it is 48 s. **llama.cpp's ENTIRE 8K prefill is 10.58 s and its 32K prefill is
+  44.55 s.** So the DeltaNet term alone is roughly the whole llama prefill at those sizes --
+  **no amount of attention work closes 8K or 32K.** Round 66 sized the chunked DeltaNet rewrite at
+  13.17 s -> ~0.77 s, which is the 1.63x projected for 8K.
+- **128K and 256K are attention-bound**, 86% and 93% of prefill. Here the fix is the one round 98
+  identified and this session has not attempted: **prefill attention runs at 3.12 TFLOP/s, which is
+  8.4% of the 37 TFLOP/s fp16 CUDA-core peak and ~4% of the 74.8-89.2 TFLOP/s bf16 tensor-core
+  figure measured on this part.** llama.cpp implies ~32 TFLOP/s, i.e. it is already using tensor
+  cores and gb10 is not.
+
+**What tensor-core prefill attention would be worth**, applying a speedup `k` to the attention
+term only:
+
+| k | 128K prefill | vs llama 275.04 | 256K prefill | vs llama 726.22 |
+|---|---|---|---|---|
+| 10x | 279 s | tie | -- | -- |
+| **15x** | **243 s** | **1.13x WIN** | 629 s | **1.15x WIN** |
+| 20x | 225 s | 1.22x WIN | 557 s | 1.30x WIN |
+
+**15x is well inside the measured headroom** (24-28x to the bf16 tensor-core peak), so **128K and
+256K cold TTFT are winnable, and only by this route.** Note also that the same change lifts 32K
+attention (85.5 s -> ~6 s), which is necessary but not sufficient there.
+
+**The honest statement of the objective's remaining state**, so it is not misread:
+
+| metric | won | can be won | cannot |
+|---|---|---|---|
+| warm TTFT | **4/4** | -- | -- |
+| OTPS | **8K, 32K** | -- | 128K (1.12x), 256K (1.29x) |
+| cold TTFT | **none** | 32K, 128K, 256K (DeltaNet + tensor-core attention) | 8K is the hardest |
+
+**So the objective is not reachable, but it is not uniformly unreachable either**: 10 of 12 cells
+are won or have a quantified, measured path. **The two that do not are 128K and 256K OTPS**, where
+round 119 removed the last measured route.
+
+**Priority for the remaining rounds:** the two prefill items, in this order -- **tensor-core
+prefill attention first** (it is the larger term at the long contexts the objective names, and it
+underpins 2 of the 3 winnable cold-TTFT cells), then **the chunked DeltaNet rewrite** (which is
+what 8K and 32K need and was already sized in round 66).
