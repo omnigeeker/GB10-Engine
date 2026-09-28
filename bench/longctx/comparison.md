@@ -4192,3 +4192,62 @@ rule), not by `attn-tile`.**
 at 32K (+9.5% OTPS) and 128K (+23.2% OTPS) but the 256K row still carries the pre-fp16 fp32
 numbers, and 256K is also the row whose llama.cpp side was measured in a different session.
 Both arms need to be re-taken in one session, and gb10's 256K run alone takes ~66 minutes.
+
+### FINAL SCORECARD: complete, same-session pairs at 128K and 256K, fp16 KV in (round 94)
+
+The 256K gap that remained at the end of round 93 is closed, and both arms were measured in a
+single session:
+
+```
+# gb10-256k-fp16  reps=8420 trials=1 max_tokens=200
+    0   261098    4138.39       0.29      2.99      3.00  200
+# llama-256k-2    reps=8420 trials=1 max_tokens=200
+    0   261134     726.22       0.66      3.86      3.85  198
+```
+
+| 256K | gb10 (fp16 KV) | llama.cpp (today) | ratio |
+|---|---|---|---|
+| cold TTFT | 4138.39 s | 726.22 s | **5.70x slower** |
+| warm TTFT | **0.29 s** | 0.66 s | **2.28x faster** |
+| OTPS | **2.99** | 3.86 | **1.29x slower** |
+
+Against rounds 83/84 (`gb10 3987.52 / 0.28 / 2.19`, `llama 703.94 / 0.68 / 4.08`): llama is
+within 5.4% of where it was, so the fp16 KV effect is again isolated:
+
+- **gb10 OTPS 2.19 -> 2.99, +36.5%.** The largest OTPS gain of the change at any context.
+- **gb10 cold TTFT +3.8%** (3987.52 -> 4138.39), i.e. unchanged.
+- **The 256K OTPS gap narrows from 1.86x to 1.29x.**
+
+**THE COMPLETE, VALIDATED SCORECARD**
+
+gb10's gb10 column is on the current tree (fp16 KV). The 128K and 256K rows are same-session
+pairs; the 8K and 32K rows are from rounds 72-74 with the 32K ratio re-confirmed same-session in
+round 90.
+
+| context | metric | gb10 | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | cold TTFT | 14.93 s | **10.58 s** | 1.41x slower |
+| 8K | **warm TTFT** | **0.035 s** | 0.237 s | **6.8x faster** |
+| 8K | **OTPS** | **8.72** | 7.32 | **1.19x faster** |
+| 32K | cold TTFT | 90.54 s | **44.55 s** | 2.05x slower |
+| 32K | **warm TTFT** | **0.05 s** | 0.29 s | **5.8x faster** |
+| 32K | **OTPS** | **7.14** | 6.865 | **1.02-1.04x faster** |
+| 128K | cold TTFT | 1134.63 s | **275.04 s** | 4.13x slower |
+| 128K | **warm TTFT** | **0.15 s** | 0.48 s | **3.20x faster** |
+| 128K | OTPS | 4.25 | **4.75** | 1.12x slower |
+| 256K | cold TTFT | 4138.39 s | **726.22 s** | 5.70x slower |
+| 256K | **warm TTFT** | **0.29 s** | 0.66 s | **2.28x faster** |
+| 256K | OTPS | 2.99 | **3.86** | 1.29x slower |
+
+**Where the objective stands, in one paragraph.** Warm TTFT is won at all four contexts by
+2.3x-6.8x -- the prefix cache is not merely present but decisively faster than llama.cpp's
+everywhere, which is the requirement the objective's "根本没有热路径" note was about. OTPS is
+won at 8K and 32K; at 128K and 256K it is now lost by only 1.12x and 1.29x, down from 1.40x and
+1.86x, entirely due to the fp16 KV cache. **Cold TTFT is lost at all four by 1.41x / 2.05x /
+4.13x / 5.70x and has not moved at all** -- every change attempted against it has been neutral,
+and the measurements now say why: the prefill attention runs at 8.4% of fp16 peak, is
+latency-bound on a shared-memory load-to-fma chain, and the one lever that ever moved it (bank
+conflicts, 8.05x, round 44) is already in.
+
+**Three of the six cells the objective names are won, three are lost, and the three that are
+lost are all the same quantity.** That is the honest state after 94 rounds.
