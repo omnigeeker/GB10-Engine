@@ -5998,3 +5998,58 @@ per-kernel timing print rather than another `--limit` sweep** -- a small, bounde
 reasoning rather than on a measurement** (rounds 114, 123, 130, and now 132). **The pattern is
 consistent: a measured effect is real, an attributed cause is assumed, and the two are treated as
 one.**
+
+### Round 134: the per-call cost is per-chunk WEIGHT STAGING, and the timing scope explains round 133
+
+Round 133 left the ~20 ms per-call cost unattributed and downgraded round 132's lever to
+speculative. **This round finds the attribution, and it turns on reading what the timing events
+actually wrap.**
+
+`crates/gb10-model/src/model.rs:495-512`: the two events are recorded around
+
+```rust
+layer.forward_prefill(dev, text, &state.a, &mut state.b, &mut state.layers[i], sc, t, seq)?;
+```
+
+**-- the whole layer, not the recurrence kernel.** So the `delta` diagnostic category is not
+`gated_delta_rule_chunk_kernel`; it is everything a DeltaNet layer does at prefill, including its
+**input and output projections**, whose weights are streamed per chunk. Recomputing the fixed cost
+against the phase breakdown already in hand:
+
+| quantity | value |
+|---|---|
+| `weight stage` at `--limit 7168` | 2034 ms |
+| layer-chunks (64 layers x 4 chunks) | 256 |
+| weight staging per layer-chunk | **7.9 ms** |
+| DeltaNet layers are 48 of 64 = 75% | **6.0 ms** attributable per delta layer-call |
+| round-131 fit's fixed cost | **16.6 ms** per delta call (+/-8 ms, r131 caveat) |
+
+**Same order of magnitude, and -- the part that matters -- the same shape.** Weight staging is
+**per chunk**, so it does not shrink when a chunk holds fewer tokens. **That is exactly why the
+per-token cost appeared to fall as `T` grew in round 131: at `T = 255` the same weights are staged
+for 255 tokens that at `T = 2048` are staged for 2048.** The "fixed per call" and the "per-token"
+terms were never two mechanisms; they are one mechanism measured at two chunk sizes.
+
+**So round 132's lever was right in direction and wrong in scope.** The cost is not specific to
+DeltaNet and is not in the recurrence, so **decoupling the DeltaNet chunk size from the attention
+chunk size would not touch it** -- decoupling leaves the number of chunk *passes*, and therefore the
+number of weight stagings, exactly as it is. **The lever is fewer chunks overall, i.e. a larger
+`PREFILL_CHUNK`, which is a global parameter and brings the coupling round 132 already identified**
+(`Scratch` sized to one chunk at gb10-server:392 and layer.rs:227; attention tiling built around
+`PREFILL_CHUNK`).
+
+**What this changes for the 8K cell:** going from 4 chunks to 1 would remove 3 of every 4 weight
+stagings. At `--limit 7168` staging is 2034 ms of 15.10 s, so the saving is bounded by ~1.5 s
+(14.93 -> ~13.4 s), **i.e. ~1.11x on the prefill, not the 1.19x round 132 projected.** And it is
+paid for in `Scratch` memory and attention tiling, which is a real cost to weigh, not a free
+parameter.
+
+**Still not enough for the 10.58 s target, and the honest total is now:** 8K needs 1.83x
+(round 128); fewer chunks offers ~1.11x; **the remainder must come from the per-token cost, which is
+the ~97x stall of round 130 -- still unattributed, still needing instrumented per-kernel timing
+within the layer, and still the only large unidentified term in this objective.**
+
+**Twenty-seventh self-correction, and the third consecutive round to revise this one thread of
+reasoning** (131 -> 132 -> 133 -> 134). **The lesson is specific and worth carrying: a diagnostic
+category named after a layer kind is not a kernel, and every time this session read `delta` as
+"the recurrence" it drew a wrong conclusion.**
