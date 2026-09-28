@@ -4697,3 +4697,79 @@ gb10's attention below ~82 ms of the measured 102 ms).
 
 **Not implemented.** This round adds no code; it removes the two ways the implementation could
 silently go wrong.
+
+### The weight-streaming path runs at 66.8% of peak, and that costs every decode step (round 106)
+
+Every recent round has aimed at attention, on the reasoning that attention is what grows with
+context. That reasoning is right about *growth* and wrong about *magnitude*: the decode step
+also pays a **context-independent** cost, and that cost is running a third short of the hardware.
+`gb10-bench stream` measures it directly:
+
+```
+per-token weight traffic : 17.555 GB
+time per token           : 115.19 ms
+achieved bandwidth       : 152.4 GB/s
+projected decode         : 8.68 tok/s (single stream)
+roofline at 228 GB/s     : 12.99 tok/s
+bandwidth utilisation    : 66.8% of measured 228 GB/s
+```
+
+**115.19 ms per token against a 77.0 ms roofline. That is 38.2 ms of waste on every single
+decode step, at every context** -- and it is the largest single inefficiency this document has
+measured, larger than the 2.71x decode-attention amplification in absolute terms and, unlike it,
+present even at 8K.
+
+**The mechanism is visible in the kernel.** `dequant_nvfp4_to_bf16_kernel` (kernels/gemm.cu:522)
+loads the weights and the scales in the same loop, one byte at a time, from two separate arrays:
+
+```cuda
+const uint8_t byte = __ldg(w  + (size_t)n * (size_t)(kk >> 1) + (size_t)(k >> 1));
+const uint8_t nib  = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+const float   s    = e4m3_to_float(__ldg(sc + (size_t)n * (size_t)(kk >> 4) + (size_t)(k >> 4)));
+```
+
+Counting 32-byte sectors for a 32-lane warp with two weights per lane:
+
+| array | what a warp fetches | sectors |
+|---|---|---|
+| `w` | 32 lanes x 1 B = 32 useful bytes | 1 sector (32 B) |
+| `sc` | 4 distinct scale bytes (8 lanes share one) | **1 sector (32 B)** |
+
+**36 useful bytes out of 64 fetched -- 56%**, which is the right order for the measured 66.8%.
+**The scale read costs a whole sector to deliver four bytes**, and it is a separate array, so it
+cannot be coalesced away with the weight read.
+
+**The fix is to make each thread do more work per iteration** -- process 32 weights (16 bytes,
+one `uint4` load) and the two scales that cover them, so the scale transaction is amortized over
+16x more weight bytes and both arrays are read at full width. That is a change of loop shape, not
+algorithm, and it does not touch the arithmetic: the dequantized bf16 values are identical.
+
+**What reaching the roofline is worth, using the measured decode budget (115.19 ms context-free
+plus the measured attention per context):**
+
+| context | today | **at the roofline** | llama.cpp | result |
+|---|---|---|---|---|
+| 8K | 8.72 | **12.99** | 7.32 | 1.77x win |
+| 32K | 7.14 | **12.99** | 6.865 | 1.89x win |
+| 128K | 4.25 | **5.59** | 4.75 | **1.18x WIN** |
+| 256K | 2.99 | **3.53** | 3.86 | 1.09x short |
+
+**This overturns the priority order this document has carried since round 99.** The decode
+attention work (rounds 99-103) targeted 128K/256K OTPS by removing a 2.71x traffic
+amplification; this targets the *same two metrics* by removing a 33% bandwidth shortfall that
+also lifts 8K and 32K, and it is a smaller and better-understood change -- a load-width fix in
+one kernel with no change to the numerics.
+
+**It also explains a number that has been sitting unexplained since round 80**: the
+"context-free floor" of ~128 ms/token that all the decode budgets were built on is not a floor
+at all. **It is 115 ms of streaming at 67% efficiency plus overhead**, and the true floor at this
+traffic is 77 ms.
+
+**Validation: unchanged and non-negotiable.** `gb10-bench stream` is the right instrument for the
+bandwidth claim -- unlike `decode-bench`, its 17.555 GB working set cannot be L2-resident, so it
+is measuring DRAM -- but the *end-to-end* claim still requires a same-session server pair
+(128K: gb10 ~19 min against llama ~4.6 min), because round 87's rule is that a kernel measurement
+is evidence about that kernel and not about the pipeline.
+
+**Not implemented.** It is the next thing to do, ahead of the decode GQA work, because it is
+larger in effect, broader in scope (every context, not just the long ones), and smaller in risk.
