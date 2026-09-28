@@ -5460,3 +5460,59 @@ round 119 removed the last measured route.
 prefill attention first** (it is the larger term at the long contexts the objective names, and it
 underpins 2 of the 3 winnable cold-TTFT cells), then **the chunked DeltaNet rewrite** (which is
 what 8K and 32K need and was already sized in round 66).
+
+### Round 121: the prefill attention has no cheap fix left, so tensor cores are the only route
+
+Round 120 established that 128K and 256K cold TTFT are attention-bound (86% and 93%) and that only
+a ~15x attention speedup closes them. Before designing that, one cheap possibility had to be ruled
+out: **that the slow path was a dispatch problem** -- that long sequences were falling through to
+the quadratic `attn_prefill_legacy` kernel while only short ones got the tiled one. That has been
+the shape of several cheap wins this session, so it was worth one check.
+
+**It is not.** `ops.rs:1291` dispatches unconditionally, and its comment records why:
+
+> Every prefill goes through the tiled kernel, including short ones. ... `attn_prefill_legacy`
+> runs one block reduction per key per query, so its cost grows quadratically with the key count
+> *and* its constant factor is far worse. Measured in situ on the same 2048-token chunk: 82.3 s at
+> 10,240 cached keys (legacy) against 39.2 s at 12,288 (tiled) -- the tiled kernel is twice as
+> fast with 20% more keys.
+
+So the tiled kernel *is* the fast path, legacy is retained only as the independent reference the
+`attn-tile` gate compares against, and **the measured 3.12 TFLOP/s is the tiled kernel's real
+performance.**
+
+**And its headroom is already accounted for.** Round 97 measured it at **80 registers, 0 spill,
+1 barrier -- 3 blocks per SM.** It is not register-limited, not spilling, not barrier-bound, and
+its grid at 32K is thousands of blocks, so unlike the decode kernel it is **not starved for
+blocks**. What it is, is a CUDA-core kernel doing `__half2` loads with `__half22float2`
+conversions and fma per element: at 3.12 TFLOP/s it is at **8.4% of the 37 TFLOP/s fp16
+CUDA-core peak**, and the round-95 PTX census of the same family showed the shape of that --
+2218 instructions of which 475 are fma and 196 are cvt, i.e. a conversion-heavy inner loop.
+
+**So there is nothing left to tune.** The conclusion round 98 reached and this session has now
+exhausted the alternatives to is the operative one: **the arithmetic has to leave the CUDA cores,
+and the only place for it to go is the tensor cores.**
+
+**What that requires, stated so the size of the job is clear:**
+
+1. **An mma-based QK^T.** `mma.sync.aligned.m16n8k16` with fp16 inputs and fp32 accumulators, so
+   queues and keys are consumed as they are without per-element conversion. `head_dim = 256` means
+   16 k-steps of 16, or 8 of 32.
+2. **The online softmax between the two products, in the mma layout.** The QK^T result must be
+   reshaped from the mma fragment layout to rows-before-current-key for the causal mask, have the
+   running max applied, and be exponentiated -- and `__expf` is a CUDA-core op, so it becomes the
+   new bottleneck unless it is done at half precision (`ex2.approx.f16x2`) alongside the mma.
+3. **A second mma for P·V**, with P as the freshly computed fp16 probabilities. This is the step
+   that makes it FlashAttention rather than just a faster GEMM, and it is where the fp16 range
+   handling lives.
+4. **The measured target is a 15x speedup, against a 24-28x headroom to the 74.8-89.2 TFLOP/s bf16
+   figure** -- so the budget is not generous once exp and the layout shuffles are counted, and the
+   first version should not be expected to hit it.
+
+**This is a multi-round job, unlike anything attempted so far in this session** -- every previous
+change was a modification of an existing kernel. **The validation path is already in place and
+does not need inventing:** `attn-tile` compares the tiled kernel against `attn_prefill_legacy`
+(the independent reference the dispatch comment describes), `prefill-shape` measures the layer
+split, and `generate --oracle` is the end-to-end check.
+
+**Not implemented.** This round closes the last cheap alternative and states the job size.
