@@ -840,9 +840,19 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     float* __restrict__ state, float* __restrict__ out, int T, int n_v_heads, int n_k_heads,
     int group, int base) {
     constexpr int D = 128;
+    // Two threads per state column: the pair (2j, 2j+1) splits column `j`'s 128
+    // rows between them, so each thread holds 64 floats. The one-thread form
+    // needed 255 registers -- the hardware maximum -- and still spilled 140
+    // stores to local memory (round 70), and spill traffic is global memory.
+    // Every removal of inner-loop traffic from this kernel so far paid 9-17%.
+    // The pair's partial sums are joined by one shfl_xor; adjacent lanes, so the
+    // pair is always inside one warp.
+    constexpr int HW = D / 2;
     const int hv = blockIdx.x;
     const int b = blockIdx.y;
-    const int j = threadIdx.x;
+    const int j = threadIdx.x >> 1;
+    const int h = (int)(threadIdx.x & 1u);
+    const int hbase = h * HW;
     const int kh = hv / group;
 
     // Thread `j` reads and writes only column `j` of the state, and the column is
@@ -860,9 +870,9 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
     __shared__ float sq[D];
 
     float* __restrict__ sh = state + base + ((size_t)b * n_v_heads + hv) * D * D;
-    float Sc[D];
+    float Sc[HW];
 #pragma unroll
-    for (int i = 0; i < D; ++i) Sc[i] = sh[(size_t)i * D + j];
+    for (int m = 0; m < HW; ++m) Sc[m] = sh[(size_t)(hbase + m) * D + j];
 
     for (int t = 0; t < T; ++t) {
         const float* __restrict__ row = qkv + (size_t)(b * T + t) * row_stride;
@@ -886,45 +896,51 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
         // sums cut the chain to 32 and give the scheduler work to interleave.
         // Only the summation order changes; the result is equal to fp32 rounding.
         float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
-        for (int i = 0; i < D; i += 4) {
-            const float s0 = Sc[i] * dec;
-            const float s1 = Sc[i + 1] * dec;
-            const float s2 = Sc[i + 2] * dec;
-            const float s3 = Sc[i + 3] * dec;
-            Sc[i] = s0;
-            Sc[i + 1] = s1;
-            Sc[i + 2] = s2;
-            Sc[i + 3] = s3;
+#pragma unroll
+        for (int m = 0; m < HW; m += 4) {
+            const int i = hbase + m;
+            const float s0 = Sc[m] * dec;
+            const float s1 = Sc[m + 1] * dec;
+            const float s2 = Sc[m + 2] * dec;
+            const float s3 = Sc[m + 3] * dec;
+            Sc[m] = s0;
+            Sc[m + 1] = s1;
+            Sc[m + 2] = s2;
+            Sc[m + 3] = s3;
             kv0 = fmaf(s0, sk[i], kv0);
             kv1 = fmaf(s1, sk[i + 1], kv1);
             kv2 = fmaf(s2, sk[i + 2], kv2);
             kv3 = fmaf(s3, sk[i + 3], kv3);
         }
-        const float kv = (kv0 + kv1) + (kv2 + kv3);
+        float kv = (kv0 + kv1) + (kv2 + kv3);
+        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
         const float delta = (vj - kv) * bet;
 
         float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
-        for (int i = 0; i < D; i += 4) {
-            const float s0 = fmaf(sk[i], delta, Sc[i]);
-            const float s1 = fmaf(sk[i + 1], delta, Sc[i + 1]);
-            const float s2 = fmaf(sk[i + 2], delta, Sc[i + 2]);
-            const float s3 = fmaf(sk[i + 3], delta, Sc[i + 3]);
-            Sc[i] = s0;
-            Sc[i + 1] = s1;
-            Sc[i + 2] = s2;
-            Sc[i + 3] = s3;
+#pragma unroll
+        for (int m = 0; m < HW; m += 4) {
+            const int i = hbase + m;
+            const float s0 = fmaf(sk[i], delta, Sc[m]);
+            const float s1 = fmaf(sk[i + 1], delta, Sc[m + 1]);
+            const float s2 = fmaf(sk[i + 2], delta, Sc[m + 2]);
+            const float s3 = fmaf(sk[i + 3], delta, Sc[m + 3]);
+            Sc[m] = s0;
+            Sc[m + 1] = s1;
+            Sc[m + 2] = s2;
+            Sc[m + 3] = s3;
             o0 = fmaf(s0, sq[i], o0);
             o1 = fmaf(s1, sq[i + 1], o1);
             o2 = fmaf(s2, sq[i + 2], o2);
             o3 = fmaf(s3, sq[i + 3], o3);
         }
-        const float o = (o0 + o1) + (o2 + o3);
-        out[(size_t)(b * T + t) * n_v_heads * D + (size_t)hv * D + j] = o;
+        float o = (o0 + o1) + (o2 + o3);
+        o += __shfl_xor_sync(0xffffffffu, o, 1);
+        if (h == 0) out[(size_t)(b * T + t) * n_v_heads * D + (size_t)hv * D + j] = o;
         __syncthreads();
     }
 
 #pragma unroll
-    for (int i = 0; i < D; ++i) sh[(size_t)i * D + j] = Sc[i];
+    for (int m = 0; m < HW; ++m) sh[(size_t)(hbase + m) * D + j] = Sc[m];
 }
 
 // Batched `deinterleave_heads`: src is [T, n_heads * 2 * head_dim].

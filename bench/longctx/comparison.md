@@ -2851,3 +2851,43 @@ registers and 140 spill stores, and spill traffic goes to local memory, which is
 memory. **Splitting each state column across two threads (64 floats, ~64 registers) would
 hold the column without spilling**, at the cost of one `__shfl_xor_sync` pair per reduction
 -- and every previous reduction in inner-loop traffic has paid 9-17%.
+
+### The spill was not the bottleneck either -- but the kernel is now resource-clean (round 71)
+
+Round 70's `ptxas` check found the one-thread-per-column form at 255 registers with 140
+spill stores, and spill traffic goes to local memory, which is global memory. Since every
+previous removal of inner-loop traffic had paid 9-17%, removing the spill looked like the
+next win. The column was split across two threads -- the pair `(2j, 2j+1)` takes 64 rows
+each, joined by one `__shfl_xor_sync` -- which needs just 148 registers:
+
+```
+before:  255 registers, 280 bytes stack, 276 spill stores, 308 spill loads
+after:   148 registers,   0 bytes stack,   0 spill stores,   0 spill loads
+```
+
+**Correctness is exact, and the speed is identical.**
+
+| | round 70 (spilling) | round 71 (spill-free) |
+|---|---|---|
+| DeltaNet layers | 9.31 / 9.26 s | **9.23 / 9.26 s** |
+| full-attention layers | 5.45 / 5.36 s | 5.51 / 5.48 s |
+| total prefill | 14.92 / 14.79 s | 14.90 / 14.90 s |
+
+**Zero.** The spill was being hidden well enough that removing it changes nothing -- so a
+fourth hypothesis (register pressure and its spill traffic) is now rejected by measurement,
+along with the block count (round 65), the within-token chains (round 67) and per-chunk
+overhead (round 68).
+
+The change is kept anyway, on the narrow grounds that it is strictly better in resources and
+not worse in anything else: 148 registers instead of the hardware maximum of 255, no spill
+at all, and 256 threads per block instead of 128, at identical speed and exact correctness.
+It is also the shape the kernel needs if occupancy is ever revisited -- the spilled form
+could not fit a second block on an SM under any circumstances, and this one can (148 x 128
+threads x 2 blocks = 37,888 of the SM's 65,536 registers).
+
+**What the four rejections leave standing is unchanged and now very well bounded: the cost is
+the 2048 sequential steps along `T`, at 18.8 us per token per layer.** Three fixes removed
+traffic *inside* a step (-30% on the DeltaNet) and one fix removed spill *inside* a step
+(0%). Nothing that keeps one token per step has much left to give. **The chunked rewrite is
+the remaining change, and it is the only one that alters the number of steps rather than
+what happens inside one.**

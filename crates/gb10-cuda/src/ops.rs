@@ -1568,7 +1568,7 @@ impl Ops {
             dev.stream().launch_builder(&self.gated_delta_rule_chunk)
                 .arg(qkv).arg(&qo).arg(&ko).arg(&vo).arg(&rs).arg(decay).arg(beta)
                 .arg(state).arg(out).arg(&tt).arg(&nv).arg(&nk).arg(&g).arg(&bs)
-                .launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (128,1,1), shared_mem_bytes: 0 })?;
+                .launch(LaunchConfig { grid_dim: (n_v_heads as u32, 1, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })?;
         }
         Ok(())
     }
