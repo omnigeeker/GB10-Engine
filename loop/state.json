@@ -1,7 +1,7 @@
 {
   "project": "GB10-Engine",
-  "round": 351,
-  "last_round_at": "20260928T060714Z",
+  "round": 352,
+  "last_round_at": "20260928T062206Z",
   "last_status": "PASS",
   "model": "nv-community/Qwen3.8-27B-NVFP4",
   "hardware": "NVIDIA GB10 (DGX Spark), sm_121, 48 SMs, 121 GiB unified, CUDA 13.0",
@@ -4443,6 +4443,20 @@
     {
       "round": 351,
       "at": "20260928T060714Z",
+      "status": "PASS",
+      "gates": {
+        "build": "pass",
+        "test": "pass",
+        "correctness": "pass",
+        "generate": "pass",
+        "decode": "pass",
+        "prefix": "pass",
+        "benchmark": "pass"
+      }
+    },
+    {
+      "round": 352,
+      "at": "20260928T062206Z",
       "status": "PASS",
       "gates": {
         "build": "pass",

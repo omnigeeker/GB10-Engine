@@ -3981,3 +3981,55 @@ floor.**
 known. Thermals, memory fragmentation, and a background load are all possible. Until that is
 identified, the right hedge is same-session A/B pairs, not a fixed expectation of the machine's
 speed.
+
+### The drift cancels: the same-session 32K pair reproduces the recorded ratios (round 90 cont.)
+
+The round-90 drift finding raised the fear that every cross-session comparison in this document
+was invalid. Measuring the other arm in the same session settles it, and the answer is better
+than feared. **llama.cpp at 32K, measured immediately after the gb10 control, three trials:**
+
+```
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0    32785      53.10       0.33      5.77      5.77  198
+    1    32785      53.83       0.31      5.77      5.76  198
+    2    32785      53.86       0.33      5.76      5.77  198
+```
+
+**llama.cpp drifted too.**
+
+| 32K, cold TTFT | round 74 | **today** | drift |
+|---|---|---|---|
+| gb10 | 90.54 s | 111.59 s | **+23.2%** |
+| llama.cpp | 44.55 s | 53.60 s (mean of 3) | **+20.3%** |
+
+**Both arms slowed by about a fifth, so the thing the scorecard is made of survives:**
+
+| 32K ratio | recorded (r74) | **today, same session** | |
+|---|---|---|---|
+| cold TTFT, gb10/llama | 2.03x | **2.08x** | preserved |
+| OTPS, gb10/llama | 1.040x | **1.021x** | preserved |
+
+**That is the useful result, and it converts the round-90 finding from a crisis into a
+method rule.** The drift is close to a machine-wide *scalar* -- it multiplies both servers'
+times by roughly the same factor -- and a ratio of two same-session measurements is therefore
+stable even when the absolute numbers wander by 20%. The scorecard's conclusions stand:
+
+- **32K cold TTFT: gb10 is ~2.05x slower than llama.cpp**, recorded and reproduced today.
+- **32K OTPS: gb10 is ~1.02-1.04x faster than llama.cpp**, recorded and reproduced today.
+
+**The rule for everything that follows: pair the two servers within one session, and compare
+ratios rather than absolute seconds.** Absolute numbers in this document are valid only within
+the round that recorded them.
+
+**And it re-frames round 87 a second time.** The fp16 KV cache was reverted because 110 s
+looked worse than a 90.54 s baseline. Today, on the same machine, fp32 measures 111.59 s: the
+fp16 change was **1.3% faster**, not 22% slower. The revert was not harmful -- 1.3% is inside
+the noise, as the accumulator split's 0.9% also was -- but **it was a decision made from a
+confounded comparison and it should be undone on evidence, not left undone on superstition.**
+The correct way to settle it is a same-session A/B of fp16 versus fp32, run back to back, which
+has not been done.
+
+**Neither of the two kernel changes attempted this session is a demonstrated win.** Both are
+within 1.5% of the current code, which is the honest state of the evidence: the fma-chain
+reasoning (round 89) and the byte-halving reasoning (round 85) both look sound in the abstract
+and neither has yet produced a same-session improvement to show for it.
