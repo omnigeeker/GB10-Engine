@@ -3410,3 +3410,65 @@ milliseconds") to split it by layer kind. `GB10_STEP_TIMING` (model.rs:322) reco
 device-side step timer for the same purpose. Neither printed under `generate`, so whichever
 harness is meant to consume them needs to be found or the two events read directly -- but the
 machinery is already in the tree and does not need to be written.
+
+### FOUND IT: the decode floor is weight streaming -- 17.60 GB per token, and gb10 has the smaller model (round 81)
+
+Round 80 attributed the 128K decode to a context-independent ~128 ms/token floor plus ~167 ms
+of attention, and noted the floor was ~2% of fp32 peak and therefore "waiting, not computing".
+Running `generate` again and reading **all** of its output rather than the last lines finds the
+answer already printed by the harness:
+
+```
+model loaded in 58.3s  (17.60 GB streamed per token)
+```
+
+That value is `model.traffic_bytes()` (gb10-verify/src/main.rs:896-900) -- **the bytes the model
+must read from its weights for every decoded token.** It is not a load-time figure despite
+appearing next to one.
+
+| | weights read per token | at 228 GB/s | ceiling |
+|---|---|---|---|
+| **gb10 NVFP4** | **17.60 GB** | **77.2 ms** | 13.0 tok/s |
+| llama.cpp GGUF (same model) | 28.23 GB | **123.8 ms** | 8.1 tok/s |
+
+**So the decode floor is memory traffic, not arithmetic, and the unexplained 128 ms is 77 ms of
+weight streaming plus ~51 ms of everything else.** The budget closes:
+
+```
+128K decode = 128 ms floor + 167 ms attention = 295 ms   (measured 290 ms)
+                floor = 77 ms weight-bound + 51 ms other
+```
+
+**This also reveals where gb10 actually stands, and it is not where the scoreboard suggests.**
+gb10 stores the model in NVFP4 at 17.60 GB; the GGUF llama.cpp runs is 28.23 GB. **gb10 needs
+77 ms/token of weight traffic where llama needs 124 ms -- a structural 1.6x advantage in the one
+term that no kernel can avoid.**
+
+| context | gb10 ms/token | llama ms/token | gb10 / llama | gb10 vs its 77 ms bound |
+|---|---|---|---|---|
+| 8K | 115 | 137 | **0.84x (gb10 wins)** | 67% efficient |
+| 32K | 140 | 145 | **0.97x (gb10 wins)** | 55% efficient |
+| 128K | **290** | **207** | **1.40x (gb10 loses)** | 27% efficient |
+
+At 8K gb10 wins OTPS while running at 67% of its weight bound; llama runs at 90% of *its*.
+**gb10's advantage is the smaller model and it is spending that advantage on attention.**
+
+**The target is now exact.** If gb10's attention at 128K came down from 167 ms to below
+**~79 ms**, the total would be 128 + 79 = 207 ms and gb10 would match llama; below that it
+wins. That is the same conclusion as round 80 reached by a different route, now with the floor
+identified as unavoidable rather than mysterious: **the floor cannot be optimised away, so
+attention is the whole of the remaining OTPS question.**
+
+It also retires two plans cleanly:
+
+- **KV in fp16/bf16** (round 78) still halves the *attention's* traffic and remains worth doing,
+  but it cannot help the 128 ms floor, which is weights, not KV.
+- **Reducing the 51 ms of non-weight floor** is worth less than it looked, since 77 of the
+  128 ms is a hard bound and llama's is worse.
+
+**One measurement remains unread, and it is the same trap as round 61:** `GB10_LAYER_TIMING`
+(model.rs:343) and `GB10_STEP_TIMING` (model.rs:322) both exist in the decode path and both
+build their events, but **neither prints anything under `generate`** -- the recording half is
+wired and the reporting half is not. That is why this round had to find the answer in a load
+message instead. Wiring those two prints is a small, well-specified piece of work and it would
+make the per-layer decode split available without guesswork.
