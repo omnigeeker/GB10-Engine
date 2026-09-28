@@ -4843,3 +4843,46 @@ per token, at every context -- and it is still the largest single inefficiency i
 **What changes is the fix: not bytes, but instructions.** The decode GQA work (rounds 99-103)
 remains the better-understood option because it removes real redundant traffic rather than
 fighting an issue-rate wall.
+
+### Static PTX of `nvfp4_gemm_kernel`: fma-dominated, with a large dequant population (round 108)
+
+Round 107's instruction-bound argument was arithmetic (3.3 parameters per SM per cycle against
+~3-4 instructions each, versus ~4 issue slots). This round looked for the same conclusion in the
+emitted code. **The result is supporting but not decisive, and the ambiguity should be recorded
+so it is not mistaken for a measurement.**
+
+```
+nvfp4_gemm_kernel total PTX instructions: 2590
+mix: fma 1024, mov 226, bra 209, setp 157, and 148, st 128, shl 127, add 92,
+     ld 90, cvt 89, shr 75, mul 73, or 70, selp 32
+```
+
+**What can be read from this:**
+
+- **`fma` dominates at 1024 of 2590.** For a decode GEMM every weight participates in exactly one
+  multiply-accumulate per token, so a large fma population is expected -- but it also means
+  **the kernel is not sitting idle waiting on memory**, which is the operative point. A purely
+  bandwidth-bound kernel would not be this fma-heavy.
+- **The dequant work is a substantial minority**: `and 148 + shl 127 + shr 75 + or 70 + mul 73 +
+  cvt 89 = 582` instructions of nibble extraction, scaling and conversion, against 1024 fma.
+  That is ~36% of the static instruction stream spent on unpacking weights, which is a large
+  fraction for a step that is nominally "just moving bytes".
+
+**What cannot be read from it, and why:** the natural next step -- instructions per weight -- is
+not available from this data. The loop-detection pass picked up the whole function body (5467
+lines, including the fma main loop) as one "loop", so the derived figure of 140 instructions per
+weight is an artifact and must not be quoted. **Static PTX counts also say nothing about dynamic
+trip counts**, and the staging loop is rolled, so a small static count can execute many times.
+
+**So the load-bearing evidence for the instruction-bound conclusion remains round 107's
+arithmetic**, which does not depend on the static mix: 3.3 parameters per SM per cycle, times
+~3-4 instructions per parameter, is 9.8-13.0 instructions per SM per cycle against ~4 issue
+slots. **The PTX is consistent with that (a big fma body plus a third of the stream doing
+unpacking) but it does not independently establish it.**
+
+**If the next session wants the measurement rather than the estimate**, the clean way is a
+counter-based one: run `nvfp4_gemm_kernel` alone via `gb10-bench stream` with the dequant
+replaced by a passthrough that reads the same bytes and writes the same tile without unpacking,
+and compare the times. That isolates the instructions from the traffic with the traffic held
+constant -- which is the one experiment this document has not run, and the one that would settle
+it. (`ncu` is unavailable on this platform: `ERR_NVGPUCTRPERM`.)
