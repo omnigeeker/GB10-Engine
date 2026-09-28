@@ -5722,3 +5722,39 @@ rewrite: **the mma work needs ~9x to pay off at all, while this needs 1.71x.**
 **Correctness gate unchanged and already in place:** `generate --oracle` plus `batch-parity`.
 **`attn-tile` does NOT cover this kernel** -- it compares prefill attention kernels only -- so a
 rewrite validated by `attn-tile` alone would be unchecked.
+
+### Round 128: the 8K target re-measured at 8K -- 1.83x, not 1.71x, and measured rather than derived
+
+Round 125 priced the remaining cell at **1.71x on DeltaNet** to win 8K cold TTFT, but that figure
+came from applying round 88's layer split -- **measured at 32K** -- to the 8K case. The session has
+been burned twice by exactly that move (rounds 114 and 123), so this round measured it at 8K
+instead:
+
+```
+[diag] LAYER GPU: delta 9.71s / 192 = 64.3%   attn 5.31s / 64 = 35.1%
+[diag] n=1600 | weight stage 2034ms (13.5%)  activ cast 622ms (4.1%)
+       cublas gemm 5856ms (38.8%)  epilogue 692ms (4.6%)
+       | op phases total 9.20s of 15.10s (61.0%)
+```
+
+**DeltaNet is 64.3% at 8K, not the 70.1% round 88 reported at 8K** (the two differ because round 88
+used a different `--limit`), and attention is 35.1% rather than 29.0%. Recomputed against the
+measured 14.93 s prefill and the 4.35 s gap to llama's 10.58 s:
+
+| quantity | value |
+|---|---|
+| DeltaNet at 8K | 9.60 s |
+| attention at 8K | 5.24 s |
+| gap to llama | 4.35 s |
+| **k needed via DeltaNet alone** | **1.83x** |
+
+**So the requirement is 1.83x, slightly worse than round 125's 1.71x, and it now rests on a
+same-context measurement rather than a 4x-context extrapolation.** The conclusion is unchanged and
+better founded: **8K remains by far the cheapest remaining cell** -- 1.83x against 5.98x / 8.40x /
+8.82x for 32K / 128K / 256K, and against round 66's never-measured 17x projection for the chunked
+rewrite. **A rewrite capturing even a tenth of that projection wins the cell.**
+
+**One further number worth recording:** `op phases total 9.20s of 15.10s (61.0%)` -- the GEMM
+phases are 61% of the 8K prefill and the layer-level delta/attn accounting covers the rest. Both
+tallies independently put the DeltaNet-side cost well ahead of attention at this context, which is
+the premise the whole priority rests on.
