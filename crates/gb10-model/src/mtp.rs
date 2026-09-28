@@ -42,6 +42,7 @@ impl MtpState {
     pub fn new(dev: &Device, cfg: &TextConfig, max_seq: usize, vocab: usize) -> Result<Self> {
         let h = cfg.hidden_size;
         let z = |n: usize| -> Result<CudaSlice<f32>> { Ok(dev.stream().alloc_zeros::<f32>(n)?) };
+        let zh = |n: usize| -> Result<CudaSlice<u16>> { Ok(dev.stream().alloc_zeros::<u16>(n)?) };
         let kvd = max_seq * cfg.num_key_value_heads * cfg.head_dim;
         Ok(Self {
             embed: z(h)?,
@@ -55,8 +56,8 @@ impl MtpState {
             layer_state: LayerState {
                 conv_hist: z(1)?,
                 rec: z(1)?,
-                k_cache: z(kvd)?,
-                v_cache: z(kvd)?,
+                k_cache: zh(kvd)?,
+                v_cache: zh(kvd)?,
                 n_seq: 1,
                 n_keys: vec![0],
                 positions: dev.stream().alloc_zeros::<i32>(1)?,

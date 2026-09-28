@@ -4033,3 +4033,54 @@ has not been done.
 within 1.5% of the current code, which is the honest state of the evidence: the fma-chain
 reasoning (round 89) and the byte-halving reasoning (round 85) both look sound in the abstract
 and neither has yet produced a same-session improvement to show for it.
+
+### The same-day A/B: fp16 KV is reinstated, and it wins OTPS by 9.5% (round 91)
+
+Round 90 established that the machine drifts by ~20% and that only same-session pairs are
+comparable. This round uses that rule to settle the question round 87 got wrong: the fp16 KV
+cache has been re-applied (cherry-pick of the round-346 code commit; all gates pass, oracle
+16/16 exact) and measured back to back against the fp32 control taken earlier the same day.
+
+| 32K | fp32 (measured today) | **fp16 (measured today)** | change |
+|---|---|---|---|
+| cold TTFT | 111.59 s | **110.86 s** | **-0.7%** |
+| warm TTFT | 0.06 s | 0.06 s | -- |
+| OTPS | 5.89 | **6.45** | **+9.5%** |
+
+**The OTPS result is corroborated by an independent run.** Round 87 measured fp16 OTPS at
+**6.45 and 6.46** on its two runs. Today fp16 measures **6.45 and 6.43**, while today's fp32
+control measures **5.89**. So:
+
+- **fp16 KV is +9.5% on 32K OTPS**, reproduced in two sessions and four runs.
+- **fp16 KV is neutral-to-slightly-better on 32K cold TTFT** (110.3-110.9 s against fp32's
+  111.6 s), i.e. the "+22% regression" of round 87 does not exist and never did.
+
+**Round 87's revert was therefore wrong on the merits, not merely under-powered.** The change
+was measured 1.3% better than its control and 9.5% better on OTPS, and it was reverted because
+109.89 s was compared against a 90.54 s figure recorded sixteen rounds earlier on a machine that
+had since slowed by 23%. **That is exactly the error this document has now made and corrected
+four times: reasoning from a number instead of from a paired measurement.**
+
+**Why the byte-halving works here after all**, given that round 87 argued the prefill attention
+was instruction-bound and not byte-bound: the two metrics respond differently. **Cold TTFT is
+dominated by the prefill, where attention is instruction/latency-bound, so halving bytes buys
+almost nothing (+0.7%). OTPS is decode, where the kernel streams the whole KV cache every token
+and the added `__half2float` is amortized over a much longer serial chain -- so halving the
+bytes buys 9.5%.** One change, two metrics, two different mechanisms, and only the decode half
+of it pays.
+
+**State of the tree: the fp16 KV cache is IN**, gated (oracle exact match, batch-parity,
+prefix A/B, decode-bench, bench) and pushed. The accumulator split of round 89/90 remains
+reverted, since it measured 0.9% -- inside noise.
+
+**And the honest scoreboard for this session's optimisation attempts is now one for two:**
+
+| change | same-session result | status |
+|---|---|---|
+| fp16 KV cache | **OTPS +9.5%, cold TTFT +0.7%** | **kept** |
+| split the fma chain | +0.9% (noise) | reverted |
+
+**What this does to the objective.** A 9.5% OTPS gain narrows the 128K and 256K OTPS gaps,
+which were 1.40x and 1.86x. It does not close them, and it does nothing for the cold TTFT gaps
+(1.41x / 2.03x / 4.10x / 5.66x), which remain the larger and harder problem. **The requirement
+is unchanged: cold TTFT needs the prefill attention to get faster in time, not in bytes.**
