@@ -5673,3 +5673,52 @@ registers, `qh` moved to shared memory -- so the next increment should be looked
 place: a redundant load or a redundant shared-memory round trip in the chunk kernel's inner loops,
 not a change to the recurrence itself. **And the bar is low: 1.71x wins 8K outright, which is a
 quarter of what round 66 projected the rewrite at.**
+
+### Round 127: the DeltaNet chunk kernel is already tuned; its limit is the sequential T loop
+
+Round 125 put DeltaNet first (1.71x needed at 8K) and round 126 confirmed prefill dispatches to the
+chunked kernel with no fallback. This round read `gated_delta_rule_chunk_kernel` (elementwise.cu:837)
+to find the next increment, and what it shows is **how much has already been done** -- the header
+comments alone record five optimisations, each stated with its measured effect:
+
+1. **Two threads per state column** -- the one-thread form needed 255 registers (the hardware
+   maximum) and still spilled 140 stores to local memory (round 70), and spill traffic is global.
+2. **`S` in registers, not shared** -- the old form used 66 KB of shared and touched it twice per
+   fma; "every removal of inner-loop traffic from this kernel so far paid 9-17%".
+3. **`sk` in shared** -- the one input every column needs.
+4. **`qh` in shared** -- it had been a *global* load inside the second hot loop, 128 per thread per
+   token, and that loop is half the kernel's cost.
+5. **Four independent partial sums** -- the two hot loops each carried a 128-long serial fma
+   chain; cutting it to 32 gave the scheduler work to interleave. The kernel had been running at
+   0.64% of fp32 peak, so the chain rather than throughput was the constraint.
+
+**What is left is structural, and it is visible in one line:**
+
+```cuda
+for (int t = 0; t < T; ++t) {
+    ...
+    __syncthreads();
+    ...
+}
+```
+
+**The token loop is fully sequential, with a block-wide barrier inside it -- two per token over the
+whole prompt.** Every optimisation above made the *inside* of an iteration cheaper; none changed the
+fact that iteration `t` cannot begin before `t-1` finishes. **There is no parallelism across tokens
+at all**, which is exactly why the recurrence is the last thing left and why round 66 sized the fix
+as a *rewrite* (13.17 s -> ~0.77 s at 2 TFLOP/s) rather than a tuning pass.
+
+**A chunked (parallel-scan) formulation is what removes it:** within a chunk of `C` tokens the
+state update `S_t = decay_t * S_{t-1} + beta_t * (k_t (x) v_t)` becomes a prefix product of the
+decays plus a sum of rank-1 terms, which is expressible as matrix products over the chunk -- so `C`
+tokens proceed together instead of one barrier apart. **That is a different algorithm, and it is
+larger than anything this session has attempted.**
+
+**And the bar remains low: 1.71x wins 8K, a quarter of round 66's projection.** A partial rewrite --
+say chunks of 16 or 32 rather than 128 -- that captures even a fraction of the projected gain would
+still win the cell, which makes this a better first target than the mma attention despite being a
+rewrite: **the mma work needs ~9x to pay off at all, while this needs 1.71x.**
+
+**Correctness gate unchanged and already in place:** `generate --oracle` plus `batch-parity`.
+**`attn-tile` does NOT cover this kernel** -- it compares prefill attention kernels only -- so a
+rewrite validated by `attn-tile` alone would be unchecked.
