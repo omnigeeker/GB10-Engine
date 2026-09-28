@@ -865,20 +865,45 @@ extern "C" __global__ void gated_delta_rule_chunk_kernel(
         const float bet = beta[(size_t)(b * T + t) * n_v_heads + hv];
         const float vj = vh[j];
 
-        float kv = 0.0f;
-        for (int i = 0; i < D; ++i) {
-            const float s = S[i][j] * dec;
-            S[i][j] = s;
-            kv = fmaf(s, sk[i], kv);
+        // Each of these two loops carried one 128-long serial fma chain, and the
+        // whole kernel runs at 0.64% of fp32 peak (round 66) -- so the chain, not
+        // the throughput, is what the block waits on. Four independent partial
+        // sums cut the chain to 32 and give the scheduler work to interleave.
+        // Only the summation order changes; the result is equal to fp32 rounding.
+        float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
+        for (int i = 0; i < D; i += 4) {
+            const float s0 = S[i][j] * dec;
+            const float s1 = S[i + 1][j] * dec;
+            const float s2 = S[i + 2][j] * dec;
+            const float s3 = S[i + 3][j] * dec;
+            S[i][j] = s0;
+            S[i + 1][j] = s1;
+            S[i + 2][j] = s2;
+            S[i + 3][j] = s3;
+            kv0 = fmaf(s0, sk[i], kv0);
+            kv1 = fmaf(s1, sk[i + 1], kv1);
+            kv2 = fmaf(s2, sk[i + 2], kv2);
+            kv3 = fmaf(s3, sk[i + 3], kv3);
         }
+        const float kv = (kv0 + kv1) + (kv2 + kv3);
         const float delta = (vj - kv) * bet;
 
-        float o = 0.0f;
-        for (int i = 0; i < D; ++i) {
-            const float s = fmaf(sk[i], delta, S[i][j]);
-            S[i][j] = s;
-            o = fmaf(s, qh[i], o);
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        for (int i = 0; i < D; i += 4) {
+            const float s0 = fmaf(sk[i], delta, S[i][j]);
+            const float s1 = fmaf(sk[i + 1], delta, S[i + 1][j]);
+            const float s2 = fmaf(sk[i + 2], delta, S[i + 2][j]);
+            const float s3 = fmaf(sk[i + 3], delta, S[i + 3][j]);
+            S[i][j] = s0;
+            S[i + 1][j] = s1;
+            S[i + 2][j] = s2;
+            S[i + 3][j] = s3;
+            o0 = fmaf(s0, qh[i], o0);
+            o1 = fmaf(s1, qh[i + 1], o1);
+            o2 = fmaf(s2, qh[i + 2], o2);
+            o3 = fmaf(s3, qh[i + 3], o3);
         }
+        const float o = (o0 + o1) + (o2 + o3);
         out[(size_t)(b * T + t) * n_v_heads * D + (size_t)hv * D + j] = o;
         __syncthreads();
     }

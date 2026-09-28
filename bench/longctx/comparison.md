@@ -2671,3 +2671,43 @@ Implementation notes for whoever does it, so nothing has to be re-derived:
 - The correctness gate is `gb10-verify generate --oracle fixtures/oracle` plus
   `batch-parity`; `attn-tile` does **not** cover this kernel, which is why round 65's
   correctness check could only assert that the *attention* output was unchanged.
+
+### The within-token chain is not the bottleneck either: 4-way partial sums give 4% (round 67)
+
+Round 66 sized the chunked rewrite at 12.4 s of the 18.9 s prefill. Before committing to
+that rewrite, one cheaper hypothesis was still open, and it is worth closing because it
+narrows what the rewrite must fix.
+
+Both inner loops of `gated_delta_rule_chunk_kernel` carried a **single 128-long serial fma
+chain** -- `kv = fmaf(s, sk[i], kv)` and `o = fmaf(s, qh[i], o)`. At 0.64% of fp32 peak,
+a serial dependency of that length is a natural suspect: four independent partial sums cut
+the chain to 32 and give the scheduler interleaved work at no arithmetic cost.
+
+**Correctness is exact.** `generate --oracle` reports `16/16 (100.0%)` and `exact match` --
+the reassociation changed no greedy token.
+
+**And the gain is small but real:**
+
+| | before (round 63/65) | after (4-way partial sums) |
+|---|---|---|
+| DeltaNet layers | 13.29 s / 13.17 s | **12.80 s / 12.65 s** |
+| full-attention layers | 5.50 s / 5.53 s | 5.49 s / 5.41 s |
+| total prefill | 18.87 s / 18.96 s | **18.44 s / 18.22 s** |
+
+Consistent in both runs: **~4% off the DeltaNet, ~3% off the whole prefill.** Not noise, but
+not the order of magnitude the chunked form promises.
+
+**So the bottleneck is neither the block count (refuted, round 65) nor the length of the
+within-token chains (refuted here). What is left is the one thing both of those leave
+untouched: the serial dependency *along `T`*.** Every token's state update needs the
+previous token's state -- 2048 sequential steps per layer, each with two barriers, and no
+amount of restructuring *inside* a step can shorten a chain that runs *between* steps. That
+is precisely the dependency the true chunked form removes, by making the intra-chunk
+computation a dense matrix product over `C` tokens at once and leaving only a `T/C`-step
+scan between chunks.
+
+Two cheap hypotheses have now been tested and rejected against measurement, which is what
+makes the third one worth the effort: 12.4 s of an 18.9 s prefill, and the difference
+between 8K cold TTFT at 1.79x slower and 1.63x faster than llama.cpp.
+
+The 4-way split is kept -- it is exact, verified, and worth ~3% of the prefill.
