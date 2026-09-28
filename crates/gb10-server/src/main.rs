@@ -40,7 +40,7 @@ const MAX_CONCURRENT: usize = 16;
 /// successive chunks that carry the KV cache and recurrent state forward. That
 /// decoupling is what makes a long context possible at all: scratch sized to a
 /// 256K context would be ~150 GB.
-const PREFILL_CHUNK: usize = 2048;
+const PREFILL_CHUNK: usize = 8192;
 
 /// KV cache bytes per (token, sequence).
 ///

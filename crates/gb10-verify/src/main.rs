@@ -223,7 +223,7 @@ fn prefill_shape(args: &Args) -> Result<()> {
     let tok = QwenTokenizer::from_model_dir(&args.model)?;
 
     // Matches the server's PREFILL_CHUNK, which is the shape under test.
-    let chunk = 2048usize;
+    let chunk = 8192usize;
     let total = args.limit.max(1) as usize;
     let ctx = args.max_seq;
     let n_seq = 10usize;

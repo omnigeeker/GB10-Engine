@@ -6053,3 +6053,66 @@ within the layer, and still the only large unidentified term in this objective.*
 reasoning** (131 -> 132 -> 133 -> 134). **The lesson is specific and worth carrying: a diagnostic
 category named after a layer kind is not a kernel, and every time this session read `delta` as
 "the recurrence" it drew a wrong conclusion.**
+
+### Round 135: PREFILL_CHUNK 2048 -> 8192 is a measured 1.50x on the 8K prefill, and it is in the tree
+
+Round 134 concluded the per-chunk cost was weight staging and bounded the win from fewer chunks at
+**~1.11x**. **That bound was too conservative, and this round measured the real number.**
+
+Change: `PREFILL_CHUNK` (and the harness's matching `chunk`) `2048 -> 8192`, so a 7168-token prefill
+is **1 chunk instead of 4**. Same 7168 tokens, same `GB10_GEMM_EVENTS` instrumentation:
+
+| | chunk 2048 | chunk 8192 | change |
+|---|---|---|---|
+| `delta` | 9.71 s | **6.25 s** | **-35.6%** |
+| `attn` | 5.31 s | **3.77 s** | **-29.0%** |
+| layer GPU total | 15.02 s | **10.02 s** | -33.3% |
+| `weight stage` | 2034 ms | **426 ms** | **-79.1%** |
+| `op phases total` | 9.20 s of 15.10 s | **5.22 s of 10.08 s** | -43% |
+| **prefill total** | **15.10 s** | **10.08 s** | **1.50x faster** |
+
+**Correctness gated before believing it:**
+
+```
+two chunk: [271, 16, 11, 220, 17, 11, 220, 18]
+decoded  : "\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10.\n\n"
+agree: YES
+chunked-prefill: OK
+```
+
+**`chunked-prefill` is the gate that matters here** -- ops.rs:416-418 records it as the check that a
+multi-chunk prefill from a non-empty cache computes exactly what a single-shot prefill does -- and
+it passes.
+
+**Why 1.50x rather than the 1.11x round 134 bounded.** The bound counted only `weight stage`
+(2034 ms -> 426 ms = 1.6 s, which alone is 1.11x of 15.10 s). But the phase table shows the saving
+is not confined to staging: `op phases total` fell 9.20 -> 5.22 s, **a 3.98 s saving, of which
+staging is only 1.6 s.** The rest is the other per-chunk work -- `activ cast` 622 -> 203 ms, the
+GEMM phases, and the per-chunk state save/restore and launch costs. **Round 134's mistake was
+bounding the win by one phase when the chunk count multiplies every phase.** This is the same
+failure mode as rounds 114/123/130/132 and is recorded as the twenty-eighth self-correction.
+
+**What it does to the scorecard.** Applying the measured 1.50x to the 8K cell:
+
+| 8K cold TTFT | gb10 | llama.cpp | result |
+|---|---|---|---|
+| before | 14.93 s | 10.58 s | 1.41x slower |
+| **after (projected)** | **~9.95 s** | 10.58 s | **~1.06x FASTER** |
+
+**So this single change is projected to win the 8K cold TTFT cell -- the first cold-TTFT cell this
+session would win**, and it needs no algorithm rewrite at all.
+
+**Not yet claimed as won, and the reasons are specific:**
+
+1. **It is projected from the harness, not measured on the server.** The harness runs `n_seq = 10`
+   and a different driver; the server number must come from a same-session pair. **Round 90's 23%
+   machine drift is why a projection is not a result here.**
+2. **Scratch memory grows with the chunk.** `Scratch` is sized to one chunk (`gb10-server:392`,
+   `layer.rs:227`), so 4x the tokens is ~4x those buffers. It ran at 7168/8192 tokens on this
+   121 GB machine, but a 256K prompt at an 8192 chunk needs checking before it is called safe.
+3. **The other contexts move too, and must be re-measured** -- this is not 8K-specific. 32K/128K/256K
+   all prefill in chunks of 2048 today, so they should gain as well, which matters for the
+   long-context cells the objective actually names.
+
+**In the tree: `crates/gb10-server/src/main.rs` `PREFILL_CHUNK = 8192` and the harness's matching
+`chunk = 8192`, correctness-gated by `chunked-prefill`.**
