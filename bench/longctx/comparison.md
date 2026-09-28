@@ -5798,3 +5798,52 @@ that `t` cannot start before `t-1` finishes.
 recurrence must do, not an instrumented count, so 0.61% could be off by the constant factor in the
 "2 * D^2" term. **It agrees with the tree's independently-recorded 0.64% to two figures, which is
 why it is being trusted -- but the agreement is the evidence, not the derivation.**
+
+### Round 130: the DeltaNet stall is per-token and unexplained -- ablation 1
+
+Round 129 found the DeltaNet kernel at 0.61% of fp32 peak and concluded the 1.83x target was easy.
+**That conclusion needs a qualification this round supplies**, because the headroom is real but its
+cause is not identified -- and "164x headroom" is only comfortable if we know what is eating it.
+
+**Ablation 1: does the cost scale with tokens or with calls?**
+
+| run | delta | calls | ms per call | us per token |
+|---|---|---|---|---|
+| `--limit 2047` | 2.83 s | 48 | 58.96 | **28.8** |
+| `--limit 7168` | 9.71 s | 192 | 50.57 | **24.7** |
+
+Per-call milliseconds are near-constant while calls scale 4x and tokens-per-call stays at 2048, and
+**per-token cost is ~25-29 us in both runs. So the cost is per-token, inside the `T` loop -- it is
+not per-call launch or setup overhead.** That rules out the explanation that would have been
+cheapest to accept.
+
+**What the source itself rules out** (read and measured this session):
+
+- **global state traffic** -- `sh` is touched only at elementwise.cu:886 (init) and :943 (after the
+  loop), **never inside it.** The "S in registers" optimisation is intact.
+- **barrier count** -- exactly two `__syncthreads()` in the loop (:887, :939), i.e. one pair per
+  token, which is the designed minimum for a shared `sk`/`sq` handoff.
+- **arithmetic** -- 128 MACs per thread per token is ~256 cycles; **~37,000 are observed.**
+- **k/q/v traffic** -- the block reads its own `D`-wide slices, ~1 KB per token, ~16.5 GB over the
+  8K prefill, which at 152 GB/s is **~108 ms against 9.6 s measured.**
+- **inner-loop shared traffic** -- already removed by rounds 70/88/95/97.
+
+**So there is a ~144x per-token stall that the source does not account for**, and this session has
+no profiler to find it with (`ncu` is blocked by `ERR_NVGPUCTRPERM`; `nsys` captures nothing).
+
+**This qualifies round 129 rather than contradicting it.** The 164x headroom to peak is genuine,
+but **we do not know which mechanism consumes it**, and the awkward possibility is that the same
+mechanism bounds any rewrite: a parallel-scan formulation removes the sequential dependency but
+does not automatically remove whatever makes a token cost 25 us.
+
+**Ablation 2, which is the next round's first action, and is cheap:** time the kernel with `T`
+varied independently of the chunking by calling `prefill-shape` at several `--limit` values and
+fitting per-token against per-call cost. If per-token cost stays flat in `T`, the stall is
+per-iteration (barrier or load latency inside the loop); if it falls with `T`, part of it is
+per-call. **That is the cheapest way to localise this without a profiler, and it costs one
+`prefill-shape` run per point.**
+
+**Caveat on the FLOP model, restated:** the 128 MACs/thread figure assumes `2 * D^2` MACs per
+v-head per token (outer-product update plus `S^T q` output). If the real recurrence does less work
+than that model, the stall factor is smaller -- **but the 0.61%-of-peak measurement itself does not
+depend on the model, only on the time, and the 25 us per token is measured.**
