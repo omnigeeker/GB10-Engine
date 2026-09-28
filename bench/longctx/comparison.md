@@ -6257,3 +6257,31 @@ measurement anyway -- the harness sends one request at a time -- **but it does m
 numbers are single-sequence numbers and are not comparable to a batched throughput figure.**
 
 **The 128K re-measurement with chunk 8192 is in flight**; its result is not in this round.
+
+### Round 139b: do not run the gate concurrently with a server measurement
+
+The 128K re-measurement launched this round died with `requests.exceptions.ChunkedEncodingError:
+Response ended prematurely`, and the cause is mine, not the server's: **`loop/run_round.sh` starts
+and stops servers on the same port (8080) and calls `pkill`, so running the gate while a
+measurement is in flight kills the server mid-request.**
+
+**This is a process rule, not a code finding, and it is worth stating because it silently corrupts
+data rather than failing loudly:**
+
+> **A server-backed measurement and `loop/run_round.sh` must not run at the same time.** The gate
+> owns port 8080 and calls `pkill -x gb10-server`; a measurement in flight will lose its server
+> partway through a record and produce a truncated or absent result -- here a `ChunkedEncodingError`
+> after the prompt had already been accepted, which reads like a transport fault.
+
+**The consequence for the objective is only a delay:** the 128K (and then 256K) cold TTFT
+re-measurements with `PREFILL_CHUNK = 8192` still need to be taken, **sequentially, before the gate
+runs**, with `--ctx 262144` (round 139), and each needs ~35-70 minutes of wall clock.
+
+**Two other operational facts confirmed this round, both needed to reproduce any long-context
+number:**
+
+- **`--ctx 262144` is mandatory** for 128K/256K; without it the server silently runs at 32768 and
+  requests return no content (round 139).
+- **At `--ctx 262144` the server self-caps to 1 concurrent sequence** (34.4 GB of KV cache for one
+  slot; ten slots would need 344 GB). **So long-context numbers are single-sequence numbers**, which
+  is the right shape for a TTFT measurement but is not a batched throughput figure.
