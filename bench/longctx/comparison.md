@@ -3919,3 +3919,65 @@ the smallest honest test.
 **This is not implemented.** It is a change to the hot loop of the kernel that carries 61% of
 the 32K prefill, and it needs the server measurement to judge; starting it without the budget to
 validate it would leave the tree in a worse state than the current fp32 baseline.
+
+### THE MEASUREMENTS DRIFTED 23%: the machine is not the same machine as round 74 (round 90)
+
+Round 87 reverted the fp16 KV cache because the 32K cold TTFT went from 90.54 s to 109.89 /
+110.32 s -- a 22% loss, reproduced twice. This round implemented a second, unrelated change
+(splitting the score loop's accumulators to halve a 128-deep fma chain), measured 110.62 s,
+and then did the one control that had not been done: **reverted it and re-measured the
+unchanged code.**
+
+```
+r74  fp32 (the baseline of record)        90.54 s
+r87  fp16 KV                              109.89 s
+r87  fp16 KV (second run)                 110.32 s
+r90  fp32, accumulator split OFF          111.59 s   <-- the control
+r90  fp32, accumulator split ON           110.62 s
+```
+
+**The control is 111.59 s. The "baseline" was 90.54 s. That is the same code, in the same
+tree, measured through the same harness -- and it is 23.2% slower today than when round 74
+recorded it.**
+
+**What this means, stated plainly:**
+
+1. **Round 87's revert was wrong.** The fp16 KV change measured 110.11 s on average and the
+   unchanged fp32 code measures 111.59 s *today*. Against a same-day control, **fp16 was 1.3%
+   faster, not 22% slower.** It was reverted because it was compared against a number recorded
+   sixteen rounds earlier, not against a control taken the same way. The change passed every
+   correctness gate and should be reinstated -- but the decision must be made from a same-day
+   A/B, and that A/B has not been run.
+2. **The accumulator split is neutral** (110.62 vs 111.59, 0.9%, inside noise), so the 128-deep
+   chain was not the binding constraint after all -- or the effect is smaller than the noise
+   floor of this machine today. The reasoning in round 89 stands; the measurement says the
+   lever is worth under 1%.
+
+**3. Every cross-session comparison in this document is suspect.** The 8K/32K/128K/256K
+scorecard was assembled over many rounds, and the gb10 column was measured at various times
+while the llama.cpp column was measured at others. If the machine drifts by 23% over the span,
+then the scorecard's gb10/llama ratios are not attributable to the code. **The one table entry
+that is safe is any pair measured in the same session on the same day** -- which is none of the
+current 12 rows.
+
+**What is actually established by the numbers above, and nothing more:**
+
+- **The drift is real and large.** It is the single biggest effect measured in this document,
+  larger than any optimisation attempted in it.
+- **fp16 KV and the accumulator split are both within noise of the current fp32 code**, so
+  neither is a 22% regression and neither is a demonstrated win.
+- **The correct next action is not an optimisation.** It is to re-measure the scorecard with
+  **both servers in the same session**, and to repeat the fp16-vs-fp32 A/B with a same-day
+  control, before any further change is judged.
+
+**The methodological rule this document needs, and did not have:** a benchmark comparison is
+valid only if the two arms are measured close together in time. Every "regression" and every
+"win" recorded above that compared against a number from an earlier session -- including the
+one that caused a revert this session -- has to be treated as unproven. **The drift also
+explains why rounds 75-89 kept finding contradictions: they were comparing across a moving
+floor.**
+
+**Also unexplained, and worth naming:** *why* the machine is 23% slower on the same code is not
+known. Thermals, memory fragmentation, and a background load are all possible. Until that is
+identified, the right hedge is same-session A/B pairs, not a fixed expectation of the machine's
+speed.
