@@ -4944,3 +4944,57 @@ memory-level parallelism, a different tile walk, larger per-thread runs -- might
 more. **But that is a new hypothesis with no supporting measurement, and it should not be
 promoted on the strength of the 228 GB/s figure alone**, which is exactly the mistake rounds
 106-108 made.
+
+### The streaming investigation, closed: three mechanisms refuted and the reference is a constant (round 110)
+
+Round 109's passthrough control refuted the instruction hypothesis. This round tested the other
+two ways the 66.8% could be explained, and checked what the 66.8% is actually measured against.
+
+**Hypothesis: serialization between weight-matrix stagings.** The bench has a switch for exactly
+this -- `--interleave` "inserts a tiny dependency-breaking kernel after every [matrix]":
+
+| variant | ms/token | GB/s | of the 228 reference |
+|---|---|---|---|
+| baseline | 115.19 | 152.4 | 66.8% |
+| no dequant (round 109) | 117.26 | 149.7 | 65.7% |
+| **`--interleave`** | **119.74** | **146.6** | **64.3%** |
+
+**Breaking the dependencies makes it slower, not faster.** The path is not serialization-limited.
+
+**And the reference is a hardcoded constant, not a measurement:**
+
+```rust
+// crates/gb10-bench/src/main.rs:20
+const ROOFLINE_GBPS: f64 = 228.0;
+```
+
+**"66.8% of peak" is therefore a comparison against a number compiled into the tool**, not
+against a bandwidth measured in the same run, and almost certainly a *sequential-read* figure.
+The weight-staging walk is not sequential: it reads the GEMM's B matrix, 16 contiguous NVFP4
+elements per thread with `n` varying across lanes, which strides across rows.
+
+**Four mechanisms have now been tested against the 152 GB/s, and all four are refuted:**
+
+| # | hypothesis | test | result |
+|---|---|---|---|
+| 1 | narrow loads / wasted sector | read the actual kernel | **refuted** -- `uint2`, 100% sector efficiency |
+| 2 | instruction-bound dequant | passthrough with no unpacking | **refuted** -- 117.26 vs 115.19 ms |
+| 3 | serialization between stagings | `--interleave` | **refuted** -- 119.74 ms, worse |
+| 4 | (the reference itself) | read the source | **it is `const 228.0`, not measured** |
+
+**So the honest statement is: this access pattern achieves ~152 GB/s, three plausible
+explanations for the shortfall against a hardcoded 228 GB/s have been measured and eliminated,
+and the most likely remainder is DRAM page locality in a strided GEMM walk** -- which the three
+tests cannot reach, because none of them changes the *order* in which rows are visited.
+
+**What would actually test it:** a weight layout whose rows are visited in a longer contiguous
+run (or an explicit larger per-thread run along `k`), compared on the same `stream` benchmark.
+**That is a data-layout experiment, it is speculative, and rounds 106-109 are the record of what
+happens when a speculative lead is promoted on arithmetic alone.** It should be attempted only
+with a same-session server pair behind it.
+
+**The operational conclusion, which is what matters for the objective:** **the decode weight
+floor is ~115 ms/token and there is no measured, demonstrated way to reduce it.** Every decode
+budget in this document should use 115 ms, as round 109's table does. The remaining OTPS levers
+are therefore all on the attention side, and the 6-head GQA decode fix is the one with a
+measured target.
