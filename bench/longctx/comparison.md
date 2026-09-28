@@ -4351,3 +4351,54 @@ round 87 is the standing proof that a kernel change which passes every gate can 
 server, and rounds 90-94 are the proof that only same-session pairs can tell. **The next session
 should start with A, because it is the only one of the two with a sized, quantified projection
 (1.63x at 8K) and because 8K needs 12.4 s removed against the 4.35 s it requires.**
+
+### The tiled kernel is already register-optimal, and K=6 pays for its ILP in occupancy (round 97)
+
+Round 95 proposed raising K, the dot products per thread-pair, from 3 to 6, on the argument that
+the score loop is latency-bound and wants more independent chains. Reading the kernel's
+declarations turns up the cost that argument missed:
+
+```cuda
+float acc[PREFILL_BQ];   // one register PER ROW, per thread
+float vr[PREFILL_BK];    // one register per column
+```
+
+**These are per-thread register arrays**, and their cost is `BQ + BK` -- which is the number that
+decides occupancy, because this kernel runs 256 threads per block. Today the kernel uses 80
+registers with zero spill, and `acc[24] + vr[16] = 40` of them are exactly these two arrays.
+
+**Sweeping the valid tiles shows the current one minimises that cost.** The constraints are
+`BQ * BK == K * (head_dim / 2)` and `BK | (nt >> 1) = 128`, with `BQ = K * (128 / BK)`:
+
+| K | (BQ, BK) | `acc+vr` | smem | estimated occupancy |
+|---|---|---|---|---|
+| **3** | **(24, 16)** | **40** | 22.1 KB | **3 blocks/SM** |
+| 3 | (12, 32) | 44 | 24.0 KB | 3 |
+| 3 | (48, 8) | 56 | 30.5 KB | 2 |
+| 3 | (6, 64) | 70 | 37.1 KB | 2 |
+| 3 | (96, 4) | 100 | 53.4 KB | 1 |
+| 3 | (3, 128) | 131 | 68.1 KB | 1 |
+| **6** | **(24, 32)** | **56** | 31.7 KB | **2** |
+| 6 | (48, 16) | 64 | 36.9 KB | 2 |
+| 6 | (96, 8) | 104 | -- | 1 |
+| 6 | (12, 64) | 76 | -- | 2 |
+
+**Every tile other than the current one is worse on array registers, and every K = 6 tile costs
+at least +16.** So the K = 6 proposal trades +2 independent chains per thread for a drop from 3
+resident blocks per SM to 2 -- and **occupancy is precisely how a latency-bound kernel hides
+latency.** Adding ILP while removing TLP is not obviously a win; it may be a wash or a loss.
+
+**That is a correction to round 95's reasoning, and it is the useful outcome of this round.**
+K = 6 remains worth trying, but it is no longer the leading candidate -- the leading candidate is
+the one whose projection is quantified and which does not touch this kernel at all.
+
+**Why the current tile is what it is, in one sentence:** `(24, 16)` is the unique pair that keeps
+`acc + vr` at its minimum of 40 while satisfying `BQ * BK == 3 * 128` and `BK | 128`, so rounds
+41-48 landed on the register-optimal tile by measurement, and there is nothing left to sweep.
+
+**The consequence for the objective.** Cold TTFT needs 4.35 s removed at 8K and 46 s at 32K. The
+prefill attention kernel has now been excluded on every axis this document can reach -- bytes
+(no), tile geometry (register-optimal and pinned), chain depth (neutral), chain count (costs
+occupancy), and its share is 29% at 8K where the loss is smallest. **The 8K loss is 70.1%
+DeltaNet, and the chunked DeltaNet rewrite is the only remaining change with a quantified
+projection (1.63x at 8K). That is where the next session should work.**
