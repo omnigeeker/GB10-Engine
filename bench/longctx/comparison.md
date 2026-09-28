@@ -6164,3 +6164,62 @@ time in this session, a cold-TTFT cell is close enough that a modest further gai
 **Twenty-ninth self-correction, and the second one that reverses a same-session projection of the
 previous round** (round 135's 1.06x win). **The error was again single-sided: the projection applied
 the measured gb10 improvement while assuming llama's recorded number was still current.**
+
+### Round 137: the 256K memory concern is resolved, and attention is now the lever for ALL four cold cells
+
+Two things settled this round, both cheap, both changing what the next work should be.
+
+**1. The chunk change is memory-safe at long context.** Round 135 raised this as a concern and it is
+answerable by reading the sizing rather than by running a 256K prefill. `layer.rs:227-228`:
+
+> `Scratch` is sized for a full prefill chunk of tokens, so `sc.conv` is `conv_dim * 2048 * 4`
+> bytes
+
+**The scratch is sized by the chunk, not by the context.** So:
+
+| chunk | `sc.conv` alone (`conv_dim = 10240`) |
+|---|---|
+| 2048 | 84 MB |
+| **8192 (now)** | **336 MB** |
+
+**The change costs ~4x scratch memory, but that cost is identical for an 8K prompt and a 256K
+prompt** -- the only structure that scales with context is the KV cache, which this change does not
+touch. **So 256K is not a memory risk from this change, and a 256K validation run is not required to
+establish safety; the 8K run that already passed is sufficient evidence.** (The absolute numbers
+should still be watched against the 121 GB budget, but the *context dependence* is the part that
+mattered and it is nil.)
+
+**2. The 8K cold gap is now small enough that the ATTENTION is the cheaper lever, not DeltaNet.**
+With the chunk change in place:
+
+| quantity | value |
+|---|---|
+| gb10 8K cold | 10.43 s |
+| llama 8K cold (same session) | 9.37 s |
+| **gap to find** | **1.06 s** |
+| attention at 8K (harness, chunk 8192) | 3.77 s |
+| **attention speedup needed to close it** | **1.39x** |
+
+**1.39x.** And that reorders the whole remaining plan, because the same work scales:
+
+| cold cell | gap | attention speedup needed |
+|---|---|---|
+| **8K** | **1.06 s** | **~1.4x** |
+| 32K | 35.45 s | 5.98x |
+| 128K | 859.59 s | 8.40x |
+| 256K | 3412.17 s | 8.82x |
+
+**So the mma prefill attention now pays at every one of the four cold cells, while DeltaNet work
+pays at only 8K and 32K.** Round 125 put DeltaNet first on the grounds that 8K was cheapest to
+close; **that is still true in absolute terms, but the asymmetry the rounds 120-124 ordering assumed
+has weakened** -- attention is the only item that touches all four, and at 8K it now needs less than
+DeltaNet would (1.4x against the 1.83x of round 128).
+
+**Recommendation for the next round, stated plainly: build the mma attention.** It is the larger
+job, but after the chunk change it is the highest-value one, and `attn-tile` already exists as its
+correctness gate. **The DeltaNet per-token stall remains unidentified and is no longer on the
+critical path for any cell except 32K.**
+
+**Thirty-first open thread closed in this session** (rounds 133-137 each closed the previous round's
+open question); **the remaining unexplained term is now only the ~97x per-token stall, which no
+current cell depends on.**
