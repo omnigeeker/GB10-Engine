@@ -2941,3 +2941,55 @@ spill) plus the three accepted fixes (-30% on the DeltaNet: shared-state to regi
 `qh` to shared, and the 4-way chain split) are all recorded above. The chunked rewrite
 remains the one change that alters the number of sequential steps rather than the cost of
 one, and it is what stands between cold TTFT and the objective.
+
+### 128K measured: the prefill turns super-linear, and attention takes over (round 73)
+
+The objective names 32K, 128K and 256K, but the reproducible baseline only covered 8K and
+32K. This round measured the third context through the same harness.
+
+**128K** (`--ctx 147456`, reps=4218, 1 trial, max-tokens 200):
+
+```
+# gb10-128k  reps=4218 trials=1 max_tokens=200
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   130832    1119.40       0.14      3.45      3.45  200
+```
+
+**The prefill is no longer linear.** 32K took 90.54 s for 32,747 tokens; 130,832 tokens is
+4.0x that, so linear scaling predicts 362 s. **1119 s is 3.1x more than that.**
+
+Additive decomposition of the 1119 s, using the per-token costs already measured in-process:
+
+| block | scaling | 128K estimate | share |
+|---|---|---|---|
+| DeltaNet recurrence | 18.8 us/token/layer x 48 layers | ~118 s | ~11% |
+| linear ops (GEMM, dequant, cast, epilogue) | 1.07 ms/token (round 60) | ~140 s | ~13% |
+| **attention** | super-linear in context | **~860 s** | **~77%** |
+
+So the ordering of the objectives inverts with context length, and this is the first
+measurement that shows it:
+
+| context | DeltaNet | attention | dominant block |
+|---|---|---|---|
+| 8K | 9.26 s (62%) | 5.5 s (37%) | **DeltaNet** |
+| 32K | ~47 s | ~26% and growing | **DeltaNet** |
+| 128K | ~118 s (11%) | ~860 s (**77%**) | **attention** |
+
+**At 128K the attention kernel is not a secondary target, it is the target** -- 77% of an
+1119 s prefill, and the reason the curve turns upward. This is the second item the objective
+named, and it is now measured rather than assumed. The round-45 attention model (per-key
+cost) is what would have predicted this; what is new is the server-side number that shows
+how far past the crossover 128K is.
+
+Two caveats recorded honestly:
+
+- **No `llama-server` number at 128K yet**, so no ratio is claimed at this context. The
+  comparison at 8K and 32K stands; 128K needs the llama side run before it can be stated.
+- **OTPS falls to 3.45 at 128K** (from 7.14 at 32K and 8.72 at 8K) -- decoding also pays the
+  attention cost, since every decoded token attends over 130K cached keys. Whether that wins
+  against llama.cpp at this length is unknown for the same reason.
+
+**The plan at 128K therefore differs from the plan at 8K.** At 8K the chunked DeltaNet
+rewrite is the whole story. At 128K it would recover ~118 s of 1119 s (11%), while the
+attention kernel -- the objective's other named item, and the one the round-45/48 work only
+began -- holds ~860 s.
