@@ -5939,3 +5939,62 @@ state are per-chunk boundaries (gb10-server:40-43 explains the design), so the D
 chunk size is coupled to those buffers. **The test is therefore a real change, not a constant edit
 -- but a smaller one than an algorithm rewrite, and it can be validated with `generate --oracle`
 plus `batch-parity` and measured with `prefill-shape` before any server run.**
+
+### CORRECTION to rounds 131-132: the per-call cost is reproducible but UNATTRIBUTED, so the lever is speculative (round 133)
+
+Rounds 131-132 built a lever out of a per-call fixed cost: ~16.6 ms per DeltaNet kernel call, 192
+calls at 8K, 3.19 s, and "decouple the DeltaNet chunk size to 8192" projected at ~1.33x on DeltaNet
+and ~1.19x on the prefill. **Before that is built on, two things had to be checked, and they point
+in opposite directions.**
+
+**First, the measurement is reproducible.** The small-`T` point was a single run in round 131, so it
+was repeated twice more:
+
+```
+--limit 255 :  delta 0.98 s / 48  -> 20.4 ms per call
+--limit 255 :  delta 0.99 s / 48  -> 20.6 ms per call
+(round 131) :  delta 1.00 s / 48  -> 20.8 ms per call
+```
+
+**Three runs within 2%. So there is genuinely a large per-call cost, and it is not noise.**
+
+**Second, nothing in the kernel accounts for it.** Per call:
+
+| candidate | cost per call | source |
+|---|---|---|
+| state init + finalise traffic (64 floats/thread read, 64 written, 48 blocks) | **41 us** | elementwise.cu:886, :943 |
+| arithmetic at `T = 255` (255 x 48 x 32768 MAC = 0.80 GFLOP at the measured 0.113 TFLOP/s) | **7.1 ms** | measured efficiency |
+| **measured per-call cost** | **~20.5 ms** | three runs |
+
+**State traffic is 500x too small and the arithmetic is 3x too small to explain it.** So the
+reproducible per-call cost has no identified source.
+
+**And that breaks the lever as specified.** The round-132 plan assumed the cost sits in the chunked
+recurrence kernel, so a larger DeltaNet chunk would amortise it. **But the `delta` diagnostic
+category is not one kernel -- it is the whole DeltaNet layer, which per chunk also runs the causal
+conv over `conv_dim = 10240` and the `decay`/`beta` computation.** If the ~20 ms lives in those
+per-chunk kernels rather than in the recurrence, **decoupling the recurrence's chunk size would
+leave every one of those calls exactly where it is, and the projected 1.33x would not appear.**
+
+**What is actually established, and what is not:**
+
+- **Established:** there is a reproducible ~20 ms per-call cost in the DeltaNet layer, and 96 of the
+  192 chunk-passes at 8K are pure fixed overhead at this chunk size (round 131's fit).
+- **Not established:** that it is inside `gated_delta_rule_chunk_kernel`, and therefore that
+  changing the recurrence's chunking removes it.
+- **Therefore:** the lever is **speculative**, and round 132's "1.19x on the prefill" must not be
+  counted as available.
+
+**The cheap test that settles it, and it is the next round's first action:** the harness already has
+the instrument. `prefill-shape` attributes time per *layer kind*, so running it with the recurrence
+disabled or with `conv_dim` narrowed would separate them -- **but the simplest available probe is
+`--limit` at a chunk-aligned size that forces exactly one chunk versus many, which is what rounds
+131/132 did, and it cannot separate kernels within the category.** **So this needs a temporary
+per-kernel timing print rather than another `--limit` sweep** -- a small, bounded change to
+`layer.rs` around the `ops.gated_delta_rule_chunk` call site at :307, which is exactly what
+`GB10_GEMM_EVENTS` already does for the GEMM phases.
+
+**This is the twenty-sixth self-correction in this session, and the fourth on this session's own
+reasoning rather than on a measurement** (rounds 114, 123, 130, and now 132). **The pattern is
+consistent: a measured effect is real, an attributed cause is assumed, and the two are treated as
+one.**
