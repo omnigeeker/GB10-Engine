@@ -4137,3 +4137,58 @@ OTPS, and why both readings had to be measured separately rather than reasoned a
 attempted so far -- because the one lever that has worked (bytes) is not the lever the prefill
 attention responds to. **The remaining problem is exactly one kernel: the prefill attention, on
 time rather than bytes, at 61% of the 32K prefill and 77% of the 128K prefill.**
+
+### The prefill attention has no tile-geometry lever left, and the block size is pinned (round 93)
+
+Round 92 left exactly one problem: cold TTFT, which is the prefill attention running at 8.4% of
+fp16 peak, and bytes do not help it. The obvious remaining lever is to give the kernel more
+parallelism -- more warps per block to hide the latency round 44 identified. Reading the host
+validation shows that is not available, and the reason is structural:
+
+```rust
+// share one K row, which requires PREFILL_BQ * PREFILL_BK to be exactly
+// 3 * (head_dim / 2)
+if BQ * BK != 3 * (head_dim / 2) {
+    return Err(CudaError::InvalidArgument(format!(
+        "attn_prefill_tiled needs BQ * BK == 3 * (head_dim / 2), got {BQ} * {BK} ..."
+```
+
+With `head_dim = 256`, the product is pinned at **384**, and the thread count follows from it:
+the score loop assigns `step = (nt >> 1) / PREFILL_BK` and covers `BQ = 3 * step` rows, so
+`nt >> 1 = BQ * BK / 3 = 128` and **`nt == 256` always**. The block cannot be widened; only
+`BQ` and `BK` can be traded against each other at a fixed product.
+
+**And that trade has already been run.** Round 44's note says `BK = 48` -- which at product 384
+means the pair `(BQ 8, BK 48)` -- "cut loads and instructions per fma and changed nothing".
+The available pairs are `(24,16)` today, `(48,8)`, `(16,24)`, `(12,32)`, `(8,48)`, `(32,12)`,
+`(96,4)`, `(4,96)`; the shared-memory cost is `(BQ + BK) * (head_dim + 4) * 2 + (BQ*BK + 3*BQ) * 4`,
+so the larger-BQ pairs do fit (`(48,8)` is ~16.5 KB against today's ~21 KB, and `(96,4)` fits
+too). But the one direction that was tested was tested and did nothing, which is what a
+latency-bound kernel that is not resource-limited should do.
+
+**So the three levers tried against this kernel, all neutral:**
+
+| lever | round | result |
+|---|---|---|
+| reduce loads/instructions per fma (BK 48) | 44 | "changed nothing" |
+| fix bank conflicts (padding to `PS 260`, `PADH 130`) | 44 | **8.05x** (already banked) |
+| shorten the dependent fma chain (split accumulators) | 89/90 | +0.9%, inside noise |
+| halve the cache bytes | 86/91 | **+23.2% OTPS, +1.4% cold TTFT** |
+
+**The one lever that ever moved this kernel was the bank-conflict fix in round 44, worth 8.05x,
+and it is already in.** Everything since has been neutral on the cold-TTFT side, which is
+consistent with the kernel being latency-bound on a shared-memory load-to-fma chain whose
+latency is already near the floor for this access pattern.
+
+**What that implies for the next attempt, and it is not a tiling change:** the remaining
+candidate is the *work per tile* that is not the score loop -- the per-tile online-softmax
+rescale of the accumulator (the other ~20% of per-tile cycles, 768 of ~3840), and whether the
+accumulator can be kept from being rescaled on every tile. That is the only part of the tile
+loop not yet examined in this document, and it is where the next measurement should go.
+**It is not implemented, and it should be judged by a same-session server pair (round 90's
+rule), not by `attn-tile`.**
+
+**The other outstanding item is the 256K re-measurement**: the fp16 KV change has been verified
+at 32K (+9.5% OTPS) and 128K (+23.2% OTPS) but the 256K row still carries the pre-fp16 fp32
+numbers, and 256K is also the row whose llama.cpp side was measured in a different session.
+Both arms need to be re-taken in one session, and gb10's 256K run alone takes ~66 minutes.
