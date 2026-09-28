@@ -4506,3 +4506,54 @@ get 10x faster in *arithmetic efficiency* and needs a new HMMA kernel; the decod
 pass. **The measured target is a 1.27x OTPS win at both long contexts, versus a cold-TTFT gap
 that no available lever has moved.** It is validated the same way as everything else in this
 document: a same-session server pair at 128K (one ~19-minute gb10 run against llama's ~4.6).
+
+### The GQA fix is tractable: the decode accumulators are registers, not shared memory (round 100)
+
+Round 99 sized the decode attention at 4.43x its memory floor and named the GQA read
+amplification as the cause. Round 77 had declared the obvious fix blocked, and reading the
+kernel shows **that blocker was attributed to the wrong kernel.**
+
+Round 77's note reads: "`sm_acc[NW][256]` = 32 KB per head; 6 heads = 192 KB vs 99 KB optin."
+That is `attn_decode_kernel` (line 624). The kernel that actually serves decode is
+**`attn_decode_multi_kernel`** (line 1125), and its accumulator is per-lane:
+
+```cuda
+constexpr int DPL = 8;   // dims per lane
+constexpr int NW  = 32;  // warps per block
+const int h = blockIdx.x;      // query head -- ONE per block
+const int s = blockIdx.y;      // sequence
+float qv[DPL];
+float acc[DPL];                // 8 registers, not 32 KB of shared memory
+for (int t = warp; t < n_keys; t += NW) { ... }   // warps split the KEY RANGE
+```
+
+**Three consequences, all favourable:**
+
+1. **The accumulators live in registers** (`acc[8]` plus `qv[8]`), so holding several query
+   heads per block costs registers, not shared memory. Six heads is roughly
+   `acc[6][8] + qv[6][8] = 96` extra floats per lane in the naive arrangement -- against a
+   255-register limit, and the register-optimal arrangement (assign each warp to one head and
+   let it sweep the whole key range) costs only `acc[8]` per warp with no multiplication at all.
+2. **The kernel is already flash-decoding-shaped.** `for (t = warp; t < n_keys; t += NW)` with
+   `NW = 32` warps means the block already splits the key range 32 ways and reduces partial
+   softmaxes -- the exact structure round 99 proposed building. **The split machinery exists; it
+   is simply split across warps of a single-head block instead of across heads of a shared-KV
+   block.**
+3. **Round 77's 192 KB figure therefore does not block this kernel.** It is a real constraint on
+   the other one.
+
+**The change, stated as a shape rather than code:** keep the grid axis that selects the KV head,
+and let one block serve all 6 query heads that share it -- either by giving each head its own
+warp subset over the whole key range, or by letting each warp sweep its key slice once and
+update six accumulator sets. **Either way the K/V slice is read once per block instead of six
+times**, which is the 4.43x. The existing per-warp `acc`/`m`/`l` reduction machinery is reused
+unchanged.
+
+**Validation, unchanged from every other claim in this document:** a same-session 128K server
+pair, gb10 (~19 min) against llama.cpp (~4.6 min) on the same day -- not `decode-bench`, whose
+33.5 MB working set is L2-resident and which round 87 proved can show a 1.64x kernel win that is
+a 22% end-to-end loss.
+
+**Not implemented.** The design is now unblocked and sized; the implementation is a real kernel
+change and the next session should open with it, because it is the only item on the board with a
+measured target (1.27x OTPS at 128K and 256K) that does not require new arithmetic.
