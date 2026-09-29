@@ -7060,3 +7060,60 @@ conclusion is that the score phase is no longer the dominant cost at all.
 > cost, and every number quoted above is a minimum. A single reading has already produced two
 > false conclusions this session, in both directions -- a phantom 2x regression (30.45 s) and a
 > phantom 9x regression (5.75 s).
+
+### Increment 2 (P·V on tensor cores): mapping proven, and the real constraint is shared memory
+
+The P·V accumulation has the **same FLOP count as the score** (`BQ x BK x HD` per tile) but is
+still scalar fp32, so with the score now on tensor cores it is the natural next target. Two
+things were settled before writing it into the kernel, and the second one is the reason it is
+not wired in yet.
+
+**(a) The mapping is proven.** `mma.sync.m16n8k16` computes `D[m][n] = sum_k A[m][k]*B[k][n]`
+with `B` column-major, so with `A = P[BQ][BK]` (row-major, k = key) and
+`B_mem = V^T[HD][BK]` (k = key contiguous) it yields exactly `O[row][dim] = sum_key P[row][key]
+V[key][dim]`. V's natural layout is `[key][dim]`, so V has to be **staged transposed**, unlike
+Q and K which the score mma consumes in their natural layout. A standalone nvcc probe of
+`O[16][8] = P[16][j] . V[j][8]` with the transpose staged into a stride-18 tile reported
+**128/128 exact** against a CPU reference, so the transpose, the stride and the fragment indices
+are all confirmed:
+
+```
+A: a0 = {Pf[m0+gid][c], Pf[m0+gid][c+1]}, a1 = row gid+8, a2/a3 = same rows at c+8
+B: b0 = {Vt[n0+gid][c], Vt[n0+gid][c+1]},  b1 = Vt[n0+gid][c+8..c+9]      (Vt[dim][key])
+D: d0 = O[m0+gid][n0+t4*2], d1 = col+1, d2/d3 = row gid+8
+```
+
+The stride-18 transpose is also conflict-free on the store: a warp writing `Vt[tid*18 + j]`
+lands on word `tid*9 + j/2`, and `9` is coprime with 32, so the 32 lanes hit 32 distinct banks.
+
+**(b) The binding constraint is shared memory, and the naive version blows it.**
+
+| line item | bytes |
+|---|---|
+| Qs `24 x 260 x 2` | 12,480 |
+| Ks `16 x 260 x 2` | 8,320 |
+| S `24 x 16 x 4` | 1,536 |
+| red `3 x 24 x 4` | 288 |
+| **current total** | **22,624** |
+| + Pf `32 x 16 x 2` | +1,024 |
+| + Vt `256 x 18 x 2` | +9,216 |
+| naive total | 32,864 |
+| **with Ks/Vt aliased instead** | **24,544** |
+
+The occupancy probe recorded in `ops.rs` pins this down: two blocks co-reside at the current
+22,624 B request, and pushing the request past **~50,688 B** drops the kernel to one block per
+SM. That makes the per-block ceiling for two blocks **~25,344 B**. The naive addition lands at
+32,864 B and would therefore **halve occupancy** -- very likely costing more than the P·V
+accelerates, while every correctness gate would still pass. Aliasing `Ks` and `Vt` fixes it:
+K is read only in the score phase and V only in the P·V phase, with a `__syncthreads()` between
+them and another at the end of the loop iteration before the next K staging, so they can share
+the same storage. `max(8320, 9216) = 9216`, giving 24,544 B and 800 B of headroom.
+
+Also note `Pf` must be **32 rows, not 24**: the second m-tile's fragment reads rows `16+gid` and
+`24+gid`, so rows 24..31 are read even though only 16..23 can ever be written out. They must be
+zero-filled rather than left stale.
+
+With the aliasing, the host's request formula in `ops.rs` has to change from the current
+`(BQ*(hd+4) + BK*(hd+4))*2 + (BQ*BK + 3*BQ)*4` to the aliased sum explicitly; if the two drift
+apart the kernel either over-requests (losing occupancy) or under-requests (out-of-bounds
+shared use).
