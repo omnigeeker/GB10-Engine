@@ -10426,3 +10426,44 @@ larger term**: the closed form says the kernel's entire 29.9 s is `(t x keys / 3
 
 **This is the plan, and the order in it is not a preference -- it is arithmetic.** The next commit
 is Q-streaming; the one after it is the K double-buffer.
+
+## Correction: the K double-buffer costs nothing if it is done at 8-key granularity
+
+The previous section concluded that Q-streaming must come first because the second K buffer needs
+8,448 B more shared memory. **That is only true if the double-buffer is done at the 16-key tile
+granularity. Done at 8-key granularity it is free, because the kernel already treats `BK = 16` as
+two 8-key n-tiles:**
+
+```cuda
+const int ntile = warp & 1;      // 0 -> keys 0..7,  1 -> keys 8..15
+```
+
+| | smem |
+|---|---|
+| K tile now (`BK = 16`, one buffer) | **8,448 B** |
+| K tile as **two 8-key buffers** | **8,448 B** |
+| total shared memory, unchanged | **22,944 B -> still 2 blocks/SM** |
+
+**So the double-buffer does not need Q-streaming, does not reduce occupancy, and does not add a
+byte of shared memory.** The score loop's two n-tiles become two pipeline stages: while the mma
+consumes keys `0..7` from buffer A, the loads for keys `8..15` go into buffer B, and the next
+iteration's keys `0..7` go back into A.
+
+**This makes the latency hiding the first change rather than the second, and it removes the
+ordering constraint entirely.** The corrected plan:
+
+1. **double-buffer the K tile at 8-key granularity** -- free, keeps 2 blocks/SM, and hides the
+   ~1100 ns per iteration that the closed form identifies as the whole of the kernel's 29.9 s;
+2. **then, optionally, Q-streaming** -- 22,944 B -> 10,272 B, worth ~1.4x from the measured
+   occupancy curve, and it can now be done afterwards or not at all.
+
+**This is the third time in this investigation that the plan has been simplified by looking at what
+the code already does rather than at what the resource arithmetic suggests.** The 8-key split was
+already there; the double-buffer was being priced against a granularity the kernel does not use.
+
+**And the payoff is the largest one available.** The closed form says the kernel's entire 29.9 s at
+32K is `(t x keys / 384)` iterations at ~1100 ns, and that the 1100 ns is an un-overlapped load.
+The attention kernel is **45.6% of the 32K prefill**, and the rest of the 32K prefill is 35.1 s
+against llama.cpp's whole 43.20 s -- so **if the attention kernel's latency were fully hidden, gb10
+would win 32K outright rather than lose it 1.48x.** That is the target, and the first change toward
+it is free.
