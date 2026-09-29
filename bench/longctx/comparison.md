@@ -8167,3 +8167,51 @@ prefill, and no amount of attention optimisation can make gb10 beat llama.cpp.**
 
 **The 1.58x delivered on the attention kernel this session remains real and in tree, and it is
 worth roughly 1.58x on a 25% share, i.e. ~9% of the prefill -- not the 79-99% the program assumed.**
+
+## The two costs separate cleanly -- and at 8K the DeltaNet layers dominate
+
+The same instrumentation at 32768 tokens:
+
+| | 16384 tok | 32768 tok | ratio for 2x tokens |
+|---|---|---|---|
+| **DeltaNet layers (48)** | 16.86 s (58.2%) | 32.75 s (45.8%) | **1.94x -- linear** |
+| **full-attention layers (16)** | 12.05 s (41.6%) | 39.08 s (54.7%) | **3.24x -- quadratic** |
+| `cublas gemm` | 10.54 s (36.4%) | 19.72 s (27.6%) | 1.87x |
+| `epilogue` | 2.60 s (9.0%) | 5.22 s (7.3%) | 2.01x |
+| `activ cast` | 1.44 s (5.0%) | 2.94 s (4.1%) | 2.04x |
+| `weight stage` | 0.87 s (3.0%) | 1.74 s (2.4%) | 2.00x |
+| op phases total | 15.45 s (53.3%) | 29.62 s (41.4%) | 1.92x |
+| non-GEMM remainder | 13.53 s (46.7%) | 41.88 s (58.6%) | 3.10x |
+
+**The two halves of the model scale differently and it is exactly as the architecture predicts:**
+the 48 Gated-DeltaNet layers are **linear** in `T` (1.94x for 2x tokens) and the 16 full-attention
+layers are **quadratic** (3.24x). So their shares cross over, and the crossover is the whole story of
+this objective:
+
+* **At 32K** attention layers are 54.7% and DeltaNet 45.8% -- and the attention *kernel* alone
+  (16 x 1.81 s = 29.0 s) is **40.6%** of the prefill.
+* **At 8K** -- one 8192-token chunk, 12.68 s measured -- DeltaNet is **8.43 s = 66%**, the attention
+  kernel is **1.4 s = 11%**, and the attention projections are **2.8 s = 22%**.
+
+**8K is the length where gb10 is closest to llama.cpp (1.22x) and it is the length where the
+DeltaNet layers are two thirds of the prefill.** The session optimised a kernel that is 11% of the
+8K prefill and 40.6% of the 32K prefill; it never looked at the block that is 66% of the 8K prefill.
+
+**What is now known to be worth attacking, in order:**
+
+1. **The 48 Gated-DeltaNet layers** -- 58.2% at 16K, 66% at 8K, 45.8% at 32K, linear in `T`. The
+   single largest block at the two shortest lengths, and completely unexamined.
+2. **The attention kernel** -- 25.4% at 16K, 40.6% at 32K, already 1.58x faster than it was.
+3. **GEMM-adjacent overhead** -- `epilogue` + `activ cast` + `weight stage` = 17.0% at 16K and 13.8%
+   at 32K. This is dequantisation, activation casting and weight staging around GEMMs that
+   themselves run at a plausible rate: `cublas gemm` does 10.54 s of work at 16384 tokens, which is
+   ~8.85e14 FLOP, i.e. **~84 TFLOP/s -- above the 74 TFLOP/s bf16 peak and therefore consistent with
+   FP4, roughly 57% of an FP4 peak.** So the GEMM itself is *not* obviously broken; the diagnostic
+   line `cublas 0.0 TFLOP/s in-model` is simply a FLOP counter that was never wired up, and should
+   not be read as an anomaly.
+
+**The objective's remaining distance, re-read through this breakdown.** At 8K, gb10 is 13.41 s against
+llama.cpp's 10.91 s -- 2.5 s to find. DeltaNet is 8.43 s of gb10's prefill and has never been
+optimised; the attention kernel is 1.4 s and has already been made 1.58x faster. **The 8K gap is
+therefore a DeltaNet problem, not an attention problem**, and that is a concrete, unexamined target
+rather than a lever that has been measured and rejected.
