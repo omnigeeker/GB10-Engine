@@ -784,6 +784,38 @@ fn cublas_gemm() -> Result<()> {
         let secs = t0.elapsed().as_secs_f64() / reps as f64;
         let flop = 2.0 * n as f64 * k as f64 * t as f64;
         let tflops = flop / secs / 1e12;
+        // COLD variant: the same GEMM, but with a 1 GiB buffer streamed through
+        // the device between iterations, so the weight and the activation are
+        // evicted from cache before every call. The model runs each of its
+        // GEMMs once per layer with 178 MB of other weights streaming through
+        // in between, so this is the regime the model is actually in. If the
+        // cold time is several times the warm time, then the gap between the
+        // model's phases and their standalone measurements is the cache.
+        let mut evict = dev.stream().alloc_zeros::<u8>(1024 * 1024 * 1024)?;
+        for _ in 0..3 {
+            dev.stream().memset_zeros(&mut evict)?;
+            unsafe { blas.gemm(cfg, &w, &x, &mut y) }?;
+        }
+        dev.synchronize()?;
+        // Time ONLY the GEMM: evict, sync, then time the GEMM and sync again.
+        // Including the memset in the window would dominate (1 GiB at the
+        // measured 228 GB/s is 4.4 ms on its own).
+        let mut cold_total = 0.0f64;
+        for _ in 0..reps {
+            dev.stream().memset_zeros(&mut evict)?;
+            dev.synchronize()?;
+            let g0 = std::time::Instant::now();
+            unsafe { blas.gemm(cfg, &w, &x, &mut y) }?;
+            dev.synchronize()?;
+            cold_total += g0.elapsed().as_secs_f64();
+        }
+        let csecs = cold_total / reps as f64;
+        let cold_tflops = flop / csecs / 1e12;
+        println!(
+            "  {:<20} {:>8.2} {:>8.1}   cold/warm = {:.2}x",
+            "  ^ COLD (1 GiB evict)", csecs * 1e3, cold_tflops, csecs / secs
+        );
+        drop(evict);
         let gbytes = (n * k * 2) as f64 / 1e9;
         println!(
             "{:<22} {:>8.2} {:>8.1} {:>9.3} {:>10.0} {:>8.1}x",

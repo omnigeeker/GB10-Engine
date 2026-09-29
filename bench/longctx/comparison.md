@@ -8964,3 +8964,62 @@ back to back (warm) and then time it again after streaming an MLP-sized buffer t
 between iterations (cold), and compare. **Until that is run, this is the tenth hypothesis, not the
 first finding.** But it is the first one that is consistent with every measurement already taken
 rather than with a subset of them.
+
+## The cold-cache hypothesis is refuted for the shapes that matter
+
+The test was built into `gb10-bench cublas-gemm`: each shape is timed twice, once back to back
+(warm) and once with a **1 GiB buffer zeroed through the device between every iteration** (cold),
+so the weight and the activation are evicted from L2 before every call. Only the GEMM is inside the
+timing window; the eviction is outside it and followed by a synchronise. `mlp gate/up` at
+`t = 2048` is the shape that dominates the model's MLP.
+
+| shape | warm | cold (1 GiB evict) | **cold/warm** |
+|---|---|---|---|
+| `mlp gate/up` | 4.91 ms | 4.88 ms | **0.99x** |
+| `mlp down` | 4.32 ms | 4.23 ms | **0.98x** |
+| `lm_head` | 65.8 ms | 67.09 ms | **1.02x** |
+| `attn q_proj` | 1.51 ms | 1.54 ms | **1.02x** |
+| `mlp gate/up t=256` | 0.46 ms | 0.63 ms | 1.36x |
+| `in_proj_a m=48` | 0.46 ms | 0.60 ms | 1.31x |
+
+**The large GEMMs have no cold penalty at all.** `mlp gate/up` is 0.99x, `lm_head` 1.02x, `attn
+q_proj` 1.02x. That is not a near-miss; it is the absence of an effect. **The explanation is
+straightforward once measured: these GEMMs' working sets are already far larger than L2, so they
+are already streaming from DRAM in the warm case too. Evicting the cache cannot slow down a kernel
+that was never cache-resident.** Only the small shapes pay (1.3x to 6.2x), and they pay in absolute
+terms that are negligible -- 0.46 ms to 0.63 ms.
+
+**So the tenth hypothesis is refuted, and it was the first one that had been consistent with all
+nine earlier refutations.** The model's MLP does not run at 1.35x its FLOP time because its weights
+are cold. The cold/warm distinction, which looked like the unifying explanation, is worth 1% on the
+shapes that matter.
+
+**And `in_proj_a`'s 17x is now 12x.** Its standalone time goes from 0.46 ms warm to 0.60 ms cold;
+the model spends 7.6 ms. The activation cast is measured separately in the model at ~1.6 ms per
+GEMM call, so cast plus cold GEMM is ~2.2 ms of the 7.6 ms. **The remaining ~5.4 ms per call is
+still unaccounted for, and no hypothesis has survived contact with it.**
+
+**Where the search actually stands.** Ten candidate causes have been proposed for the `proj in`
+overhead and ten have been refuted, each by a measurement designed to falsify it:
+
+| # | hypothesis | refuted by |
+|---|---|---|
+| 1 | fixed per-call cost | scales 3.88x with `t` |
+| 2 | per-call cuBLAS algorithm choice | cached handle, correct parameters |
+| 3 | scratch `Mutex` contention | would be fixed; it is not |
+| 4 | launch overhead | CPU/GPU = 0.06 |
+| 5 | activation cast | ~1.1 ms of 7.6 ms, bandwidth-bound standalone |
+| 6 | weight dequantisation | fixed per call, tiny |
+| 7 | split-K on `m = 48` | swapped orientation no faster |
+| 8 | the GEMM itself | 0.44 ms standalone at this exact shape |
+| 9 | enqueue starvation | CPU 0.12 s against GPU 2.21 s |
+| 10 | cold cache | 0.99x for the shapes that matter |
+
+**The honest reading is that the phase-level attribution is not yet trustworthy.** Nine of the ten
+hypotheses assumed the phase measurement means what its name says, and the tenth was the first to
+question that. What has been established is that the *sum* of the phases reproduces the total
+prefill time, so the GPU is genuinely busy for 12.4 s -- but **which work it is busy with, at the
+level of individual `Linear` calls, has not been verified against an independent instrument.** The
+next measurement should not be another hypothesis about the 7.6 ms. It should be a direct check
+that the `in_proj_a` phase really contains only the work attributed to it -- for example by timing
+`in_proj_a` alone, in the model, with its inputs pre-staged and nothing else in flight.
