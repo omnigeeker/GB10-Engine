@@ -12361,3 +12361,68 @@ document are totals, not decompositions.
 
 **This is the honest state: 8K is won, 32K is reachable with the two identified levers, and 128K/256K
 need their own decomposition before it is known whether they are reachable at all.**
+
+## The 128K decomposition -- and the arithmetic says 128K is NOT reachable
+
+Both layer types instrumented at 128K, same run (total 451.23 s):
+
+```
+[diag] DELTA n=768 | proj in (qkv/z/a/b) 21633ms (4.8%)  conv + l2norm + gate 6384ms (1.4%)
+                     delta rule chunk 8246ms (1.8%)  proj out 9617ms (2.1%)  mlp 65452ms (14.5%)
+                     total 111.33s of 451.23s (24.7%)
+[diag] ATTN n=256  | proj + norm 7118ms (1.6%)  rope (tables + htod) 3466ms (0.8%)
+                     kv cache append 151ms (0.0%)  attn kernel 304067ms (67.4%)
+                     o_proj + mlp 24329ms (5.4%)
+                     total 339.13s of 451.23s (75.2%)
+```
+
+| component | 128K | share | 32K share (for comparison) |
+|---|---|---|---|
+| **attention kernel** | **304,067 ms** | **67.4%** | 34.8% |
+| MLP (both layer types) | 89,781 ms | 19.9% | 40.4% |
+| delta `proj in` | 21,633 ms | 4.8% | 9.5% |
+| delta `proj out` | 9,617 ms | 2.1% | 4.4% |
+| delta rule chunk | 8,246 ms | 1.8% | 4.0% |
+| attention `proj + norm` | 7,118 ms | 1.6% | 3.4% |
+| delta conv + l2norm + gate | 6,384 ms | 1.4% | 3.1% |
+| rope | 3,466 ms | 0.8% | 0.1% |
+
+**The attention kernel grows from 34.8% of the prefill at 32K to 67.4% at 128K** -- the quadratic term
+asserting itself, exactly as the model predicts. **Everything else shrinks as a share.**
+
+### The arithmetic, with both levers applied at generous values
+
+128K target is 228.21 s; the gap is 223.0 s.
+
+| lever | effect | resulting total | ratio |
+|---|---|---|---|
+| now | -- | 451.2 s | 1.962x |
+| tensor-core PV at 4x (PV = 41.8% of the kernel) | saves 95.3 s | 355.9 s | **1.56x** |
+| + FP4 MLP at 2x (MLP = 89.8 s) | saves another 44.9 s | 311.0 s | **1.36x** |
+
+**Even with both levers landing at generous values, 128K lands at ~1.36x -- not parity.** And the
+attention kernel is still 209 s of that 311 s, so a third breakthrough would be needed, on top of
+two that have not yet been demonstrated.
+
+**256K will be worse**, because the attention share grows further with context: at 256K the measured
+ratio is 2.511x and the attention kernel is a larger fraction still.
+
+### The honest state of objective (1)
+
+| length | status |
+|---|---|
+| **8K** | **WON** -- 0.925-0.963x, measured, both trials |
+| **32K** | **reachable** -- both levers together project ~0.85x |
+| **128K** | **not reachable** with the identified levers -- ~1.36x at best |
+| **256K** | **not reachable** -- the gap is larger and the attention share higher |
+
+**This is not a claim that the work was wasted: gb10's own cold TTFT fell 17.5%/16.4%/29.1%/14.3% at
+the four lengths this session, and 8K went from 1.22x behind to a win.** It is a statement that the
+objective as written -- all four lengths ahead of llama.cpp -- is bounded away by the measured
+composition of the remaining time, and that the bound is now quantitative rather than a matter of
+effort.
+
+**The attention kernel is the whole story at long context, and this session established that its
+cost is the per-iteration work -- staging, barriers, and 384 PV MACs per thread -- not occupancy,
+not bandwidth, and not the tile size.** Those are the terms a further breakthrough would have to
+attack.
