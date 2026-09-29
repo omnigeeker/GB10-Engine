@@ -11039,3 +11039,41 @@ ratio predicted. gb10 wins OTPS at 32K as well, and warm TTFT by 5.2x.
 that was 1.22x behind at the start of the session.** The remaining three are all the same
 super-linear attention term, whose share is 39.5% at 32K and 71.9% at 128K, and whose fix is the
 occupancy change the closed form points at.
+
+## 256K same-session pair: 3.86x -> 2.918x, completing the four-length dataset
+
+`bench/longctx/ttft.py --reps 8200 --trials 1`, both servers started and measured sequentially in
+one session:
+
+```
+# gb10-256K  reps=8200 trials=1
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   254274    1699.78       0.26      3.73      3.76  128
+# llama-256K  reps=8200 trials=1
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0   254312     582.55       0.59      4.64      4.64  128
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| cold TTFT | **1699.78 s** | 582.55 s | **2.918x** |
+| OTPS | 3.73 | 4.64 | 0.80x |
+| warm TTFT | **0.26 s** | 0.59 s | **2.3x** |
+
+**256K: `4.54x -> 3.86x -> 2.918x`.** Note that llama.cpp itself was faster this session than when
+the pre-fix pair was taken (582.55 s against 702.72 s), so **the ratio improved by more than gb10's
+own speedup alone would explain** -- gb10 went 2712.43 -> 1699.78 s (-37%) while the ratio went
+3.86x -> 2.918x (-24%). gb10 still loses OTPS at 256K, which is the only length where that is true.
+
+### All four lengths, post-fix, same session
+
+| length | gb10 cold TTFT | llama.cpp | ratio | session start | status |
+|---|---|---|---|---|---|
+| **8K** | **8.77-8.92 s** | 9.06-9.25 s | **0.948-0.985x** | 1.22x | **gb10 wins** |
+| 32K | 57.06-57.13 s | 43.11-44.28 s | 1.289-1.325x | 1.80x | loses (OTPS won 1.16x) |
+| 128K | 505.65 s (instrumented) | 290.63 s | 1.74x | 4.21x | loses |
+| 256K | 1699.78 s | 582.55 s | 2.918x | 4.54x | loses (OTPS 0.80x) |
+
+**Every length improved, and one of the four now wins.** The ratios fall monotonically with length
+because the attention kernel's share rises monotonically -- 13.6% at 8K, 39.5% at 32K, 71.9% at
+128K -- and **the attention kernel is the only term that grows faster than linearly.**
