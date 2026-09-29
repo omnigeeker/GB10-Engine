@@ -9529,3 +9529,64 @@ exactly the pattern in the table two sections above.**
 worked three times: bracket the attention layer's own phases -- q/k/v/o projections, the norm
 before attention, the kernel, and the cache read/write -- and see which one is super-linear. That
 is where the 36.9 s is, and it is 58% of the prefill that has never been attributed.
+
+## The super-linear term is NOT the attention key range -- an existing diagnostic already answered it
+
+`layer.rs` carries a diagnostic built for exactly this question, with its purpose written in the
+comment:
+
+> `GB10_ATTN_START_ZERO` makes the attention ignore the cached prefix, so a chunked prefill
+> produces wrong output but does the same attention work in every chunk. It exists to answer
+> whether the per-chunk cost that grows with `pos` is the attention's key range at all -- the
+> isolated kernel says it should not be.
+
+The question had already been asked by an earlier session and the tool already existed. It was run:
+
+| chunk | normal | `GB10_ATTN_START_ZERO=1` |
+|---|---|---|
+| 0 (start 0) | 10.75 s | 10.86 s |
+| 1 (start 8192) | 14.30 s | 14.57 s |
+| 2 (start 16384) | 18.17 s | 18.42 s |
+| 3 (start 24576) | 22.09 s | 22.35 s |
+| **total** | **65.31 s** | **66.21 s** |
+
+**Identical, within noise.** Making the attention ignore the entire cached prefix -- so that every
+chunk does the same key-range work -- changes the total by 1.4%, in the wrong direction.
+**The growing per-chunk cost is not the attention's key range.** That hypothesis is closed.
+
+**But the measurement gives something better than the refutation: the shape of the growth.** The
+per-chunk increments are remarkably regular:
+
+```
+chunk 0 -> 1:  +3.55 s
+chunk 1 -> 2:  +3.87 s
+chunk 2 -> 3:  +3.92 s
+```
+
+**A constant increment per chunk means the per-chunk cost is linear in `pos`, so the total is
+quadratic in the number of chunks.** At 32K that extra cost is **3.55 + 3.87 + 3.92 = 11.3 s of the
+65.31 s -- 17% of the prefill**, and it is the entire super-linear component.
+
+**And it is not in any phase this session has instrumented.** Every instrumented phase was linear
+(3.18x to 4.10x for 4x tokens). So 11.3 s of the 32K prefill is spent in work that:
+
+* grows linearly with the cumulative token count,
+* is inside the attention layers,
+* is **not** the attention's key range (just refuted),
+* and is **not** any of the GEMM phases, the MLP, the norms, or the delta path (all measured linear).
+
+**The remaining candidates are the ones that scale with `pos` rather than with `t`**, and there
+are only a few in that function: the K/V cache write path (`kv_cache_append_batched`, called with
+`pos` and `kv_base = seq * kv_stride`), the RoPE table construction (`rope_tables_range(cfg, pos,
+t)` plus a host-to-device copy), and the cache addressing itself. **Any of them that touches the
+whole cache, or that recomputes something of size `pos`, produces exactly this signature.**
+
+**This is now a well-posed question with a bounded answer set, which is the most useful state this
+investigation has been in.** 11.3 s at 32K, growing quadratically, inside a function of about
+sixty lines, in one of three named operations.
+
+**One more thing the table establishes, and it is worth recording because it corrects a plausible
+intuition.** The 1.17 s estimate for the 32K attention kernel was derived by scaling `attn-tile`'s
+65536-token figure by query-key pair count. The `START_ZERO` result is consistent with it: making
+the key range constant per chunk did not remove 3.5 s per chunk, because the kernel was never
+costing that. **The isolated kernel and the model agree; the growth is somewhere else.**
