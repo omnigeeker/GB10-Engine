@@ -749,6 +749,12 @@ fn cublas_gemm() -> Result<()> {
         ("attn v_proj", 1024, 5120, 2048),
         ("small n, short t", 1024, 5120, 256),
         ("mlp gate/up t=256", 17408, 5120, 256),
+        // The DeltaNet in_proj_a/in_proj_b shape (n = 48) and the same GEMM
+        // with the operands swapped (m = 8192, nn = 48). If the swapped
+        // orientation is several times faster, cuBLAS is picking split-K for
+        // the m = 48 case and re-reading the activation once per split.
+        ("in_proj_a m=48", 48, 5120, 8192),
+        ("in_proj_a SWAPPED", 8192, 5120, 48),
     ] {
         let w = dev.stream().alloc_zeros::<bf16>(n * k)?;
         let x = dev.stream().alloc_zeros::<bf16>(t * k)?;

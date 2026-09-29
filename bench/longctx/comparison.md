@@ -8844,3 +8844,60 @@ cost (it scales with `t`), it is not a bad algorithm *choice* being made per cal
 cached and the parameters are correct), it is not the activation cast (1.1 ms of the 7.6 ms), and it
 is not the weight dequantisation (fixed per call, and tiny). It is data-proportional, it is specific
 to shapes whose `m` is 48, and the leading candidate mechanism is split-K re-reading the activation.
+
+## Split-K is refuted, and the real result is bigger: the GEMM is 0.44 ms, the phase is 7.6 ms
+
+The two orientations of the `in_proj_a` GEMM were added to `gb10-bench cublas-gemm` and measured
+directly:
+
+| shape | ms | TFLOP/s | reported GB/s |
+|---|---|---|---|
+| `in_proj_a m=48` (n=48, k=5120, t=8192) | **0.44** | 9.2 | 1 |
+| `in_proj_a SWAPPED` (m=8192, nn=48, k=5120) | **0.48** | 8.5 | 176 |
+| `mlp gate/up` (large, for reference) | 4.78 | 76.4 | 37 |
+
+**The swapped orientation is not faster -- it is marginally slower (0.48 ms against 0.44 ms). Split-K
+is refuted.** The `m = 48` shape is genuinely low-utilization (9.2 TFLOP/s against 76.4 for a large
+shape), but that is a *throughput* statement about 0.44 ms of work, and it does not explain the
+733 ms.
+
+**The result that does matter is the comparison with the model.** The standalone GEMM for exactly
+`in_proj_a`'s shape takes **0.44 ms**. The instrumented `in_proj_a` phase in the model takes
+**7.6 ms per layer call** -- 365 ms over 48 layers. **That is a 17x discrepancy, and the GEMM is not
+it.**
+
+**So the 733 ms is not in the matrix multiply.** Combined with what has already been measured and
+refuted, the phase's 7.6 ms cannot be:
+
+* the GEMM: 0.44 ms standalone, and the swapped orientation does not help;
+* the activation cast: ~1.1 ms at 228 GB/s, and the bench measures `f32_to_bf16` as bandwidth-bound;
+* the weight dequantisation: 245,760 elements, and it is fixed per call, so it cannot produce the
+  observed 3.88x scaling with `t`;
+* a fixed per-call cost: refuted by the `t`-scaling;
+* a bad per-call algorithm choice: refuted by the cached handle and correct parameters.
+
+**What is left, and it is a different class of explanation than everything tried so far:** the
+0.44 ms figure is a *warm, back-to-back* measurement of the GEMM alone, and the 7.6 ms is a *cold,
+once-per-layer* measurement of a phase that contains four kernel launches, a cuBLAS call, a
+`Mutex` lock on the shared scratch, and several `env::var` lookups. **If the CPU cannot enqueue that
+phase's work faster than the GPU retires it, the event delta measures GPU idle time, not GPU work**
+-- and that would be invisible in any standalone kernel benchmark, which is exactly the pattern
+here. It would also be consistent with the `t`-scaling, because the GPU work per phase grows with
+`t` while the launch count does not.
+
+**This changes the fix but not the target.** If the phase is launch- or enqueue-bound, then the
+right change is **not** to make the four `proj in` GEMMs faster -- they are already fast -- but to
+**launch fewer of them**: one fused GEMM instead of four, which removes three launches, three
+scratch-lock acquisitions, three cast kernels and three epilogues per layer, 48 times. **That was
+already the leading candidate fix; it now has a different and better-supported justification.**
+
+**And it sharpens the test.** Before building the fusion, the discriminating measurement is cheap:
+run the same phase with the four projections replaced by four *empty* calls, or time a phase that
+launches the same kernels back to back with no intervening work. If the phase time collapses, it is
+enqueue-bound and the fusion is worth 0.5-0.7 s at 8K. If it does not, the fusion is worth much
+less and the 733 ms is somewhere that has not yet been looked at.
+
+**Stated plainly: this session has now refuted eight candidate causes for the same quantity.** The
+value of the last two rounds is that the search space is no longer "somewhere in the prefill" but
+"either enqueue overhead in the `proj in` phase, or a cost that the standalone benchmark cannot
+see."
