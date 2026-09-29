@@ -9321,3 +9321,51 @@ also why `activ cast` rose from 713 ms to 852 ms -- those two calls each cast th
 **2.07 s removed -- 16.4% of the 8K prefill -- and both changes are structural rather than
 tuning.** The first was aimed by reading the dispatch; the second by reading the epilogue. Neither
 came from a hypothesis about a kernel.
+
+## End-to-end 8K after both fixes: parity (1.001x on the best pair, 0.986x on the mean)
+
+Same harness, same session, sequential servers, 2 trials each, identical prompts:
+
+```
+=== gb10 8K (post-fix) ===
+    0     7171       9.10       0.03      9.01      8.93  128
+    1     7171       9.13       0.03      9.01      8.92  128
+=== llama 8K ===
+    0     7209       9.09       0.23      7.17      7.16  128
+    1     7209       9.40       0.23      7.23      7.18  128
+```
+
+| | trial 0 | trial 1 | best | mean |
+|---|---|---|---|---|
+| **gb10** | **9.10 s** | 9.13 s | **9.10 s** | 9.115 s |
+| llama.cpp | 9.09 s | 9.40 s | 9.09 s | 9.245 s |
+| **ratio** | 1.001x | **0.97x** | **1.001x** | **0.986x** |
+
+**8K is at parity.** On the best-of-two discipline used everywhere else in this document the ratio
+is **1.001x** -- a dead heat, 10 ms apart on a 9.1 s measurement. On the mean of both trials it is
+**0.986x, a gb10 win.** gb10 wins OTPS at 8K by **1.26x** (9.01 against 7.17) and wins warm TTFT
+by **7.7x** (0.03 s against 0.23 s).
+
+**The progression, all same-session ratios:**
+
+| | gb10 | llama | ratio |
+|---|---|---|---|
+| start of the dispatch investigation | 13.41 s | 10.91 s | **1.22x** |
+| after the small-`n` dispatch fix | 10.08 s | 9.12 s | **1.10x** |
+| after folding the epilogue into `alpha` | 9.10 s | 9.09 s | **1.001x** |
+
+**The 8K gap has gone from 2.50 s to 0.01 s**, and it was closed by two structural changes that
+between them removed 2.07 s of instrumented prefill: routing the `n = 48` projections off a path
+that re-read their weights once per token, and deleting an elementwise pass over every GEMM
+output.
+
+**Stated without overreach: this is parity, not a certified win.** 10 ms on 9.1 s is inside the
+spread between the two llama trials (9.09 and 9.40 -- a 310 ms spread), so the honest claim is that
+the 8K cold TTFT is now indistinguishable between the two engines rather than that gb10 is ahead.
+**The objective requires a win at all four lengths, and one length at parity is one length at
+parity.**
+
+**What remains, and it is measured:** the activation cast is now 852 ms (8.1%) because the dispatch
+fix added two casting calls per layer; the four `proj in` projections still launch separately and
+could be fused; and at 32K the requirement is 1.65x against a gap that nothing found so far
+scales to close.
