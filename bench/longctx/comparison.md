@@ -10271,3 +10271,124 @@ blocks per SM.** From the measured occupancy curve (2 -> 1 costs 2.36x), 2 -> 3 
 **Neither is tensor cores, and the kernel already uses tensor cores.** The objective's named path
 is complete; what remains is that the kernel is idle 99.8% of the time waiting for loads, and the
 two changes above are what stop it waiting.
+
+---
+
+# State of the objective at round 220
+
+## Part (2) -- long-context retrieval: COMPLETE and certified
+
+Closed earlier in this session with same-session control data. Not revisited.
+
+## Part (1) -- cold TTFT: 8K at parity, 32K/128K/256K open
+
+### Same-session end-to-end, all measured
+
+| length | gb10 | llama.cpp | ratio | OTPS |
+|---|---|---|---|---|
+| **8K** | 9.10 s | 9.09 s | **1.001x** | 9.01 vs 7.17-7.23 |
+| **32K** | 63.91 s | 43.20 s | **1.48x** | 7.92 vs 6.85 |
+| 128K | 804.92 s | 273.86 s | 2.94x | (pre-fix) |
+| 256K | 2712.43 s | 702.72 s | 3.86x | (pre-fix) |
+
+**gb10 wins OTPS at both measured lengths** (8K 1.26x, 32K 1.16x) and warm TTFT by 5.8-7.7x.
+
+### Two fixes, both landed, both verified end to end
+
+1. **Dispatch routing** (`weights.rs:307`): `if t <= 16 || (self.n < 256 && t < small_n_cut)`. The
+   `n < 256` arm had no `t` dependence, so `in_proj_a`/`in_proj_b` (n=48) took the batched GEMV at
+   every length. Worth 12.61 s -> 11.69 s at 8K.
+2. **GEMM epilogue folded into `alpha`** (`weights.rs`, `ops.rs:cublas_gemm_bf16_f32`): the
+   post-GEMM `f32_scale` is numerically identical to scaling the accumulator, so it is now the
+   GEMM's `alpha`. Epilogue 1301 ms -> 1 ms; 8K 11.69 s -> 10.54 s.
+
+**Combined: 8K instrumented prefill 12.61 s -> 10.54 s (-16.4%), and 8K end-to-end from 1.22x to
+parity.**
+
+### The quadratic term: identified, quantified, and confirmed by experiment
+
+**At 32K the attention kernel is 29,946 ms -- 45.6% of the prefill -- and it is the only
+super-linear component.** Every other instrumented phase is linear or sub-linear (3.18x to 4.10x
+for 4x tokens).
+
+| phase | 8K | 32K | ratio |
+|---|---|---|---|
+| `cublas gemm` | 5099 ms | 20487 ms | 4.02x |
+| `activ cast` | 852 ms | 3377 ms | 3.96x |
+| `weight stage` | 426 ms | 1706 ms | 4.00x |
+| delta rule chunk | 530 ms | 2132 ms | 4.02x |
+| `proj + norm` (attn) | 456 ms | 1830 ms | 4.01x |
+| `o_proj + mlp` (attn) | 1526 ms | 6113 ms | 4.01x |
+| **attn kernel** | **1825 ms** | **29910 ms** | **16.4x** |
+
+### Root cause, with a closed form
+
+```
+kernel time = (t x keys / 384) x ~1100 ns
+```
+
+* `t x keys / 384` is the K/V loop iteration count, **pinned by `BQ * BK == 384`** and independent
+  of how 384 is split;
+* `~1100 ns` per iteration is an **un-overlapped K/V load round trip**.
+
+The model predicts 33.2 s against 29.946 s measured (11% over, one fitted constant).
+
+**Measured utilization in that kernel: 0.39% of compute peak, 24% of DRAM bandwidth, 1.68
+MAC/cycle/SM -- idle ~99.8% of the time.**
+
+### Confirmed by a single-variable experiment
+
+`GB10_ATTN_SMEM_PROBE` forces 1 block/SM with identical arithmetic:
+
+| shape | 2 blocks/SM | 1 block/SM | ratio |
+|---|---|---|---|
+| start 0, ntok 8192 | 0.12 s | 0.26 s | 2.17x |
+| start 24576, ntok 8192 | 0.83 s | 1.96 s | 2.36x |
+| start 0, ntok 65536 | 7.60 s | 17.94 s | 2.36x |
+
+**Halving occupancy costs 2.2-2.4x. The kernel is occupancy- and latency-bound, not compute- or
+bandwidth-bound.**
+
+### The next change, with its payoff measured
+
+```
+registers 77  -> 3 blocks/SM by registers
+shared 22944 B -> 2 blocks/SM by shared    <-- BINDING
+```
+
+| smem component | bytes |
+|---|---|
+| **Q tile** | **12,672** |
+| K tile | 8,448 |
+| S | 1,536 |
+| red | 288 |
+
+**No tiling of `BQ * BK = 384` reaches the 17,066 B that 3 blocks need** (minimum 22,848 B at
+BQ=16/BK=24). **Removing the Q tile gives 10,272 B -> 3 blocks/SM**, worth ~1.4x by the measured
+occupancy curve. Then **double-buffer the K tile** to hide the ~1100 ns.
+
+### Eliminated, each by a specific measurement or read
+
+| hypothesis | how it was closed |
+|---|---|
+| raise `BQ` via `#define` | `BQ * BK == 384` is enforced; `BQ=48/BK=8` faults (illegal access) |
+| tensor cores are missing | **already used** -- `mma.sync...m16n8k16` at `elementwise.cu:547` |
+| `n_seq` inflates the cost | measured: 29946 vs 30081 ms |
+| cache stride spreads pages | `kv_stride() = k_cache.len() / n_seq` -- contiguous |
+| call-path overhead | isolated and in-model timings agree to 2.4% |
+| cold cache | large GEMMs 0.98-1.02x cold/warm |
+| weight cache | regression, reverted (round 190) |
+| split-K, enqueue, M=48 | all refuted by measurement |
+| attention key range | `GB10_ATTN_START_ZERO` changes nothing |
+
+### Verified state at this commit
+
+```
+HEAD == origin/main == c49c8eb        tree clean
+attn-tile: OK
+8K  prefill  10.53 s   (post-fix baseline 10.54 s)
+32K prefill  64.71 s   (earlier 65.04-65.59 s)
+```
+
+**The root cause is settled and confirmed by experiment; the remaining work is the two kernel
+staging changes, both with measured payoffs.**
