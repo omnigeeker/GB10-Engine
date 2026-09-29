@@ -1802,8 +1802,12 @@ impl Ops {
         // while S and the reduction scratch stay fp32. Halving the Q/K staging
         // takes this kernel from 2 to 4 blocks per SM, which is the lever the
         // round-39 occupancy probe identified.
+        // The kernel's row stride is head_dim + 8, not head_dim + 4: rows must be
+        // 16-byte aligned so ldmatrix can read whole fragments in one instruction,
+        // which retires the old +4 gap that only existed for the scalar kernel's
+        // bank behaviour.
         let smem =
-            (BQ * (head_dim + 4) + BK * (head_dim + 4)) * 2 + (BQ * BK + 3 * BQ) * 4;
+            (BQ * (head_dim + 8) + BK * (head_dim + 8)) * 2 + (BQ * BK + 3 * BQ) * 4;
 
         // Occupancy probe. The computed request (43,104 B here) is what lets two
         // blocks co-reside per SM; `GB10_ATTN_SMEM_PROBE=<bytes>` raises the

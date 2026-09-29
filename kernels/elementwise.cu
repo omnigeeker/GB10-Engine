@@ -258,6 +258,11 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
 // Pack two fp16 values into one .b32 for an mma fragment, low half first.
 // The order matters and is not symmetric: verified against a CPU reference
 // before use (bench/longctx/comparison.md, "mma-layout").
+// Shared-memory window address for ldmatrix.
+__device__ __forceinline__ unsigned smem_addr(const void* p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+
 __device__ __forceinline__ unsigned pk2(__half lo, __half hi) {
     return (unsigned)__half_as_ushort(lo) | ((unsigned)__half_as_ushort(hi) << 16);
 }
@@ -406,8 +411,15 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     // spreads (j, sub) across all 32 banks -- the same property PADH = 129
     // provides for fp32. The intra-row gap below is 2 for the same reason.
     // See bench/longctx/comparison.md, round 41.
-    const int PADH = HD / 2 + 2;
-    const int PS = 2 * PADH;
+    // Row stride is a multiple of 8 halfs (16 bytes) so every 16-byte segment
+    // ldmatrix reads is aligned, which is what lets ONE instruction replace six
+    // shared loads plus their address arithmetic in the score mma. The old
+    // `PADH = HD/2 + 2` gap (PS = 2*PADH) existed only to spread the SCALAR
+    // kernel's `sub * PADH` accesses across banks; nothing reads Q or K
+    // scalar-wise any more, and ldmatrix does its own conflict-free access, so
+    // the gap is gone. That also removes the `koff` correction the mma fragment
+    // loads needed to step over the gap.
+    const int PS = HD + 8;
     __half* Qs = reinterpret_cast<__half*>(smem);  // BQ * PS fp16
     __half* Ks = Qs + PREFILL_BQ * PS;                    // BK * PS fp16
     float* S = reinterpret_cast<float*>(Ks + PREFILL_BK * PS);   // BQ * BK fp32
@@ -425,7 +437,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     // Q tile. Rows past `rows` are zero-filled and masked out below.
     for (int idx = tid; idx < PREFILL_BQ * HD; idx += nt) {
         const int i = idx / HD, d = idx % HD;
-        Qs[i * PS + d + (d >= HD / 2 ? 2 : 0)] = __float2half(
+        Qs[i * PS + d] = __float2half(
             (i < rows) ? q[((size_t)(t0 + i) * n_q_heads + h) * HD + d] : 0.0f);
     }
     if (tid < PREFILL_BQ) {
@@ -450,7 +462,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            Ks[j * PS + d + (d >= HD / 2 ? 2 : 0)] =
+            Ks[j * PS + d] =
                 (s <= win_max)
                     ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
                     : __float2half(0.0f);
@@ -511,29 +523,26 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
                 const int m0 = mt * 8;
                 const int r0 = m0 + gid;
                 const int r1 = r0 + 8;
-                const int krow = ntile * 8 + gid;   // K row (key) this lane holds
+                // ldmatrix address lanes. For x4 every lane names one 16-byte row
+                // segment: lanes 0-15 cover rows m0+0..15 at column 0, lanes 16-31
+                // the same rows at column 8, which lands the four resulting 8x8
+                // matrices in exactly the mma's a0..a3. For x2 only lanes 0-15 are
+                // read: rows n0+0..7 at columns 0 and 8, giving b0 and b1.
+                const int arow = m0 + ((lane < 16) ? lane : (lane - 16));
+                const int acol = (lane < 16) ? 0 : 8;
+                const int brow = ntile * 8 + (lane & 7);
+                const int bcol = ((lane & 8) != 0) ? 8 : 0;
                 float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 for (int kt = 0; kt < HD; kt += 16) {
-                    // The staged row is NOT a flat padded array. `PS = 2 * PADH`
-                    // with `PADH = HD / 2 + 2`, so the two halves of head_dim sit
-                    // at `sub * PADH` and element `d >= HD/2` is stored at
-                    // `d + 2`; slots 128 and 129 are never written. That layout
-                    // exists for the scalar kernel's `sub * PADH` addressing and
-                    // it is easy to read straight through: doing so for the upper
-                    // half reads two slots of UNINITIALISED shared memory into
-                    // every score, which is where the NaN outputs came from.
-                    // Because `kt` is a multiple of 16 and the halves split at
-                    // HD/2 == 128, the gap falls exactly on a k-step boundary --
-                    // the largest index in a k-step below the split is
-                    // 112 + 6 + 9 == 127 -- so one offset per k-step is exact.
-                    const int koff = (kt >= (HD >> 1)) ? 2 : 0;
                     unsigned a[4], b[2];
-                    a[0] = pk2(Qs[r0 * PS + kt + c + koff], Qs[r0 * PS + kt + c + 1 + koff]);
-                    a[1] = pk2(Qs[r1 * PS + kt + c + koff], Qs[r1 * PS + kt + c + 1 + koff]);
-                    a[2] = pk2(Qs[r0 * PS + kt + c + 8 + koff], Qs[r0 * PS + kt + c + 9 + koff]);
-                    a[3] = pk2(Qs[r1 * PS + kt + c + 8 + koff], Qs[r1 * PS + kt + c + 9 + koff]);
-                    b[0] = pk2(Ks[krow * PS + kt + c + koff], Ks[krow * PS + kt + c + 1 + koff]);
-                    b[1] = pk2(Ks[krow * PS + kt + c + 8 + koff], Ks[krow * PS + kt + c + 9 + koff]);
+                    asm volatile(
+                        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                        : "r"(smem_addr(&Qs[arow * PS + kt + acol])));
+                    asm volatile(
+                        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                        : "=r"(b[0]), "=r"(b[1])
+                        : "r"(smem_addr(&Ks[brow * PS + kt + bcol])));
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
