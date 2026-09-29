@@ -12104,3 +12104,73 @@ decode path, and on `GB10_MLP_EVENTS=1` for the prefill pricing.
 
 **Recorded because the evidence against this path was a test that measured the GEMV fallback, and
 because the opportunity is now the largest one in the objective.**
+
+## NVFP4 is a first-class cuBLASLt format here -- the exact recipe, from the header
+
+The previous entry found `CUDA_R_4F_E2M1` and the `A/B_SCALE_POINTER` attributes and read them as
+block-scale support. **Reading the header documentation shows those two attributes are something
+else, and that the real block-scale mechanism is separate:**
+
+```
+CUBLASLT_MATMUL_DESC_A_SCALE_POINTER = 17
+  "Device pointer to the scale factor *value* that converts data in matrix A to the
+   compute data type range. The scaling factor value must have the same type as the
+   compute type."
+```
+
+**That is a single per-tensor scalar** -- the same thing this codebase already calls `scale_host`
+for its fp8 path -- **not the per-16-element block scales NVFP4 needs.** Using it for NVFP4 would be
+wrong.
+
+**The real mechanism is a matrix-scale mode, and NVFP4 is one of its documented values:**
+
+```c
+// /usr/local/cuda/include/cublasLt.h:923
+typedef enum {
+  CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F   = 0,
+  /** Scaling factors are tensors that contain a dedicated scaling factor stored as
+   *  an 8-bit CUDA_R_8F_UE4M3 value for each 16-element block in the innermost
+   *  dimension of the corresponding data tensor. */
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3  = 1,   // <-- NVFP4
+  /** Same as above, except ... CUDA_R_8F_UE8M0 and the block size is 32 elements. */
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0  = 2,   // <-- MXFP4
+  CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3,
+  CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F   = 4,
+  CUBLASLT_MATMUL_MATRIX_SCALE_BLK128x128_32F = 5,
+} cublasLtMatmulMatrixScale_t;
+```
+
+**`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3 = 1` is exactly NVFP4**: a dedicated 8-bit `UE4M3` scale
+for each 16-element block along the innermost dimension. **That is the format these weights are
+already stored in**, and it is a first-class cuBLASLt mode on this part.
+
+### The complete recipe
+
+| piece | value |
+|---|---|
+| A/B data type | `CUDA_R_4F_E2M1` (33) |
+| A/B scale type | `CUDA_R_8F_UE4M3` |
+| matrix scale mode | `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` (1) |
+| compute type | `CUBLAS_COMPUTE_32F` (the accumulator stays fp32, as the reference requires) |
+| descriptor | `cublasLtMatmulDescCreate` + `SetAttribute` for the scale mode and the two scale pointers |
+| call | `cublasLtMatmul` via raw `sys` FFI -- `cublaslt/safe.rs` exposes only `new()` |
+
+**Note the accumulator requirement matches this codebase's own hard-won rule**: the reference applies
+the per-tensor `s2` to the **fp32 accumulator**, never folded into the weights, because folding it
+rounds every weight for no reason. `CUBLAS_COMPUTE_32F` is the right choice for the same reason.
+
+### What this changes
+
+**The MLP is 40.4% of the 32K prefill, it runs at ~52 TFLOP/s on a bf16 path, and the weights are
+NVFP4 -- a format cuBLASLt supports natively on this part.** The only thing standing between the
+objective and that ceiling is FFI plumbing and a layout match, not a hardware limitation and not an
+algorithm change.
+
+**Every earlier reason to believe FP4 was unavailable or slow has now been traced to a specific
+error:** the "4.5x slower" measurement was the GEMV fallback, and the two `*_SCALE_POINTER`
+attributes were read as block scales when they are per-tensor scalars. **Both were readings of real
+things, both attributed to the wrong cause.**
+
+**Concrete next action: write the isolated prototype** -- one `5120 x 17408` matrix, real weights,
+`CUDA_R_4F_E2M1` + `VEC16_UE4M3`, timed against the existing `cublas_gemm_bf16_f32` and checked for
+numerical agreement -- before any model change.
