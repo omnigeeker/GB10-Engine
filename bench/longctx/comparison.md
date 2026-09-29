@@ -12485,3 +12485,56 @@ this size needs the whole context of the person making it, and a subagent brief 
 
 **Lever 1 and Lever 2 together would make two of the four lengths wins and take 128K from 1.96x to
 ~1.36x.** That is the largest remaining step available, and it is fully specified above.
+
+## Why the tensor-core PV is hard: the accumulator layout, not the mma
+
+Read the actual code this round. The obstacle is **not** the `mma` instruction -- it is the
+**accumulator layout**, and this is what the two subagents were circling without naming.
+
+### The score product's layout (already tensor-core)
+
+```cuda
+const int mt = warp >> 1;        // 0 -> rows 0..15, 1 -> rows 8..23
+const int ntile = warp & 1;      // 0 -> keys 0..7,  1 -> keys 8..15
+const int m0 = mt * 8;
+float d[4] = {0,0,0,0};
+for (int kt = 0; kt < HD; kt += 16) {
+    ldmatrix.x4 ... Qs[arow * PS + kt + acol]     // A = Q,  [M=16][K=16]
+    ldmatrix.x2 ... Ks[brow * PS + kt + bcol]     // B = K,  [N=8][K=16]  (K contiguous)
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {d0..d3}, {a0..a3}, {b0,b1}, {d0..d3};
+}
+// d0/d1 are row r0, d2/d3 are row r1 -- the mma D layout, each lane owning 4 (row,col) pairs
+```
+
+`Ks` is stored `[key][dim]` = `[N][K]` with **K contiguous**, which is exactly the column-major B the
+`.col` qualifier wants -- **so the score product's B load is the *non*-transposed `ldmatrix`.**
+
+### What the PV needs, and the two real problems
+
+The PV is `acc[24][256] += P[24][16] . V[16][256]`.
+
+1. **The B operand needs a transposed load.** `Vs` is stored `[key][dim]` = `[K][N]` with **N
+   contiguous** -- the opposite of `Ks`. For `mma...row.col` the B operand must be K-contiguous, so
+   the PV's B load has to be `ldmatrix.sync.aligned.m8n8.x2.**trans**.shared.b16`. That is a
+   mechanical difference and easy to get wrong.
+2. **The accumulator layout is incompatible, and this is the real cost.** The kernel's `acc` is
+
+   ```cuda
+   float acc[PREFILL_BQ];      // 24 values
+   // ... thread `tid` owns output dim `tid` for ALL 24 rows
+   out[((size_t)(t0 + i) * n_q_heads + h) * HD + tid] = acc[i] / red[PREFILL_BQ + i];
+   ```
+
+   **Every thread owns one *column* of the output for all 24 rows.** The `mma` D layout is the
+   opposite: each lane owns four scattered `(row, col)` pairs across a 16x8 tile. **So moving the PV
+   to `mma` does not just replace 384 FMAs -- it changes who owns which output element, which forces
+   the online-softmax rescale (`acc[i] * c`), the normalisation, and the final store all to be
+   rewritten around the mma layout.**
+
+**That is a whole-kernel restructure, not a substitution** -- and it is why two subagents read this
+code and changed nothing. The measured 41.8% is real and the arithmetic is available, but the price
+is a rewrite of the kernel's output path, and that price was not visible from the pricing probe.
+
+**Recorded so the next attempt starts from the real obstacle instead of the mma instruction.** A
+workable route would be to give each warp a 16-row x 8-column output tile (8 warps x ... ) and write
+`acc` as `d[4]`-shaped fragments throughout, which is a rewrite of `acc`, the rescale, and the store.
