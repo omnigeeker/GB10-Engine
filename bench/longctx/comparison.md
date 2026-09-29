@@ -11249,3 +11249,52 @@ and it composes with the occupancy change.** With both, 32K would be ~1.19x / 1.
 pricing of a staging loop in this session that did not go through the correctness gate, and it is
 worth recording that the number came out at 30.9% when the extrapolation from K had suggested
 ~25%: the extrapolation was, if anything, conservative.**
+
+## Correction: the V transpose helps prefill and hurts decode -- they want opposite layouts
+
+The previous entry concluded that transposing V is the larger of the two remaining paths, priced at
+a measured 30.9% of the attention kernel. **That pricing is correct, but the change is not free, and
+the reason is that the two readers of the V cache want opposite layouts.**
+
+**Prefill** (the tiled kernel) reads V **column-per-thread**: thread `tid` needs dim `tid` for
+sixteen different keys, i.e. sixteen values 2048 bytes apart. That is why it is sixteen scalar
+loads, and why `[dim][key]` would make it two `uint4` loads.
+
+**Decode reads V row-per-key**, and the two patterns are exact opposites:
+
+```cuda
+// elementwise.cu:712, the decode attention's V read
+active ? __half2float(v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f
+```
+
+For a given key `s` and head `kh`, consecutive `d` are **contiguous** -- `head_dim = 256` halves,
+one coalesced row. **Under a transposed layout those 256 values are `max_seq` apart, so the same
+read becomes 256 separate transactions.** The change that turns prefill's 16 loads into 2 would turn
+decode's 1 coalesced row into 256 uncoalesced accesses.
+
+**So the transpose is a trade, not a win, and the trade is against the one number where gb10 is
+furthest ahead.** Warm TTFT is 0.03-0.05 s against llama.cpp's 0.23-0.27 s -- a 5-7x lead that
+comes from the decode path. **Spending that to buy prefill would be trading the objective's
+strongest result for its weakest.**
+
+**Three ways out, none free:**
+
+1. **Keep both layouts.** A transposed V copy alongside the natural one. The V cache is
+   `n_kv_heads * head_dim * max_seq * 2` bytes per layer = **537 MB per full-attention layer, 8.6 GB
+   across the 16 full-attention layers** at `max_seq = 262144`, so a second copy costs **+8.6 GB**.
+   Affordable on 121 GB of unified memory, but it is a real cost and it doubles the append traffic.
+2. **Transpose inside the decode kernel.** Stage the V tile through shared memory and transpose
+   there, which is standard flash-attention practice and is what the decode kernel most likely
+   already does for its K/V tiles. **This preserves decode's coalescing and keeps prefill's win**,
+   at the cost of touching the decode kernel.
+3. **Leave V alone and take the occupancy path instead** -- stream the Q or K tile, 22,944 B ->
+   10,016 B, 2 -> 3 blocks/SM, ~1.4x by the measured occupancy curve, which helps *both* prefill
+   and decode.
+
+**Option 2 is the one to check first**, because it is the only one that keeps both the 25% prefill
+win and the 5-7x warm-TTFT lead. **Option 3 is the safer one**, because it is orthogonal to the
+layout and the occupancy curve has already been measured directly.
+
+**Recording this because the previous entry's projection assumed the transpose was free on the
+decode side, and it is not.** The 30.9% figure stands; what changes is that the change must be
+scoped to include the decode kernel rather than treated as a prefill-only edit.
