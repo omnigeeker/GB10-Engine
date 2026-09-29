@@ -12538,3 +12538,34 @@ is a rewrite of the kernel's output path, and that price was not visible from th
 **Recorded so the next attempt starts from the real obstacle instead of the mma instruction.** A
 workable route would be to give each warp a 16-row x 8-column output tile (8 warps x ... ) and write
 `acc` as `d[4]`-shaped fragments throughout, which is a rewrite of `acc`, the rescale, and the store.
+
+## The softmax exp is 4.7% of the attention kernel -- real, but not the target
+
+Priced the same way as the others: replace `__expf` with the subtract it operates on, leaving every
+loop and every byte of memory traffic in place.
+
+```
+32K, __expf replaced by the subtract:  attn kernel 17,669 ms  (baseline 18,548 ms)  -4.7%
+```
+
+**So the whole softmax exponential is 4.7% of the kernel.** That is the last component priced, and it
+completes the picture:
+
+| component | share | status |
+|---|---|---|
+| **PV accumulation** | **41.8%** | needs an accumulator-layout rewrite (obstacle identified) |
+| V loads | 30.9% (before) | **staged, -18.9% landed** |
+| K staging | ~25% (before) | **vectorised, -25% landed** |
+| softmax `exp` | 4.7% | parallelisable, but only ~5% on the kernel |
+| mma score product | remainder | already tensor-core |
+
+**The softmax is worth ~4.7% and is paid by 24 threads out of 256 while the other 232 wait at the
+barrier** -- so there is a real, layout-safe optimisation there (spread the 384 exponentials over more
+threads with a `__shfl_xor_sync` reduction). **But ~5% of the attention kernel is ~1.8% of the 32K
+prefill, which is far too little to change the objective's outcome, and the session has already been
+burned by changes whose share was assumed rather than measured.**
+
+**So the accounting is complete and the conclusion is stable: the attention kernel is now made of
+two landed load optimisations, a 4.7% softmax, an already-tensor-core score product, and a 41.8% PV
+whose removal requires rewriting the kernel's output path.** There is no cheap remaining win in this
+kernel -- the cheap ones were taken, and the expensive one is genuinely expensive.
