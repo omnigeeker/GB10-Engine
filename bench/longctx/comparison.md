@@ -10579,3 +10579,51 @@ breaks a bank conflict that `ldmatrix` does not avoid by itself. **Reverted; `at
 of clearing it** (10,016 B with `PS` intact), which is what the plan already said -- but the
 justification is now the *measured* budget rather than an assumed one, and the margin is smaller
 and better understood.
+
+## The budget is pinned: B in [66,000, 66,400), so three blocks need only an 811-944 B cut
+
+Bisecting the declared-request probe against the discriminating shape (`start 24576, ntok 8192`):
+
+| declared request | time | blocks/SM |
+|---|---|---|
+| 22,944 B (actual) | 0.82 s | 2 |
+| 30,000 B | 0.83 s | 2 |
+| 32,000 B | 0.83 s | 2 |
+| **33,000 B** | **0.84 s** | **2** |
+| **33,200 B** | **1.08 s** | **1** |
+| 34,000 B | 1.10 s | 1 |
+| 40,000 B | 1.09 s | 1 |
+
+**The transition is between 33,000 and 33,200 B**, so `B in [66,000, 66,400)` and the per-block
+ceiling for three blocks is `B/3 in [22,000, 22,133)`.
+
+**Current shared memory is 22,944 B. The cut required is 811-944 B -- under 4%.** Every previous
+figure in this session was derived from a 51,200 B budget and was wrong by a factor of 1.3:
+
+| | this session assumed | measured |
+|---|---|---|
+| per-SM budget | 51,200 B | **66,000-66,400 B** |
+| 3-block per-block ceiling | 17,066 B | **22,000-22,133 B** |
+| required cut from 22,944 B | 5,878 B (26%) | **811-944 B (3.5-4.1%)** |
+
+### What can supply 811-944 B
+
+| component | bytes | can it shrink? |
+|---|---|---|
+| Q tile (24 x 264 fp16) | 12,672 | no -- 24 rows are all read by the two m-tiles |
+| K tile (16 x 264 fp16) | 8,448 | no -- 16 rows are all read by `ldmatrix` |
+| S (24 x 16 fp32) | 1,536 | **768 B if stored fp16** |
+| red (3 x 24 fp32) | 288 | 144 B if fp16; `c` must stay in shared because `acc` is distributed across threads |
+| **stride padding (24+16) x 8 halves** | **640** | **no -- measured load-bearing, 3.6x slower without it** |
+
+**`S` in fp16 alone gives 768 B, which lands at 22,176 B -- inside the ceiling only if `B >= 66,528`.
+`S` fp16 plus `red` fp16 gives 912 B, landing at 22,032 B, which clears it if `B >= 66,096`.** Both
+are knife-edge against a budget known only to +/-400 B, and `S` holds softmax logits whose fp16
+rounding is exactly the kind of change the `attn-tile` gate exists to catch (its tolerance is
+1.5e-5 rms relative).
+
+**So the honest reading is that the cheap cut is *nearly* available but not provably so, and the
+guaranteed one is still removing the Q tile** (10,016 B, six blocks by shared memory, three by
+registers). **What has changed is that the cheap path is now within 811-944 B instead of 5,878 B,
+and the next round can settle it by testing the fp16-`S` variant directly** -- `attn-tile` decides
+correctness and the `start 24576, ntok 8192` row decides occupancy, in one command.
