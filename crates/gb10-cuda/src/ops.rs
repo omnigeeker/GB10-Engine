@@ -1850,6 +1850,27 @@ impl Ops {
                     })?;
             }
         }
+        // Report what the *runtime* actually allocated. The build compiles to PTX
+        // and the driver JITs it at load, so `ptxas -v`'s register count is not
+        // what runs -- and this session has twice drawn the wrong occupancy
+        // conclusion from a proxy (once from the smem formula, once from ptxas).
+        // `GB10_ATTN_OCCUPANCY=1` prints the real numbers, plus the block count
+        // `cuOccupancyMaxActiveBlocksPerMultiprocessor` derives from them.
+        if std::env::var("GB10_ATTN_OCCUPANCY").is_ok() {
+            use cudarc::driver::sys::CUfunction_attribute_enum as A;
+            let f = &self.attn_prefill_tiled;
+            let regs = f.get_attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS).unwrap_or(-1);
+            let ssb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(-1);
+            let mtb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK).unwrap_or(-1);
+            let by_regs = if regs > 0 { 65536 / (regs * 256) } else { -1 };
+            let by_smem = if ssb >= 0 { 102400 / (ssb + smem as i32) } else { -1 };
+            println!(
+                "[occ] attn_prefill_tiled: regs {regs}  static_smem {ssb} B  \
+                 dynamic_smem {smem} B  maxThreads {mtb}  \
+                 -> by_regs {by_regs}  by_smem {by_smem}  binding {}",
+                if by_regs < by_smem { "REGS" } else { "SMEM" }
+            );
+        }
         let (t, nq, nk, hd) =
             (n_tokens as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
         let (st, kb) = (start as i32, kv_base as i32);

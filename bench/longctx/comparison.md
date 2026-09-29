@@ -11605,3 +11605,53 @@ what runs; the runtime reports 96. Any future register reasoning must use the ru
 **This is the fifth path closed by measurement, and the second where the session's own recorded
 conclusion contradicted its own instrument.** The durable lesson is the one already written down:
 read the instrument, and check which constraint it is actually measuring.
+
+## The kernel is ALREADY at 3 blocks/SM -- the occupancy premise was wrong all along
+
+Added a runtime occupancy report to `ops.rs`, gated on `GB10_ATTN_OCCUPANCY=1`. It reads what the
+driver actually allocated after JIT, rather than a formula or a `ptxas -v` line:
+
+```rust
+let regs = f.get_attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS).unwrap_or(-1);
+let ssb  = f.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(-1);
+let mtb  = f.get_attribute(A::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK).unwrap_or(-1);
+let by_regs = 65536 / (regs * 256);
+let by_smem = 102400 / (ssb + smem as i32);
+```
+
+```
+[occ] attn_prefill_tiled: regs 80  static_smem 0 B  dynamic_smem 22944 B
+      maxThreads 768  -> by_regs 3  by_smem 4  binding REGS
+```
+
+**The kernel is already at 3 blocks per SM.** Three consequences, all of which rewrite the plan:
+
+1. **"smem is binding, 2 blocks/SM" was wrong.** `by_smem` is **4** -- 22,944 B of dynamic shared
+   memory permits four blocks. Every "cut 811-944 B to reach 3 blocks" calculation in this session,
+   including the whole `PS`-padding and `red`-in-registers line of reasoning, **was solving a problem
+   that did not exist.**
+2. **The earlier probe's "96 regs -> 2 blocks" was also wrong.** The runtime reports **80 registers**,
+   which gives `65536 / (80 * 256) = 3.2 -> 3 blocks`. The 96 figure must have come from a different
+   build or a stale measurement.
+3. **This explains why `__launch_bounds__(256, 3)` changed nothing.** It was already at three blocks,
+   so the hint was a no-op -- not a spill problem, just nothing to fix. Same for
+   `-maxrregcount=80 -> 0%`.
+
+**`maxThreads 768` independently confirms it: 768 = 3 x 256.**
+
+### What this means for the objective
+
+**The concurrency lever is already fully pulled.** The one solid occupancy measurement stands -- the
+ablation probe's 2 -> 1 transition costs 2.36x, so concurrency matters -- but the kernel is at 3 of a
+possible 4 blocks, and 4 would need `regs <= 64`, which is a 20% register cut on a kernel that
+already spills nothing.
+
+**So the remaining cost is the per-iteration latency itself, not the number of concurrent blocks.**
+That is consistent with every failed attempt in this session: the K staging vectorisation worked
+because it removed instructions *inside* the iteration; the occupancy work all failed because there
+was no occupancy left to win. **The closed form is `(t x keys / 384)` iterations at ~850 ns, and the
+only remaining levers are fewer iterations or a shorter iteration.**
+
+**This is the most consequential correction of the session: an entire branch of work -- Q streaming,
+K streaming, m-tile serialisation, smem cuts, the carveout -- was aimed at an occupancy gain that was
+already banked.**
