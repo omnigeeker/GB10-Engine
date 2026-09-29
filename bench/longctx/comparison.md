@@ -6783,38 +6783,119 @@ Re-run with the recorded configuration, reproduced exactly from `bench/ppl/engin
 **So on the standard precision metric the engine is normal: it matches its own recorded value to
 within 0.003%, beats llama.cpp on the same weights, and sits the expected distance from BF16.**
 
-## 2. Long-context needle: NOT reproducible, on gb10 AND on llama.cpp -- flagged, not attributed
+## 2. Long-context needle: RESOLVED and CERTIFIED -- engine regression found, fixed, and gated
 
-`bench/longctx/run_validation.sh` records 3/3 at 32K, 1/1 at 128K and 1/1 at 256K
-(`bench/longctx/results-32k-128k-256k.log`, round 251, 09-27 13:43). **Re-running the identical 32K
-leg today gives 0/3 on gb10**, so this was investigated rather than reported as a regression -- and
-the investigation does not implicate the engine:
+**Certified today, one session, one harness, both engines, same prompts:**
 
-| test | result | what it rules out |
+| engine | prompt tokens | depths 10/50/90% | secs |
+|---|---|---|---|
+| gb10-engine (fixed) | 34,779 | **3/3 PASS** | 306.2 / 308.8 / 308.9 |
+| llama.cpp (control) | 34,819 | **3/3 PASS** | 71.2 / 71.0 / 67.1 |
+
+Long-context retrieval is certified. The engine was broken, the break was real,
+and llama.cpp never failed.
+
+### This section previously said the opposite, and how it was wrong is the useful part
+
+It read:
+
+> **the same prompts on llama.cpp** | **0/3**, empty content | **the engine**
+>
+> ... **which is the control that takes the engine out of the frame.**
+>
+> **long-context retrieval is not currently certified by this harness, in either
+> direction.**
+
+Two independent errors, both of which pointed the same wrong way.
+
+**Error 1 -- the control was harness-broken.** llama.cpp answers in
+`reasoning_content`; `needle.py` read only `content`, which is empty for
+llama.cpp, so every leg scored a miss no matter how well the model did. The
+"0/3 on llama.cpp" was a field-name bug in the probe. Reading the right field,
+llama.cpp passes 3/3. **A control that fails is a reason to suspect the
+harness, not to exonerate the subject** -- and here it was used to do exactly the
+opposite.
+
+There is a second trap in the same place: llama.cpp *thinks* before answering
+even with `enable_thinking: false`, so a 24-token budget truncates it mid-thought
+(`'The user provided a very'`) and scores a miss for a model that is retrieving
+perfectly. The budget has to be large enough for the thought to finish; 1024
+works. Both traps are now handled and documented in `needle.py`.
+
+**Error 2 -- the symptom was read as evidence of innocence.** The original table:
+
+| test | result | what it was read as ruling out |
 |---|---|---|
-| 32K leg (reps 1054, depths 0.1/0.5/0.9), gb10 | **0/3**, `' 10000000000000000000000'` | -- |
-| **the same prompts on llama.cpp** | **0/3**, empty content | **the engine** |
+| 32K leg (reps 1054, depths 0.1/0.5/0.9), gb10 | 0/3, `' 10000000000000000000000'` | -- |
 | reps 20 / 100 / 200 / 400 / 800 / 1054 | PASS / MISS / MISS / PASS / PASS / MISS | a monotone precision loss |
-| `temperature: 0` vs default | **identical** | sampling |
-| `--no-prefix-cache` | **identical** | the prefix cache |
+| `temperature: 0` vs default | identical | sampling |
+| `--no-prefix-cache` | identical | the prefix cache |
 | `PREFILL_CHUNK = 2048` vs `8192` | both fail | this session's chunk change |
 | `enable_thinking` omitted / false / true | all `completion_tokens: 0` | the thinking switch |
 
-**The failures are deterministic (`finish_reason: stop`, `completion_tokens: 0`, i.e. the model emits
-EOS as its first token), erratic in length rather than monotone, and identical on llama.cpp.** A
-monotone precision loss is what a KV-precision regression would look like, and this is not that.
-The fp16 KV cache did land on 09-28 (rounds 346-353) *after* the last passing needle run, so it
-remained the leading suspect until llama.cpp failed the same prompts -- **which is the control that
-takes the engine out of the frame.**
+Every one of those results is real and every one is **equally consistent with the
+actual cause**: a single flipped greedy argmax at the first generated position,
+which is deterministic, non-monotone in length, sampling-independent,
+cache-independent, chunk-independent and thinking-independent. "Erratic in length
+rather than monotone, therefore not a precision regression" was the load-bearing
+inference, and it does not hold: 8 mantissa bits of operand precision flips an
+argmax wherever the model happens to be near a tie, and that is erratic in
+length by construction.
 
-**What this means, stated plainly:** the engine's precision on the standard metric is normal, but
-**long-context retrieval is not currently certified by this harness, in either direction.** The
-needle result should not be cited as passing, and should not be read as an engine regression, until
-the harness produces non-degenerate output on a known-good implementation. **That is an open issue,
-not a conclusion.**
+### What it actually was
 
-**One real bug was found and fixed while investigating:** `needle.py:23` had `CHUNK = 2048` as a
-hardcoded mirror of the server's `PREFILL_CHUNK`, which is now 8192, so its `chunks` column
-understated the number of passes through the chunked prefill path by 4x. It is a reporting constant
-only -- nothing functional depended on it -- but it described the very path under test, so it is
-corrected to 8192 with a comment pointing at `crates/gb10-server/src/main.rs`.
+`git bisect run` between `1358b7c` (round 251, the passing run) and `aa91bb7`
+isolated **`336d91d` (round 282)**: `crates/gb10-model/src/weights.rs` only,
+flipping the bf16 tensor-core prefill GEMM from opt-in to on-by-default. Same
+binary, one environment variable: `GB10_TC_GEMM=1` -> 0/5 on a fixed long-prompt
+battery, `GB10_TC_GEMM=0` -> 5/5.
+
+bf16 has 8 mantissa bits. Beyond ~970 prompt tokens the perturbation flipped the
+first generated token to EOS and the engine answered nothing. Fixing the GEMM's
+output rounding, and then moving *both* operands to fp16 (10 bits), each still
+failed, so this is not a rounding detail to tune -- it needs more than 10 bits,
+and the fp32 prefill GEMM is the default again. Full record:
+`bench/longctx/TC_GEMM_REGRESSION.md`.
+
+### Why no gate caught it for 126 rounds
+
+`generate` against the frozen oracle passes 16/16 (its prompt is 59 tokens),
+`batch-parity` passes 16/16, and perplexity at a 512-token window moves 0.023%
+(mean NLL 1.875052 -> 1.875490). `attn-tile`, `decode-bench`, the prefix A/B and
+the stream bench are untouched by it. **A 0.023% perplexity move and a
+short-prompt token match are not evidence that a change is numerically safe.**
+`loop/run_round.sh` now runs `longctx-follow`
+(`bench/longctx/longctx_gate.sh`): a 994-token prompt through the real chat
+template, asserting only that the model generates something. Validated both
+ways -- exit 0 on the fixed default, exit 1 (immediate EOS) with
+`GB10_TC_GEMM=1`.
+
+### Cost, stated honestly
+
+The 2.48x the tensor-core GEMM bought was bought with the numerical error that
+caused all of this, so it has been given back. At the 32K class the engine is now
+~307 s against llama.cpp's ~70 s (~4.4x), where the scorecard recorded 1.80x
+while the broken GEMM was in place. **Recovering cold TTFT needs a lever that
+does not change the numerics** -- the `mma.sync` prefill attention, which keeps
+fp32 accumulation. Prefill attention is separately gated by `attn-tile`.
+
+### One real bug found along the way
+
+`needle.py:23` had `CHUNK = 2048` as a hardcoded mirror of the server's
+`PREFILL_CHUNK`, which is now 8192, so its `chunks` column understated the number
+of passes through the chunked prefill path by 4x. Reporting constant only --
+nothing functional depended on it -- but it described the very path under test,
+so it is corrected to 8192 with a comment pointing at
+`crates/gb10-server/src/main.rs`. `needle.py` also now takes `NEEDLE_URL` so both
+engines can be driven by one harness, which is what makes the control row above
+meaningful.
+
+### Also still open
+
+The **fp32 path is itself not deterministic**: `generate --repeat 8` failed 1 of
+7 repeats once (a run emitting a reasoning preamble where the others answered
+directly) and passed 7/7 on the next attempt. Pre-existing -- the fp32 path was
+not touched by the fix -- but real, and consistent with the near-tie reading
+above. `GB10_KSPLIT 2` (split-K atomic accumulation) is the first suspect. Not
+yet investigated.
+

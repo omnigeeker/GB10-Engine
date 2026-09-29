@@ -84,32 +84,55 @@ pass cannot be carried by recency alone.
 
 | prompt | leg | result |
 |---|---|---|
-| 32 K (32,733 tok, 16 chunks) | depths 10% / 50% / 90% | **3/3 PASS** — 815.8 / 816.6 / 819.3 s |
-| 128 K (130,693 tok, 64 chunks) | depth 50% | **PASS** — 10,784.7 s (3.00 h) |
-| 256 K (261,358 tok, 128 chunks) | depth 50% | **PASS** — 41,821.6 s (11.62 h) |
+| **34,779 tok (32 K class)** | depths 10% / 50% / 90% | **3/3 PASS** — 306.2 / 308.8 / 308.9 s |
+| **34,819 tok, llama.cpp control** | depths 10% / 50% / 90% | **3/3 PASS** — 71.2 / 71.0 / 67.1 s |
+| 32 K (32,733 tok, 16 chunks) | depths 10% / 50% / 90% | PASS 3/3 — 815.8 / 816.6 / 819.3 s (historical) |
+| 128 K (130,693 tok, 64 chunks) | depth 50% | PASS — 10,784.7 s (historical) |
+| 256 K (261,358 tok, 128 chunks) | depth 50% | PASS — 41,821.6 s (historical) |
 
-All five requests recovered the needle exactly. The full transcript is committed
-as `bench/longctx/results-32k-128k-256k.log`. Each leg ran against its own
-server, sized just past that leg's prompt, and the unit exited clean with no
-error text in either the results or the server log.
+The top two rows are one session, one harness, both engines, same prompts. That
+is what certifies long-context retrieval today. The full transcript of the
+original 32K/128K/256K run is committed as
+`bench/longctx/results-32k-128k-256k.log`.
 
-> **These numbers are historical, and two things about them have changed.**
+> **History: this section previously said the 32K leg did not reproduce "on
+> gb10-engine *or* llama.cpp", and concluded that because llama.cpp failed the
+> same prompts, the engine was not implicated. Both halves of that were wrong,
+> and the way they were wrong is worth keeping.**
 >
-> **The timings are ~7x better now.** Since this run the prefill path was optimized (tiled attention
-> made unconditional, the DeltaNet chunk kernel, and `PREFILL_CHUNK` 2048 -> 8192), taking cold TTFT
-> to **10.35 s at 8K, 80.0 s at 32K, 890.5 s at 128K and 3295.5 s at 256K**, all gated by the
-> `chunked-prefill` correctness check. The `chunks` column above reflects the old 2048-token chunk;
-> at 8192 the same 32K prompt is 4 chunks.
+> **The engine was implicated.** The failure was a real regression in the
+> committed default: the tensor-core prefill GEMM (default-on since round 282,
+> commit `336d91d`) computed its operands in bf16, and 8 mantissa bits is not
+> enough for this model. Past roughly 970 prompt tokens the reduced precision
+> flipped one greedy argmax at the first generated position to EOS, so the engine
+> answered nothing at all — deterministic `completion_tokens: 0`, erratic in
+> *length* rather than monotone, identical under every `temperature` /
+> `--no-prefix-cache` / `PREFILL_CHUNK` / `enable_thinking` setting. Every one of
+> those observations was read as evidence of *not a regression*, and every one of
+> them was equally consistent with "one flipped argmax at long context". It was
+> found by `git bisect run`, and it is fixed: the fp32 prefill GEMM is the
+> default again, and `loop/run_round.sh` now runs a long-prompt gate
+> (`longctx-follow`) so it cannot come back silently. Full record in
+> `bench/longctx/TC_GEMM_REGRESSION.md`.
 >
-> **The 32K leg does not currently reproduce, on gb10-engine *or* llama.cpp.** Re-running the
-> identical leg gives **0/3 on both**, with deterministic `completion_tokens: 0` (EOS as the first
-> token), and the failures are erratic in prompt *length* rather than monotone — which is not the
-> shape of a KV-precision regression. It was isolated: identical with `temperature: 0`, with
-> `--no-prefix-cache`, with `PREFILL_CHUNK` 2048 *and* 8192, and with `enable_thinking`
-> omitted/false/true. **Because llama.cpp fails the same prompts, the engine is not implicated, and
-> long-context retrieval is neither certified nor refuted here today.** Full write-up in
-> `bench/longctx/comparison.md`; the precision metrics that *are* certified (perplexity, MMLU) are in
-> the README.
+> **llama.cpp never failed.** It answers these prompts in `reasoning_content`
+> rather than `content`, and `needle.py` read only `content`, so every llama.cpp
+> leg scored as a miss. It also needs a token budget larger than 24: it thinks
+> before answering, and 24 tokens truncates it mid-thought (`'The user provided a
+> very'`). With `reasoning_content` read and a 1024-token budget it passes 3/3,
+> as the control row above shows. A harness that reads the wrong field will
+> convict an innocent engine — and a control that fails is a reason to doubt the
+> harness, not a reason to exonerate the subject.
+
+The timings above are slower than the pre-regression scorecard at the same
+length, and that is expected: the 2.48x the tensor-core GEMM bought was bought
+with the numerical error that caused this whole failure, so it was given back.
+Cold TTFT at the 32 K class is currently ~307 s against llama.cpp's ~70 s (~4.4x)
+— the honest post-fix baseline, and much worse than the 1.80x the scorecard
+recorded while the broken GEMM was in place. Recovering it needs a lever that
+does not change the numerics (see the `mma.sync` prefill-attention plan in
+`bench/longctx/comparison.md`).
+
 
 Two operational traps cost real time here, both invisible from the code.
 

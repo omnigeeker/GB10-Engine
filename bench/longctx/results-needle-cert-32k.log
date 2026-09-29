@@ -1,0 +1,50 @@
+Long-context needle certification -- gb10-engine vs llama.cpp, one session, one harness.
+Both engines run non-streaming, greedy, enable_thinking=false, same prompts, same depths.
+
+HARNESS NOTES (both were bugs that previously produced a false "both engines fail")
+  * the answer is read from `content` OR `reasoning_content`. llama.cpp answers in
+    `reasoning_content` and leaves `content` empty; reading only `content` scored
+    llama.cpp as missing every leg.
+  * the token budget must cover llama.cpp's reasoning preamble. At max_tokens=24 it
+    truncates mid-thought ('The user provided a very') and scores a miss for a model
+    that is retrieving correctly. The gb10 rows below use 24; the llama.cpp rows 1024.
+  * NEEDLE_URL selects the server, so one harness drives both. gb10 on 8080, llama.cpp 8899.
+
+================================================================================
+gb10-engine, fixed default (fp32 prefill GEMM; GB10_TC_GEMM off), --ctx 36864
+haystack: repeated filler, needle at 10% / 50% / 90%
+================================================================================
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 1120    0.1    34779       5    306.2       9  PASS '74921'
+ 1120    0.5    34779       5    308.8       9  PASS '74921'
+ 1120    0.9    34779       5    308.9       9  PASS '74921'
+
+3/3 passed
+
+================================================================================
+llama.cpp control, same prompts, same harness (NEEDLE_MAX_TOKENS=1024)
+================================================================================
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 1120    0.1    34819       5     71.2       2  PASS '74921'
+ 1120    0.5    34819       5     71.0       2  PASS '74921'
+ 1120    0.9    34819       5     67.1       2  PASS '74921'
+
+3/3 passed
+
+================================================================================
+CONTROL THAT WAS WRONG: the same llama.cpp leg at max_tokens=24 (uncorrected harness)
+================================================================================
+ 1120    0.1    34819       5     60.9       2  MISS 'The user provided a very'
+ 1120    0.5    34819       5     61.4       2  MISS 'We need answer just the '
+ 1120    0.9    34819       5     61.6       2  MISS 'The user provided a very'
+
+0/3 passed
+
+The three MISS rows above are not a llama.cpp retrieval failure. The model is
+retrieving correctly and reasoning towards the answer; it simply has not said the
+number yet within 24 tokens. This is the exact shape of the mistake that produced
+the earlier false "llama.cpp fails identically, so the engine is exonerated"
+conclusion: a harness limit read as a model failure.
+
+Note the prompt-token difference: gb10 34,779 vs llama.cpp 34,819 (40 tokens), the
+chat template's thinking block.

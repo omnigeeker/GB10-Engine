@@ -127,3 +127,28 @@ not touched by any of these changes — but it is a real reproducibility bug and
 it is consistent with the near-tie diagnosis above. `GB10_KSPLIT 2` (split-K)
 is the obvious first suspect, since an atomic accumulation order would explain
 run-to-run variation exactly like this. Not yet investigated.
+
+## Certification (the point of the fix)
+
+One session, one harness, both engines, same prompts, after the fix:
+
+| engine | prompt tokens | depths 10/50/90% | secs |
+|---|---|---|---|
+| gb10-engine (fixed) | 34,779 | **3/3 PASS** | 306.2 / 308.8 / 308.9 |
+| llama.cpp (control) | 34,819 | **3/3 PASS** | 71.2 / 71.0 / 67.1 |
+
+Transcript: `bench/longctx/results-needle-cert-32k.log`.
+
+The control leg only passes once the harness is fixed. llama.cpp answers in
+`reasoning_content` (the probe read only `content`, which is empty for llama.cpp)
+and it needs a budget above 24 tokens, because it reasons before answering and 24
+truncates it mid-thought. Both were wrong in the original harness, which is why
+the control appeared to fail and why the engine was declared exonerated. A control
+that fails is a reason to doubt the harness, not the subject.
+
+## Cost
+
+The 2.48x was bought with this bug, so it is gone: the 32 K class is ~307 s
+against llama.cpp's ~70 s (~4.4x), where the scorecard recorded 1.80x with the
+broken GEMM in place. The lever that can get it back without changing the
+numerics is the `mma.sync` prefill attention, which keeps fp32 accumulation.
