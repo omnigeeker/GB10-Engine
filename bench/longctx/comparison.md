@@ -8598,3 +8598,48 @@ dequantisation, activation casting and epilogue work wrapped around GEMMs that a
 are now measured, and all three can be checked the same way this session has learned to check
 things: `tc-phase` for the pipeline, `prefill-shape` for the phase split, and a same-session
 gb10-vs-llama.cpp TTFT pair for the end-to-end claim.
+
+## The weight cache was implemented, measured, and rejected -- it is a cold-TTFT regression
+
+The largest single target identified by the new attribution was the MLP pipeline overhead, and its
+largest named component was `dequant_nvfp4_to_bf16` at 13.8% of the bench's pipeline. The fix was
+implemented: an opt-in (`GB10_WEIGHT_CACHE=1`) per-`Linear` cache of the dequantised bf16 weight,
+swapped into the GEMM operand for the duration of the call and swapped back afterwards, so the
+dequantisation and the staging copy happen once instead of once per call. It builds, and the
+correctness gate passes with it on (`attn-tile: OK`).
+
+It is slower. Same binary, same shapes, alternating:
+
+| | chunk 0 | chunk 1 | total |
+|---|---|---|---|
+| cache OFF | 12.34 s | 16.07 s | 28.41 s |
+| cache ON | **14.05 s** | **15.72 s** | 29.77 s |
+
+**Steady state it is 2.2% faster** -- chunk 1, after the cache is warm, goes from 16.07 s to
+15.72 s. **But the first chunk is 14% slower**, 12.34 s to 14.05 s, because the cache has to be
+filled: up to ~34 GB of dequantised bf16 weights allocated and written during the measured window.
+
+**The objective is about cold TTFT -- the first prefill.** On that metric this change is a
+regression of 1.71 s, and it is the only metric the objective names. **Reverted.**
+
+**Two things it establishes, and they matter more than the change itself:**
+
+1. **The bench overstates the dequantisation share by about 6x.** `tc-phase` says dequant is 13.8%
+   of the pipeline; the real prefill improves by 2.2% when it is removed entirely. The bench's
+   pipeline is a synthetic reconstruction of one GEMM at `t = 2048`; it is not the model, and this
+   is the second time in three rounds that reading its stages as the model's stages produced a wrong
+   conclusion.
+2. **The 1.70 s MLP pipeline overhead is not one removable thing.** Its largest *named* component,
+   removed completely, is worth 0.27 s at 8K -- not 1.70 s. Whatever the rest of that overhead is,
+   it is not the dequantisation, and it is not something a cache addresses.
+
+**This is the seventh intervention in this session that removed work and made the prefill slower.**
+The first six were on the attention kernel; this one was on the MLP path, and it reproduces the same
+pattern on completely different code. That is now strong evidence that the pattern is not about the
+attention kernel at all -- it is about **what the measured quantity responds to**, and every
+intervention so far has been a change to the schedule whose runtime effect could not be predicted
+from the work removed.
+
+**What survives:** the dequantisation is real and is recomputed per call, and a cache of it is real
+and does help in steady state. It is simply not worth 1.71 s of cold start and 34 GB, and it is not
+the 8K win.
