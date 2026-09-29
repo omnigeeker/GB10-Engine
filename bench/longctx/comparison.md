@@ -11767,3 +11767,59 @@ stages it.
 **Both bugs were caught by `attn-tile` before any performance number was believed.** This is the
 second-largest single change of the session after the K staging, and the first one that the corrected
 occupancy model directly enabled.
+
+## End-to-end after the V staging: 8K 0.925x, 32K 1.214x
+
+Same-session pairs, both servers started and measured sequentially, `bench/longctx/ttft.py`, 2 trials
+each, greedy, `max-tokens 128`.
+
+### 8K (`--reps 229`)
+
+```
+# gb10-8K   trial 0  cold 8.72  warm 0.03  otps 8.95
+            trial 1  cold 8.69  warm 0.03  otps 9.07
+# llama-8K  trial 0  cold 9.06  warm 0.23  otps 7.33
+            trial 1  cold 9.40  warm 0.22  otps 7.21
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| trial 0 | **8.72 s** | 9.06 s | **0.963x** |
+| trial 1 | **8.69 s** | 9.40 s | **0.925x** |
+| OTPS | 8.95-9.07 | 7.21-7.33 | **1.24x** |
+| warm TTFT | **0.03 s** | 0.22-0.23 s | **7.3x** |
+
+**8K progression across the session: `1.22x -> 1.10x -> 1.001x -> 0.948-0.985x -> 0.925-0.963x`.**
+gb10 wins cold TTFT on both trials, by a wider margin than before.
+
+### 32K (`--reps 1049`)
+
+```
+# gb10-32K   trial 0  cold 53.99  warm 0.05  otps 7.82
+             trial 1  cold 54.08  warm 0.05  otps 7.81
+# llama-32K  trial 0  cold 43.25  warm 0.27  otps 6.66
+             trial 1  cold 44.56  warm 0.27  otps 6.84
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| trial 0 | **53.99 s** | 43.25 s | **1.248x** |
+| trial 1 | **54.08 s** | 44.56 s | **1.214x** |
+| OTPS | 7.81-7.82 | 6.66-6.84 | **gb10 wins 1.17x** |
+| warm TTFT | **0.05 s** | 0.27 s | **5.4x** |
+
+**32K progression: `1.80x -> 1.59x -> 1.48x -> 1.289-1.325x -> 1.214-1.248x`**, which is the ~1.22x
+the kernel measurement predicted.
+
+### All four lengths
+
+| length | gb10 | llama.cpp | ratio | session start |
+|---|---|---|---|---|
+| **8K** | **8.69-8.72 s** | 9.06-9.40 s | **0.925-0.963x -- gb10 wins** | 1.22x |
+| 32K | 53.99-54.08 s | 43.25-44.56 s | 1.214-1.248x | 1.80x |
+| 128K | (not yet re-measured after V staging) | 290.63 s | ~1.50x projected | 4.21x |
+| 256K | (not yet re-measured after V staging) | 582.55 s | ~2.4x projected | 4.54x |
+
+**Two more fixes landed this round and last, both from the corrected occupancy model:**
+`__launch_bounds__(256, 4)` was tested and rejected (1%), and **the V staging tile was accepted at
+-18.9% of the attention kernel.**
