@@ -549,11 +549,36 @@ fn attn_tile(args: &Args) -> Result<bool> {
         let mut max_abs = 0f32;
         let mut rms_ref = 0f64;
         let mut rms_diff = 0f64;
+        // Diagnostics for when a NaN makes `rel` useless: which side is NaN, and
+        // where the first real disagreement is. Without these a NaN rms says
+        // only "something is wrong" and the search starts from nothing.
+        let mut nan_a = 0usize;
+        let mut nan_b = 0usize;
+        let mut first_diff: Option<(usize, usize, usize, usize, f32, f32)> = None;
         for i in 0..av.len() {
+            if av[i].is_nan() {
+                nan_a += 1;
+            }
+            if bv[i].is_nan() {
+                nan_b += 1;
+            }
             let d = (av[i] - bv[i]).abs();
+            if d > 1e-4 && first_diff.is_none() {
+                // (flat, tok, head, dim) of the first disagreement worth naming
+                let dim = i % hd;
+                let head = (i / hd) % nh;
+                let tok = i / (hd * nh);
+                first_diff = Some((i, tok, head, dim, av[i], bv[i]));
+            }
             max_abs = max_abs.max(d);
             rms_ref += (av[i] as f64) * (av[i] as f64);
             rms_diff += (d as f64) * (d as f64);
+        }
+        if nan_a > 0 || nan_b > 0 {
+            println!("    nan: legacy {nan_a}, tiled {nan_b} (of {})", av.len());
+        }
+        if let Some((i, tok, head, dim, ra, rb)) = first_diff {
+            println!("    first diff at flat {i} (tok {tok} head {head} dim {dim}): legacy {ra:.6e} tiled {rb:.6e}");
         }
         let rms_ref = (rms_ref / av.len() as f64).sqrt();
         let rms_diff = (rms_diff / av.len() as f64).sqrt();

@@ -255,6 +255,13 @@ extern "C" __global__ void gated_delta_rule_step_kernel(
 // fine for the correctness fixtures but will be replaced by a tiled
 // flash-attention kernel for real prefill throughput (M6).
 // ---------------------------------------------------------------------------
+// Pack two fp16 values into one .b32 for an mma fragment, low half first.
+// The order matters and is not symmetric: verified against a CPU reference
+// before use (bench/longctx/comparison.md, "mma-layout").
+__device__ __forceinline__ unsigned pk2(__half lo, __half hi) {
+    return (unsigned)__half_as_ushort(lo) | ((unsigned)__half_as_ushort(hi) << 16);
+}
+
 extern "C" __global__ void attn_prefill_kernel(
     const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
@@ -455,66 +462,91 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         }
         __syncthreads();
 
-        // S[i][j] = Qs[i] . Ks[j] * scale. BQ*BK pairs over `nt` threads: two
-        // threads per pair, each covering half of head_dim, combined with a
-        // lane-adjacent shuffle.
+        // ---- score: S[BQ][BK] = Q . K^T * scale, on tensor cores ----------
         //
-        // A thread-pair owns three pairs, and they share a K row. Adding
-        // `nt >> 1` to the pair index advances `i` by `(nt >> 1) / PREFILL_BK`
-        // and leaves `j` alone because PREFILL_BK divides `nt >> 1`; with
-        // nt == 256, PREFILL_BK == 16 and PREFILL_BQ == 24 the three are
-        // (i0, j), (i0 + 8, j), (i0 + 16, j). Holding the K value in a register
-        // across the three makes the inner loop four shared reads per three fma
-        // instead of six, and the score loop is ~80% of the per-tile cycles
-        // (3072 of ~3840, at 32 floats/cycle/SM): this is the 1.5x.
-        // `attn_prefill_tiled` on the host refuses any launch where
-        // PREFILL_BQ * PREFILL_BK != 3 * (nt >> 1).
-        const int half = HD / 2;
-        const int sub = tid & 1;
-        const int q = tid >> 1;
-        const int j = q % PREFILL_BK;
-        const int i0 = q / PREFILL_BK;
-        const int step = (nt >> 1) / PREFILL_BK;
-        const __half* krow = Ks + j * PS + sub * PADH;
-        const __half* qr0 = Qs + i0 * PS + sub * PADH;
-        const __half* qr1 = Qs + (i0 + step) * PS + sub * PADH;
-        const __half* qr2 = Qs + (i0 + 2 * step) * PS + sub * PADH;
-        // Two elements per load. Round 44 showed this loop is latency-bound on
-        // the load-to-fma chain rather than limited by any counted resource:
-        // BK=48 cut loads and instructions per fma and changed nothing, while a
-        // 32-way bank conflict (which inflates each request's *latency* 32x) was
-        // worth 8.05x. So the lever is fewer dependent steps, not fewer loads:
-        // one __half2 fetch feeds two independent fmas and halves the chain
-        // length. All row starts are even -- PS == 260 and sub * PADH == 130 are
-        // both even -- so the reinterpret is 4-byte aligned.
-        const __half2* krow2 = reinterpret_cast<const __half2*>(krow);
-        const __half2* qr02 = reinterpret_cast<const __half2*>(qr0);
-        const __half2* qr12 = reinterpret_cast<const __half2*>(qr1);
-        const __half2* qr22 = reinterpret_cast<const __half2*>(qr2);
-        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
-        for (int d = 0; d < half / 2; ++d) {
-            const float2 k = __half22float2(krow2[d]);
-            const float2 a0 = __half22float2(qr02[d]);
-            const float2 a1 = __half22float2(qr12[d]);
-            const float2 a2 = __half22float2(qr22[d]);
-            d0 = fmaf(a0.x, k.x, d0);
-            d0 = fmaf(a0.y, k.y, d0);
-            d1 = fmaf(a1.x, k.x, d1);
-            d1 = fmaf(a1.y, k.y, d1);
-            d2 = fmaf(a2.x, k.x, d2);
-            d2 = fmaf(a2.y, k.y, d2);
-        }
-        d0 += __shfl_xor_sync(0xffffffffu, d0, 1);
-        d1 += __shfl_xor_sync(0xffffffffu, d1, 1);
-        d2 += __shfl_xor_sync(0xffffffffu, d2, 1);
-        if (sub == 0) {
-            const int s = s0 + j;
+        // `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` computes
+        // D[m][n] = sum_k A[m][k] * B[k][n] with B held column-major, i.e. with
+        // BOTH operands k-contiguous -- which is exactly Q . K^T here, because a
+        // key's head_dim is contiguous both in the global layout and in the
+        // staged tile above. The fragment mapping was checked against a CPU
+        // reference on its own before being wired in (128/128 exact):
+        //   A: a0 = {Qs[m0+gid][kt+c], Qs[m0+gid][kt+c+1]}, a1 = row gid+8,
+        //      a2/a3 = the same two rows at kt+c+8
+        //   B: b0 = {Ks[n0+gid][kt+c], Ks[n0+gid][kt+c+1]}, b1 = same at kt+c+8
+        //   D: d0 = S[m0+gid][n0+t4*2], d1 = col+1, d2/d3 = row gid+8
+        //
+        // The scalar version this replaces issued ~256 shared loads per thread
+        // per tile and ran at the measured ~32 loads/cycle/SM operand-load
+        // ceiling. That ceiling is why the two cheaper fixes both failed --
+        // fewer loads per fma (round 44, BK=48) changed nothing, and cutting the
+        // accumulator chain to twelve partial sums was a 12% regression. Moving
+        // the operands into registers once per k-step and letting the tensor
+        // core consume 16x8x16 MACs per instruction removes the resource that
+        // was actually saturated.
+        //
+        // BK == 16 gives 2 x 8-key n-tiles and BQ == 24 needs 2 x 16-row
+        // m-tiles, so four warps cover the whole tile with no cross-warp
+        // reduction. The m-tiles OVERLAP by 8 rows (mt=0 covers rows 0..15,
+        // mt=1 covers rows 8..23) rather than padding Qs to 32 rows: it keeps
+        // the shared tile at its current size, and the two writers of rows 8..15
+        // compute the identical value from identical inputs, so the duplicate
+        // store is benign. The other four warps idle in this phase and rejoin
+        // for the softmax; four warps of mma is already far past the scalar
+        // loop, so there is nothing to gain by splitting it further.
+        {
+            const int warp = tid >> 5;
+            if (warp < 4) {
+                const int lane = tid & 31;
+                const int gid = lane >> 2;
+                const int t4 = lane & 3;
+                const int c = t4 * 2;
+                const int mt = warp >> 1;        // 0 -> rows 0..15, 1 -> rows 8..23
+                const int ntile = warp & 1;      // 0 -> keys 0..7,  1 -> keys 8..15
+                const int m0 = mt * 8;
+                const int r0 = m0 + gid;
+                const int r1 = r0 + 8;
+                const int krow = ntile * 8 + gid;   // K row (key) this lane holds
+                float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int kt = 0; kt < HD; kt += 16) {
+                    // The staged row is NOT a flat padded array. `PS = 2 * PADH`
+                    // with `PADH = HD / 2 + 2`, so the two halves of head_dim sit
+                    // at `sub * PADH` and element `d >= HD/2` is stored at
+                    // `d + 2`; slots 128 and 129 are never written. That layout
+                    // exists for the scalar kernel's `sub * PADH` addressing and
+                    // it is easy to read straight through: doing so for the upper
+                    // half reads two slots of UNINITIALISED shared memory into
+                    // every score, which is where the NaN outputs came from.
+                    // Because `kt` is a multiple of 16 and the halves split at
+                    // HD/2 == 128, the gap falls exactly on a k-step boundary --
+                    // the largest index in a k-step below the split is
+                    // 112 + 6 + 9 == 127 -- so one offset per k-step is exact.
+                    const int koff = (kt >= (HD >> 1)) ? 2 : 0;
+                    unsigned a[4], b[2];
+                    a[0] = pk2(Qs[r0 * PS + kt + c + koff], Qs[r0 * PS + kt + c + 1 + koff]);
+                    a[1] = pk2(Qs[r1 * PS + kt + c + koff], Qs[r1 * PS + kt + c + 1 + koff]);
+                    a[2] = pk2(Qs[r0 * PS + kt + c + 8 + koff], Qs[r0 * PS + kt + c + 9 + koff]);
+                    a[3] = pk2(Qs[r1 * PS + kt + c + 8 + koff], Qs[r1 * PS + kt + c + 9 + koff]);
+                    b[0] = pk2(Ks[krow * PS + kt + c + koff], Ks[krow * PS + kt + c + 1 + koff]);
+                    b[1] = pk2(Ks[krow * PS + kt + c + 8 + koff], Ks[krow * PS + kt + c + 9 + koff]);
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                          "r"(b[0]), "r"(b[1]));
+                }
+                // Scale, apply the row/causal mask, and scatter into S for the
+                // online softmax below. d0/d1 are row r0, d2/d3 are row r1.
+                const int cr[4] = {c, c + 1, c, c + 1};
+                const int rr[4] = {r0, r0, r1, r1};
 #pragma unroll
-            for (int k = 0; k < 3; ++k) {
-                const float dot = (k == 0) ? d0 : (k == 1 ? d1 : d2);
-                const int i = i0 + k * step;
-                const bool ok = (i < rows) && (s <= start + t0 + i);
-                S[i * PREFILL_BK + j] = ok ? dot * scale : -INFINITY;
+                for (int u = 0; u < 4; ++u) {
+                    const int i = rr[u];
+                    const int jc = ntile * 8 + cr[u];
+                    const int s = s0 + jc;
+                    const bool ok = (i < rows) && (s <= start + t0 + i);
+                    S[i * PREFILL_BK + jc] = ok ? d[u] * scale : -INFINITY;
+                }
             }
         }
         __syncthreads();
