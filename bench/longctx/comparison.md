@@ -8020,3 +8020,41 @@ but is not the kernel's time.
 are 19% to 33% effects, reproduced across three or more runs each, and they are larger than any
 plausible allocation variance. So the methodological flaw is real and worth fixing, and it is not
 the explanation for the pattern.
+
+## The timing harness is fixed: the kernel is 18% faster than every number reported above
+
+The flaw identified in the previous section was real and is now fixed. The D2H copy and the 1.61 GB
+allocation are outside the timed window, and three launches are amortised so per-launch overhead is
+divided out too. Same binary, same shapes, only the measurement changed:
+
+| | 16384 | 65536 |
+|---|---|---|
+| old harness (kernel + D2H copy + alloc) | 0.57 s | 9.14 - 9.21 s |
+| **fixed harness (kernel only, 3 reps)** | **0.46 - 0.47 s** | **7.50 - 7.59 s** |
+
+**~18% of every timing reported in this document before this section was harness overhead, not
+kernel time.** The kernel is **7.5 s** at the 65536 span, not 9.2 s. The 16384 -> 65536 ratio is a
+clean 16.3x, so the kernel is genuinely quadratic in sequence length, as it must be.
+
+**This does not rescue any of the six backfires -- it makes them larger.** The overhead `C` is
+additive and present in both arms of every comparison, so a change that costs `w` of the kernel time
+shows up in the reported figure as `w * K / (K + C)`, i.e. **diluted** by `K / (K + C)`. With
+`C` ~ 18% of the total, `K / (K + C)` ~ 0.82, so every measured share was **understated by ~1.22x**:
+
+| component | reported share (of 9.2 s) | corrected share (of the 7.5 s kernel) |
+|---|---|---|
+| P·V `fmaf` | ~17% | **~22%** |
+| K staging (latency + bandwidth) | ~8% | **~10%** |
+| V staging | ~2% | **~3%** |
+| everything else | ~73% | **~65%** |
+
+**And it changes what the six backfires mean quantitatively**: the 19% slowdown from `BK = 32` was
+19% of `K + C`, which is **~23% of the kernel**. Removing real work from this kernel does not merely
+fail to help -- it costs, and it costs more than was being reported.
+
+**The lesson generalises past this kernel.** Every conclusion in this document rests on differences
+between timings, and the harness was adding a sequence-length-dependent term to each one. The
+measurements were *internally consistent* -- two builds were always compared under the same harness
+-- so the direction of every finding stands. But the magnitudes were wrong by a factor that nobody
+had checked, and the check was one `sed` away for many rounds. **When a measurement is the
+instrument, the instrument has to be read, not assumed.**

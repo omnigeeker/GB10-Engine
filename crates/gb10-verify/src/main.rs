@@ -683,16 +683,29 @@ fn attn_tile(args: &Args) -> Result<bool> {
             dev.stream().memcpy_htod(&kh16, &mut kd)?;
             dev.stream().memcpy_htod(&vh16, &mut vd)?;
             let mut b = dev.stream().alloc_zeros::<f32>(nt * nh * hd)?;
+            // Time the KERNEL, not the harness. Previously this window contained a
+            // full D2H copy of `b` -- 1.61 GB at the 65536 span -- plus the
+            // allocation of its destination Vec, which is where the multi-second
+            // outliers came from. Now the copy and the allocation are outside the
+            // timed region and REPS launches are amortised, which also removes
+            // per-launch overhead.
+            const REPS: usize = 3;
+            for _ in 0..2 {
+                ops.attn_prefill_tiled(
+                    &dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0,
+                )?;
+            }
+            dev.stream().synchronize()?;
             let t0 = std::time::Instant::now();
-            ops.attn_prefill_tiled(
-                &dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0,
-            )?;
+            for _ in 0..REPS {
+                ops.attn_prefill_tiled(
+                    &dev, &qd, &kd, &vd, &mut b, nt, nh, nkv, hd, scale, start, 0,
+                )?;
+            }
+            dev.stream().synchronize()?;
+            let el = t0.elapsed().as_secs_f64() / REPS as f64;
             dev.check_err()?;
-            // The launch is asynchronous, so the timer has to be stopped after
-            // something that actually waits for the kernel. The D2H copy below
-            // does; timing before it measures the launch and reports ~0 s.
             let bv = dev.stream().memcpy_dtov(&b)?;
-            let el = t0.elapsed().as_secs_f64();
             let nan = bv.iter().filter(|v| !v.is_finite()).count();
             let nonzero = bv.iter().filter(|v| v.abs() > 1e-9).count();
             let pass = nan == 0 && nonzero > bv.len() / 2;
