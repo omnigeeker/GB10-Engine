@@ -223,7 +223,32 @@ impl Linear {
         // parts carry ~24, which is fp32's own width. The weights are untouched
         // because 4-bit NVFP4 / FP8 is already exact in bf16, so the whole loss
         // was in the activation.
-        kern.f32_split3_bf16(dev, x, xhi, xmid, xlo, t * k)?;
+        // How many bf16 parts the activation is split into.
+        //
+        // This was 3 for a while, on the theory that the long-context failure
+        // was a precision floor (8 bits failed, 10 failed, 16 failed, 24
+        // worked in the sense of not being *worse*). That theory was wrong: the
+        // real defect was a truncated grid in the element-wise kernels, and
+        // once it is fixed ONE bf16 operand is enough. Kept selectable so the
+        // cost/precision trade-off stays measurable rather than asserted.
+        //   1: one GEMM   (fastest; bf16 operand, ~8 mantissa bits)
+        //   2: two GEMMs  (~16 bits)
+        //   3: three GEMMs (~24 bits)
+        let split: u32 = std::env::var("GB10_TC_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        match split {
+            1 => {
+                kern.f32_to_bf16(dev, x, xhi, t * k)?;
+            }
+            2 => {
+                kern.f32_split_bf16(dev, x, xhi, xlo, t * k)?;
+            }
+            _ => {
+                kern.f32_split3_bf16(dev, x, xhi, xmid, xlo, t * k)?;
+            }
+        }
         mark!(2);
         // Three GEMMs accumulating in fp32 straight into the caller's `y`: the
         // first starts from zero and the other two add their residual terms, so
@@ -231,8 +256,12 @@ impl Linear {
         // bits. This is the price of fp32-grade precision on tensor cores --
         // three bf16 GEMMs against one fp32 CUDA-core GEMM, still ~3.7x cheaper.
         kern.cublas_gemm_bf16_f32(dev, wb, xhi, y, n, k, t, 0.0)?;
-        kern.cublas_gemm_bf16_f32(dev, wb, xmid, y, n, k, t, 1.0)?;
-        kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0)?;
+        if split >= 2 {
+            kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0)?;
+        }
+        if split >= 3 {
+            kern.cublas_gemm_bf16_f32(dev, wb, xmid, y, n, k, t, 1.0)?;
+        }
         mark!(3);
 
         // The per-tensor scales are applied to the fp32 accumulator, never
@@ -285,40 +314,32 @@ impl Linear {
         if self.n < 256 || t <= 16 {
             return self.forward(dev, x, y, t);
         }
-        // Tensor-core prefill GEMM (see `forward_prefill_tensor_core`).
-        // **Opt-in, and it must stay that way until its numerics are fixed.**
+        // Tensor-core prefill GEMM, on by default. Set `GB10_TC_GEMM=0` to fall
+        // back to the fp32 CUDA-core path (kept as the reference the gates
+        // compare against).
         //
-        // It is 2.48x faster on 8K cold TTFT and it holds every gate the round
-        // loop runs -- `generate` 16/16 token-exact against the frozen HF oracle,
-        // `batch-parity` 16/16, and perplexity within 0.023% of fp32 at a
-        // 512-token window. All of those gates are blind to what it breaks,
-        // because what it breaks only appears at long context and only through
-        // the chat template.
+        // This was opt-in for a while because it broke long context: for any
+        // prompt over ~900 tokens the engine emitted EOS as its first sampled
+        // token and answered nothing at all. Five operand-precision rewrites
+        // (bf16, fp16, two-way and three-way bf16 splits, plus an fp8 scale
+        // fix) all failed to change that, which read as a precision floor above
+        // 10 bits. It was not a precision problem at all.
         //
-        // Measured with `gb10-verify generate` on one fixed 958-token prompt:
+        // The element-wise kernels that stage the operands and apply the
+        // per-tensor scale used `if (i < n)` with a host grid capped at 65535
+        // blocks x 256 threads = 16,776,960 elements. Every element past that
+        // was silently skipped, and for `mlp.gate_proj` (n = 17408) the
+        // activation covers t*17408 elements, which crosses the cap at t = 964.
+        // That is exactly where the answers stopped: 950-token prompts worked,
+        // 970-token prompts did not. The skipped tail was also the part the
+        // `s2` scale had not been applied to, which is why it looked like a
+        // precision problem instead of a missing-work problem.
         //
-        //   raw prompt,  fp32 [271, 14556]   fp16-tensor-core [271, 14556]   same
-        //   templated,   fp32 "We need answer user's request. User..."       ok
-        //                fp16-tensor-core []  -- EOS as the first token
-        //
-        // That single flipped argmax is the whole long-context failure: through
-        // the server the engine then answers nothing at all for every prompt
-        // over roughly 970 tokens (5/5 -> 0/5 on a fixed battery, with
-        // `completion_tokens: 0`), while llama.cpp answers the same prompts
-        // correctly. It is a genuine near-tie at the first generated position,
-        // and reduced-precision operands land on the wrong side of it.
-        //
-        // Both precisions fail. bf16 (8 mantissa bits) fails, and so does fp16
-        // (10 bits) even with an fp32 accumulator written straight out of
-        // cuBLAS, so the required precision is above 10 bits and this is not a
-        // rounding detail to be tuned. The fp32 CUDA-core GEMM below is the
-        // correct path. Getting the speed back needs a lever that does not
-        // change the numerics -- see the `mma.sync` prefill attention plan in
-        // `bench/longctx/comparison.md`, which keeps fp32 accumulation.
-        //
-        // Warm TTFT and OTPS were never affected: the decode path runs the
-        // NVFP4 GEMV, untouched by any of this.
-        if std::env::var("GB10_TC_GEMM").map(|v| v == "1").unwrap_or(false) {
+        // Fixed by making all eight staging/scale kernels grid-stride, so their
+        // correctness no longer depends on the grid size. `gb10-bench tc-parity`
+        // is the gate: on real weights it shows the tensor-core path within
+        // 1.3e-6 of the fp32 reference at t=1024, where it used to be 1.5e3.
+        if std::env::var("GB10_TC_GEMM").map(|v| v != "0").unwrap_or(true) {
             return self.forward_prefill_tensor_core(dev, x, y, t);
         }
         let kern = dev.ops();

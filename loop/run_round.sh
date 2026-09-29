@@ -38,7 +38,7 @@ REPORT="$ROUNDS/$(printf '%03d' "$ROUND")-round.md"
 
 say() { echo "[round $ROUND] $*" | tee -a "$LOG"; }
 
-GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_LONGCTX=skip; GATE_DECODE=skip; GATE_PREFIX=skip; GATE_BENCH=skip
+GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_LONGCTX=skip; GATE_TCPARITY=skip; GATE_DECODE=skip; GATE_PREFIX=skip; GATE_BENCH=skip
 STATUS=FAIL
 
 {
@@ -119,6 +119,22 @@ if [ "$GATE_TEST" = pass ]; then
     fi
   else
     GATE_LONGCTX=missing; say "no bench/longctx/longctx_gate.sh — gate pending"
+  fi
+
+  # `longctx-follow` above catches the SYMPTOM of a broken prefill GEMM; this
+  # catches the arithmetic itself. The tensor-core prefill GEMM was silently
+  # truncating every element past 16,776,960 because eight element-wise kernels
+  # had no grid-stride loop under a 65535-block cap -- invisible at t=512
+  # (mathematically exact), fatal from t=964. A long prompt caught that; this
+  # gate localises it without a prompt, a template or sampling in the way.
+  # FAILS if the tensor-core path and the fp32 reference disagree on real
+  # weights at a length past the cliff.
+  say "tc-parity (tensor-core prefill GEMM vs fp32 reference, real weights)"
+  if ./target/release/gb10-bench tc-parity --model "$ROOT/models/Qwen3.8-27B-NVFP4" \
+       >>"$LOG" 2>&1; then
+    GATE_TCPARITY=pass; say "tc-parity OK"
+  else
+    GATE_TCPARITY=fail; say "tc-parity FAILED (see $LOG)"
   fi
 fi
 
@@ -206,6 +222,7 @@ fi
   echo "| correctness (layers) | $GATE_CORRECT |"
   echo "| correctness (64-layer) | $GATE_GENERATE |"
   echo "| longctx-follow (long prompt, no silent EOS) | $GATE_LONGCTX |"
+  echo "| tc-parity (prefill GEMM vs fp32, real weights) | $GATE_TCPARITY |"
   echo "| decode-bench (warp vs serial) | $GATE_DECODE |"
   echo "| prefix cache A/B | $GATE_PREFIX |"
   echo "| benchmark | $GATE_BENCH |"
@@ -220,9 +237,9 @@ fi
 } >> "$REPORT"
 
 # ---------------------------------------------------------------- 6. state ---
-python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_LONGCTX" "$GATE_DECODE" "$GATE_PREFIX" "$GATE_BENCH" <<'PY'
+python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_LONGCTX" "$GATE_TCPARITY" "$GATE_DECODE" "$GATE_PREFIX" "$GATE_BENCH" <<'PY'
 import json, sys
-state_path, rnd, status, stamp, b, t, c, g, lc, dc, pf, bm = sys.argv[1:13]
+state_path, rnd, status, stamp, b, t, c, g, lc, tp, dc, pf, bm = sys.argv[1:14]
 s = json.load(open(state_path))
 s["round"] = int(rnd)
 s["last_round_at"] = stamp
@@ -230,7 +247,7 @@ s["last_status"] = status
 s.setdefault("history", []).append(
     {"round": int(rnd), "at": stamp, "status": status,
      "gates": {"build": b, "test": t, "correctness": c, "generate": g,
-               "longctx": lc, "decode": dc, "prefix": pf, "benchmark": bm}}
+               "longctx": lc, "tcparity": tp, "decode": dc, "prefix": pf, "benchmark": bm}}
 )
 json.dump(s, open(state_path, "w"), indent=2)
 print(f"state: round={rnd} status={status}")
@@ -243,7 +260,7 @@ if [ "$PUSH" = 1 ] && [ -d "$ROOT/.git" ]; then
   if ! git diff --cached --quiet; then
     git commit -q -m "round $ROUND: $STATUS
 
-gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT generate=$GATE_GENERATE longctx=$GATE_LONGCTX bench=$GATE_BENCH
+gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT generate=$GATE_GENERATE longctx=$GATE_LONGCTX tcparity=$GATE_TCPARITY bench=$GATE_BENCH
 
 Automated round by loop/run_round.sh" >>"$LOG" 2>&1
   fi

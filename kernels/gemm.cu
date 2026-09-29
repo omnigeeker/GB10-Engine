@@ -559,8 +559,19 @@ extern "C" __global__ void dequant_fp8_to_bf16_kernel(const uint8_t* __restrict_
 // gemm2d_outer_bf16), which is what cleared this path to proceed.
 extern "C" __global__ void f32_to_bf16_kernel(const float* __restrict__ x,
                                               __nv_bfloat16* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2bfloat16_rn(__ldg(x + i));
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) out[i] = __float2bfloat16_rn(__ldg(x + i));
 }
 
 // ---- bf16 -> fp32 epilogue, with the optional per-tensor nvfp4 scale -------
@@ -573,8 +584,19 @@ extern "C" __global__ void bf16_to_f32_scaled_kernel(const __nv_bfloat16* __rest
                                                      float* __restrict__ out,
                                                      const float* __restrict__ s2,
                                                      int has_scale, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
         float v = __bfloat162float(__ldg(x + i));
         if (has_scale) v *= __ldg(s2);
         out[i] = v;
@@ -587,8 +609,19 @@ extern "C" __global__ void bf16_to_f32_scaled_kernel(const __nv_bfloat16* __rest
 // `CudaSlice<half::bf16>`. Same bits, different Rust type.
 extern "C" __global__ void u16_to_bf16_kernel(const uint16_t* __restrict__ x,
                                               __nv_bfloat16* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __ushort_as_bfloat16(__ldg(x + i));
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) out[i] = __ushort_as_bfloat16(__ldg(x + i));
 }
 
 // In-place scale of an fp32 buffer by a single scalar.
@@ -602,8 +635,19 @@ extern "C" __global__ void u16_to_bf16_kernel(const uint16_t* __restrict__ x,
 // index with no cross-thread dependence.
 extern "C" __global__ void f32_scale_kernel(float* __restrict__ x,
                                             const float* __restrict__ s, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = x[i] * __ldg(s);
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) x[i] = x[i] * __ldg(s);
 }
 
 // fp32 -> fp16 for the tensor-core activation operand.
@@ -615,8 +659,19 @@ extern "C" __global__ void f32_scale_kernel(float* __restrict__ x,
 // Atype and Btype independently, so the pair is mixed rather than converted.
 extern "C" __global__ void f32_to_f16_kernel(const float* __restrict__ x,
                                              __half* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2half_rn(__ldg(x + i));
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) out[i] = __float2half_rn(__ldg(x + i));
 }
 
 // ---- fp16 twins of the operand staging kernels ---------------------------
@@ -658,8 +713,19 @@ extern "C" __global__ void dequant_fp8_to_f16_kernel(const uint8_t* __restrict__
 
 extern "C" __global__ void u16_to_f16_kernel(const uint16_t* __restrict__ x,
                                              __half* __restrict__ out, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __ushort_as_half(__ldg(x + i));
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) out[i] = __ushort_as_half(__ldg(x + i));
 }
 
 // ---- fp32 -> bf16 hi/lo split (split-precision activation) ---------------
@@ -683,8 +749,19 @@ extern "C" __global__ void f32_split_bf16_kernel(const float* __restrict__ x,
                                                  __nv_bfloat16* __restrict__ hi,
                                                  __nv_bfloat16* __restrict__ lo,
                                                  int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
         const float v = __ldg(x + i);
         const __nv_bfloat16 h = __float2bfloat16_rn(v);
         hi[i] = h;
@@ -712,8 +789,19 @@ extern "C" __global__ void f32_split3_bf16_kernel(const float* __restrict__ x,
                                                   __nv_bfloat16* __restrict__ mid,
                                                   __nv_bfloat16* __restrict__ lo,
                                                   int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
+    // Grid-stride, NOT `if (i < n)`. The host caps the grid at 65535 blocks x
+    // 256 threads = 16,776,960 elements, and with a plain bounds check every
+    // element past that was SILENTLY SKIPPED. That is the whole long-context
+    // failure: for `mlp.gate_proj` (n = 17408) the activation split covers
+    // t*17408 elements, which crosses 16,776,960 at t = 964 -- and the engine
+    // emitted EOS as the first token from exactly there (939 tokens answered,
+    // 970 did not). It looked like a precision problem because the skipped
+    // elements were the ones the per-tensor `s2` scale had not been applied to,
+    // and it survived five operand-precision rewrites because precision was
+    // never the problem. `tc-parity` shows the GEMM is exact to 1.3e-6 at t=512
+    // and 1.5e3 relative at t=1024 on the same weights.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
         const float v = __ldg(x + i);
         const __nv_bfloat16 h = __float2bfloat16_rn(v);
         const float r1 = v - __bfloat162float(h);

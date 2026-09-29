@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         "cublas-gemm" => cublas_gemm(),
         "dequant-parity" => dequant_parity(),
         "cublas-parity" => cublas_parity(),
+        "tc-parity" => tc_parity(&model),
         "tc-phase" => tc_phase(),
         _ => {
             eprintln!(
@@ -947,6 +948,145 @@ fn dequant_parity() -> Result<()> {
 /// and if `m`/`n` are swapped the result comes out silently transposed rather
 /// than failing. Integer-valued inputs keep every product exact in bf16 (and the
 /// sums exact in fp32), so the comparison is exact rather than tolerance-based.
+/// Numerical parity of the two real prefill paths, on real model weights.
+///
+/// The tensor-core prefill GEMM (`GB10_TC_GEMM=1`) emits EOS as the first token
+/// for prompts over ~970 tokens, where the fp32 CUDA-core path answers. Five
+/// operand precisions were tried (bf16, fp16, bf16 two-way split, three-way
+/// split, plus an fp8 scale fix) and all of them failed, including one at ~24
+/// mantissa bits -- so "not enough precision" cannot be the explanation, and
+/// llama.cpp runs tensor-core MMA over this same NVFP4 model successfully.
+///
+/// That leaves a systematic defect in this path, and the tool to find it is a
+/// direct numerical comparison on real weights rather than the existing
+/// 48x32x17 integer fixture, which only proves the operand layout is not
+/// transposed.
+///
+/// This runs BOTH paths over the same activation for a spread of real matrices
+/// -- covering all three stored dtypes (NVFP4, FP8, bf16), both layer kinds
+/// (DeltaNet and full attention) and shapes from huge to tiny -- and reports the
+/// error of the tensor-core path relative to the fp32 reference. If the error is
+/// at fp32-rounding scale the GEMM is fine and the defect is elsewhere; if it is
+/// orders of magnitude larger, the defect is here and the dtype/name that shows
+/// it is the lead.
+fn tc_parity(model: &str) -> Result<()> {
+    let dev = Device::new(0)?;
+    let store = gb10_model::Store::open(model, "model.language_model.")?;
+
+    // `t` is deliberately in the failing regime: the bug is invisible at t=59
+    // (the oracle fixture) and appears past ~970 tokens.
+    // Overridable so the same matrices can be compared in the short-prompt
+    // regime (where the token-exact oracle gate passes) and the long-prompt one
+    // (where the engine emits EOS). A defect that only appears at large t is a
+    // t-dependent bug; one that appears at both would have broken the oracle.
+    let t: usize = std::env::var("TC_T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+
+    let names = [
+        "layers.0.mlp.gate_proj",
+        "layers.0.mlp.down_proj",
+        "layers.0.linear_attn.in_proj_qkv",
+        "layers.0.linear_attn.in_proj_z",
+        "layers.0.linear_attn.in_proj_a",
+        "layers.3.self_attn.q_proj",
+        "layers.3.self_attn.k_proj",
+        "layers.3.self_attn.o_proj",
+    ];
+
+    // Deterministic, roughly unit-variance activations. Real prefill
+    // activations are post-layernorm, so unit scale is the right regime.
+    let mut state = 0x243f_6a88_85a3_08d3u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let unit = |r: u64| ((r >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+
+    println!("tc-parity: tensor-core prefill GEMM vs the fp32 CUDA-core reference");
+    println!("  t = {t} activations per matrix, unit-scale pseudo-random input");
+    println!(
+        "  {:<38} {:>6} {:>6} {:>11} {:>11} {:>11}",
+        "matrix", "n", "k", "ref_rms", "tc_rms_err", "rel_rms"
+    );
+
+    let mut worst_rel = 0f64;
+    let mut worst_name = String::new();
+    for name in names {
+        let lin = match store.linear(&dev, name) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("  {name:<38}  skipped: {e}");
+                continue;
+            }
+        };
+        let (n, k) = (lin.n, lin.k);
+        let xs: Vec<f32> = (0..t * k).map(|_| unit(next()) as f32).collect();
+        let xd = dev.stream().memcpy_stod(&xs)?;
+
+        let run = |tc: bool| -> Result<Vec<f32>> {
+            std::env::set_var("GB10_TC_GEMM", if tc { "1" } else { "0" });
+            let mut y = dev.stream().alloc_zeros::<f32>(t * n)?;
+            lin.forward_prefill(&dev, &xd, &mut y, t)?;
+            Ok(dev.stream().memcpy_dtov(&y)?)
+        };
+        let y_tc = run(true)?;
+        let y_ref = run(false)?;
+
+        let n_el = t * n;
+        let mut ref_sq = 0f64;
+        let mut err_sq = 0f64;
+        let mut max_abs = 0f64;
+        for i in 0..n_el {
+            let r = y_ref[i] as f64;
+            let d = (y_tc[i] as f64) - r;
+            ref_sq += r * r;
+            err_sq += d * d;
+            max_abs = max_abs.max(d.abs());
+        }
+        let ref_rms = (ref_sq / n_el as f64).sqrt();
+        let err_rms = (err_sq / n_el as f64).sqrt();
+        let rel = if ref_rms > 0.0 { err_rms / ref_rms } else { 0.0 };
+        let dtype = match &lin.data {
+            gb10_model::LinearData::NvFp4 { .. } => "nvfp4",
+            gb10_model::LinearData::Fp8 { .. } => "fp8",
+            gb10_model::LinearData::Bf16 { .. } => "bf16",
+        };
+        println!(
+            "  {:<38} {:>6} {:>6} {:>11.4e} {:>11.4e} {:>11.3e}  {dtype}",
+            name, n, k, ref_rms, err_rms, rel
+        );
+        if rel > worst_rel {
+            worst_rel = rel;
+            worst_name = format!("{name} ({dtype})");
+        }
+    }
+
+    println!();
+    println!("  worst: {worst_name} at rel_rms {worst_rel:.3e}");
+    std::env::remove_var("GB10_TC_GEMM");
+
+    // Threshold. The legitimate differences here are ~1e-6 for the nvfp4 path
+    // (exact to fp32 rounding) and ~2.5e-3 for the fp8 path, where the fp32
+    // reference rounds `e4m3(w) * wscale` into a bf16 staged weight and the
+    // tensor-core path is the more accurate of the two. The defect this gate
+    // exists for measured 1.5e3. So 1e-2 separates cleanly with two orders of
+    // margin on the passing side and five on the failing side.
+    const LIMIT: f64 = 1e-2;
+    if worst_rel > LIMIT {
+        anyhow::bail!(
+            "tc-parity: FAILED -- {worst_name} disagrees with the fp32 reference by \
+             rel_rms {worst_rel:.3e} (limit {LIMIT:.0e}). The tensor-core prefill \
+             GEMM is not reproducing the fp32 path; do NOT ship it enabled."
+        );
+    }
+    println!("tc-parity: OK (worst rel_rms {worst_rel:.3e} <= {LIMIT:.0e})");
+    Ok(())
+}
+
 fn cublas_parity() -> Result<()> {
     use half::bf16;
 

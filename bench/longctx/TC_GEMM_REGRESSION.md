@@ -276,3 +276,140 @@ Candidates not yet excluded, in the order worth testing:
 
 A direct numerical comparison of the two paths' GEMM output on a real layer -- not a
 48x32x17 integer fixture -- is the tool that is missing, and is the first thing to build.
+
+---
+
+# ROOT CAUSE FOUND: a truncated grid, not precision
+
+Everything above that treats this as a precision floor is superseded. The defect was
+found by building the tool that was missing -- `gb10-bench tc-parity`, which runs BOTH
+real prefill paths over the same activation on real model weights and reports the error
+of the tensor-core path against the fp32 reference.
+
+## The measurement that found it
+
+`tc-parity` at t=1024, per-matrix `rel_rms` of the tensor-core path against fp32:
+
+| matrix | n | k | before the fix | after |
+|---|---|---|---|---|
+| `layers.0.mlp.gate_proj` (nvfp4) | 17408 | 5120 | **1.545e3** | 1.300e-6 |
+| `layers.0.mlp.down_proj` (nvfp4) | 5120 | 17408 | **2.426e-1** | 5.278e-6 |
+| `layers.3.self_attn.o_proj` (fp8) | 5120 | 6144 | 2.019e-3 | 2.019e-3 |
+
+`mlp.gate_proj` was **1500x too large**. That is not a rounding error, and it cannot be
+fixed by adding mantissa bits -- which is exactly what five precision rewrites had been
+trying to do.
+
+The `t`-dependence was the tell:
+
+| t | gate_proj rel_rms | down_proj rel_rms |
+|---|---|---|
+| 64 | 1.3e-6 | 5.3e-6 |
+| 512 | 1.3e-6 | 5.3e-6 |
+| **1024** | **1.5e3** | **2.4e-1** |
+
+Exact at t=512, destroyed at t=1024, on identical weights.
+
+## The defect
+
+The element-wise staging/scale kernels -- `f32_scale`, `f32_to_bf16`, `f32_to_f16`,
+`f32_split_bf16`, `f32_split3_bf16`, `u16_to_bf16`, `u16_to_f16`,
+`bf16_to_f32_scaled` -- indexed as
+
+```cuda
+const int i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < n) ...
+```
+
+with **no grid-stride loop**, while the host capped the launch at
+
+```rust
+let grid = cdiv(n, 256).min(65535) as u32;
+```
+
+65535 blocks x 256 threads = **16,776,960 elements**. Everything past that index was
+silently never processed.
+
+For `mlp.gate_proj`, `n = 17408`, so the activation buffer has `t * 17408` elements and
+crosses 16,776,960 at
+
+```
+t = 16_776_960 / 17408 = 963.6
+```
+
+**The engine answered 950-token prompts and emitted EOS from 964.** The cliff that had
+been attributed to "the argmax is numerically ill-conditioned beyond ~970 tokens" was an
+integer division. It is deterministic precisely *because* it is not a numerical effect.
+
+Two things made this look like precision:
+
+* the skipped tail was the region the per-tensor `s2` scale had never been applied to, so
+  the symptom was "values at the wrong magnitude", which reads as an arithmetic-precision
+  failure;
+* the fp8 path *did* show a genuine ~2e-3 difference, which is real (see below) and
+  supplied a plausible story that the whole thing was about mantissa bits.
+
+`.min(65535)` is not a hardware limit either: for a 1-D grid `gridDim.x` may reach 2^31-1.
+The cap looks like it was carried over from the 2-D convention, where `gridDim.y/z` are
+indeed limited to 65535.
+
+## The fix
+
+All eight kernels became grid-stride:
+
+```cuda
+for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+     i += gridDim.x * blockDim.x) ...
+```
+
+so their correctness no longer depends on the grid size at all, rather than merely raising
+a magic constant.
+
+## Why the gates missed it for so long
+
+Every gate ran at a prompt length below the threshold, and the threshold is a *count of
+elements*, not a context length. `generate` 16/16 uses a 59-token prompt; `batch-parity`
+16/16 likewise; perplexity uses a 512-token window. `512 * 17408 = 8.9M < 16.78M`, so the
+broken path was **mathematically exact** on every gate the project had -- 1.3e-6 agreement
+at t=512, verified above. Perplexity moving 0.023% was not a fuzzy warning sign; at that
+length there was nothing to warn about.
+
+This is the same lesson as the original regression, one level deeper: `longctx-follow`
+was added because a short-prompt token match is not evidence a change is numerically
+safe. It was necessary but **not sufficient** -- it tested one 994-token prompt, which
+caught the symptom while hiding that the cause was a buffer-size cliff rather than a
+context-length cliff. `tc-parity` closes that gap by testing the arithmetic directly at a
+length past the cliff, with no prompt, no chat template, and no sampling in the way.
+
+## Consequence: the tensor-core GEMM is usable
+
+With the fix, `GB10_TC_GEMM` is **on by default** (`GB10_TC_GEMM=0` opts out to the fp32
+reference), and all of these pass on the default path:
+
+| gate | result |
+|---|---|
+| `tc-parity` (t=1024, real weights) | within **1.3e-6** of fp32 on nvfp4 |
+| `longctx-follow` (994-token prompt) | **OK** |
+| long-context battery | **5/5 HELLO** |
+| `generate` vs frozen HF oracle | **16/16 exact**, determinism 3/3 |
+
+And the three-way split is no longer needed. It only ever existed to add mantissa bits to
+a computation that was not short of mantissa bits. `GB10_TC_SPLIT` now selects
+1/2/3 bf16 parts (default **1**, one GEMM), and one bf16 operand passes every gate above.
+The measured cost of the extra parts is why this matters: three GEMMs where one will do is
+a 3x regression on the dominant term of prefill.
+
+The residual **fp8** difference (~2e-3) is a separate and benign finding, not this bug: the
+fp32 reference rounds `e4m3(w) * wscale` into a **bf16 staged weight** (`kernels/gemm.cu:143`),
+losing the scale's low bits, whereas the tensor-core path applies the scale in fp32 on the
+accumulator. The tensor-core path is the *more* accurate of the two there; the 2e-3 is the
+reference's rounding, and it is above the `tc-parity` noise floor because it is real.
+
+## The lesson worth keeping
+
+The failure mode this whole episode shares is **treating a measured effect as an
+attributed cause**. "8 bits fail, 10 fail, 16 fail, 24 work" was a real measurement. "The
+model therefore needs 24 bits of activation precision" was an assumption, and it was wrong
+on the first test that compared the two paths directly instead of through a prompt. Five
+precision rewrites were spent on it, and the actual defect -- 40 lines away, in the
+launch geometry -- was never in the numerics at all.
