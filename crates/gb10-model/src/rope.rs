@@ -60,6 +60,34 @@ mod tests {
         }
     }
 
+    /// `rope_tables_range` must produce exactly the same tables as calling
+    /// `rope_tables` once per position and concatenating. It is the same
+    /// arithmetic with the position-independent inverse frequencies hoisted out
+    /// of the loop, so this is a bit-for-bit comparison, not a tolerance.
+    #[test]
+    fn range_tables_are_bit_identical_to_per_position_tables() {
+        let Some(cfg) = config() else { return };
+        for (start, n) in [(0usize, 1usize), (0, 8), (7, 33), (4096, 512), (122880, 64)] {
+            let (cos, sin) = rope_tables_range(&cfg, start, n);
+            assert_eq!(cos.len(), n * (cfg.rotary_dim() / 2));
+            assert_eq!(sin.len(), n * (cfg.rotary_dim() / 2));
+            for i in 0..n {
+                let (c, s) = rope_tables(&cfg, start + i);
+                let half = cfg.rotary_dim() / 2;
+                assert_eq!(
+                    &cos[i * half..(i + 1) * half],
+                    &c[..],
+                    "cos mismatch at start={start} n={n} i={i}"
+                );
+                assert_eq!(
+                    &sin[i * half..(i + 1) * half],
+                    &s[..],
+                    "sin mismatch at start={start} n={n} i={i}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn frequencies_match_the_reference_formula() {
         let Some(cfg) = config() else { return };
@@ -80,13 +108,32 @@ mod tests {
 /// RoPE tables for `n` consecutive positions starting at `start`, flattened as
 /// `[n, rotary_dim/2]` so the batched prefill kernel can index them by row.
 pub fn rope_tables_range(cfg: &TextConfig, start: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
-    let half = cfg.rotary_dim() / 2;
+    let rotary = cfg.rotary_dim();
+    let half = rotary / 2;
+    let theta = cfg.rope_parameters.rope_theta as f64;
+
+    // `inv_freq[i] = 1 / theta^(2i / rotary_dim)` does not depend on the
+    // position, so it is built once here rather than recomputed inside the
+    // per-position loop. The previous form called `rope_tables` once per
+    // position, which recomputed all `half` inverse frequencies with `powf` and
+    // allocated two `Vec`s each time -- `n * half` transcendentals and `2 * n`
+    // allocations per call, for a table that only needs `half` of each. The
+    // arithmetic below is unchanged and element-for-element identical, so the
+    // generated tables are bit-for-bit the same.
+    let mut inv = Vec::with_capacity(half);
+    for i in 0..half {
+        inv.push(1.0 / theta.powf((2 * i) as f64 / rotary as f64));
+    }
+
     let mut cos = Vec::with_capacity(n * half);
     let mut sin = Vec::with_capacity(n * half);
     for i in 0..n {
-        let (c, s) = rope_tables(cfg, start + i);
-        cos.extend_from_slice(&c);
-        sin.extend_from_slice(&s);
+        let pos = (start + i) as f64;
+        for &v in &inv {
+            let angle = pos * v;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
     }
     (cos, sin)
 }

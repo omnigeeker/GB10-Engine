@@ -10806,3 +10806,45 @@ constant, so the table's row stride is constant while `pos` is not.
 `pos`-driven it would be far larger at 256K**, and the objective needs 256K. The next round should
 either hoist `inv` and measure, or instrument the three parts of the phase separately -- which is
 cheap, because they are already bracketed by `amark!` calls.
+
+## FIXED: `rope_tables_range` recomputed the inverse frequencies and reallocated per position
+
+`rope_tables_range` called `rope_tables` once per position. `rope_tables` computes
+`inv_freq[i] = 1 / theta^(2i / rotary_dim)` **inside its element loop** -- and that value does not
+depend on the position -- and allocates two fresh `Vec`s per call. So a call for `n` positions did
+`n * half` `powf` calls and `2 * n` heap allocations for a table that needs `half` of each.
+
+**Hoisted out of the loop, and proven bit-identical:**
+
+```
+test rope::tests::range_tables_are_bit_identical_to_per_position_tables ... ok
+```
+
+The new test compares `rope_tables_range` against calling `rope_tables` once per position and
+concatenating, **element-for-element with `assert_eq!` on `f32` slices -- not a tolerance** -- across
+`(start, n)` of `(0,1)`, `(0,8)`, `(7,33)`, `(4096,512)` and `(122880,64)`. The arithmetic is the
+same operations in the same order, so this is a true identity check.
+
+**Measured, same session:**
+
+| | before | after |
+|---|---|---|
+| rope at 32K | 45 ms | 48 ms (noise) |
+| **rope at 128K** | **6777 ms** | **5121 ms (-24%)** |
+| 128K total | 639.35 s | **631.31 s** |
+
+**So the redundancy was about a quarter of the phase, not all of it.** The rest is the `pos`-driven
+anomaly, which survives and is now measured more precisely: **5121 ms over 256 invocations is 20 ms
+per invocation for a table of `8192 x 32` entries -- 76 ns per `cos`/`sin` pair, against 2.9 ns per
+pair at 32K for the identical work.** A 26x per-element difference with no change in `t`.
+
+**That is now the whole of the rope question, and it is narrow:** the phase contains exactly
+`rope_tables_range`, two `memcpy_htod` of `t * half` f32, and `rope_neox_batched`. The tables are
+now built in `half` `powf` calls plus `n * half` `cos`/`sin`, so the remaining 20 ms per invocation
+is in the `htod` or in `rope_neox_batched`. **The next step is to instrument those three separately
+rather than to reason about them** -- they are already inside an `amark!` bracket, so it is a
+three-line change.
+
+**The commit is a real, verified improvement even though it is small (1.1% -> 0.8% of the 128K
+prefill), because it removes work that provably should not have been there and it is proven not to
+change a single output bit.**
