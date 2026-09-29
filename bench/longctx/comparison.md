@@ -9833,3 +9833,56 @@ the traffic should roughly halve the kernel: 29,910 ms to about 15,000 ms at 32K
 registers, costs no occupancy, reduces shared memory rather than increasing it, and attacks the same
 6x factor. **The next change is to stream Q and set `BQ = 48`.** The gate is `attn-tile`; the
 measurement is the `attn kernel` phase of `prefill-shape --limit 32768`, currently **29,910 ms**.
+
+## The query-tile lever is closed by a hard kernel constraint: BQ * BK == 384
+
+The Q-streaming plan was tested directly rather than argued. `PREFILL_BQ` was raised to 48 and
+`PREFILL_BK` lowered to 8 -- the same product, the same K/V bytes per loop iteration, but half the
+row-blocks and therefore half the K/V traffic:
+
+```
+#define PREFILL_BQ 48
+#define PREFILL_BK 8
+BQ * BK = 384  (required 384)          smem = 31,680 B -> 1 block/SM
+```
+
+**The gate rejected it, and it rejected it twice, at two different levels.**
+
+1. **`BQ = 48, BK = 16` does not launch at all:**
+
+   ```
+   Error: invalid argument: attn_prefill_tiled needs BQ * BK == 3 * (head_dim / 2),
+   got 48 * 16 against head_dim 256
+   ```
+
+   **`BQ * BK` must equal `3 * (head_dim / 2) = 384`.** The tiling is not free: the score loop
+   consumes `BQ * BK` elements in `blockDim.x / 2 = 128`-wide passes, and the kernel requires the
+   product to be exactly `3 x 128`. With `head_dim = 256` that fixes **`BQ * BK = 384`**, and the
+   only factorisations are `24x16`, `32x12`, `48x8`, `16x24`, `12x32`, `8x48`, `6x64`.
+
+2. **`BQ = 48, BK = 8` satisfies the product and faults:**
+
+   ```
+   Error: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS)
+   ```
+
+   The kernel's inner loop is hardcoded to `BK = 16` in a way the product check does not capture --
+   almost certainly the `ldmatrix` fragment geometry, which is fixed at 16 rows for `fp16` with a
+   16-byte row.
+
+**So the query-tile lever is closed, and it is closed at the source, not by measurement.** `BQ = 24,
+BK = 16` is the only tiling of 384 that the kernel actually supports. **Raising the rows per K/V
+read requires rewriting the `ldmatrix` staging, not changing a `#define`.**
+
+**This does not weaken the finding, and it sharpens the plan.** The K/V re-read is still the
+quadratic term -- 45.6% of the 32K prefill at 23 GFLOP/s -- and the 6x factor is still in the grid
+(`grid_dim: (n_q_heads, tiles, 1)`). What is now established is that **it cannot be fixed by tiling
+alone**, because both the score-loop pass count and the fragment geometry pin `BQ = 24`. **The fix
+must change the operand staging -- stream Q, or share K/V across the six query heads -- and both of
+those are kernel rewrites whose cost is now measured:**
+
+* streaming Q and raising `BQ` requires re-doing the `ldmatrix` path for Q, and the freed 10.8 KB
+  then allows `BQ = 48` at 2 blocks/SM and half the traffic;
+* sharing K/V across six heads needs ~221 registers and drops to 1 block/SM, a net 3x.
+
+**Both remain open. Neither is a `#define`.** The reverted tree is at `1ee5bfa` with `attn-tile: OK`.
