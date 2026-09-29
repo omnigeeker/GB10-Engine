@@ -7811,3 +7811,36 @@ barrier -> softmax -> barrier -> P·V -> barrier) as the thing that actually set
 **The requirement is therefore unchanged in size but changed in kind:** the 1.31x / 1.65x / 3.06x /
 3.97x cannot be reached by doing less; they need the per-iteration chain shortened or overlapped,
 which is a rewrite of the loop structure rather than any substitution inside it.
+
+### Doubling the work instead of removing it: the P·V fma is ~17% of runtime, not 34%
+
+Every work-removal ablation backfired, so the experiment was inverted: **double** the P·V's fma
+instead. A second accumulator (`a2`) accumulates the identical product while `a` does, and the two
+are averaged -- so the values stay exactly in the range the real kernel produces, and only the
+*work* changes. This is the control the earlier ablations should have been.
+
+| build | 65536 |
+|---|---|
+| baseline | 9.20 / 9.21 / 9.24 s |
+| **2x P·V fma work** (75 regs, 0 spill) | **10.72 / 10.83 s** |
+
+**Doubling the P·V's fma costs ~1.55 s, i.e. ~17% of a 9.2 s kernel** -- not 100%, so the fma is
+partly hidden, and not 0%, so it is genuinely on the critical path. Two things follow.
+
+**First, this corrects the "P·V is 34%" figure that has been carried for many rounds.** That number
+came from an ablation that reduced the P·V's inner loop from 16 to 1 *and* therefore changed the
+data flowing through the rest of the kernel. The honest figure is **~17%**: the P·V fma is real but
+about half as large as advertised, and every requirement estimate that leaned on the 34% figure was
+leaning on an inflated number.
+
+**Second, it explains why the tensor-core P·V could not win, quantitatively.** The mma removes
+~17% (the fma) but it must preserve precision, and precision is what costs: a single fp16 `P` gives
+rms rel 1.0--1.9e-4 against a 1.2e-4 gate, so the two-term `Pf` + `Pflo` split is mandatory -- which
+means the softmax writes two arrays instead of one and computes a split per element, `Pf`/`Pflo`
+must be zeroed for the rows past `rows` that whole 16-row fragments now touch, and the A fragment
+needs its own `ldmatrix.x4`. That overhead measured **~1.8 s against the ~1.55 s the fma was
+worth**, which is exactly the 0.95x that was observed. The mma was not badly implemented; it was
+arithmetically incapable of paying for its own precision requirement on this hardware.
+
+**So the P·V is a dead end in both directions**: too small a share to save much (17%), and the only
+mechanism that removes it carries a precision overhead larger than the saving.
