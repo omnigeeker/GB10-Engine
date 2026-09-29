@@ -10898,3 +10898,34 @@ is the latency that only occupancy or overlap can remove.
 2. **The remaining 22.9 s at 32K is still the latency term**, so the occupancy work (removing the Q
    or K tile) is still the way to the objective -- but the target is now 22.9 s rather than 29.9 s,
    and the 32K end-to-end ratio should improve from 1.48x to roughly 1.33x.
+
+## The 8x staging fix scales: all three lengths measured, same session
+
+| length | attention kernel before | after | change | prefill total before | after | change |
+|---|---|---|---|---|---|---|
+| **8K** | 1825 ms | **1369 ms** | **-25.0%** | 10.53 s | **10.04 s** | -4.7% |
+| **32K** | 29946 ms | **22887 ms** | **-23.6%** | 64.61 s | **58.42 s** | -9.6% |
+| **128K** | 482689 ms | **363468 ms** | **-24.7%** | 631.31 s | **505.65 s** | **-19.9%** |
+
+**A uniform ~25% off the attention kernel at every length**, which is what a constant-factor cut to
+the per-iteration instruction count should produce, and the total gain grows with length because the
+kernel's share grows: 13.6% at 8K, 39.2% at 32K, 71.9% at 128K.
+
+**End-to-end ratios against the recorded llama.cpp pairs:**
+
+| length | gb10 before | gb10 now | llama.cpp | ratio before | ratio now |
+|---|---|---|---|---|---|
+| 8K | 9.10 s | ~8.7 s (est) | 9.09 s | 1.001x | **< 1 (win)** |
+| 32K | 63.91 s | ~57.4 s (est) | 43.20 s | 1.48x | **~1.33x** |
+| **128K** | 1224.16 s (pre-fix) | 505.65 s (instrumented) | 290.63 s | **4.21x** | **1.74x** |
+
+**The 128K ratio improved from 4.21x to 1.74x across the session, and 2.20x -> 1.74x from this
+change alone.** The estimates for 8K and 32K are the instrumented ratios applied to the recorded
+end-to-end pairs; the 128K line compares the instrumented prefill to llama.cpp's end-to-end number
+and is therefore an upper bound on the ratio, not a like-for-like pair.
+
+**The remaining gap is still the latency term.** The kernel is 71.9% of the 128K prefill and its
+cost is `(t x keys / 384)` iterations at roughly 850 ns each (down from ~1100 ns, the 25% the
+instruction cut recovered). **The rest of the 128K prefill -- 142 s -- is already 2.05x faster than
+llama.cpp's whole 128K prefill**, so the objective remains reachable by the same two occupancy
+changes, now against a smaller and better-understood target.
