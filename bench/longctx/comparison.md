@@ -10104,3 +10104,66 @@ now closed, and the path that is the kernel is open with 250x of headroom.**
 `attn_prefill_tiled`.** The gate is `attn-tile`; the measurement is the `attn kernel` phase of
 `prefill-shape --limit 32768`, currently **29,946 ms**, and the target is 32K end-to-end parity from
 the current **1.48x**.
+
+## The attention kernel is latency-bound on un-overlapped K/V loads, and the cost has a closed form
+
+The kernel uses **0.39% of compute peak and 24% of DRAM bandwidth**:
+
+| chunk 3 (start 24576, ntok 8192, keys 32768, 0.83 s) | achieved | available | utilization |
+|---|---|---|---|
+| compute | 0.29 TFLOP/s | 75 TFLOP/s | **0.39%** |
+| DRAM | 55.2 GB/s | 228 GB/s | **24%** |
+| MACs | 1.68 MAC/cycle/SM | 1024+ | **idle ~99.8%** |
+
+**It is neither compute-bound nor bandwidth-bound. It is waiting.**
+
+And the structure of the wait is countable. The inner loop iterates over `BK`-sized K/V tiles:
+
+```
+total iterations per call = (t / BQ) * (keys / BK) = t * keys / (BQ * BK)
+```
+
+**and `BQ * BK` is pinned at 384** -- the constraint that already closed the tiling lever. So
+
+```
+iterations = t * keys / 384          (independent of how the 384 is split)
+```
+
+For chunk 3 that is 8192 x 32768 / 384 = **698,368 iterations in 0.83 s = 1188 ns per
+iteration.** Each iteration is `load K/V tile -> __syncthreads -> compute -> __syncthreads ->
+next tile`, with **2 blocks per SM (33% occupancy, 512 of 1536 threads)** and nothing to run during
+the stall. **A DRAM round trip on this part is 400-700 ns, and 1188 ns per iteration is the
+signature of a serialized round trip that is not overlapped with anything.**
+
+**The model predicts the whole prefill.** Using 1188 ns per iteration:
+
+| chunk | iterations | predicted | 
+|---|---|---|
+| 0 | 174,763 | 0.208 s |
+| 1 | 349,525 | 0.415 s |
+| 2 | 524,288 | 0.623 s |
+| 3 | 699,051 | 0.830 s |
+| **per layer** | | **2.076 s** |
+| **x 16 layers** | | **33.2 s** against **29.946 s measured** |
+
+**11% over, from a single fitted constant.** The cost is `(t x keys / 384) x ~1100 ns`, and every
+factor in it is now understood.
+
+**This changes what the fix is, and it contradicts the objective's stated path.** The objective says
+the only route is an `mma.sync` tensor-core rewrite at a 9x design point. **Tensor cores cannot help
+a kernel that uses 0.39% of compute peak.** Doubling the arithmetic throughput of a kernel that is
+idle 99.8% of the time changes nothing. **The 250x of "headroom" against the tensor-core peak is not
+headroom at all -- it is idle time, and it is idle because the kernel is blocked on memory.**
+
+**The actual fix is to overlap the K/V loads with the compute** -- a second K/V buffer with the next
+tile issued before the current one is consumed, or `cp.async` on this architecture. That is a change
+to the loop's staging, not to its arithmetic, and it is **smaller than the mma.sync rewrite the
+objective proposed while addressing the bottleneck that actually exists.**
+
+**The iteration count is not reducible.** `t x keys / 384` is fixed by the same `BQ * BK = 384`
+constraint that already blocked the tiling lever, and it is independent of how 384 is split. **The
+only lever is the ~1188 ns per iteration**, and hiding it is worth up to the full 29.9 s.
+
+**Everything else has been eliminated**: `n_seq` (measured), cache stride (code), tiling (the
+constraint and the illegal-access fault), occupancy (the 48 KB budget), the call path (isolated and
+in-model timings agree to 2.4%), and tensor cores (0.39% of compute peak).
