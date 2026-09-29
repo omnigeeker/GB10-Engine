@@ -9230,3 +9230,52 @@ epilogue at 1301 ms and the activation cast at 713 ms remain untargeted.
 too -- the same 48 layers per chunk -- but the requirement grows with length (1.65x, 3.06x, 3.97x),
 so this alone will not flip all four. **The next measurement is the end-to-end same-session cold
 TTFT against llama.cpp at 8K, to see whether it flips the first of the four.**
+
+## End-to-end 8K, same session, after the dispatch fix: 1.22x -> 1.10x
+
+Same harness (`bench/longctx/ttft.py`), same session, gb10 server and llama.cpp server run
+sequentially, 2 trials each, identical prompt construction (`--reps 229`, 128 max tokens):
+
+```
+=== gb10 8K (post-fix) ===
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0     7171      10.08       0.03      9.02      9.09  128
+    1     7171      10.23       0.03      8.99      8.98  128
+=== llama 8K ===
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0     7209       9.12       0.23      7.14      7.28  128
+    1     7209       9.38       0.23      7.22      7.24  128
+```
+
+| | prompt | cold TTFT | ratio | OTPS |
+|---|---|---|---|---|
+| **gb10 (post-fix)** | 7,171 | **10.08 s** | **1.10x** | **9.02** |
+| llama.cpp | 7,209 | 9.12 s | | 7.14 |
+
+**8K is still not a win, but it moved from 1.22x to 1.10x** -- from 13.41 s against 10.91 s in the
+pre-fix session to 10.08 s against 9.12 s now. **gb10 wins OTPS at 8K by 1.26x**, and wins warm
+TTFT by 7.7x (0.03 s against 0.23 s).
+
+**Two honest caveats, and the first one matters.**
+
+1. **The absolute improvement is much larger than the instrument predicted.** The PROJ instrument
+   said the dispatch fix was worth **920 ms** of the 8K prefill. The end-to-end cold TTFT improved
+   by **3.33 s**. The instrument and the server do not measure the same thing: `prefill-shape` runs
+   a single 8192-token chunk with `n_seq = 10` in one process, while the server path chunks,
+   schedules and copies differently. **The instrument is trustworthy for *relative* attribution --
+   it has passed three consistency checks and it did predict the direction and the affected phases
+   exactly -- but its absolute milliseconds do not transfer to the end-to-end metric.**
+2. **The llama.cpp number also moved** (10.91 s -> 9.12 s), so the two sessions are not directly
+   comparable in absolute terms. What *is* comparable is the same-session ratio, and that is what
+   the objective asks for: **1.22x before, 1.10x after.**
+
+**What this establishes for the objective.** The dispatch fix is real and it is worth roughly a
+quarter of the 8K cold TTFT in the end-to-end path. The 8K requirement was 1.44 s and the gap is
+now 0.96 s. **The remaining identified targets are the fusion of the four `proj in` projections
+(~167 ms plus two launches per layer), the epilogue at 1301 ms, and the activation cast at
+713 ms.** At 32K and beyond the same 48 layers per chunk benefit, but the requirement grows with
+length and nothing found so far scales with it.
+
+**The methodological result is worth as much as the performance one.** Ten hypotheses about a
+kernel were refuted before the dispatch line was read. The single change that worked came from
+asking *which code runs*, not *how fast the code is*.
