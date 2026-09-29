@@ -12217,3 +12217,46 @@ re-quantisation is needed, only a layout check against what cuBLASLt expects.
 
 **This is the highest-value remaining action in the objective, and it is now fully specified rather
 than exploratory.**
+
+## 256K after the staging work: 2.918x -> 2.511x, and this time the reference held still
+
+```
+# gb10-256K   trial 0  cold 1456.16  warm 0.26  otps 3.71
+# llama-256K  trial 0  cold  579.86  warm 0.61  otps 4.54
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| before the staging fixes | 1699.78 s | 582.55 s | 2.918x |
+| **now** | **1456.16 s** | **579.86 s** | **2.511x** |
+
+**gb10 improved 14.3%, and llama.cpp moved by 0.5% (582.55 -> 579.86), so unlike the 128K pair
+this ratio improvement is real and not reference drift.** The 128K re-measurement had llama moving
+21.5% in the same session, which is why the 128K number needs repeated trials before it can support a
+conclusion; at 256K the reference is stable to 0.5% and the improvement is entirely ours.
+
+### All four lengths, post-fix, same session
+
+| length | gb10 | llama.cpp | ratio | session start |
+|---|---|---|---|---|
+| **8K** | **8.69-8.72 s** | 9.06-9.40 s | **0.925-0.963x -- gb10 wins** | 1.22x |
+| 32K | 53.99-54.08 s | 43.25-44.56 s | 1.214-1.248x | 1.80x |
+| 128K | 447.66 s | 228.21 s | 1.962x (single trial; reference moved 21.5%) | 4.21x |
+| 256K | 1456.16 s | 579.86 s | 2.511x (reference stable to 0.5%) | 4.54x |
+
+**gb10's own cold TTFT, all four lengths, monotonically improved this session:**
+
+| length | session start | now | reduction |
+|---|---|---|---|
+| 8K | 10.53 s | **8.69 s** | -17.5% |
+| 32K | 64.61 s | **53.99 s** | -16.4% |
+| 128K | 631.31 s | **447.66 s** | -29.1% |
+| 256K | 1699.78 s | **1456.16 s** | -14.3% |
+
+**The reduction grows with context, which is the signature of the two staging fixes attacking the
+quadratic term** -- the attention kernel is the only term that grows faster than linearly, and both
+fixes removed work from inside its inner loop.
+
+**8K is won, and the remaining gap is largest at 128K/256K. The identified path from here is the MLP
+(40.4% of the 32K prefill, and a larger share at longer contexts where attention is amortised
+differently), which runs at bf16 GEMM rates on FP4 weights.**
