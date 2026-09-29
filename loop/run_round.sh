@@ -38,7 +38,7 @@ REPORT="$ROUNDS/$(printf '%03d' "$ROUND")-round.md"
 
 say() { echo "[round $ROUND] $*" | tee -a "$LOG"; }
 
-GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_DECODE=skip; GATE_PREFIX=skip; GATE_BENCH=skip
+GATE_BUILD=skip; GATE_TEST=skip; GATE_CORRECT=skip; GATE_GENERATE=skip; GATE_LONGCTX=skip; GATE_DECODE=skip; GATE_PREFIX=skip; GATE_BENCH=skip
 STATUS=FAIL
 
 {
@@ -101,7 +101,28 @@ if [ "$GATE_TEST" = pass ]; then
   fi
 fi
 
-# ------------------------------------------------- 3c. batched-decode gate ---
+# --------------------------------- 3b-ii. long-context follow gate ---
+# Every gate above is short-prompt, and that is exactly why round 282's
+# tensor-core prefill GEMM could pass all of them (generate 16/16, batch-parity
+# 16/16, PPL within 0.023%) while breaking the engine completely: past ~970
+# prompt tokens, through the chat template, one flipped argmax made the model
+# emit EOS as its first token and answer nothing at all, for 126 rounds.
+# This gate is deliberately a long prompt through the real template; it asserts
+# only that the model generates SOMETHING. See bench/longctx/longctx_gate.sh.
+if [ "$GATE_TEST" = pass ]; then
+  if [ -x "$ROOT/bench/longctx/longctx_gate.sh" ]; then
+    say "longctx-follow (long prompt + chat template; catches immediate EOS)"
+    if "$ROOT/bench/longctx/longctx_gate.sh" "$ROOT" >>"$LOG" 2>&1; then
+      GATE_LONGCTX=pass; say "longctx-follow OK"
+    else
+      GATE_LONGCTX=fail; say "longctx-follow FAILED (see $LOG)"
+    fi
+  else
+    GATE_LONGCTX=missing; say "no bench/longctx/longctx_gate.sh — gate pending"
+  fi
+fi
+
+
 # The generate gate above is single-sequence. This one proves that N sequences
 # decoded together in one pass give token-exact results, which is what the
 # concurrency target depends on. It uses prompts of *different* lengths: with
@@ -167,6 +188,7 @@ fi
 if [ "$GATE_BUILD" = pass ] && [ "$GATE_TEST" = pass ] &&
    { [ "$GATE_CORRECT" = pass ] || [ "$GATE_CORRECT" = missing ]; } &&
    { [ "$GATE_GENERATE" = pass ] || [ "$GATE_GENERATE" = missing ]; } &&
+   { [ "$GATE_LONGCTX" = pass ] || [ "$GATE_LONGCTX" = missing ]; } &&
    { [ "$GATE_DECODE" = pass ] || [ "$GATE_DECODE" = missing ]; } &&
    { [ "$GATE_PREFIX" = pass ] || [ "$GATE_PREFIX" = missing ]; } &&
    { [ "$GATE_BENCH" = pass ] || [ "$GATE_BENCH" = skip ]; }; then
@@ -183,6 +205,7 @@ fi
   echo "| test | $GATE_TEST |"
   echo "| correctness (layers) | $GATE_CORRECT |"
   echo "| correctness (64-layer) | $GATE_GENERATE |"
+  echo "| longctx-follow (long prompt, no silent EOS) | $GATE_LONGCTX |"
   echo "| decode-bench (warp vs serial) | $GATE_DECODE |"
   echo "| prefix cache A/B | $GATE_PREFIX |"
   echo "| benchmark | $GATE_BENCH |"
@@ -197,9 +220,9 @@ fi
 } >> "$REPORT"
 
 # ---------------------------------------------------------------- 6. state ---
-python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_DECODE" "$GATE_PREFIX" "$GATE_BENCH" <<'PY'
+python3 - "$STATE" "$ROUND" "$STATUS" "$STAMP" "$GATE_BUILD" "$GATE_TEST" "$GATE_CORRECT" "$GATE_GENERATE" "$GATE_LONGCTX" "$GATE_DECODE" "$GATE_PREFIX" "$GATE_BENCH" <<'PY'
 import json, sys
-state_path, rnd, status, stamp, b, t, c, g, dc, pf, bm = sys.argv[1:12]
+state_path, rnd, status, stamp, b, t, c, g, lc, dc, pf, bm = sys.argv[1:13]
 s = json.load(open(state_path))
 s["round"] = int(rnd)
 s["last_round_at"] = stamp
@@ -207,7 +230,7 @@ s["last_status"] = status
 s.setdefault("history", []).append(
     {"round": int(rnd), "at": stamp, "status": status,
      "gates": {"build": b, "test": t, "correctness": c, "generate": g,
-               "decode": dc, "prefix": pf, "benchmark": bm}}
+               "longctx": lc, "decode": dc, "prefix": pf, "benchmark": bm}}
 )
 json.dump(s, open(state_path, "w"), indent=2)
 print(f"state: round={rnd} status={status}")
@@ -220,7 +243,7 @@ if [ "$PUSH" = 1 ] && [ -d "$ROOT/.git" ]; then
   if ! git diff --cached --quiet; then
     git commit -q -m "round $ROUND: $STATUS
 
-gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT generate=$GATE_GENERATE bench=$GATE_BENCH
+gates: build=$GATE_BUILD test=$GATE_TEST correctness=$GATE_CORRECT generate=$GATE_GENERATE longctx=$GATE_LONGCTX bench=$GATE_BENCH
 
 Automated round by loop/run_round.sh" >>"$LOG" 2>&1
   fi

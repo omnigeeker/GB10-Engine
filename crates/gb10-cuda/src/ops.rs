@@ -8,7 +8,7 @@
 //! correctness rather than peak occupancy.
 
 use crate::{CudaError, CudaSlice, Device, LaunchConfig, Result};
-use cudarc::driver::{CudaFunction, PushKernelArg};
+use cudarc::driver::{CudaFunction, DevicePtr, DevicePtrMut, PushKernelArg};
 use std::collections::HashMap;
 
 /// Kernel symbols owned by `Ops`. Kept separate from the GEMV set so a typo in
@@ -50,9 +50,14 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "concat2_kernel",
     "nvfp4_gemm_kernel",
     "dequant_nvfp4_to_bf16_kernel",
+    "dequant_nvfp4_to_f16_kernel",
+    "dequant_fp8_to_f16_kernel",
+    "u16_to_f16_kernel",
     "dequant_fp8_to_bf16_kernel",
     "f32_to_bf16_kernel",
+    "f32_to_f16_kernel",
     "bf16_to_f32_scaled_kernel",
+    "f32_scale_kernel",
     "u16_to_bf16_kernel",
     "fp8_gemm_kernel",
     "bf16_gemm_kernel",
@@ -105,9 +110,14 @@ pub struct Ops {
     concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
     dequant_nvfp4_to_bf16: CudaFunction,
+    dequant_nvfp4_to_f16: CudaFunction,
+    dequant_fp8_to_f16: CudaFunction,
+    u16_to_f16: CudaFunction,
     dequant_fp8_to_bf16: CudaFunction,
     f32_to_bf16: CudaFunction,
+    f32_to_f16: CudaFunction,
     bf16_to_f32_scaled: CudaFunction,
+    f32_scale: CudaFunction,
     u16_to_bf16: CudaFunction,
     fp8_gemm: CudaFunction,
     bf16_gemm: CudaFunction,
@@ -170,9 +180,14 @@ impl Ops {
             concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
             dequant_nvfp4_to_bf16: take(map, "dequant_nvfp4_to_bf16_kernel")?,
+            dequant_nvfp4_to_f16: take(map, "dequant_nvfp4_to_f16_kernel")?,
+            dequant_fp8_to_f16: take(map, "dequant_fp8_to_f16_kernel")?,
+            u16_to_f16: take(map, "u16_to_f16_kernel")?,
             dequant_fp8_to_bf16: take(map, "dequant_fp8_to_bf16_kernel")?,
             f32_to_bf16: take(map, "f32_to_bf16_kernel")?,
+            f32_to_f16: take(map, "f32_to_f16_kernel")?,
             bf16_to_f32_scaled: take(map, "bf16_to_f32_scaled_kernel")?,
+            f32_scale: take(map, "f32_scale_kernel")?,
             u16_to_bf16: take(map, "u16_to_bf16_kernel")?,
             fp8_gemm: take(map, "fp8_gemm_kernel")?,
             bf16_gemm: take(map, "bf16_gemm_kernel")?,
@@ -779,6 +794,162 @@ impl Ops {
         Ok(())
     }
 
+    /// fp16 twin of `dequant_nvfp4_to_bf16`. See `cublas_gemm_f16_f32`.
+    pub fn dequant_nvfp4_to_f16(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<u8>,
+        sc: &CudaSlice<u8>,
+        out: &mut CudaSlice<half::f16>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        need(out.len() >= n * k, "dequant_nvfp4_to_f16")?;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let grid = cdiv(n * k, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.dequant_nvfp4_to_f16)
+                .arg(w)
+                .arg(sc)
+                .arg(out)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// fp16 twin of `dequant_fp8_to_bf16`. See `cublas_gemm_f16_f32`.
+    pub fn dequant_fp8_to_f16(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<u8>,
+        s1: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::f16>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        need(out.len() >= n * k, "dequant_fp8_to_f16")?;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let grid = cdiv(n * k, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.dequant_fp8_to_f16)
+                .arg(w)
+                .arg(s1)
+                .arg(out)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// fp16 twin of `u16_to_bf16`. See `cublas_gemm_f16_f32`.
+    pub fn u16_to_f16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<u16>,
+        out: &mut CudaSlice<half::f16>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && out.len() >= n, "u16_to_f16")?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.u16_to_f16)
+                .arg(x)
+                .arg(out)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `y[t, n] = x[t, k] * W[n, k]^T` on **fp16** tensor cores, fp32
+    /// accumulate, **fp32 output**.
+    ///
+    /// This is the prefill GEMM the tensor-core path uses. Same operand layout
+    /// and same `cublasGemmEx` call as `cublas_gemm_bf16_f32`; both operands are
+    /// `CUDA_R_16F`.
+    ///
+    /// fp16 rather than bf16 because bf16's 8 mantissa bits were not enough for
+    /// this model: `generate` was 16/16 token-exact with bf16 operands, yet at
+    /// 970+ prompt tokens the greedy argmax flipped to EOS and the engine
+    /// returned no content at all, where the fp32 CUDA-core path answers
+    /// correctly and so does llama.cpp on the same prompts. Perplexity at a
+    /// 512-token window could not see it (0.023% on mean NLL), which is why the
+    /// short-prompt gates cleared it. fp16 keeps 10 mantissa bits at identical
+    /// throughput.
+    ///
+    /// Mixed bf16 weights with fp16 activations is *not* used: this cuBLAS
+    /// rejects that pair with a buffer-size error even though the documentation
+    /// allows differing `Atype`/`Btype` under `CUBLAS_COMPUTE_32F`.
+    pub fn cublas_gemm_f16_f32(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<half::f16>,
+        x: &CudaSlice<half::f16>,
+        y: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        t: usize,
+    ) -> Result<()> {
+        use cudarc::cublas::sys::{
+            cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
+        };
+        need(
+            w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
+            "cublas_gemm_f16_f32",
+        )?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let status = unsafe {
+            cublasGemmEx(
+                *dev.blas().handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                t as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16F,
+                k as i32,
+                x.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16F,
+                k as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                y.device_ptr_mut(dev.stream()).0 as *mut std::ffi::c_void,
+                cudaDataType::CUDA_R_32F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        need(
+            status == cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+            "cublasGemmEx(f16 x f16 -> f32) failed",
+        )?;
+        Ok(())
+    }
+
     /// Cast `n` fp32 values to bf16 (the tensor-core activation format).
     pub fn f32_to_bf16(
         &self,
@@ -884,6 +1055,198 @@ impl Ops {
                     shared_mem_bytes: 0,
                 })?;
         }
+        Ok(())
+    }
+
+    /// Cast `n` fp32 values to fp16 (round to nearest).
+    ///
+    /// The activation operand of the tensor-core prefill GEMM. fp16 rather than
+    /// bf16 because bf16's 8 mantissa bits were not enough: see
+    /// `cublas_gemm_bf16_f16_f32`.
+    pub fn f32_to_f16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::f16>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && out.len() >= n, "f32_to_f16")?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.f32_to_f16)
+                .arg(x)
+                .arg(out)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `y[t, n] = x[t, k] * W[n, k]^T` with **bf16 weights, fp16 activations**
+    /// and an fp32 output, accumulating in fp32.
+    ///
+    /// Same layout and same `cublasGemmEx` path as `cublas_gemm_bf16_f32`; the
+    /// only difference is `Btype = CUDA_R_16F`. The two operands are allowed to
+    /// differ because the compute type is `CUBLAS_COMPUTE_32F`, which is what
+    /// lets the weights stay in bf16 -- bf16 is already lossless for the 4-bit
+    /// NVFP4 and FP8 weights, so re-converting them to fp16 would cost a kernel
+    /// pass and buy nothing.
+    ///
+    /// The activations are the operand that needs the precision: they are the
+    /// only full-precision value on this path, and they feed a 48-layer
+    /// Gated-DeltaNet recurrence that compounds their error with length.
+    pub fn cublas_gemm_bf16_f16_f32(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<half::bf16>,
+        x: &CudaSlice<half::f16>,
+        y: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        t: usize,
+    ) -> Result<()> {
+        use cudarc::cublas::sys::{
+            cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
+        };
+        need(
+            w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
+            "cublas_gemm_bf16_f16_f32",
+        )?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let status = unsafe {
+            cublasGemmEx(
+                *dev.blas().handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                t as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                k as i32,
+                x.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16F,
+                k as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                y.device_ptr_mut(dev.stream()).0 as *mut std::ffi::c_void,
+                cudaDataType::CUDA_R_32F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        need(
+            status == cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+            "cublasGemmEx(bf16 x f16 -> f32) failed",
+        )?;
+        Ok(())
+    }
+
+    /// Scale `n` fp32 values by the single scalar in `s`, in place.
+    ///
+    /// This is the NVFP4 `s2` application that used to ride along with the
+    /// bf16 -> fp32 epilogue. It exists separately now because the GEMM writes
+    /// fp32 directly (see `cublas_gemm_bf16_f32`), so there is no conversion
+    /// left to fuse it into.
+    pub fn f32_scale(
+        &self,
+        dev: &Device,
+        x: &mut CudaSlice<f32>,
+        s: &CudaSlice<f32>,
+        n: usize,
+    ) -> Result<()> {
+        need(x.len() >= n && s.len() >= 1, "f32_scale")?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.f32_scale)
+                .arg(x)
+                .arg(s)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `y[t, n] = x[t, k] * W[n, k]^T` on bf16 tensor cores with an **fp32**
+    /// output, accumulating in fp32.
+    ///
+    /// This is `cublas_gemm_bf16` with `C` left in fp32, and it exists because
+    /// rounding the accumulator to bf16 on the way out costs real accuracy for
+    /// no speed. cudarc's safe `Gemm<bf16>` fixes A, B *and* C to
+    /// `CUDA_R_16BF`, so a mixed bf16-in/fp32-out GEMM has to go through
+    /// `cublasGemmEx` directly.
+    ///
+    /// The operand layout is unchanged from `cublas_gemm_bf16`: cuBLAS is
+    /// column-major and computes `C(m, n) = op(A) * op(B)`, so `m = n_out` and
+    /// `n = t` make `C`, read column-major, exactly our row-major `y[t, n_out]`.
+    /// `W` is row-major `[n_out, k]`, which read column-major with `lda = k` is
+    /// `W^T`, hence `transa = T`; `x` is row-major `[t, k]`, already the
+    /// `(k, t)` operand with `ldb = k`, hence `transb = N`.
+    ///
+    /// Writing straight into the caller's fp32 `y` also removes the separate
+    /// bf16 -> fp32 convert kernel, so this path is one launch shorter than the
+    /// bf16-output one it replaces.
+    pub fn cublas_gemm_bf16_f32(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<half::bf16>,
+        x: &CudaSlice<half::bf16>,
+        y: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        t: usize,
+    ) -> Result<()> {
+        use cudarc::cublas::sys::{
+            cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
+            cublasComputeType_t,
+        };
+        need(
+            w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
+            "cublas_gemm_bf16_f32",
+        )?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let status = unsafe {
+            cublasGemmEx(
+                *dev.blas().handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                t as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                k as i32,
+                x.device_ptr(dev.stream()).0 as *const std::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                k as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                y.device_ptr_mut(dev.stream()).0 as *mut std::ffi::c_void,
+                cudaDataType::CUDA_R_32F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        need(
+            status == cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+            "cublasGemmEx(bf16 x bf16 -> f32) failed",
+        )?;
         Ok(())
     }
 

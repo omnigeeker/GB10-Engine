@@ -98,10 +98,21 @@ impl Linear {
     /// measures ~80 TFLOP/s at these exact shapes -- an 11-12x step -- and the
     /// prefill is 75-93% GEMM, so this is the whole remaining gap.
     ///
-    /// Four kernels per matrix: dequantise W to bf16, cast the activations to
-    /// bf16, the cuBLAS GEMM, then an epilogue back to fp32 that also applies
-    /// `s2` for the NVFP4 case (which must *not* be folded into the weights --
+    /// Three kernels per matrix: dequantise W to bf16, cast the activations to
+    /// bf16, then one cuBLAS GEMM that accumulates in fp32 and **writes fp32**
+    /// into the caller's output. The NVFP4 path owes one more tiny kernel to
+    /// apply its per-tensor `s2` (which must *not* be folded into the weights --
     /// the reference applies it to the fp32 accumulator).
+    ///
+    /// Rounding the GEMM *output* to bf16 was a real accuracy bug, not a
+    /// rounding detail: it discarded precision cuBLAS had already computed, in
+    /// roughly 450 GEMMs per prefill, feeding a 48-layer Gated-DeltaNet
+    /// recurrence whose state compounds the error with sequence length. It went
+    /// unnoticed because perplexity at a 512-token window moves only 0.023%
+    /// (mean NLL 1.875052 -> 1.875490) while the long-context greedy argmax
+    /// flips: at 970+ prompt tokens the model emitted EOS as its first token and
+    /// answered nothing, where the fp32 path answers correctly. Measured across
+    /// a fixed battery of 5 long prompts as 5/5 -> 0/5. See `bench/longctx`.
     ///
     /// The buffers are per-call rather than a shared persistent scratch, which
     /// relies on cudarc's caching allocator to make the repeat allocations
@@ -131,27 +142,18 @@ impl Linear {
         // grown, which is what removes the per-call allocator cost.
         let mut sc = dev.tc_scratch();
         if sc.w.as_ref().map_or(true, |b| b.len() < n * k) {
-            sc.w = Some(stream.alloc_zeros::<bf16>(n * k)?);
+            sc.w = Some(stream.alloc_zeros::<half::f16>(n * k)?);
         }
         if sc.x.as_ref().map_or(true, |b| b.len() < t * k) {
-            sc.x = Some(stream.alloc_zeros::<bf16>(t * k)?);
-        }
-        if sc.y.as_ref().map_or(true, |b| b.len() < t * n) {
-            sc.y = Some(stream.alloc_zeros::<bf16>(t * n)?);
-        }
-        if sc.one.is_none() {
-            let mut one = stream.alloc_zeros::<f32>(1)?;
-            dev.stream().memcpy_htod(&[1.0f32], &mut one)?;
-            sc.one = Some(one);
+            sc.x = Some(stream.alloc_zeros::<half::f16>(t * k)?);
         }
         // Named with an `s` prefix because `x` and `y` are already the fp32
         // input and output of this function.
-        let TcScratch { w: sw, x: sx, y: sy, one } = &mut *sc;
-        let (wb, xb, yb) = (
-            sw.as_mut().unwrap(),
-            sx.as_mut().unwrap(),
-            sy.as_mut().unwrap(),
-        );
+        //
+        // There is no longer a bf16 `sc.y`: the GEMM writes fp32 directly into
+        // the caller's `y`, so the accumulator is never rounded on the way out.
+        let TcScratch { w: sw, x: sx, .. } = &mut *sc;
+        let (wb, xb) = (sw.as_mut().unwrap(), sx.as_mut().unwrap());
 
         // Gated: the server shares this path and only `gemm_event_snapshot`
         // drains the Vec, so unconditional recording would retain events for
@@ -180,28 +182,27 @@ impl Linear {
         mark!(0);
         match &self.data {
             LinearData::NvFp4 { w: qw, wscale, .. } => {
-                kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
+                kern.dequant_nvfp4_to_f16(dev, qw, wscale, wb, n, k)?;
             }
             LinearData::Fp8 { w: qw, scale } => {
-                kern.dequant_fp8_to_bf16(dev, qw, scale, wb, n, k)?;
+                kern.dequant_fp8_to_f16(dev, qw, scale, wb, n, k)?;
             }
             LinearData::Bf16 { w: qw } => {
-                kern.u16_to_bf16(dev, qw, wb, n * k)?;
+                kern.u16_to_f16(dev, qw, wb, n * k)?;
             }
         }
         mark!(1);
-        kern.f32_to_bf16(dev, x, xb, t * k)?;
+        kern.f32_to_f16(dev, x, xb, t * k)?;
         mark!(2);
-        kern.cublas_gemm_bf16(dev, wb, xb, yb, n, k, t)?;
+        // fp32 straight into the caller's `y`: cuBLAS still accumulates in
+        // fp32, but the result is no longer rounded to bf16 before we see it.
+        kern.cublas_gemm_f16_f32(dev, wb, xb, y, n, k, t)?;
         mark!(3);
 
-        // Only NVFP4 defers a scale to the epilogue; the others pass one.
-        let one = one.as_ref().unwrap();
-        match &self.data {
-            LinearData::NvFp4 { scale2, .. } => {
-                kern.bf16_to_f32_scaled(dev, yb, y, scale2, true, t * n)?
-            }
-            _ => kern.bf16_to_f32_scaled(dev, yb, y, one, false, t * n)?,
+        // Only NVFP4 defers a per-tensor scale; every other dtype folded its
+        // scale into the weights during the dequant above, so it is done.
+        if let LinearData::NvFp4 { scale2, .. } = &self.data {
+            kern.f32_scale(dev, y, scale2, t * n)?;
         }
         mark!(4);
         if let Some(t) = evs.take() {
@@ -244,16 +245,40 @@ impl Linear {
         if self.n < 256 || t <= 16 {
             return self.forward(dev, x, y, t);
         }
-        // bf16 tensor-core GEMM (see `forward_prefill_tensor_core`). Default on:
-        // it measured 2.48x on 8K cold TTFT (54.88 -> 22.15 s) and holds both
-        // token-exact gates -- `generate` 16/16 against the oracle and
-        // `batch-parity` 16/16 over 16 sequences. Set `GB10_TC_GEMM=0` to fall
-        // back to the fp32 CUDA-core GEMM, which is still the reference for
-        // `forward-cost`.
+        // Tensor-core prefill GEMM (see `forward_prefill_tensor_core`).
+        // **Opt-in, and it must stay that way until its numerics are fixed.**
         //
-        // Warm TTFT and OTPS are untouched by this, by construction: the decode
-        // path still runs the NVFP4 GEMV, so its roofline is unchanged.
-        if std::env::var("GB10_TC_GEMM").map(|v| v != "0").unwrap_or(true) {
+        // It is 2.48x faster on 8K cold TTFT and it holds every gate the round
+        // loop runs -- `generate` 16/16 token-exact against the frozen HF oracle,
+        // `batch-parity` 16/16, and perplexity within 0.023% of fp32 at a
+        // 512-token window. All of those gates are blind to what it breaks,
+        // because what it breaks only appears at long context and only through
+        // the chat template.
+        //
+        // Measured with `gb10-verify generate` on one fixed 958-token prompt:
+        //
+        //   raw prompt,  fp32 [271, 14556]   fp16-tensor-core [271, 14556]   same
+        //   templated,   fp32 "We need answer user's request. User..."       ok
+        //                fp16-tensor-core []  -- EOS as the first token
+        //
+        // That single flipped argmax is the whole long-context failure: through
+        // the server the engine then answers nothing at all for every prompt
+        // over roughly 970 tokens (5/5 -> 0/5 on a fixed battery, with
+        // `completion_tokens: 0`), while llama.cpp answers the same prompts
+        // correctly. It is a genuine near-tie at the first generated position,
+        // and reduced-precision operands land on the wrong side of it.
+        //
+        // Both precisions fail. bf16 (8 mantissa bits) fails, and so does fp16
+        // (10 bits) even with an fp32 accumulator written straight out of
+        // cuBLAS, so the required precision is above 10 bits and this is not a
+        // rounding detail to be tuned. The fp32 CUDA-core GEMM below is the
+        // correct path. Getting the speed back needs a lever that does not
+        // change the numerics -- see the `mma.sync` prefill attention plan in
+        // `bench/longctx/comparison.md`, which keeps fp32 accumulation.
+        //
+        // Warm TTFT and OTPS were never affected: the decode path runs the
+        // NVFP4 GEMV, untouched by any of this.
+        if std::env::var("GB10_TC_GEMM").map(|v| v == "1").unwrap_or(false) {
             return self.forward_prefill_tensor_core(dev, x, y, t);
         }
         let kern = dev.ops();

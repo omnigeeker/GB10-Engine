@@ -942,7 +942,7 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
     );
 
     let mut state = ModelState::new(&dev, &model, args.max_seq, 1)?;
-    let mut sc = Scratch::new(&dev, &text, 512)?;
+    let mut sc = Scratch::new(&dev, &text, args.max_seq.max(512))?;
 
     let t1 = std::time::Instant::now();
     let mut next = model.prefill(&dev, &ids, &mut state, &mut sc)?;
@@ -1004,7 +1004,7 @@ fn generate(args: &Args, prompt: &str, n_new: usize) -> Result<bool> {
         let t_r = std::time::Instant::now();
         for rep in 1..args.repeat {
             let mut st = ModelState::new(&dev, &model, args.max_seq, 1)?;
-            let mut sc2 = Scratch::new(&dev, &text, 512)?;
+            let mut sc2 = Scratch::new(&dev, &text, args.max_seq.max(512))?;
             let mut nx = model.prefill(&dev, &ids, &mut st, &mut sc2)?;
             let mut o2 = Vec::with_capacity(n_new);
             for _ in 0..n_new {

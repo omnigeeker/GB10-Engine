@@ -590,3 +590,74 @@ extern "C" __global__ void u16_to_bf16_kernel(const uint16_t* __restrict__ x,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __ushort_as_bfloat16(__ldg(x + i));
 }
+
+// In-place scale of an fp32 buffer by a single scalar.
+//
+// The tensor-core prefill GEMM now returns fp32 straight from cuBLAS so that the
+// accumulator is not rounded to bf16 on the way out (see
+// `cublas_gemm_bf16_f32`). That removed the bf16 -> fp32 epilogue, but the NVFP4
+// path still owes its per-tensor `s2`, so this applies just that. `n` is the
+// element count and `s` is one value, matching the `__ldg(s2)` scalar of the
+// epilogue it replaces. In-place is safe: each thread reads and writes its own
+// index with no cross-thread dependence.
+extern "C" __global__ void f32_scale_kernel(float* __restrict__ x,
+                                            const float* __restrict__ s, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] * __ldg(s);
+}
+
+// fp32 -> fp16 for the tensor-core activation operand.
+//
+// bf16 carries 8 mantissa bits, and casting the activations to it was enough to
+// flip the greedy argmax at long context (see `forward_prefill_tensor_core`).
+// fp16 carries 10, at the same tensor-core throughput, and it is lossless for
+// the 4-bit NVFP4 / FP8 weights, which stay in bf16 -- `cublasGemmEx` takes
+// Atype and Btype independently, so the pair is mixed rather than converted.
+extern "C" __global__ void f32_to_f16_kernel(const float* __restrict__ x,
+                                             __half* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half_rn(__ldg(x + i));
+}
+
+// ---- fp16 twins of the operand staging kernels ---------------------------
+//
+// The tensor-core prefill GEMM runs entirely in fp16 rather than bf16. bf16's 8
+// mantissa bits were not enough: `generate` 16/16 was token-exact with bf16
+// activations, but at 970+ prompt tokens the greedy argmax flipped to EOS and
+// the model answered nothing (5/5 -> 0/5 on a fixed long-prompt battery, and
+// llama.cpp answers the same prompts fine). fp16 has 10 mantissa bits at the
+// same tensor-core throughput, and it is still lossless for these weights --
+// NVFP4 carries 4 bits and FP8 E4M3 carries 4, both well inside fp16's 10.
+extern "C" __global__ void dequant_nvfp4_to_f16_kernel(const uint8_t* __restrict__ w,
+                                                       const uint8_t* __restrict__ sc,
+                                                       __half* __restrict__ out,
+                                                       int N, int K) {
+    const size_t total = (size_t)N * (size_t)K;
+    const int kk = K;
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (size_t)gridDim.x * blockDim.x) {
+        const int n = (int)(idx / (size_t)kk);
+        const int k = (int)(idx % (size_t)kk);
+        const uint8_t byte = __ldg(w + (size_t)n * (size_t)(kk >> 1) + (size_t)(k >> 1));
+        const uint8_t nib = (k & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+        const float s = e4m3_to_float(__ldg(sc + (size_t)n * (size_t)(kk >> 4) + (size_t)(k >> 4)));
+        out[idx] = __float2half_rn(e2m1_to_float(nib) * s);
+    }
+}
+
+extern "C" __global__ void dequant_fp8_to_f16_kernel(const uint8_t* __restrict__ w,
+                                                     const float* __restrict__ s1,
+                                                     __half* __restrict__ out,
+                                                     int N, int K) {
+    const size_t total = (size_t)N * (size_t)K;
+    const float wscale = __ldg(s1);
+    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (size_t)gridDim.x * blockDim.x)
+        out[idx] = __float2half_rn(e4m3_to_float(__ldg(w + idx)) * wscale);
+}
+
+extern "C" __global__ void u16_to_f16_kernel(const uint16_t* __restrict__ x,
+                                             __half* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __ushort_as_half(__ldg(x + i));
+}
