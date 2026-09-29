@@ -8799,3 +8799,48 @@ earlier finding that the attention kernel is 11% of the 8K prefill. **The 8K gap
 linear-work problem in every phase that has been instrumented**, and the phases that have been
 instrumented are now 45.5% (MLP) + 17.4% (`proj in`) + 5.3% (`proj out`) + 4.2% (delta rule chunk)
 + 3.4% (conv/l2norm/gate) = **75.8% of the prefill**, plus the attention kernel's 11%.
+
+## The `in_proj_a` GEMM is correct and uses a cached handle -- what is left is a shape problem
+
+The wrapper was read (`crates/gb10-cuda/src/ops.rs:1279`). It is not doing anything obviously wrong:
+
+```rust
+cublasGemmEx(*dev.blas().handle(),          // cached handle, not per-call
+    CUBLAS_OP_T, CUBLAS_OP_N,
+    n as i32, t as i32, k as i32,           // m = n = 48,  nn = t = 8192,  k = 5120
+    &alpha, w.ptr, CUDA_R_16BF, k as i32,   // A = w  [48, 5120], lda = k
+            x.ptr, CUDA_R_16BF, k as i32,   // B = x  [8192, 5120], ldb = k
+    &beta,  y.ptr, CUDA_R_32F,  n as i32,   // C = y  [48, 8192],  ldc = n
+    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)
+```
+
+The handle is cached on the device, the leading dimensions are consistent with the row-major
+layout, and `ldc = n` is right for a column-major `[m=48, n=8192]` result. **So the call is
+correct, and the remaining ~6 ms per call is a property of the shape, not of a bug.**
+
+**The shape is `m = 48, n = 8192, k = 5120` -- and that is the smallest possible `m` for a
+tensor-core GEMM.** cuBLAS tiles the `m` dimension in units of 128 or 64, so an `m` of 48 occupies
+less than half of a single tile row, and the kernel gets at most 48 rows of parallelism against 48
+SMs. **A very plausible consequence, and it fits every measurement so far, is that
+`CUBLAS_GEMM_DEFAULT` selects a split-K algorithm for this shape**: split-K is exactly what cuBLAS
+does when the `m x n` grid is too small to fill the device, and it re-reads the `B` operand once per
+split. `B` here is the activation, 84 MB; at the measured 228 GB/s, four to eight splits is
+**1.5 to 3.0 ms of extra traffic** on top of the ~1.5 ms of cast and traffic that is already
+accounted for -- which is the right order to explain a 7.6 ms call.
+
+**This is a hypothesis, not a finding, and it is recorded as one.** It is also cheap to test and
+cheap to act on if true:
+
+* **Test**: benchmark the exact shape `m = 48, n = 8192, k = 5120` in isolation, and the same
+  shape with the operands swapped (`m = 8192, n = 48`) -- i.e. computing `y^T = x @ w^T` instead of
+  `y = w @ x^T`. If the swapped orientation is several times faster, split-K is confirmed.
+* **Act**: if it is, the fix is to transpose the two small projections. `in_proj_a` and `in_proj_b`
+  produce 48 columns of output; computing them as `m = t, n = 48` gives the kernel 8192 rows of
+  parallelism, no split-K, and a weight operand of 0.5 MB that stays in cache. It costs a transposed
+  output buffer, which is a local change to two call sites.
+
+**What is now established about the 733 ms, stated without overreach:** it is not a fixed per-call
+cost (it scales with `t`), it is not a bad algorithm *choice* being made per call (the handle is
+cached and the parameters are correct), it is not the activation cast (1.1 ms of the 7.6 ms), and it
+is not the weight dequantisation (fixed per call, and tiny). It is data-proportional, it is specific
+to shapes whose `m` is 48, and the leading candidate mechanism is split-K re-reading the activation.
