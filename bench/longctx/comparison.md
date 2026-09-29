@@ -10675,3 +10675,28 @@ preserves the arithmetic.** The two paths that remain are the ones already ident
 **Both are streaming changes to the `ldmatrix` operands, and both are larger than anything this
 session has attempted on the kernel.** The negative result is recorded because it prevents the next
 round from spending its budget on a padding or fp16-`S` micro-cut that cannot work.
+
+## The direct-FP4 kernel path is 4.5x slower -- there is no cheap FP4 win
+
+The MLP dominates the non-attention prefill (19.52 s of the 32K total) and runs **bf16 cuBLAS GEMMs
+on weights that are stored as NVFP4**. Since bf16 tensor cores are ~75 TFLOP/s on this part and FP4
+is ~148 TFLOP/s, an FP4 GEMM looked like it could halve the largest non-attention term. **The
+codebase already contains an `nvfp4_gemm_kernel` (`kernels/gemm.cu:491`) and a `nvfp4_gemm` binding,
+so this was one environment variable away from being testable:**
+
+| 8K prefill | total |
+|---|---|
+| default (`forward_prefill_tensor_core`, bf16 cuBLAS) | **10.61 s** |
+| `GB10_TC_GEMM=0` (direct FP4 kernel) | **47.51 s** |
+
+**The direct-FP4 path is 4.5x slower, not 2x faster.** It is the documented fallback, reached only
+when the tensor-core path is disabled, and it is a hand-written kernel rather than a cuBLAS
+implementation with the NVFP4 block-scaled layouts. **So the 2x that FP4 tensor cores offer is real
+but not reachable through anything that already exists** -- it would need a cuBLASLt FP4 GEMM with
+block scaling (`CUDA_R_4F_E2M1` plus the scale-factor layouts), which is a new implementation, not a
+switch.
+
+**This closes the last cheap direction outside the attention kernel.** Every remaining term in the
+32K prefill is either already near its measured ceiling (the MLP at ~76% of bf16 peak, the large
+GEMMs at 0.98-1.02x cold/warm) or is the attention kernel, whose root cause is settled and whose fix
+is the streaming change described above.
