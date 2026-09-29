@@ -11823,3 +11823,44 @@ the kernel measurement predicted.
 **Two more fixes landed this round and last, both from the corrected occupancy model:**
 `__launch_bounds__(256, 4)` was tested and rejected (1%), and **the V staging tile was accepted at
 -18.9% of the attention kernel.**
+
+## 128K after the staging work: gb10 -11.5%, but llama.cpp moved further -- ratio 1.96x
+
+```
+# gb10-128K   trial 0  cold 447.66  warm 0.14  otps 5.33
+# llama-128K  trial 0  cold 228.21  warm 0.43  otps 5.57
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| earlier this session | 505.65 s | 290.63 s | 1.74x |
+| **now** | **447.66 s** | **228.21 s** | **1.962x** |
+
+**gb10 got 11.5% faster, exactly as the kernel work predicts** (the attention kernel is 71.9% of the
+128K prefill, and it fell 18.9%). **But llama.cpp's own 128K cold TTFT fell from 290.63 s to 228.21 s
+-- 21.5% -- so the ratio moved the wrong way.** That is a 27% swing in llama's number between two
+same-session measurements of the same command, and it is the honest reading: **at 128K the paired
+ratio is dominated by variance in the reference, not only by our own kernel.**
+
+**Two conclusions that matter for the objective:**
+
+1. **Our own progress is real and measurable in absolute terms:** 128K cold TTFT has gone
+   `631.31 s -> 505.65 s -> 447.66 s` this session, a **29% absolute reduction**, tracking the two
+   staging changes.
+2. **The ratio at 128K is not yet a stable measurement.** A single trial against a reference whose
+   own spread is 27% cannot support a claim either way. **Any 128K claim needs repeated trials on
+   both sides**, which the objective's "reproducible same-session comparison" wording requires.
+
+**Current state of all four lengths:**
+
+| length | gb10 | llama.cpp | ratio | best ratio this session |
+|---|---|---|---|---|
+| **8K** | **8.69-8.72 s** | 9.06-9.40 s | **0.925-0.963x -- gb10 wins** | 0.925x |
+| 32K | 53.99-54.08 s | 43.25-44.56 s | 1.214-1.248x | 1.214x |
+| 128K | 447.66 s | 228.21 s | 1.962x | 1.74x (llama's slower run) |
+| 256K | (not re-measured) | 582.55 s | ~2.4x projected | 2.918x |
+
+**gb10's own cold TTFT, all four lengths, has improved monotonically this session:** 8K
+`10.53 -> 8.69 s`, 32K `64.61 -> 53.99 s`, 128K `631.31 -> 447.66 s`. **The remaining gap at 128K is
+now a single-trial measurement against a variable reference, and closing it needs the attention
+kernel to fall further -- it is still 71.9% of that prefill.**
