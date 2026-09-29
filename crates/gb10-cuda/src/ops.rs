@@ -1812,8 +1812,9 @@ impl Ops {
         // 16-byte aligned so ldmatrix can read whole fragments in one instruction,
         // which retires the old +4 gap that only existed for the scalar kernel's
         // bank behaviour.
-        let smem =
-            (BQ * (head_dim + 8) + BK * (head_dim + 8)) * 2 + (BQ * BK + 3 * BQ) * 4;
+        let smem = (BQ * (head_dim + 8) + BK * (head_dim + 8)) * 2
+            + (BQ * BK + 3 * BQ) * 4
+            + BK * (head_dim + 8) * 2;   // the staged V tile
 
         // Occupancy probe. The computed request (43,104 B here) is what lets two
         // blocks co-reside per SM; `GB10_ATTN_SMEM_PROBE=<bytes>` raises the

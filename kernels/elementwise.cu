@@ -424,6 +424,13 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     __half* Ks = Qs + PREFILL_BQ * PS;                    // BK * PS fp16
     float* S = reinterpret_cast<float*>(Ks + PREFILL_BK * PS);   // BQ * BK fp32
     float* red = S + PREFILL_BQ * PREFILL_BK;      // 3 * BQ  (m, l, correction)
+    // A shared-memory staging tile for V, so its sixteen per-thread loads become
+    // two uint4 loads -- the same transformation that took the K staging down 25%.
+    // V was measured at 30.9% of this kernel by removing its loads outright.
+    // The extra 8,448 B does NOT cost occupancy: 22,944 B and 31,392 B both give
+    // three blocks per SM (102400/22944 = 4.46, 102400/31392 = 3.26, and the
+    // kernel is at 3 by registers anyway), so the tile is free.
+    __half* Vs = reinterpret_cast<__half*>(red + 3 * PREFILL_BQ);   // BK * PS fp16
 
     const int h = blockIdx.x;
     const int t0 = blockIdx.y * PREFILL_BQ;
@@ -473,27 +480,27 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
         for (int idx = tid * 8; idx < PREFILL_BK * HD; idx += nt * 8) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            uint4 val;
+            uint4 kval, vval;
             if (s <= win_max) {
-                val = *reinterpret_cast<const uint4*>(
-                    k + (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d);
+                const size_t base = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d;
+                kval = *reinterpret_cast<const uint4*>(k + base);
+                vval = *reinterpret_cast<const uint4*>(v + base);
             } else {
-                val = make_uint4(0u, 0u, 0u, 0u);
+                kval = make_uint4(0u, 0u, 0u, 0u);
+                vval = make_uint4(0u, 0u, 0u, 0u);
             }
-            *reinterpret_cast<uint4*>(Ks + j * PS + d) = val;
-        }
-        // This thread's column of V, held in registers. Consecutive threads read
-        // consecutive addresses, so each of the BK loads is one 128-byte
-        // transaction per warp. Issued here so the latency overlaps the score
-        // loop and the softmax rather than stalling the accumulator loop.
-#pragma unroll
-        for (int j = 0; j < PREFILL_BK; ++j) {
-            const int s = s0 + j;
-            vr[j] = (s <= win_max)
-                        ? __half2float(v[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + tid])
-                        : 0.0f;
+            *reinterpret_cast<uint4*>(Ks + j * PS + d) = kval;
+            *reinterpret_cast<uint4*>(Vs + j * PS + d) = vval;
         }
         __syncthreads();
+        // This thread's column of V, held in registers, now read from the staged
+        // tile. It MUST be after the barrier: unlike the global load it replaced,
+        // these bytes were written by other threads in this block. The reads are
+        // shared-memory, so they are cheap and do not need latency hiding.
+#pragma unroll
+        for (int j = 0; j < PREFILL_BK; ++j) {
+            vr[j] = __half2float(Vs[j * PS + tid]);
+        }
 
         // ---- score: S[BQ][BK] = Q . K^T * scale, on tensor cores ----------
         //

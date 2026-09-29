@@ -11702,3 +11702,68 @@ shorter iteration.** `(t x keys / 384)` iterations at ~850 ns; the 384 is pinned
 `BQ * BK == 3 * (head_dim / 2)` and the ~850 ns is the staging plus four barriers.
 
 **This closes the occupancy branch conclusively, and it is the sixth path closed by measurement.**
+
+## FIXED: stage V in shared memory -- attention kernel -18.9% at 32K
+
+**This change was blocked by a wrong occupancy model for ~20 rounds.** The reasoning was that adding
+an 8,448 B V tile would push shared memory to 31,392 B, drop occupancy to 1 block per SM, and
+regress. **The runtime measurement shows that is false:** at 22,944 B the kernel is at **3** blocks
+(by registers), and at 31,392 B it is still **3** blocks (`102400 / 31392 = 3.26`). **The V tile is
+occupancy-free.**
+
+```
+baseline:  regs 80  dynamic_smem 22944 B  -> by_regs 3  by_smem 4  binding REGS
+V staged:  regs 80  dynamic_smem 31392 B  -> by_regs 3  by_smem 3  binding SMEM
+```
+
+**And V was the largest single item in the iteration -- measured at 30.9% of the kernel by removing
+its sixteen loads outright.** Staging it turns sixteen scalar 2-byte global loads per thread into two
+`uint4` loads plus sixteen cheap shared-memory reads -- **the same transformation that took the K
+staging down 25%**, and the `win_max` zero-fill is shared between the two tiles because out-of-window
+keys are irrelevant to both.
+
+```cuda
+for (int idx = tid * 8; idx < PREFILL_BK * HD; idx += nt * 8) {
+    const int j = idx / HD, d = idx % HD;
+    const int s = s0 + j;
+    uint4 kval, vval;
+    if (s <= win_max) {
+        const size_t base = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d;
+        kval = *reinterpret_cast<const uint4*>(k + base);
+        vval = *reinterpret_cast<const uint4*>(v + base);
+    } else { kval = make_uint4(0,0,0,0); vval = make_uint4(0,0,0,0); }
+    *reinterpret_cast<uint4*>(Ks + j * PS + d) = kval;
+    *reinterpret_cast<uint4*>(Vs + j * PS + d) = vval;
+}
+__syncthreads();
+#pragma unroll
+for (int j = 0; j < PREFILL_BK; ++j) vr[j] = __half2float(Vs[j * PS + tid]);
+```
+
+**Measured, same session:**
+
+| | baseline | V staged | change |
+|---|---|---|---|
+| **32K attention kernel** | 22,879 ms | **18,548 ms** | **-18.9%** |
+| **32K prefill total** | 58.42 s | **53.70 s** | **-8.1%** |
+| **8K attention kernel** | 1,369 ms | **1,127 ms** | **-17.7%** |
+| **8K prefill total** | 10.04 s | **9.85 s** | -1.9% |
+
+`attn-tile: OK`, and **`generate` still reproduces all 16 oracle ids exactly**, which is what proves
+the decode path is untouched -- the V cache layout did not change, only where the *prefill* kernel
+stages it.
+
+### Two bugs found on the way, both worth recording
+
+1. **The first attempt staged K's data into the V tile** -- the staging loop had been written to load
+   from `k`, and reusing its `val` for `Vs` put K's values in the V buffer. The gate caught it
+   immediately (`attn-tile gate FAILED`).
+2. **The second attempt had a shared-memory race.** The V read was left in its original position,
+   *before* `__syncthreads()`, because that is where it had to be when it read *global* memory to
+   overlap the load latency. Once it reads shared memory written by other threads in the same block,
+   it must come *after* the barrier. **The gate caught this too.** The reads are shared-memory now,
+   so they need no latency hiding and the repositioning costs nothing.
+
+**Both bugs were caught by `attn-tile` before any performance number was believed.** This is the
+second-largest single change of the session after the K staging, and the first one that the corrected
+occupancy model directly enabled.
