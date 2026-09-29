@@ -8424,3 +8424,44 @@ cast/stage/epilogue (17%, 2.2 s) and the attention kernel (1.4 s) -- about 8.2 s
 and it is the same "non-GEMM remainder 46.7%" the 16K run reported. That remainder, not buffer
 allocation, is where the 8K win has to come from, and **nothing in this session has yet identified
 what it is.**
+
+## The bench's pipeline model does not model the model -- and the gap is inside the DeltaNet layers
+
+The corrected arithmetic leaves ~4.5 s of the 8K prefill unaccounted. The per-layer CUDA events
+localise it. Dividing the measured layer times by the number of calls gives a per-call cost for an
+8192-token chunk, which can be compared against the same layer's GEMM FLOPs at the measured
+75 TFLOP/s:
+
+| | measured per call | GEMM FLOPs | at 75 TFLOP/s | ratio |
+|---|---|---|---|---|
+| **DeltaNet layer** | **175.6 ms** | 4.811e12 | 64.1 ms | **2.74x** |
+| **attention layer** | **376.6 ms** | 5.583e12 | 74.4 ms | **5.06x** |
+
+**The bench's pipeline factor -- dequant + cast + gemm + epilogue -- is 1.60x.** The real DeltaNet
+layer is **2.74x**. So the instrumented stages explain only 58% of a DeltaNet layer's cost:
+
+* **73.0 ms per DeltaNet layer-call is unaccounted for.**
+* x 48 layers = **3.50 s per 8192-token chunk**.
+* The attention kernel for that same chunk is only 1.84 s.
+* The whole 8K prefill measures 12.68 s.
+
+**So 3.50 s -- 28% of the 8K prefill -- is unaccounted for inside the DeltaNet layers alone**, and it
+is not the recurrence (0.53% of the layer's FLOPs), not buffer allocation (cached, see the correction
+above), and not any of the four phases the instrument names.
+
+The attention layer's 5.06x is larger but not comparable, because that ratio includes the attention
+kernel whose cost grows with the chunk's starting position; the DeltaNet layer is linear and its
+2.74x is a clean, position-independent number.
+
+**What this means for the next step, and it is a change of method rather than another hypothesis.**
+Four times now this document has measured a real quantity, assumed a cause, and been wrong --
+`BK = 32` removing idle warps and barriers, the S-stride bank conflict, the softmax ablation, and
+`alloc_zeros`. The instrument that keeps producing these readings names only four GEMM-adjacent
+phases; **it does not name the norms, the residual adds, the SiLU, the DeltaNet convolution, or the
+recurrence**, and it is precisely in that unnamed space that 28% of the 8K prefill now sits.
+
+**The next action should therefore be to extend the instrumentation rather than to try another
+optimisation**: put a CUDA event around each kernel launch inside the layer, or bisect
+`prefill_seq` with events until every millisecond of the 12.68 s has an owner. **Until the 3.50 s is
+named, any optimisation of it is a guess, and this session has already demonstrated four times what
+guesses cost.**
