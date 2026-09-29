@@ -9886,3 +9886,56 @@ those are kernel rewrites whose cost is now measured:**
 * sharing K/V across six heads needs ~221 registers and drops to 1 block/SM, a net 3x.
 
 **Both remain open. Neither is a `#define`.** The reverted tree is at `1ee5bfa` with `attn-tile: OK`.
+
+## The isolated kernel is ~20x faster than the model's use of it -- at the same `start`
+
+`attn-tile` runs the production kernel at non-zero `start`, which is exactly the configuration the
+traffic model blamed. Its "long spans" table:
+
+| start | ntok | keys | time |
+|---|---|---|---|
+| 0 | 4096 | 4096 | 0.03 s |
+| 0 | 16384 | 16384 | 0.46 s |
+| 12288 | 1024 | 13312 | 0.05 s |
+| 0 | 2048 | 2048 | 0.01 s |
+| 10240 | 2048 | 12288 | 0.09 s |
+| **20480** | **2048** | **22528** | **0.16 s** |
+
+**These are fast, and they are fast at large `start`.** Take `start = 20480, ntok = 2048, keys =
+22528 -> 0.16 s`. The model's chunk 3 is `start = 24576, ntok = 8192, keys = 32768`. Scaling the
+isolated figure for the extra queries and keys gives
+
+```
+0.16 s x (8192 / 2048) x (32768 / 22528) = 0.93 s
+```
+
+**The measured kernel cost for that chunk is roughly 19 s -- about 20x more.**
+
+**So the kernel is not inherently slow, and `pos` does not make it slow.** The same kernel, at the
+same non-zero `start`, with the same tiling and the same `BQ * BK = 384`, runs **20x faster in
+isolation than inside the model.**
+
+**This redirects the fix.** The previous four sections were building toward a kernel rewrite --
+stream Q, or share K/V across six heads -- on the theory that the kernel's K/V traffic is the
+problem. **The kernel's K/V traffic is evidently not the problem: the isolated kernel does the same
+traffic and is 20x faster.** Whatever costs 19 s per chunk in the model is something the model does
+around or to the kernel, not something the kernel does.
+
+**The candidates are the arguments the model passes and the state it passes them with**, and there
+is one that stands out immediately: **`prefill-shape` runs `n_seq = 10`**, so the model calls
+attention with ten sequences' worth of state, and `kv_base = seq * state.kv_stride()` spreads those
+sequences across a cache with a stride derived from the maximum context. **The isolated test uses
+one sequence and a compact cache.**
+
+**That is a hypothesis, not a finding, and it has an immediate and cheap test:** run
+`prefill-shape` with `n_seq = 1` and see whether the `attn kernel` phase collapses from 29,910 ms.
+If it does, the 29.9 s was an artefact of the harness's sequence count and **the entire 32K
+attribution needs redoing at `n_seq = 1`** -- which is also the configuration the end-to-end TTFT
+test actually uses.
+
+**The one thing that argues against the artefact reading, and it must be stated**: the instrument's
+total (65.28 s) matches the end-to-end 32K cold TTFT (63.91 s) closely, so the harness is
+representative of the end-to-end path in aggregate. **But a single sequence with a 32K prompt and
+ten sequences with 3.2K prompts each are not the same workload**, and the aggregate agreement could
+be coincidence between two different compositions. **The `n_seq = 1` run settles it, and it is one
+command.**
