@@ -10627,3 +10627,51 @@ guaranteed one is still removing the Q tile** (10,016 B, six blocks by shared me
 registers). **What has changed is that the cheap path is now within 811-944 B instead of 5,878 B,
 and the next round can settle it by testing the fp16-`S` variant directly** -- `attn-tile` decides
 correctness and the `start 24576, ntok 8192` row decides occupancy, in one command.
+
+## No precision-safe cut clears the ceiling -- the cheap path is closed
+
+The previous section found the required cut is only 811-944 B and listed candidate components.
+**Enumerating every combination shows none of them clears the ceiling without changing arithmetic
+the gate validates:**
+
+```
+ceiling: [22000, 22133)  -- must reach <= 22000 to be certain
+
+current                        22944
+remove all stride padding      22304   <- still over 22133
+Q stride 256 only              22560
+K stride 256 only              22688
+S in fp16 only                 22176   <- still over 22133
+Q256 + S fp16                  21792   <- clears
+K256 + S fp16                  21920   <- clears
+Q256 + K256 + S fp16           21536
+```
+
+**Two facts close it:**
+
+1. **Removing every byte of stride padding -- 640 B, both tiles -- is not enough.** It leaves
+   22,304 B against a ceiling of at most 22,133 B. So the padding is not the answer even if it were
+   free, and it is not free (measured 3.6x slower).
+2. **`S` in fp16 alone is not enough either** -- 22,176 B is still above 22,133 B. It only works in
+   combination with a stride reduction, i.e. `Q256 + S fp16` at 21,792 B.
+
+**And that combination is unattractive on both counts.** `S` holds the softmax logits `d[u] *
+scale`; rounding them to fp16 is a ~1e-3 relative perturbation that propagates through `exp` into
+the output, against an `attn-tile` gate tolerance of **1.5e-5 rms relative**. And the stride change
+is known to cost up to 3.6x when applied to both tiles -- whether that cost is the Q tile's or the
+K tile's is not established, because **`kernels/elementwise.cu` uses a single `const int PS = HD +
+8` (line 422) for both tiles**, so testing them separately means splitting it into two constants and
+updating every index site in the staging loops and the `ldmatrix` address arithmetic.
+
+**So the conclusion is that the 811-944 B figure, while correct, is not reachable by any change that
+preserves the arithmetic.** The two paths that remain are the ones already identified:
+
+1. **remove the Q tile** -- 10,016 B, six blocks by shared memory and three by registers, and the
+   only change whose margin is large enough to be certain of clearing the ceiling;
+2. **remove the K tile** -- 14,496 B, three blocks, and it also removes the barrier that serialises
+   the K load against the previous iteration's compute, which is the latency the closed form
+   identifies.
+
+**Both are streaming changes to the `ldmatrix` operands, and both are larger than anything this
+session has attempted on the kernel.** The negative result is recorded because it prevents the next
+round from spending its budget on a padding or fp16-`S` micro-cut that cannot work.
