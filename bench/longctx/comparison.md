@@ -7641,3 +7641,41 @@ within 1.31x of a win.
 Still **0/4** (0/3 measured). gb10 wins warm TTFT at all three lengths (0.03/0.05/0.15 s vs
 0.26/0.30/0.49 s) and OTPS at 8K and 32K (7.41 vs 6.16, 6.79 vs 5.75) but **loses OTPS at 128K
 (4.51 vs 4.88)**. 256K remains unmeasured; it is the only length where gb10 has never been timed.
+
+### A larger query tile is slower too -- BQ 32 measured and rejected
+
+The last untested lever, and it came with a specific inefficiency to remove. At `BQ = 24` the score
+phase runs two **overlapping** 16-row m-tiles (rows 0-15 and 8-23), so it computes 32 rows of mma to
+use 24 -- **a third of the score work is discarded** -- and each K/V staging serves only 24 rows.
+`BQ = 32` makes the m-tiles rows 0-15 and 16-31: no overlap, no waste, and 33% more rows per
+staging. The counts work out in its favour:
+
+| | BQ = 24 | BQ = 32 |
+|---|---|---|
+| key-tile iterations at the 65536 span | 5.60e6 | **4.20e6** (-25%) |
+| score mma, total | 3.58e8 | **2.69e8** (-25%) |
+| P·V fma, total | 5.5e11 | 5.5e11 (same) |
+| shared per block | 22,944 B | 27,776 B |
+| registers / spills | 90 / 0 B | **90 / 0 B** |
+
+Everything is in budget -- 27,776 B of the 51,200 B available at two blocks, and 0 spills, so two
+blocks/SM still fit -- and it is correct (`attn-tile: OK`, rms rel unchanged):
+
+    16384   0.62 / 0.64 s          (baseline 0.56)
+    65536   9.68 / 9.77 / 9.82 / 9.88 s   (baseline 8.95 / 9.01)
+
+**~9% slower, reproducibly, despite strictly less work.** Reverted.
+
+This is worth recording precisely because the arithmetic predicted a win and the measurement
+refused it. The likely explanation is that `acc[PREFILL_BQ]` grows from 24 to 32 registers *per
+thread*, so the fully-unrolled P·V loop goes from 384 to **512 `fmaf` in one basic block** -- the
+same total fma, but issued as one much longer straight-line run per iteration, on top of a Q tile
+that is 33% larger in shared memory. The kernel appears to be sensitive to the shape of the
+per-iteration instruction stream in a way that total-work accounting does not capture.
+
+**So the structural lever is measured too, and it does not pay at this granularity.** Every lever
+this program has tried is now accounted for: score mma **1.37x** (kept), `ldmatrix` **1.15x**
+(kept, 1.58x cumulative), P·V mma **0.95x** (rejected), and now query-tile size **0.91x**
+(rejected). The kernel is at a local optimum with respect to every axis anyone has proposed, and
+the 8K/32K/128K requirements of 1.31x / 1.65x / 3.06x are not reachable by any single substitution
+tried here.
