@@ -7895,3 +7895,47 @@ not yet been identified at all.
 themselves change. The magnitudes do not (still `Q . K` over 256 dims, still ~O(1) after `scale`),
 which is what the earlier invalid ablation violated -- but a reader should treat the 8%/2% split as
 indicative of magnitude rather than exact.
+
+### Shared-memory bank conflicts on `S`: real, and worth nothing -- the fifth backfire
+
+The one mechanism that both scaled with the key-tile iteration count and had never been touched was
+shared-memory bank behaviour. The most concrete instance was `S`: its stride is `PREFILL_BK = 16`
+floats = 64 B = **16 words**, and 16 shares a factor of 16 with the 32 banks, so rows `i` and `i + 2`
+land on the same bank -- a genuine 2-way conflict on every softmax read and every scatter write. The
+codebase already knew the fix: the DeltaNet kernel a few hundred lines above uses
+`__shared__ float S[D][D + 1]`. Padding the tiled kernel's `S` to stride 17 makes it coprime with 32,
+spreading the 24 rows over 24 distinct banks.
+
+    baseline                    9.14 / 9.16 / 9.20 s
+    S stride padded to 17       9.28 / 9.31 / 9.34 / 9.36 s
+
+**~1.5% slower**, and correct (`attn-tile: OK`). The conflict was real; removing it did not help.
+
+That is the **fifth** independent change that removes cost and slows this kernel down:
+
+| change | removed | result |
+|---|---|---|
+| P·V on tensor cores | 384 `fmaf`/thread/key tile | 0.95x |
+| query tile 24 -> 32 | 25% of iterations and score mma | 0.91x |
+| softmax `1/16` | 15/16 of the softmax work | 0.75x |
+| softmax without load/`__expf` | all 16 `S` loads and `__expf` | 0.77x |
+| V staged from L2 | V's DRAM latency and bandwidth | 0.93x |
+| `S` stride padded | a real 2-way bank conflict | 0.985x |
+
+**Six rows, and every one of them is a cost that was genuinely there and genuinely removed.** The
+magnitudes are not noise -- each is reproduced across three or more runs -- and they do not have a
+common sign in any model where the kernel is bound by the resource being freed. Two of them (K from
+L2, and the inverted P·V doubling) *do* move the runtime, in opposite directions, which is the only
+reason we can bound anything at all: the P·V fma is ~17%, K's staging ~8%, V's ~2%, and the
+remaining ~73% is not arithmetic, not K/V DRAM traffic, not barrier count (0.7%), not occupancy
+(0%), not `__expf`, and now not the `S` bank conflict either.
+
+**What this says about the method.** Every measurement in this program has been an ablation, and an
+ablation can only ever price the thing it removes *if removing it is what the kernel is waiting on*.
+Six times now, removing a real cost has not paid. The honest conclusion is not that the costs are
+imaginary -- they are all real, and they all show up when doubled (the P·V fma) or when made more
+expensive. It is that **this kernel's runtime is not set by the sum of its parts**, which is the
+signature of a synchronisation- or scheduling-limited kernel rather than a throughput-limited one,
+and it is consistent with the one structural fact that has never been explained: 96 resident blocks
+doing 1.34e8 key-tile iterations at ~6.6 us each, roughly 28% of fp32 peak, with no single
+identified bottleneck.
