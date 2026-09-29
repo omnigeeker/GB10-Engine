@@ -10167,3 +10167,51 @@ only lever is the ~1188 ns per iteration**, and hiding it is worth up to the ful
 **Everything else has been eliminated**: `n_seq` (measured), cache stride (code), tiling (the
 constraint and the illegal-access fault), occupancy (the 48 KB budget), the call path (isolated and
 in-model timings agree to 2.4%), and tensor cores (0.39% of compute peak).
+
+## The kernel already uses `mma.sync` tensor cores -- the objective's premise is already done
+
+Reading the kernel's score phase settles what the remaining work is:
+
+```
+// ---- score: S[BQ][BK] = Q . K^T * scale, on tensor cores ----------
+// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` computes
+```
+
+and the instruction itself is at line 547 of `kernels/elementwise.cu`. **The tensor-core
+`mma.sync` rewrite that the objective names as "the only path" is already implemented, already
+correct (the `attn-tile` gate passes it), and already in the hot path.**
+
+**The comment also records why two earlier optimisation attempts failed, and the reason is the same
+one this investigation arrived at independently:**
+
+> The scalar version this replaces issued ~256 shared loads per thread per tile and ran at the
+> measured ~32 loads/cycle/SM operand-load ceiling. **That ceiling is why the two cheaper fixes both
+> failed** -- fewer loads per fma (round 44, BK=48) changed nothing, and cutting the accumulator
+> chain to twelve partial sums was a 12% regression.
+
+So the tensor-core work is done, it removed the operand-load ceiling, and the kernel is *still* at
+0.39% of compute peak. **What remains is the memory latency, exactly as the closed form says.**
+
+**And the loop structure shows where it is exposed.** Per iteration:
+
+1. stage the K tile into shared memory (a global load per element);
+2. prefetch this thread's V column into registers -- the comment says this is deliberately issued
+   before the barrier "so the latency overlaps the score loop and the softmax";
+3. `__syncthreads()` at line 481 -- **the block now waits for the K tile**;
+4. the `mma` score phase, in which **only four of the eight warps participate** (`if (warp < 4)`);
+5. `__syncthreads()` at 567, then 593, then 606.
+
+**The V prefetch is overlapped; the K tile is not, and it cannot be, because the load for iteration
+`i+1` does not begin until iteration `i`'s compute and barriers have finished.** That is the ~1188 ns
+per iteration, and it is precisely a load that is never in flight at the same time as arithmetic.
+
+**So the fix is to double-buffer the K tile** -- stage iteration `i+1`'s K while iteration `i` is
+being consumed -- which is what the closed-form model has been pointing at since it was derived.
+**It is a change to the staging, not to the arithmetic, and the arithmetic is already on tensor
+cores.**
+
+**This is the second time the objective's stated premise has been corrected by measurement.** The
+first was at 8K, where the two real wins turned out to be dispatch routing and the GEMM epilogue.
+This one is larger: the objective's named path is not a path, because it is already walked. **The
+remaining 29.9 s at 32K is memory latency in a kernel that is idle 99.8% of the time, and no amount
+of tensor-core work addresses it.**
