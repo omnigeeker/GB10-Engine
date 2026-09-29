@@ -6943,3 +6943,36 @@ not touched by the fix -- but real, and consistent with the near-tie reading
 above. `GB10_KSPLIT 2` (split-K atomic accumulation) is the first suspect. Not
 yet investigated.
 
+
+### Prefill attention: the accumulator-chain hypothesis is excluded
+
+Before committing to the `mma.sync` rewrite, the cheapest plausible non-mma lever was tested
+and **measured to be a regression**, so the rewrite is not being done on an untested premise.
+
+`attn_prefill_tiled_kernel`'s score loop is ~80% of the per-tile cycles (3072 of ~3840) and is
+documented as latency-bound on the load-to-fma chain. Each dot used a *single* accumulator, a
+`half / 2 == 64`-pair deep dependent chain, i.e. only three independent fma in flight per thread.
+Splitting each dot into four partial sums (twelve chains of 16, combined once at the end) should
+have fixed exactly that. Measured with `gb10-verify attn-tile`, same binary otherwise:
+
+| span | baseline (1 accumulator) | 4 partial sums |
+|---|---|---|
+| 4096 | 0.06 s | 0.07 s |
+| 16384 | **0.88 s** | 0.99 s |
+| 10240 + 2048 | **0.15 s** | 0.18 s |
+| 20480 + 2048 | **0.29 s** | 0.34 s |
+| 65536 | **14.20 s** | 16.00 s |
+
+**~12% slower**, not faster. Correctness was fine (`attn-tile: OK`, rms rel 1.55e-5 against the
+gate's 1.2e-4), so this is purely a scheduling result: nvcc already extracts that ILP, and the
+twelve live partials cost registers and reassociation for nothing. Reverted.
+
+This is worth keeping because it is the second time a load-count hypothesis has failed here.
+Round 44 cut loads and instructions per fma (BK=48) and changed nothing; a 32-way bank conflict
+was worth 8.05x. Together those say the kernel is bound by the **operand-load path itself** --
+~32 four-byte shared loads per cycle per SM, with the score loop issuing ~256 of them per thread
+per tile -- and not by chain length, not by instruction count, and not by total bytes. That is
+precisely the resource `mma.sync` removes: its A and B fragments live in registers and are fed by
+`ldmatrix`, so the tensor core consumes 16x8x16 MACs per instruction instead of one MAC per fma
+per shared load. The rewrite is therefore targeting the right resource rather than the most
+recently suspected one.
