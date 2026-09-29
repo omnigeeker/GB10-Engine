@@ -11655,3 +11655,50 @@ only remaining levers are fewer iterations or a shorter iteration.**
 **This is the most consequential correction of the session: an entire branch of work -- Q streaming,
 K streaming, m-tile serialisation, smem cuts, the carveout -- was aimed at an occupancy gain that was
 already banked.**
+
+## Four blocks per SM buys 1% -- the kernel is not occupancy-bound, and the 2.36x figure was confounded
+
+The runtime report said the kernel sits at 3 blocks/SM (80 regs), with shared memory allowing 4. Four
+blocks needs `regs <= 64`, which `__launch_bounds__(256, 4)` requests. **Applied, and the driver
+honours it:**
+
+```
+baseline:  regs 80  maxThreads 768  -> by_regs 3  by_smem 4  binding REGS
+4 blocks:  regs 64  maxThreads 256  -> by_regs 4  by_smem 4  binding SMEM
+```
+
+**Registers fell 80 -> 64, the block count rose 3 -> 4, and `maxThreads` fell 768 -> 256, all
+confirming the increase. Measured:**
+
+| 32K | attention kernel | prefill total |
+|---|---|---|
+| 3 blocks (baseline) | 22,879 ms | 58.42 s |
+| **4 blocks** | **22,642 ms** | 56.99 s |
+
+**A 33% increase in concurrent blocks buys 1.0% on the attention kernel.** `attn-tile: OK`, change
+reverted.
+
+### This is the cleanest statement of the root cause in the session
+
+**The kernel is not occupancy-bound.** The concurrency lever has now been tested in the only clean
+way available -- a register cap that changes occupancy and nothing else -- and it is worth ~1%.
+
+**It also means the session's one "solid" occupancy measurement was confounded.** The ablation probe
+established "2 -> 1 blocks costs 2.36x" by *raising the shared-memory request* past the threshold.
+But raising the request **also changes the kernel's shared-memory layout**, and the session had
+already measured that layout changes are expensive on their own (`PS = HD` instead of `HD + 8` is
+3.6x slower). **So the 2.36x was at least partly the padding, not the occupancy** -- and it has been
+the stated justification for an entire branch of work that this round shows was aimed at nothing.
+
+**Every measurement now agrees on one story:**
+
+* K staging vectorised: **-25%** -- it removed instructions *inside* the iteration;
+* P.V loop vectorised: **0%** -- the instructions were broadcast, so there was no cost to remove;
+* 3 -> 4 blocks: **-1%** -- concurrency is not the constraint;
+* V prefetch removed: **-30.9%** -- the largest single item inside the iteration.
+
+**The kernel's cost is the per-iteration latency, and the only levers are fewer iterations or a
+shorter iteration.** `(t x keys / 384)` iterations at ~850 ns; the 384 is pinned by
+`BQ * BK == 3 * (head_dim / 2)` and the ~850 ns is the staging plus four barriers.
+
+**This closes the occupancy branch conclusively, and it is the sixth path closed by measurement.**
