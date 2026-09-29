@@ -7380,3 +7380,38 @@ say that a single much larger tile is worse, which is a different question and w
 5% slower), shared-load count (three separate reductions), matmul quality (real but capped at
 1.37x and 1.15x), barriers (~1%), `__expf` (0%), K's global reads (~9%), registers and spills
 (0 B), and occupancy (0% from +50%). What is left is the kernel's *shape*.
+
+## Same-session cold-TTFT pair after the attention work (8K)
+
+Both legs run back-to-back in one session, gb10 with `--ctx 262144` and `GB10_TC_GEMM` on (the
+default), llama.cpp with `-c 262144 -ngl 99 -fa on`. Reps 227, 2 trials each, greedy, unique
+marker per trial so every cold TTFT is a genuine full prefill.
+
+| server | prompt tokens | cold TTFT | warm TTFT | OTPS cold |
+|---|---|---|---|---|
+| gb10 | 7,109 | **13.41 / 13.49 s** | 0.03 s | 7.41 / 7.45 |
+| llama.cpp | 7,147 | **10.91 / 11.16 s** | 0.26 s | 6.16 / 6.21 |
+
+**Ratio 13.41 / 10.91 = 1.22x slower** (taking each server's better trial; the worst-case pairing
+gives 1.21x). The prompt-token counts differ by 0.5% because the tokenisers differ, so the
+comparison is like-for-like.
+
+This is progress on the objective's first item but **not yet a win: 0/4 becomes 0/1 measured, at
+1.22x rather than 1.41x.** The attention kernel's 1.58x shows up here as prefill going from
+18.90 s to 13.41 s for the same shape.
+
+**What the remaining gap needs at this length, computed rather than guessed.** The
+least-squares decomposition puts the quadratic (attention) share of gb10 prefill at 79% at 8K, so
+`13.41 = L + A` with `A = 0.79 * 13.41 = 10.59 s` and `L = 2.82 s`. To reach llama.cpp's 10.91 s
+the attention must come down to `10.91 - 2.82 = 8.09 s`, i.e. **only 1.31x further** -- which is
+within reach of the same kind of change that already delivered 1.58x.
+
+But the same arithmetic at the long end is unforgiving, and it is why 8K is the *easy* one: at
+128K the quadratic share is 98%, so essentially all of gb10's 1224 s is attention, and matching
+llama.cpp's 290 s needs the attention **~4.2x** faster still. A same-session pair at 128K has not
+been re-measured since the attention work.
+
+**Session drift, and why only same-session pairs count:** llama.cpp's own 8K figure moved from
+13.45 s in the earlier session to 10.91 s now -- **1.23x on an unchanged binary**. Any comparison
+built from numbers taken in different sessions would have mis-stated this result by more than the
+effect being claimed, in either direction.
