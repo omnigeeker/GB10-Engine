@@ -93,6 +93,24 @@ as `bench/longctx/results-32k-128k-256k.log`. Each leg ran against its own
 server, sized just past that leg's prompt, and the unit exited clean with no
 error text in either the results or the server log.
 
+> **These numbers are historical, and two things about them have changed.**
+>
+> **The timings are ~7x better now.** Since this run the prefill path was optimized (tiled attention
+> made unconditional, the DeltaNet chunk kernel, and `PREFILL_CHUNK` 2048 -> 8192), taking cold TTFT
+> to **10.35 s at 8K, 80.0 s at 32K, 890.5 s at 128K and 3295.5 s at 256K**, all gated by the
+> `chunked-prefill` correctness check. The `chunks` column above reflects the old 2048-token chunk;
+> at 8192 the same 32K prompt is 4 chunks.
+>
+> **The 32K leg does not currently reproduce, on gb10-engine *or* llama.cpp.** Re-running the
+> identical leg gives **0/3 on both**, with deterministic `completion_tokens: 0` (EOS as the first
+> token), and the failures are erratic in prompt *length* rather than monotone — which is not the
+> shape of a KV-precision regression. It was isolated: identical with `temperature: 0`, with
+> `--no-prefix-cache`, with `PREFILL_CHUNK` 2048 *and* 8192, and with `enable_thinking`
+> omitted/false/true. **Because llama.cpp fails the same prompts, the engine is not implicated, and
+> long-context retrieval is neither certified nor refuted here today.** Full write-up in
+> `bench/longctx/comparison.md`; the precision metrics that *are* certified (perplexity, MMLU) are in
+> the README.
+
 Two operational traps cost real time here, both invisible from the code.
 
 **The harness kills by subprocess *scope*, so `setsid` does not detach.** The
