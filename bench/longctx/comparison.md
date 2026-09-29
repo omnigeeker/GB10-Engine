@@ -12321,3 +12321,43 @@ as fp16 and the existing `ldmatrix`/`mma.sync` machinery reused. `V` is already 
 
 **Keep `attn-tile` in the loop, but use it to localise a discrepancy, not to veto a change that
 `generate` and `perplexity` pass.**
+
+## What the objective actually needs now -- the original 1.29x/5.98x/8.40x/8.82x is stale
+
+The objective was written when the prefill GEMM was still on the slow path, and it states the
+required attention speedups as 1.29x/5.98x/8.40x/8.82x. **Those numbers are no longer the
+requirement**, because the linear term has since been cut. Recomputing from this session's own
+measured breakdown:
+
+**32K** (prefill total 53,080 ms; attention kernel 18,495 ms; MLP 21,456 ms; target 43,250 ms):
+
+* the gap is 9,830 ms, which is **53% of the attention kernel** -- so the requirement is a
+  **2.1x attention speedup**, not 5.98x.
+
+**And the PV cannot deliver 2.1x on its own.** It is 41.8% of the kernel, so removing it *entirely*
+would give `1 / (1 - 0.418) = 1.72x`. A tensor-core PV that is 4x faster than the scalar one gives
+
+```
+18,495 ms  ->  18,495 * (1 - 0.418 + 0.418/4)  =  12,706 ms   (1.46x)
+prefill total 53,080  ->  47,291 ms  =  47.3 s  vs llama 43.25 s  =  1.09x
+```
+
+**so the PV alone takes 32K from 1.21x to about 1.09x -- real, but not parity.**
+
+**Adding the FP4 MLP does reach parity at 32K:** if the MLP is 2x faster, that is another 10,728 ms,
+taking the total to **36.6 s = 0.85x -- a win**, with margin.
+
+**The two levers are therefore complementary at 32K, and each is now specified:**
+
+| lever | share at 32K | expected effect |
+|---|---|---|
+| tensor-core PV | 41.8% of the attention kernel | 1.21x -> ~1.09x |
+| FP4 MLP (nvfp4 weights straight into cuBLASLt) | 40.4% of the prefill | ~1.09x -> **~0.85x (win)** |
+
+**At 128K and 256K the same two levers apply but attention carries a larger share, so parity there
+needs both to land *and* the attention share to be smaller than the quadratic term suggests.** A
+measured breakdown at those two lengths is required before any claim -- the 128K/256K figures in this
+document are totals, not decompositions.
+
+**This is the honest state: 8K is won, 32K is reachable with the two identified levers, and 128K/256K
+need their own decomposition before it is known whether they are reachable at all.**
