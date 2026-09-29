@@ -282,6 +282,17 @@ fn prefill_shape(args: &Args) -> Result<()> {
                 println!("  [diag] DELTA n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", dn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
             }
         }
+        {
+            let (mp, mn) = gb10_model::layer::mlp_event_snapshot();
+            if mn > 0 {
+                let tot: f64 = mp.iter().sum();
+                let mut line = String::new();
+                for (i, name) in gb10_model::layer::MLP_PHASES.iter().enumerate() {
+                    line.push_str(&format!("{} {:.0}ms ({:.1}%)  ", name, mp[i], 100.0 * mp[i] / (wall * 1e3)));
+                }
+                println!("  [diag] MLP n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", mn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
+            }
+        }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
         if n > 0 {
             let tot: f64 = ph.iter().sum();

@@ -8643,3 +8643,56 @@ from the work removed.
 **What survives:** the dequantisation is real and is recomputed per call, and a cache of it is real
 and does help in steady state. It is simply not worth 1.71 s of cold start and 34 GB, and it is not
 the 8K win.
+
+## The MLP is named, and the GEMM pipeline overhead is now priced exactly: 2.90 s, 23.5% of the 8K prefill
+
+The MLP was instrumented the same way (env-gated `GB10_MLP_EVENTS`, five events / four phases,
+drained by `layer::mlp_event_snapshot`). At 8192 tokens, n = 64 layers:
+
+```
+[diag] MLP n=64 | gate gemm 1680ms (13.6%)  up gemm 1694ms (13.7%)
+       swiglu 528ms (4.3%)  down gemm 1672ms (13.5%)  | total 5.57s of 12.35s (45.1%)
+```
+
+**The MLP is 45.1% of the 8K prefill -- the single largest block in the model -- and it is almost
+entirely three GEMMs** (13.6 + 13.7 + 13.5 = 40.8%), with the elementwise SwiGLU at only 4.3%.
+
+**This makes the GEMM pipeline overhead directly measurable rather than inferred.** For each
+GEMM-bearing phase, compare the measured time against the same phase's FLOPs at the measured
+75 TFLOP/s:
+
+| phase | measured | GEMM at 75 TFLOP/s | **overhead** | ratio |
+|---|---|---|---|---|
+| **MLP gate + up + down** (64 layers) | 5046 ms | 3740 ms | **1308 ms** | 1.35x |
+| **delta `proj in`** qkv/z/a/b (48 layers) | 2156 ms | 880 ms | **1271 ms** | **2.44x** |
+| **delta `proj out`** (48 layers) | 649 ms | 331 ms | **319 ms** | 1.97x |
+| | | | **2898 ms** | |
+
+**The identified GEMM pipeline overhead is 2.90 s -- 23.5% of the 8K prefill -- and the objective
+needs 12.35 -> 10.91 s, which is 1.44 s.** It is the first component in this session that is
+measured, localised, and larger than the gap it has to close.
+
+**And the worst offender is now obvious: `proj in` runs at 2.44x its own GEMM time, 1271 ms of pure
+overhead.** The reason is in the shapes and it was visible in the source:
+
+```rust
+self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
+self.in_proj_z.forward_prefill(dev, &sc.hidden, &mut sc.z, t)?;
+self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
+self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
+```
+
+**Four separate GEMM calls, so four separate per-call pipelines** -- four weight stagings, four
+activation casts, four epilogues, four sets of `cudaLaunchKernel` overheads -- for work that is one
+matrix multiply against a concatenated weight. And two of the four (`in_proj_a`, `in_proj_b`) have
+`n = 48`: they pay a full pipeline for 48 columns.
+
+**Fusing those four into one GEMM is the single highest-value change now available.** It removes
+three of the four pipelines, and unlike the weight cache it does not add memory, does not add a
+warm-up cost, and does not touch the cold path in any way that could regress it: the first call does
+strictly less work than before.
+
+**Note also what the MLP measurement rules out.** The MLP's own ratio is 1.35x -- *better* than the
+1.61x the bench pipeline predicted, and the same bench whose dequant stage turned out to be 6x
+overstated. The three MLP GEMMs are close to as good as they can be without fusing the SwiGLU into
+the gate/up GEMMs. **The MLP is not where the remaining slack is; `proj in` is.**

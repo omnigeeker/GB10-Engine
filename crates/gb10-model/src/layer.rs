@@ -25,6 +25,24 @@ pub const DELTA_PHASES: [&str; 5] = [
     "proj out",
     "mlp",
 ];
+/// Per-phase GPU events for the prefill MLP, gated by `GB10_MLP_EVENTS`.
+/// Five events bracket four phases. Same pattern as `DELTA_EVENTS`.
+pub static MLP_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
+pub const MLP_PHASES: [&str; 4] = ["gate gemm", "up gemm", "swiglu", "down gemm"];
+pub fn mlp_event_snapshot() -> ([f64; 4], usize) {
+    let mut v = MLP_EVENTS.lock().unwrap();
+    let n = v.len();
+    let mut acc = [0.0f64; 4];
+    for ev in v.drain(..) {
+        for i in 0..4 {
+            if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
+                acc[i] += ms as f64;
+            }
+        }
+    }
+    (acc, n)
+}
+
 pub fn delta_event_snapshot() -> ([f64; 5], usize) {
     let mut v = DELTA_EVENTS.lock().unwrap();
     let n = v.len();
@@ -87,10 +105,34 @@ impl Mlp {
         b: &mut CudaSlice<f32>,
         t: usize,
     ) -> Result<()> {
+        let ev_ctx = dev.stream().context().clone();
+        let mut evs: Option<Vec<CudaEvent>> = None;
+        if std::env::var("GB10_MLP_EVENTS").is_ok() {
+            let mut tv = Vec::with_capacity(5);
+            let mut ok = true;
+            for _ in 0..5 {
+                match ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+                    Ok(e) => tv.push(e),
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            if ok { evs = Some(tv); }
+        }
+        macro_rules! mmark {
+            ($i:expr) => { if let Some(t) = &evs { let _ = t[$i].record(dev.stream()); } };
+        }
+        mmark!(0);
         self.gate.forward_prefill(dev, x, a, t)?;
+        mmark!(1);
         self.up.forward_prefill(dev, x, b, t)?;
+        mmark!(2);
         dev.ops().swiglu_inplace(dev, a, b, self.gate.n * t)?;
+        mmark!(3);
         self.down.forward_prefill(dev, a, out, t)?;
+        mmark!(4);
+        if let Some(t) = evs {
+            MLP_EVENTS.lock().unwrap().push(t);
+        }
         Ok(())
     }
 
