@@ -11202,3 +11202,50 @@ GB10_ATTN_EVENTS=1 ./target/release/gb10-verify prefill-shape \
 the instrument that does not check correctness, and verify correctness with the instrument that
 does.** The two roles are separate and `attn-tile` deliberately does both, which makes it unusable
 for this kind of ablation.
+
+## The V prefetch costs 30.9% of the attention kernel -- the transpose is justified
+
+Priced with the timing-only instrument (`prefill-shape`, which reports the kernel's ms without
+verifying the output), so a deliberately incorrect kernel can still be timed. Probe: replace the
+sixteen V loads with a constant, changing nothing else.
+
+```cuda
+for (int j = 0; j < PREFILL_BK; ++j)
+    vr[j] = 0.0f;   // PROBE: V loads removed
+```
+
+| 32K, n=64 | attention kernel | prefill total |
+|---|---|---|
+| baseline | **22,879 ms** | 58.42 s |
+| V loads removed | **15,817 ms** | 50.28 s |
+| **difference** | **7,062 ms = 30.9% of the kernel** | **8.14 s** |
+
+**The V prefetch alone is 30.9% of the attention kernel at 32K.** For comparison, the K staging
+change -- sixteen scalar loads replaced by two `uint4` loads, *not* removed -- was worth 7,059 ms at
+the same shape (29,946 -> 22,887 ms). **The two staging loops cost almost exactly the same, ~7.0 s
+each at 32K, which is what the "identical pattern" claim predicted.** The K loop's residual cost
+after vectorising is the two `uint4` loads plus the shared store; the V probe removes its sixteen
+outright, so the true V ceiling is slightly below 30.9%.
+
+**This settles the decision the previous round deferred.** The V transpose is not a speculative
+~25% extrapolated from K; **it is a measured 30.9% of the kernel, of which the vectorised form
+should recover the same ~25% that K's did** -- because after the transpose thread `tid` reads
+`V[tid][s0 .. s0+15]`, 32 contiguous bytes, which is two `uint4` loads, the *same instruction
+pattern that is already measured at 25%.*
+
+**Projected effect if it recovers the K-equivalent 25%:**
+
+| length | attention kernel now | after V transpose | prefill total | ratio vs llama.cpp |
+|---|---|---|---|---|
+| 32K | 22,879 ms | ~15,900 ms | 58.42 -> ~51.4 s | 1.33x -> **~1.19x** |
+| 128K | 363,468 ms | ~250,800 ms | 505.65 -> ~393 s | 1.74x -> **~1.35x** |
+| 256K | (not split) | -- | 1699.78 -> ~1300 s | 2.918x -> **~2.2x** |
+
+**Still short of a win at 32K and above on its own, but it is the larger of the two remaining paths
+and it composes with the occupancy change.** With both, 32K would be ~1.19x / 1.4 = **~0.85x**, and
+128K ~1.35x / 1.4 = **~0.96x** -- which is the win the objective asks for at both lengths.
+
+**The probe was reverted** (`attn-tile: OK`, tree clean). **The measurement is the first direct
+pricing of a staging loop in this session that did not go through the correctness gate, and it is
+worth recording that the number came out at 30.9% when the extrapolation from K had suggested
+~25%: the extrapolation was, if anything, conservative.**
