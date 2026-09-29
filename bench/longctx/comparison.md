@@ -7756,3 +7756,58 @@ The softmax's true cost therefore remains **unmeasured**, and pricing it properl
 that keeps `S` a valid probability row -- e.g. keep all 16 iterations and all 16 stores, but replace
 the `__expf` and the `S` load with a constant, so `ls`, `red`, and the P·V all still see sane
 magnitudes.
+
+## The work-reduction paradox: four independent reductions, four slowdowns
+
+The properly-controlled softmax ablation was run, and it is the fourth time in this program that
+**removing work made the kernel slower**. Same call, back to back, so the two rows are directly
+comparable:
+
+| build | 65536 |
+|---|---|
+| baseline, full softmax | **9.20 / 9.21 / 9.24 s** |
+| softmax with no `S` load and no `__expf`, `p = 1/16` (a **valid** probability row) | **12.05 / 12.20 / 12.27 s** |
+
+The ablation keeps all 16 iterations and all 16 stores; it removes only the shared load and the
+`__expf`, and it holds `S` at a legitimate probability so `ls`, `red` and the P·V all see the
+magnitudes the real kernel produces. It is a clean control, it uses **more** registers (82 vs 77),
+and it spills **nothing** (0 bytes both). It is **32% slower**.
+
+The four reductions, side by side:
+
+| reduction | work removed | result |
+|---|---|---|
+| P·V on tensor cores | 384 `fmaf` per thread per key tile | **0.95x** |
+| query tile 24 -> 32 | 25% of key-tile iterations, 25% of score mma | **0.91x** |
+| softmax, `1/16` iterations | 15/16 of the softmax's per-element work | **0.75x** |
+| softmax, no load/`__expf` | all 16 `S` loads and 16 `__expf` | **0.77x** |
+
+**Every single attempt to make this kernel do less work has made it slower**, by margins far larger
+than any of the micro-optimisations that were meant to pay for themselves. That is not a coincidence
+and it is not noise: the margins are 5% to 33%, each reproduced across three or more runs, and the
+last one was confirmed against a freshly-built baseline in the same invocation.
+
+**What this rules out is more valuable than what it suggests.** It rules out instruction throughput,
+`fma` throughput, shared-load count, and `__expf` as the binding constraint -- the kernel is simply
+not limited by how much arithmetic the softmax or the P·V does. And it explains why the earlier
+ablation work in this program was so misleading: the "P·V is 34%" figure came from an ablation that
+also changed the data, and the whole ablation methodology on this kernel has been measuring
+something other than the cost of the work removed.
+
+**What it points to** is a kernel whose runtime is set by *latency that the arithmetic was hiding*.
+The most consistent reading: the softmax's `__expf` chain in the single active warp overlaps other
+warps' outstanding K/V global loads, and shortening it removes that overlap window, so every warp
+arrives at the barrier together and then stalls together on the next iteration's memory. Under that
+reading the fix is not to remove work but to *add* something that overlaps -- more independent
+memory in flight -- which is exactly the direction the structural rewrite was already heading.
+
+**And it closes the loop on the one measurement that never fit:** occupancy was raised 50% (79
+registers, 0 spills, 3 blocks/SM) and bought **0%**. If the kernel were latency-bound in the
+ordinary way, more resident blocks should have helped. It did not, which means the latency is
+*inside* each block's critical path, not between blocks -- consistent with every work reduction
+backfiring, and pointing at the per-iteration dependency chain (stage K/V -> barrier -> score ->
+barrier -> softmax -> barrier -> P·V -> barrier) as the thing that actually sets the runtime.
+
+**The requirement is therefore unchanged in size but changed in kind:** the 1.31x / 1.65x / 3.06x /
+3.97x cannot be reached by doing less; they need the per-iteration chain shortened or overlapped,
+which is a rewrite of the loop structure rather than any substitution inside it.
