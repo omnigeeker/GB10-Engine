@@ -7606,3 +7606,38 @@ accumulator-chain ILP, matmul quality, barriers, `__expf`, K's global reads, reg
 occupancy (+50% for 0%), and the shared-memory budget (which turned out to be 51,200 B, not the
 24,576 B four rounds were designed against). What is left is the kernel's *shape*: larger query
 tiles so each K/V staging serves more rows, which needs a rewrite rather than a substitution.
+
+## Same-session cold-TTFT pair at 128K, and the requirement at three lengths
+
+Same protocol as the 8K and 32K pairs: both legs back-to-back in one session, gb10 `--ctx 262144`
+with `GB10_TC_GEMM` on, llama.cpp `-c 262144 -ngl 99 -fa on`, unique marker so every cold TTFT is a
+genuine full prefill.
+
+| length | server | prompt tok | cold TTFT | warm TTFT | OTPS cold | ratio |
+|---|---|---|---|---|---|---|
+| 8K | gb10 | 7,109 | 13.41 s | 0.03 s | 7.41 | **1.22x** |
+| 8K | llama.cpp | 7,147 | 10.91 s | 0.26 s | 6.16 | |
+| 32K | gb10 | 32,530 | 83.86 s | 0.05 s | 6.79 | **1.59x** |
+| 32K | llama.cpp | 32,568 | 52.72 s | 0.30 s | 5.75 | |
+| 128K | gb10 | 130,832 | **804.92 s** | 0.15 s | 4.51 | **2.94x** |
+| 128K | llama.cpp | 130,870 | **273.86 s** | 0.49 s | 4.88 | |
+
+gb10's 128K prefill was ~1224 s before the attention work, so the kernel's 1.58x shows up here as
+**1.52x** end to end. Against llama.cpp the same length went from **4.21x to 2.94x**.
+
+**The remaining requirement, computed from the least-squares decomposition at each length:**
+
+| length | attention share | gb10 = L + A | needs `A'` | further attention speedup |
+|---|---|---|---|---|
+| 8K | 79% | 13.41 = 2.82 + 10.59 | 8.09 | **1.31x** |
+| 32K | 94% | 83.86 = 5.03 + 78.83 | 47.69 | **1.65x** |
+| 128K | 98% | 804.92 = 16.10 + 788.82 | 257.76 | **3.06x** |
+
+**Three lengths measured, and the requirement grows only from 1.31x to 3.06x** -- not the
+1.29x/5.98x/8.40x the objective was written against, because 1.58x of attention speedup is already
+delivered. The growth is genuine but it is sub-linear in the attention share, and the 8K case is
+within 1.31x of a win.
+
+Still **0/4** (0/3 measured). gb10 wins warm TTFT at all three lengths (0.03/0.05/0.15 s vs
+0.26/0.30/0.49 s) and OTPS at 8K and 32K (7.41 vs 6.16, 6.79 vs 5.75) but **loses OTPS at 128K
+(4.51 vs 4.88)**. 256K remains unmeasured; it is the only length where gb10 has never been timed.
