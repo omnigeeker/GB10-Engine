@@ -459,13 +459,28 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
     for (int s0 = 0; s0 <= win_max; s0 += PREFILL_BK) {
         // Stage this key tile. Keys past `win_max` are irrelevant to every row
         // here and get zero-filled; the causal mask below excludes them anyway.
-        for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {
+        //
+        // Eight halves (16 bytes) per thread per pass rather than one, so this
+        // is two 16-byte instructions per thread instead of sixteen 2-byte
+        // ones. Both sides are 16-byte aligned: a group of eight never crosses
+        // a row because `head_dim` is a multiple of 8 and `d` is a multiple of
+        // 8, the global row base `(s * n_kv_heads + kh) * head_dim` is a
+        // multiple of 8, and the shared row stride `PS = head_dim + 8` is too.
+        // The kernel's staging is instruction-issue limited -- the comment
+        // below records the measured ~32 loads/cycle/SM ceiling that the scalar
+        // operand path hit -- so moving the same bytes in 8x fewer instructions
+        // is the point.
+        for (int idx = tid * 8; idx < PREFILL_BK * HD; idx += nt * 8) {
             const int j = idx / HD, d = idx % HD;
             const int s = s0 + j;
-            Ks[j * PS + d] =
-                (s <= win_max)
-                    ? k[(size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d]
-                    : __float2half(0.0f);
+            uint4 val;
+            if (s <= win_max) {
+                val = *reinterpret_cast<const uint4*>(
+                    k + (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * HD + d);
+            } else {
+                val = make_uint4(0u, 0u, 0u, 0u);
+            }
+            *reinterpret_cast<uint4*>(Ks + j * PS + d) = val;
         }
         // This thread's column of V, held in registers. Consecutive threads read
         // consecutive addresses, so each of the BK loads is one 128-byte

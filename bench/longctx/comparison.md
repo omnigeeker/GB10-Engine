@@ -10848,3 +10848,53 @@ three-line change.
 **The commit is a real, verified improvement even though it is small (1.1% -> 0.8% of the 128K
 prefill), because it removes work that provably should not have been there and it is proven not to
 change a single output bit.**
+
+## FIXED: the K staging was scalar -- 8x fewer load instructions buys 23.6% of the attention kernel
+
+The kernel's own comment records that the scalar operand path "ran at the measured ~32
+loads/cycle/SM operand-load ceiling", and that this ceiling is why two earlier fixes failed. **The
+tensor-core `mma.sync` rewrite removed the *shared*-memory operand loads, but the *global* staging
+of the K tile was still scalar: sixteen 2-byte loads per thread per iteration.**
+
+```
+for (int idx = tid; idx < PREFILL_BK * HD; idx += nt) {   // 16 iterations, 2 bytes each
+    const int j = idx / HD, d = idx % HD;
+    Ks[j * PS + d] = (s <= win_max) ? k[... + d] : __float2half(0.0f);
+}
+```
+
+**Every group of eight halves is 16-byte aligned on both sides**, so this is now two `uint4`
+transfers per thread instead of sixteen scalar ones:
+
+* the global row base `(s * n_kv_heads + kh) * head_dim` is a multiple of 8 halves because
+  `head_dim = 256`;
+* `d` is a multiple of 8, and a group of eight never crosses a row because `head_dim` is a multiple
+  of 8;
+* the shared row stride `PS = head_dim + 8 = 264` is a multiple of 8, and `Ks` starts 16-byte
+  aligned because it is `Qs + PREFILL_BQ * PS`.
+
+**Measured, same session, `attn-tile: OK` and the `nonzero` counts identical:**
+
+| shape | before | after |
+|---|---|---|
+| isolated `ntok 65536` | 7.59 s | **5.65 s (-26%)** |
+| **model attention kernel @ 32K** | **29,946 ms** | **22,887 ms (-23.6%)** |
+| **32K prefill total** | **64.61 s** | **58.42 s (-9.6%)** |
+
+**This is the largest single change to the attention kernel in the session, and it confirms the
+diagnosis rather than replacing it.** The closed form said the kernel's time is
+`(t x keys / 384)` iterations at ~1100 ns, and that the 1100 ns is not bandwidth (24% of DRAM) or
+compute (0.39% of peak) but *issue and latency*. **Cutting the staging instructions by 8x cut the
+iteration cost by 23.6%** -- so a meaningful part of the 1100 ns was instruction issue, and the rest
+is the latency that only occupancy or overlap can remove.
+
+**Two consequences:**
+
+1. **The V prefetch is still sixteen scalar 2-byte loads per thread per iteration** -- the other
+   half of the staging, and now the larger half. It cannot be vectorized the same way, because
+   thread `tid` needs its own column of V (stride `n_kv_heads * head_dim` between keys), not eight
+   contiguous halves. Staging V through shared memory would vectorize the load but costs 8,448 B and
+   drops occupancy to one block per SM, which the probe measured as a 2.36x loss.
+2. **The remaining 22.9 s at 32K is still the latency term**, so the occupancy work (removing the Q
+   or K tile) is still the way to the objective -- but the target is now 22.9 s rather than 29.9 s,
+   and the 32K end-to-end ratio should improve from 1.48x to roughly 1.33x.
