@@ -7037,3 +7037,26 @@ softmax, neither of which this increment touched. That is increment 2, and its d
 already pinned by the same fragment rule: P·V needs `A = P[16][BK]` in fp16 and
 `B_mem = V^T[HD][BK]` with k=BK contiguous, i.e. V staged transposed (256x16 fp16 = 8 KB), plus
 the online-softmax rescale applied to fp32 accumulator fragments.
+
+### A third load-count hypothesis, and how to measure on this box
+
+Folding each fragment pair into one 32-bit shared load (six loads per k-step instead of twelve)
+was tried and **measured slower**: 16384 0.64 -> 0.75 s, 65536 10.38 -> 11.9 s, reproducible over
+three runs. The two 2-byte loads are not the cost, and the reason is most likely the bank
+pattern -- with `PS = 260` halfs the warp's word addresses land in `2*gid + t4`, which overlaps
+across `gid`, so a 4-byte-per-thread access conflicts where two 2-byte accesses do not.
+
+That is now the **third** load-count hypothesis to fail on this kernel, after BK=48 (round 44)
+and the accumulator-chain split. Together with the fact that the mma score loop improved the
+whole kernel by only 1.37x rather than the ~5x that "score is 80% of cycles" predicted, the
+conclusion is that the score phase is no longer the dominant cost at all.
+
+> **Measurement discipline on this box.** The `attn-tile` timings are intermittently
+> contaminated -- the same binary and shape has read 0.64 s, 5.75 s and 5.86 s for the 16384 span
+> while the 65536 span in the *same* run read 10.39 s, which is arithmetically impossible
+> (4x the tokens is 16x the work, so 16384 must be ~1/16 of 65536). Load average is only ~4 of
+> 20 cores, so this is not simple CPU saturation. **Read a shape repeatedly and believe the
+> minimum**, not a single sample: the minimum is the least-contaminated estimate of the kernel's
+> cost, and every number quoted above is a minimum. A single reading has already produced two
+> false conclusions this session, in both directions -- a phantom 2x regression (30.45 s) and a
+> phantom 9x regression (5.75 s).

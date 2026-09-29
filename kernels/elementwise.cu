@@ -262,6 +262,12 @@ __device__ __forceinline__ unsigned pk2(__half lo, __half hi) {
     return (unsigned)__half_as_ushort(lo) | ((unsigned)__half_as_ushort(hi) << 16);
 }
 
+// NOTE: loading a whole fragment register as one 32-bit word (`pk2_at`, six
+// loads per k-step instead of twelve) was tried and measured SLOWER -- 16384
+// 0.64 -> 0.75 s and 65536 10.38 -> 11.9 s, reproducible over three runs. The
+// two 2-byte loads are not the cost. Kept out deliberately; see the three
+// failed load-count hypotheses in bench/longctx/comparison.md.
+
 extern "C" __global__ void attn_prefill_kernel(
     const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
