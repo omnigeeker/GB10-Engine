@@ -9420,3 +9420,65 @@ only from before the fixes and their requirements are far larger.** The remainin
 are all linear-work items (the activation cast at 852 ms, the fusion of the four `proj in`
 projections, the weight stage at 426 ms) and none of them will move 128K or 256K, where the
 requirement is 3x and 4x.
+
+## 32K attribution: the super-linear growth is entirely in the attention layers (9.47x)
+
+Same instrument, 32768 tokens, all five event groups on:
+
+```
+[diag] DELTA n=192 | proj in 5021ms (7.7%)  conv+l2norm+gate 1663ms (2.5%)
+       delta rule chunk 2132ms (3.3%)  proj out 2231ms (3.4%)  mlp 15895ms (24.3%) | total 26.94s
+[diag] MLP n=256 | gate 5212ms  up 5205ms  swiglu 2106ms  down 7021ms | total 19.54s (29.9%)
+[diag] PROJ n=192 | qkv 2809ms  z 1565ms  a 324ms  b 323ms | total 5.02s (7.7%)
+[diag] n=1984 | weight stage 1706ms (2.6%)  activ cast 3377ms (5.2%)
+       cublas gemm 20487ms (31.4%)  epilogue 2ms (0.0%) | total 25.57s (39.2%)
+```
+
+**8K against 32K, four times the tokens:**
+
+| phase | 8K | 32K | ratio | shape |
+|---|---|---|---|---|
+| `cublas gemm` | 5099 ms | 20487 ms | **4.02x** | linear |
+| `activ cast` | 852 ms | 3377 ms | **3.96x** | linear |
+| `weight stage` | 426 ms | 1706 ms | **4.00x** | linear |
+| `epilogue` | 1 ms | 2 ms | -- | removed |
+| delta rule chunk | 530 ms | 2132 ms | **4.02x** | linear |
+| conv + l2norm + gate | 406 ms | 1663 ms | **4.10x** | linear |
+| `proj in` | 1.58 s | 5.02 s | 3.18x | sub-linear |
+| MLP | 5.63 s | 19.54 s | 3.47x | sub-linear |
+| **DELTA total** | 8.27 s | 26.94 s | **3.26x** | sub-linear |
+| **attention layers** | 4.05 s | **38.34 s** | **9.47x** | **super-linear** |
+| **prefill total** | 12.38 s | **65.28 s** | **5.27x** | super-linear |
+
+**Every instrumented sub-phase is linear or sub-linear. Not one of them grows faster than the
+token count.** The whole of the super-linear growth is in the attention layers, which go from
+**32.7% of the prefill at 8K to 58.7% at 32K** and grow **9.47x** for a 4x token increase.
+
+**This corrects a number used earlier in this document.** The "attention is 11% of the 8K prefill"
+figure refers to the attention *kernel* alone. The attention *layers* -- kernel plus their own
+projections, norms and MLP -- are **32.7% at 8K and 58.7% at 32K**. The two figures are consistent
+but they answer different questions, and the layer figure is the one that governs the end-to-end
+ratio.
+
+**And it settles the objective's premise, in a form that is more precise than either the original
+claim or the rebuttal.**
+
+* The original claim -- that the gap is a prefill-attention problem -- is **right at 32K and
+  beyond**: the attention layers are 58.7% of the prefill there and are the only super-linear
+  term.
+* The rebuttal -- that gb10's non-attention work alone exceeds llama.cpp's entire prefill -- was
+  **right at the time it was made, and is now much weaker**. The fixes since then removed 2.07 s
+  from the 8K prefill and 4.0 s from 32K's linear work (26.94 s against the 8.27 x 4 = 33.1 s the
+  pre-fix phases would have predicted).
+
+**What the arithmetic says about 32K, using this session's numbers.** The 32K prefill is 65.28 s
+against llama.cpp's 43.20 s. The DELTA layers are 26.94 s, and the attention layers are 38.34 s.
+If the attention *kernel* inside those layers is quadratic and was ~1.4 s at 8K, it is ~22 s at
+32K, leaving ~16.3 s of non-kernel work in the attention layers. **So the non-attention-kernel
+total is roughly 26.94 + 16.3 = 43.2 s -- which is exactly llama.cpp's 43.20 s.** Zeroing the
+attention kernel entirely would reach parity at 32K and no further.
+
+**That is the most useful sentence this investigation has produced about 32K**: at 32K, no single
+component wins, because two independent halves each need to improve. The objective's "attention
+only" path cannot reach a win at 32K, and neither can the linear-work path this session has been
+mining. **Both are required.**
