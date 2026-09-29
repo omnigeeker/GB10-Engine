@@ -8113,3 +8113,57 @@ the attention kernel, in tree and verified) is real but cannot reach the goal on
 10% K staging -- all were measured on a kernel that is 10-65% of the prefill, not the 79-99% the
 program assumed. That does not make them wrong; it makes them **optimisations of a minority of the
 runtime**, which is why none of them moved the end-to-end numbers enough to matter.
+
+## The real prefill breakdown -- and it is not attention
+
+The repository already contained the instrument needed for this, and it had never been switched on
+in this session: `prefill_shape` with `GB10_GEMM_EVENTS=1` and `GB10_LAYER_TIMING=1` reports both a
+per-layer-type CUDA-event split and a named GEMM phase breakdown. Run at 16384 tokens:
+
+```
+chunk  0 ( 8192 tok, start     0):  12.68s
+chunk  1 ( 8192 tok, start  8192):  16.29s
+total 28.98s
+[diag] LAYER GPU: delta 16.86s / 96 = 58.2%   attn 12.05s / 32 = 41.6%
+[diag] n=800 | weight stage 874ms (3.0%)  activ cast 1436ms (5.0%)
+             cublas gemm 10542ms (36.4%)  epilogue 2595ms (9.0%)
+             | op phases total 15.45s of 28.98s (53.3%)
+```
+
+| component | time | share of prefill |
+|---|---|---|
+| **DeltaNet layers (48)** | 16.86 s | **58.2%** |
+| **full-attention layers (16)** | 12.05 s | **41.6%** |
+| -- of which the attention KERNEL (16 x 0.46 s) | 7.36 s | **25.4%** |
+| -- of which attention projections | 4.7 s | 16.2% |
+| `cublas gemm` (all layers) | 10.54 s | 36.4% |
+| `epilogue` | 2.60 s | 9.0% |
+| `activ cast` | 1.44 s | 5.0% |
+| `weight stage` | 0.87 s | 3.0% |
+| non-GEMM remainder | 13.53 s | 46.7% |
+
+**The attention kernel -- the entire subject of this session's optimisation work -- is 25% of the
+prefill.** The 48 Gated-DeltaNet layers are **58.2%**, more than the attention layers, and the GEMM
+ops are 53.3% in total with `cublas gemm` alone at 36.4%.
+
+**This independently confirms the previous section's finding by a completely different method.** The
+32K chunk timings grow linearly (12.38, 15.96, 19.96, 23.70 s; slope 3.77 s/chunk, intercept
+12.38 s), so non-attention is 12.38 x 4 = 49.5 s and attention 22.5 s of 72 s -- **69% / 31%**. The
+event instrumentation at 16K says attention layers are 41.6%, and the attention *kernel* inside them
+is 25.4%. Two independent methods, the same conclusion: **attention is a minority of gb10's
+prefill, and no amount of attention optimisation can make gb10 beat llama.cpp.**
+
+**So the objective's target was wrong, and now the correct one is measured:**
+
+1. **The DeltaNet layers, 58.2%.** 48 layers of a linear-attention recurrence, each with GEMMs plus a
+   sequential scan. This is the single largest block in the prefill and it has never been examined
+   in this session.
+2. **`cublas gemm`, 36.4%** across all layers -- and the diagnostic line itself flags the anomaly:
+   `cublas 0.0 TFLOP/s in-model`. The GEMMs are not being counted as tensor-core FLOPs, which is
+   consistent with the MIXED_PRECISION path (NVFP4/FP8 weights, BF16 activations) not mapping onto
+   the cuBLAS tensor-core path the way the peak numbers assume.
+3. **The `epilogue` at 9.0%** -- 2.6 s, larger than `activ cast` and `weight stage` combined, which
+   is a dequantisation/scatter cost worth its own look.
+
+**The 1.58x delivered on the attention kernel this session remains real and in tree, and it is
+worth roughly 1.58x on a 25% share, i.e. ~9% of the prefill -- not the 79-99% the program assumed.**
