@@ -7439,3 +7439,40 @@ the right target even though the first attempt at it measured slower: that attem
 barrier and a transpose pass, and those two costs are now known to be avoidable (`Vs` fits in its
 own storage under the corrected 51,200 B budget, and `ldmatrix.trans` builds the transposed
 fragment directly).
+
+## Same-session cold-TTFT pairs after the attention work (8K and 32K)
+
+Both legs back-to-back per length, one session, same flags as the 8K pair above (`--ctx 262144`,
+`GB10_TC_GEMM` on; llama.cpp `-c 262144 -ngl 99 -fa on`), unique marker per trial.
+
+| length | server | prompt tok | cold TTFT | warm TTFT | OTPS cold | ratio |
+|---|---|---|---|---|---|---|
+| 8K | gb10 | 7,109 | 13.41 / 13.49 s | 0.03 s | 7.41 / 7.45 | **1.22x** |
+| 8K | llama.cpp | 7,147 | 10.91 / 11.16 s | 0.26 s | 6.16 / 6.21 | |
+| 32K | gb10 | 32,530 | **84.00 / 83.86 s** | 0.05 s | 6.79 / 6.77 | **1.59x** |
+| 32K | llama.cpp | 32,568 | **52.72 / 52.81 s** | 0.30 s | 5.75 / 5.74 | |
+
+Progress against the objective's first item, same-session and like-for-like:
+
+| length | before the attention work | now | requirement left |
+|---|---|---|---|
+| 8K | 1.41x slower | **1.22x slower** | 1.31x more attention speedup |
+| 32K | 2.11x slower | **1.59x slower** | 1.65x more |
+
+The "requirement left" column is computed from the least-squares decomposition, not guessed. With
+quadratic shares of 79% (8K) and 94% (32K):
+
+* 8K: `13.41 = L + A`, `A = 10.59`, `L = 2.82`; matching llama's 10.91 needs `A' = 8.09`, **1.31x**.
+* 32K: `83.86 = L + A`, `A = 78.83`, `L = 5.03`; matching llama's 52.72 needs `A' = 47.69`, **1.65x**.
+
+**So the required attention speedup is no longer the 1.29x/5.98x the objective was written against;
+after 1.58x of delivered attention speedup it is 1.31x at 8K and 1.65x at 32K.** That is a much
+smaller and, importantly, *roughly constant* factor across these two lengths -- it grows only
+slowly with context, because the linear term is small and the attention term has already been cut.
+
+gb10 wins warm TTFT decisively at both lengths (0.03/0.05 s vs 0.26/0.30 s) and wins OTPS at both
+(7.41 vs 6.16, 6.79 vs 5.75).
+
+Still not a win: **0/4 remains, now 0/2 measured, at 1.22x and 1.59x.** 128K and 256K have not been
+re-measured since the attention work; the 128K leg alone is ~800 s for gb10 and ~290 s for
+llama.cpp, so it needs its own round.
