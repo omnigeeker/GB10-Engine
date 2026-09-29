@@ -7939,3 +7939,46 @@ signature of a synchronisation- or scheduling-limited kernel rather than a throu
 and it is consistent with the one structural fact that has never been explained: 96 resident blocks
 doing 1.34e8 key-tile iterations at ~6.6 us each, roughly 28% of fp32 peak, with no single
 identified bottleneck.
+
+### Fixing the score's idle warps made it 19% slower -- the sixth backfire
+
+The clearest structural defect found so far was in the score phase, and it was hiding in plain sight:
+the phase ran under `if (warp < 4)`. With `BK = 16` there are only 2 m-tiles x 2 key-groups = 4
+warp-tasks, so **four of the block's eight warps idled through the entire score**, every iteration.
+The comment above it even asserted "four warps of mma is already far past the scalar loop, so there
+is nothing to gain by splitting it further."
+
+`BK = 32` gives 2 m-tiles x 4 key-groups = **8 warp-tasks**, so all eight warps do mma -- and because
+each iteration covers twice the keys, there are **half as many iterations**, hence half as many of
+the four per-iteration barriers. Both of the two things the last section identified as structural
+suspects (warp utilisation, barrier count) are fixed by this one change.
+
+    baseline                      0.57 s / 9.11 - 9.21 s
+    BK = 32, all 8 warps          0.68 - 0.70 s / 10.88 - 10.91 s
+
+**~19% slower**, correct (`attn-tile: OK`), 0 spills, 121 registers (from 77 -- `vr[32]` plus larger
+fragments) which still fits two blocks/SM at 61,952 of 65,536.
+
+That is the sixth backfire, and the most decisive one, because it removes the two explanations that
+had survived everything else. The kernel is **not** limited by idle warps, and **not** limited by
+barrier count. It is now possible to state what has been excluded, all with same-session
+measurements:
+
+| excluded | how |
+|---|---|
+| ALU / `fma` throughput | P·V fma is ~17%; removing it (mma) was 0.95x |
+| `__expf` | removing all 16 per row was 0.77x |
+| K/V DRAM latency and bandwidth | both L2-pinned was 1.10x |
+| shared bank conflicts on `S` | padding the stride was 0.985x |
+| barrier count | -1 barrier 1.01x; BK=32 halves them and is 0.84x |
+| idle warps in the score | BK=32 fills them and is 0.84x |
+| occupancy | +50% (79 regs, 0 spill, 3 blocks) was 1.00x |
+| query tile size | 24 -> 32 was 0.91x |
+| shared-memory budget | corrected to 51,200 B; never the limit |
+
+**Six independent removals of real, measured cost, and one structural fix of two real defects --
+every one of them slower.** A kernel whose runtime falls when you remove work and falls again when
+you remove idle warps is not throughput-limited in any of the dimensions anyone has measured. The
+honest summary is that **the binding constraint on this kernel has not been identified**, and that
+every intervention attempted so far has been, in effect, a change to its scheduling behaviour whose
+effect on the runtime cannot be predicted from the work it removes.
