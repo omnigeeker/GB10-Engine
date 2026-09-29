@@ -11462,3 +11462,77 @@ transpose. **The instrument is the occupancy probe** (`start 24576, ntok 8192`),
 **This is the third consecutive entry where reading the actual code changed the plan.** The Q tile
 looked like the largest single allocation and therefore the obvious thing to shrink; it is in fact
 already minimal for the work it does.
+
+## The most promising remaining lead: the ~66 KB budget may be a discrete carveout step, not the hardware limit
+
+Every occupancy conclusion in this session has rested on one number: the achievable shared memory per
+SM is **B in [66,000, 66,400)**. It came from the ablation probe and it has been treated as fixed
+hardware reality ever since. **But the device reports something quite different:**
+
+```
+sharedMemPerBlock          49152
+sharedMemPerBlockOptin    101376
+sharedMemPerMultiprocessor 102400     <-- 100 KB
+```
+
+**102,400 is 55% more than the 66,000 the probe can actually use.** If the real limit were 102,400,
+then the current kernel's 22,944 B would allow **`102400 / 22944 = 4.46 -> 4 blocks per SM`** instead
+of the 2 it gets. **The entire occupancy problem may be an artifact of a setting, not of the
+arithmetic.**
+
+### The mechanism that would explain 66,000
+
+On Hopper and Blackwell the L1/shared carveout is **discrete**, not continuous -- the selectable
+steps are roughly 0, 8, 16, 32, 64, 100 KB (and upward on parts with more L1). The driver picks the
+**smallest step that fits the launched configuration**, to leave the rest as L1 cache. If it picks
+the **64 KB step**, then
+
+```
+65536 / 22944 = 2.86  ->  2 blocks per SM
+```
+
+**which is exactly the 2 blocks measured.** And the next step up, **100 KB**, gives
+
+```
+102400 / 22944 = 4.46  ->  4 blocks per SM
+```
+
+**The probe's pinned value of 66,000 B sits just above 65,536, which is the 64 KB step plus a small
+reservation -- the signature of a discrete step rather than a hardware ceiling.** The 33,200 B
+threshold is consistent too: `65536 / 33200 = 1.97 -> 1 block`, which is what the probe measured as
+the 1-block transition.
+
+### Why this matters more than any kernel change
+
+**If this is right, the kernel needs no restructuring at all.** No Q streaming, no m-tile
+serialisation, no loss of mma warps, no V transpose, no K streaming. The current 22,944 B kernel
+would go from 2 to 4 blocks per SM by requesting the carveout:
+
+```c
+cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                     cudaSharedmemCarveoutMaxShared);   // or the raw value 100
+```
+
+**That is a one-line change against a ~2x occupancy increase**, on a kernel the closed form says is
+waiting on exactly that -- and it would explain why every kernel-level restructuring attempt has
+looked like a trade rather than a win.
+
+### What is verified and what is not
+
+**Verified:** the device limit is 102,400; the probe's achievable budget is ~66,000; 65536/22944 = 2.86
+and 102400/22944 = 4.46; the probe's two transitions (2->1 at ~33,200, and the much larger slowdown
+at 60,000) are both consistent with discrete steps.
+
+**Not verified:** that the carveout is the cause, and that it can be raised on this part. The
+`cuFuncSetAttribute` binding is **absent from cudarc 0.19.9** -- only the enum value
+`CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9` exists in its sys crate -- and
+`CudaFunction` exposes no public `CUfunction` accessor, so testing it needs a hand-written `extern
+"C"` declaration plus a way to reach the function handle.
+
+**The decisive instrument is `cuOccupancyMaxActiveBlocksPerMultiprocessor`, which cudarc *does*
+expose** (`cudarc::driver::result::occupancy::max_active_block_per_multiprocessor(f, block_size,
+dynamic_smem_size)`). It returns the exact block count rather than requiring the ablation probe's
+timing inference, so it can confirm both the current 2 and the post-change 4 directly.
+
+**Recorded as the highest-value open lead: it is cheap, it is a one-line change, and if it holds it
+dissolves the constraint that every other path in this session has been fighting.**
