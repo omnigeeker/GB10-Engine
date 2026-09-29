@@ -7982,3 +7982,41 @@ you remove idle warps is not throughput-limited in any of the dimensions anyone 
 honest summary is that **the binding constraint on this kernel has not been identified**, and that
 every intervention attempted so far has been, in effect, a change to its scheduling behaviour whose
 effect on the runtime cannot be predicted from the work it removes.
+
+### Why `attn-tile`'s timings are contaminated, and what it does not explain
+
+The timing harness in `crates/gb10-verify/src/main.rs` was finally read. It is:
+
+```rust
+let t0 = std::time::Instant::now();
+ops.attn_prefill_tiled(&dev, &qd, &kd, &vd, &mut b, ...)?;   // async launch
+dev.check_err()?;
+let bv = dev.stream().memcpy_dtov(&b)?;      // <-- D2H copy INSIDE the timed window
+let el = t0.elapsed().as_secs_f64();
+```
+
+**The measured window contains a full device-to-host copy of the output, plus the allocation of its
+destination `Vec`.** The output is `nt * nh * hd` fp32, so at the 65536 span that is
+65536 x 24 x 256 x 4 B = **1.61 GB**, allocated and copied on every single timed iteration. This is
+the source of the contamination that has been visible all along: the readings of 5.66 s, 29.55 s and
+30.82 s that appeared next to normal readings in the same run are host-side allocation and
+page-fault stalls, not kernel behaviour. It is also why the minimum over repeated runs is the only
+trustworthy statistic, which is the rule this program has been following.
+
+The copy itself is not large enough to explain the six backfires: 1.61 GB at the ~228 GB/s this
+machine measures is ~7 ms against a ~9.1 s reading, and the 16384 -> 65536 scaling is a clean 16x,
+which it could not be if a fixed overhead dominated. But the **allocation** of 1.61 GB per iteration
+is not bounded by bandwidth, it is bounded by the host allocator, and that is where the multi-second
+outliers come from.
+
+**The correct fix for future rounds is to time the kernel with CUDA events around the launch alone,
+moving the D2H copy and the allocation outside the timed region** -- and to keep the correctness
+check where it is. Until then, every number in this document is a minimum over repeated runs of
+(kernel + D2H copy + allocation), which is a valid basis for comparing two builds *to each other*
+but is not the kernel's time.
+
+**What it does not explain.** A constant additive overhead would make real improvements look
+*smaller* than they are; it cannot make a change that removes work look *slower*. The six backfires
+are 19% to 33% effects, reproduced across three or more runs each, and they are larger than any
+plausible allocation variance. So the methodological flaw is real and worth fixing, and it is not
+the explanation for the pattern.
