@@ -9279,3 +9279,45 @@ length and nothing found so far scales with it.
 **The methodological result is worth as much as the performance one.** Ten hypotheses about a
 kernel were refuted before the dispatch line was read. The single change that worked came from
 asking *which code runs*, not *how fast the code is*.
+
+## The epilogue is folded into the GEMM: 1301 ms -> 1 ms, and the 8K prefill is 10.54 s
+
+The per-tensor quantisation scale was being applied to the fp32 accumulator by a separate
+`f32_scale` kernel after every GEMM. `cublasGemmEx` computes `y = alpha * A*B + beta * y` with
+`CUBLAS_COMPUTE_32F`, so **alpha is applied to the fp32 accumulator too** -- folding the scale into
+`alpha` is numerically identical to scaling the result afterwards, and it deletes the pass.
+
+The only obstacle was representational: `scale2` and `scale` are `CudaSlice<f32>` (device-resident
+constants), so the host had no `f32` to pass. The loader already has the host value in `s2host` /
+`shost` before the `memcpy_stod`, so both variants now carry the constant on the host as well
+(`scale2_host`, `scale_host`) purely so it can be handed to `alpha`.
+
+**Measured, same session, same instrument:**
+
+| | before | after |
+|---|---|---|
+| **`epilogue` phase** | **1301 ms (10.5%)** | **1 ms (0.0%)** |
+| `cublas gemm` | 5056 ms | 5099 ms |
+| `activ cast` | 713 ms | 852 ms |
+| `weight stage` | 425 ms | 426 ms |
+| GEMM calls (`n=`) | 400 | 496 |
+| **8K prefill total** | **11.69 s** | **10.54 s** |
+
+**1.15 s removed from the 8K prefill by deleting one elementwise pass**, and the correctness gate
+passes (`attn-tile: OK`).
+
+**The GEMM call count rose from 400 to 496, and that is the previous fix working as intended**: the
+`n = 48` projections now take the GEMM path, adding two calls per delta layer (48 x 2 = 96). It is
+also why `activ cast` rose from 713 ms to 852 ms -- those two calls each cast the activation.
+
+**Cumulative, this session, both fixes, same instrument:**
+
+| | 8K prefill |
+|---|---|
+| start of the dispatch investigation | 12.61 s |
+| after the small-`n` dispatch fix | 11.69 s |
+| after folding the epilogue into `alpha` | **10.54 s** |
+
+**2.07 s removed -- 16.4% of the 8K prefill -- and both changes are structural rather than
+tuning.** The first was aimed by reading the dispatch; the second by reading the epilogue. Neither
+came from a hypothesis about a kernel.

@@ -1286,6 +1286,7 @@ impl Ops {
         k: usize,
         t: usize,
         beta_in: f32,
+        alpha_in: f32,
     ) -> Result<()> {
         use cudarc::cublas::sys::{
             cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
@@ -1295,7 +1296,12 @@ impl Ops {
             w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
             "cublas_gemm_bf16_f32",
         )?;
-        let alpha = 1.0f32;
+        // `alpha_in` is the caller's per-tensor quantisation scale, folded into
+        // the GEMM instead of being applied to `y` by a separate `f32_scale`
+        // pass. `CUBLAS_COMPUTE_32F` applies alpha to the fp32 accumulator, so
+        // this is numerically identical to scaling the result afterwards --
+        // and it removes a full read-modify-write of `y` per projection.
+        let alpha = alpha_in;
         let beta = beta_in;
         let status = unsafe {
             cublasGemmEx(

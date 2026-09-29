@@ -47,11 +47,15 @@ pub enum LinearData {
         w: CudaSlice<u8>,
         wscale: CudaSlice<u8>,
         scale2: CudaSlice<f32>,
+        /// The same constant on the host, so it can be folded into the GEMM's
+        /// `alpha` instead of being applied by a separate `f32_scale` pass.
+        scale2_host: f32,
     },
     /// `w` E4M3 `[N, K]` with a per-tensor fp32 scale.
     Fp8 {
         w: CudaSlice<u8>,
         scale: CudaSlice<f32>,
+        scale_host: f32,
     },
     /// Unquantized bf16 `[N, K]`.
     Bf16 { w: CudaSlice<u16> },
@@ -74,10 +78,10 @@ impl Linear {
     ) -> Result<()> {
         let kern = dev.kernels();
         match &self.data {
-            LinearData::NvFp4 { w, wscale, scale2 } => {
+            LinearData::NvFp4 { w, wscale, scale2, .. } => {
                 kern.nvfp4_gemv(dev, x, w, wscale, scale2, y, self.n, self.k, batch)?
             }
-            LinearData::Fp8 { w, scale } => {
+            LinearData::Fp8 { w, scale, .. } => {
                 kern.fp8_gemv(dev, x, w, scale, y, self.n, self.k, batch)?
             }
             LinearData::Bf16 { w } => kern.bf16_gemv(dev, x, w, y, self.n, self.k, batch)?,
@@ -249,12 +253,21 @@ impl Linear {
         // the result is W*(hi + mid + lo) with no intermediate rounding to 16
         // bits. This is the price of fp32-grade precision on tensor cores --
         // three bf16 GEMMs against one fp32 CUDA-core GEMM, still ~3.7x cheaper.
-        kern.cublas_gemm_bf16_f32(dev, wb, xhi, y, n, k, t, 0.0)?;
+        // The per-tensor scale, folded into the GEMM's `alpha` rather than
+        // applied to `y` afterwards. The epilogue pass this replaces measured
+        // 1301 ms at 8192 tokens -- 10.5% of the whole prefill, and the second
+        // largest GEMM phase in the model.
+        let alpha_scale: f32 = match &self.data {
+            LinearData::NvFp4 { scale2_host, .. } => *scale2_host,
+            LinearData::Fp8 { scale_host, .. } => *scale_host,
+            LinearData::Bf16 { .. } => 1.0,
+        };
+        kern.cublas_gemm_bf16_f32(dev, wb, xhi, y, n, k, t, 0.0, alpha_scale)?;
         if split >= 2 {
-            kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0)?;
+            kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0, alpha_scale)?;
         }
         if split >= 3 {
-            kern.cublas_gemm_bf16_f32(dev, wb, xmid, y, n, k, t, 1.0)?;
+            kern.cublas_gemm_bf16_f32(dev, wb, xmid, y, n, k, t, 1.0, alpha_scale)?;
         }
         mark!(3);
 
@@ -262,11 +275,9 @@ impl Linear {
         // folded into a 16-bit weight: NVFP4's `s2` and fp8's `scale` both are
         // single constants, and the reference applies both in fp32. `bf16` rows
         // have no scale and are already done.
-        match &self.data {
-            LinearData::NvFp4 { scale2, .. } => kern.f32_scale(dev, y, scale2, t * n)?,
-            LinearData::Fp8 { scale, .. } => kern.f32_scale(dev, y, scale, t * n)?,
-            LinearData::Bf16 { .. } => {}
-        }
+        // The scales are applied inside the GEMM now (see `alpha_scale`
+        // above); this pass used to be `kern.f32_scale(dev, y, scale, t * n)`.
+        let _ = &self.data;
         mark!(4);
         if let Some(t) = evs.take() {
             GEMM_EVENTS.lock().unwrap().push(t);
@@ -362,10 +373,10 @@ impl Linear {
         }
         let kern = dev.ops();
         match &self.data {
-            LinearData::NvFp4 { w, wscale, scale2 } => {
+            LinearData::NvFp4 { w, wscale, scale2, .. } => {
                 kern.nvfp4_gemm(dev, w, wscale, scale2, x, y, self.n, self.k, t)?
             }
-            LinearData::Fp8 { w, scale } => {
+            LinearData::Fp8 { w, scale, .. } => {
                 kern.fp8_gemm(dev, w, scale, x, y, self.n, self.k, t)?
             }
             LinearData::Bf16 { w } => kern.bf16_gemm(dev, w, x, y, self.n, self.k, t)?,
@@ -460,13 +471,13 @@ impl Store {
                     .memcpy_stod(self.bytes(&format!("{name}.weight_scale"))?)?;
                 let s2host = self.f32(&format!("{name}.weight_scale_2"))?;
                 let scale2 = dev.stream().memcpy_stod(&s2host)?;
-                LinearData::NvFp4 { w, wscale, scale2 }
+                LinearData::NvFp4 { w, wscale, scale2, scale2_host: s2host[0] }
             }
             DType::F8_E4M3 => {
                 let w = dev.stream().memcpy_stod(self.bytes(&wname)?)?;
                 let shost = self.f32(&format!("{name}.weight_scale"))?;
                 let scale = dev.stream().memcpy_stod(&shost)?;
-                LinearData::Fp8 { w, scale }
+                LinearData::Fp8 { w, scale, scale_host: shost[0] }
             }
             DType::BF16 => {
                 let w = self.bf16_u16(dev, &wname)?;
