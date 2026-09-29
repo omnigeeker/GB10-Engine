@@ -11077,3 +11077,52 @@ own speedup alone would explain** -- gb10 went 2712.43 -> 1699.78 s (-37%) while
 **Every length improved, and one of the four now wins.** The ratios fall monotonically with length
 because the attention kernel's share rises monotonically -- 13.6% at 8K, 39.5% at 32K, 71.9% at
 128K -- and **the attention kernel is the only term that grows faster than linearly.**
+
+## The next instruction-count win: V is the same 16-scalar-load pattern K was
+
+Vectorizing the K staging took the attention kernel down 25% by replacing sixteen scalar 2-byte
+global loads per thread per iteration with two `uint4` loads. **The V prefetch is the identical
+pattern and is now the larger half:**
+
+```cuda
+#pragma unroll
+for (int j = 0; j < PREFILL_BK; ++j) {
+    const int s = s0 + j;
+    vr[j] = (s <= win_max) ? __half2float(v[kv_base + (s * n_kv_heads + kh) * HD + tid]) : 0.0f;
+}
+```
+
+Sixteen loads per thread, one per key, each 2 bytes, at stride `n_kv_heads * head_dim`. **Unlike K,
+they cannot simply be widened, because thread `tid` needs its own *column* of V -- sixteen values
+2048 bytes apart -- not eight contiguous halves.**
+
+**The fix is to transpose V in the cache.** Stored as `[dim][key]` instead of `[key][dim]`, thread
+`tid` would read `V[tid][s0 .. s0+15]`, which is 32 contiguous bytes -- **two `uint4` loads, exactly
+the K change, and on the K measurement worth roughly the same ~25%.**
+
+**What that touches (verified, not assumed):**
+
+| site | file | what changes |
+|---|---|---|
+| `v_cache: CudaSlice<u16>` | `layer.rs:839` | the layout itself |
+| `kv_cache_append_batched` | `layer.rs:695` | write V transposed |
+| `kv_cache_append_multi` | `layer.rs:803` | same |
+| `kv_cache_append` | `layer.rs:1145` | same |
+| prefill V prefetch | `elementwise.cu` | two `uint4` loads instead of sixteen scalars |
+| decode attention | `layer.rs:815` | reads V for the decode path |
+
+**So it is a layout change spanning three append kernels, the prefill kernel and the decode
+attention -- larger than the K change, which touched one loop.** The append itself is cheap (29 ms,
+0.1% of the 32K prefill), so the transposing write costs nothing measurable; the risk is the decode
+path, which is where gb10's 2.3-7.7x warm-TTFT advantage lives.
+
+**This is recorded as the second remaining path, alongside the occupancy change**, with the
+inference that it is worth ~25% stated explicitly so the next round does not have to re-derive it
+from the K result. **The two are independent and both are still on the table:**
+
+1. **transpose V** -- ~25% off the attention kernel, spanning 3 append kernels + prefill + decode;
+2. **stream the Q or K tile** -- 22,944 B -> 10,016 B, occupancy 2 -> 3 blocks/SM, ~1.4x by the
+   measured occupancy curve, spanning the kernel's staging and `ldmatrix` operands.
+
+**Neither is reachable by a micro-cut:** the required 811-944 B for occupancy has no precision-safe
+source (recorded above), and the V pattern is not widen-able in place (recorded here).
