@@ -10700,3 +10700,50 @@ switch.
 32K prefill is either already near its measured ceiling (the MLP at ~76% of bf16 peak, the large
 GEMMs at 0.98-1.02x cold/warm) or is the attention kernel, whose root cause is settled and whose fix
 is the streaming change described above.
+
+## 128K post-fix: the attention kernel is 75.3% of the prefill, and rope becomes a new super-linear term
+
+`GB10_ATTN_EVENTS=1 prefill-shape --limit 131072 --max-seq 131072`, 16 chunks of 8192:
+
+```
+total 639.35 s
+[diag] ATTN n=256 | proj + norm 7514ms (1.2%)  rope (tables + htod) 6777ms (1.1%)
+                    kv cache append 244ms (0.0%)  attn kernel 481214ms (75.3%)
+                    o_proj + mlp 26077ms (4.1%)  | total 521.83s of 639.35s (81.6%)
+```
+
+Per-chunk times are the closed form again -- `13.38, 15.24, 18.48, 22.48, 26.14, 30.10, 33.30,
+37.24, 41.19, 45.12, 49.09, 53.56, 57.64, 61.68, 65.67, 69.02` -- increments of roughly +3.5 to
++4.5 s, exactly the `t x keys / 384` growth.
+
+**The attention kernel is 75.3% of the 128K prefill, up from 45.6% at 32K.** And the arithmetic that
+matters most:
+
+| | |
+|---|---|
+| 128K instrumented total | **639.35 s** |
+| attention kernel | **481.21 s (75.3%)** |
+| everything else | **158.14 s** |
+| llama.cpp 128K (pre-fix same-session) | 290.63 s |
+| gb10 / llama now | **2.20x** (pre-fix 4.21x) |
+| **gb10 / llama if the attention kernel were hidden** | **0.54x -- gb10 would win 128K by 1.84x** |
+
+**So at 128K the attention kernel is not merely the largest term, it is the entire deficit.** Every
+other phase together (158 s) is already 1.84x faster than llama.cpp's whole 128K prefill.
+
+### And a new super-linear term: `rope`
+
+| phase | 32K | 128K | scaling for 4x tokens |
+|---|---|---|---|
+| proj + norm | 1830 ms | 7514 ms | 4.11x |
+| **rope (tables + htod)** | **45 ms** | **6777 ms** | **150.6x** |
+| kv cache append | 29 ms | 244 ms | 8.41x |
+| attn kernel | 29910 ms | 481214 ms | 16.09x |
+| o_proj + mlp | 6113 ms | 26077 ms | 4.27x |
+
+**`rope` scales 150x for 4x tokens -- far more steeply than the attention kernel itself.** It is
+only 1.1% of the 128K prefill, so it is not the objective, but **it is a phase whose name says
+"tables + htod", which means the rope frequency tables are being rebuilt or re-uploaded, and a
+150x growth for 4x tokens means that work is scaling with something other than the table size.**
+At 256K it would be ~100 s if the trend holds, which is worth knowing before the next 256K
+measurement. **Recorded as a lead, not as a target: the objective is the 481 s, not the 6.8 s.**
