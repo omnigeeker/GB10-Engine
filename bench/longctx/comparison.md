@@ -10929,3 +10929,46 @@ cost is `(t x keys / 384)` iterations at roughly 850 ns each (down from ~1100 ns
 instruction cut recovered). **The rest of the 128K prefill -- 142 s -- is already 2.05x faster than
 llama.cpp's whole 128K prefill**, so the objective remains reachable by the same two occupancy
 changes, now against a smaller and better-understood target.
+
+## Refuted: the PV loop is not the bottleneck, despite 384 shared loads per thread
+
+The K-staging win showed the kernel is instruction-issue limited, so the next candidate was the
+P.V accumulation, which by instruction count is the largest loop in the kernel:
+
+```cuda
+for (int i = 0; i < PREFILL_BQ; ++i) {
+    float a = acc[i] * c;
+    const float* prow = S + i * PREFILL_BK;
+    for (int j = 0; j < PREFILL_BK; ++j)
+        a = fmaf(prow[j], vr[j], a);        // 384 loads + 384 FMAs per thread per iteration
+}
+```
+
+`PREFILL_BQ * PREFILL_BK` is 384, and `prow` is a shared-memory read, so this looked like the
+dominant instruction cost. **It is not.** The probability row is 16 fp32 = 64 bytes, so it was
+rewritten as four `float4` loads with the 16 `fmaf`s unrolled -- 384 loads per thread down to 96,
+a 4x cut in the largest load count in the kernel. **Measured, same session:**
+
+| | before | after |
+|---|---|---|
+| isolated `ntok 65536` | 5.65 s | 5.71 s |
+| model attention kernel @ 32K | 22887 ms | **22879 ms** |
+| 32K prefill total | 58.42 s | 57.89 s |
+
+**Identical within noise, and the change was reverted.** The reason is that `prow[j]` is the *same
+address for all 256 threads* in a row -- every thread accumulates the whole probability row for its
+own output dimension -- so these are shared-memory **broadcast** reads, which cost one transaction
+per warp rather than one per thread. **The instruction count was real; the cost was not.** The
+registers did drop from 80 to 72, but shared memory is the binding occupancy constraint, so that
+buys nothing today.
+
+**This is the third time in the session that an instruction-count argument has been tested and the
+first time it has come back negative** -- the K staging was genuinely issue-bound, the P.V loop is
+not. **The distinction is broadcast versus distinct addresses, and it is worth recording because the
+instruction counts are nearly the same (384 either way) while the measured costs differ by a
+factor that made one change worth 25% and the other worth nothing.**
+
+**So the remaining per-iteration cost is not the arithmetic loops.** It is the K and V staging
+issue, the `__syncthreads()` barriers (four per iteration), and the exposed load latency -- which
+is what the closed form has said since it was derived, and what only occupancy or cross-iteration
+overlap can remove.
