@@ -11298,3 +11298,59 @@ layout and the occupancy curve has already been measured directly.
 **Recording this because the previous entry's projection assumed the transpose was free on the
 decode side, and it is not.** The 30.9% figure stands; what changes is that the change must be
 scoped to include the decode kernel rather than treated as a prefill-only edit.
+
+## The decode kernel has no shared-memory staging, and is weight-bandwidth-bound
+
+Checked the one question that decides between the transpose and the occupancy path: **does the
+decode kernel already stage its V tile through shared memory?** It does not.
+
+```cuda
+// elementwise.cu:686-718, attn_decode_kernel -- one block per query head, one thread per channel
+const int d = threadIdx.x;
+for (int s = 0; s < n_keys; ++s) {
+    const float kk = active ? __half2float(k_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f;
+    const float dot = block_reduce_sum(qv * kk) * scale;
+    ...
+    acc = fmaf(p, active ? __half2float(v_cache[base + ((size_t)s * n_kv_heads + kh) * head_dim + d]) : 0.0f, acc * corr);
+}
+```
+
+**Every V element is read straight from global memory, one per thread per key.** Consecutive `d`
+are consecutive, so the row read is coalesced -- and it is coalesced *because* the layout is
+`[key][n_kv_heads][head_dim]`. There is no tile to transpose in place, so **option 2 from the
+previous entry ("transpose inside the decode kernel") is not a one-line index change; it means
+adding shared-memory staging to a kernel that has none.**
+
+**And the kernel's own comment says why that matters:**
+
+> This is the decode path: it costs O(n_keys) per token, and the KV cache read
+> (2 * n_kv_heads * head_dim * 4 bytes per key) stays tiny next to the 17.6 GB
+> of weights streamed per token.
+
+**Decode is weight-bandwidth-bound, and the numbers confirm it.** The measured decode rate is
+9.4 tok/s, i.e. 106 ms per token, so 17.6 GB / 106 ms = **166 GB/s against a measured peak of
+228 GB/s -- 73% of bandwidth, spent on weights.** The V read is 8 KB per key, which at 256K keys is
+2 GB against those 17.6 GB, about 11%.
+
+**So uncoalescing the V read by the transpose's factor of 16 would replace 2 GB with roughly 32 GB
+of sector traffic -- more than the entire weight stream -- and decode would get about three times
+slower.** At 256K, gb10's OTPS is already 3.73 against llama.cpp's 4.64, the only length where it
+loses; **a 3x decode regression would take that to roughly 1.2 and would be a far larger loss than
+the prefill win is a gain.**
+
+**Conclusion, with the decision now forced:**
+
+* **The naive transpose is off the table.** It buys ~25% of prefill and pays with a ~3x decode
+  regression on the one metric where gb10 is furthest ahead and already losing at 256K.
+* **Option 1 (keep both layouts) costs +8.6 GB** and doubles append traffic. It is affordable but
+  wasteful, and it does not help decode.
+* **Option 3 (stream the Q or K tile for occupancy) is the right next move.** It is orthogonal to
+  the V layout, it is worth ~1.4x by the *directly measured* occupancy curve rather than by
+  extrapolation, and **it helps prefill and decode alike** -- decode because the tiled prefill
+  kernel is not involved, and prefill because that is where the occupancy gain lands.
+
+**This is the second time in three rounds that a change priced only on the prefill kernel has turned
+out to be a trade against decode.** The prefill attention kernel is 71.9% of the 128K prefill and
+the whole objective is about prefill TTFT, which makes it easy to price a change on that number
+alone -- **and the decode path is where the objective's strongest existing result lives.** Both must
+be in the ledger.
