@@ -226,7 +226,16 @@ fn prefill_shape(args: &Args) -> Result<()> {
     let chunk = 8192usize;
     let total = args.limit.max(1) as usize;
     let ctx = args.max_seq;
-    let n_seq = 10usize;
+    // The sequence count is the one harness parameter that changes what the
+    // attention is asked to do -- see the attn-tile comparison in
+    // bench/longctx/comparison.md, where the same kernel at the same non-zero
+    // `start` runs ~20x faster in isolation than in the model. Default 10 keeps
+    // every earlier measurement comparable; `GB10_PREFILL_NSEQ=1` is the
+    // configuration the end-to-end TTFT harness actually uses.
+    let n_seq = std::env::var("GB10_PREFILL_NSEQ")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10usize);
 
     // A real, in-distribution sequence rather than random ids.
     let seed_text = "The archive room contains many boxes of old records. Each box \

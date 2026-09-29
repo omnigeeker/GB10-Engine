@@ -9939,3 +9939,49 @@ representative of the end-to-end path in aggregate. **But a single sequence with
 ten sequences with 3.2K prompts each are not the same workload**, and the aggregate agreement could
 be coincidence between two different compositions. **The `n_seq = 1` run settles it, and it is one
 command.**
+
+## `n_seq` refuted: the 29.9 s attention kernel is real and representative
+
+The hypothesis was that `prefill-shape`'s ten sequences inflated the attention cost. `n_seq` was
+made configurable (`GB10_PREFILL_NSEQ`, default 10 unchanged) and both configurations were run at
+32K:
+
+```
+=== n_seq=10 (harness default) ===
+  [diag] ATTN n=64 | ... attn kernel 29946ms (45.7%) | total 37.95s of 65.50s (57.9%)
+=== n_seq=1 (end-to-end configuration) ===
+  [diag] ATTN n=64 | ... attn kernel 30081ms (46.4%) | total 37.92s of 64.78s (58.5%)
+```
+
+**29,946 ms against 30,081 ms -- a 0.5% difference, in the wrong direction.** `n_seq` is not the
+cause, and the 29.9 s figure is real. It is also the configuration the end-to-end harness uses, so
+**the 32K attribution stands as measured.**
+
+**And a correction to the previous section, which is important.** That section claimed the isolated
+kernel was "~20x faster than the model's use of it" by scaling one isolated call to one chunk. That
+comparison was wrong in one respect: the 29,910 ms is a **sum over 64 calls** (16 layers x 4
+chunks), not one call. Done properly, per pair of query-key work:
+
+| | pairs | time | FLOP/s |
+|---|---|---|---|
+| `attn-tile` start 0, ntok 16384 | 1.34e8 (causal) | 0.46 s | **~300 GFLOP/s** |
+| `attn-tile` start 20480, ntok 2048, keys 22528 | 4.61e7 | 0.16 s | **~295 GFLOP/s** |
+| **the model, 32K, all 64 calls** | **6.711e8** | **29.946 s** | **~23 GFLOP/s** |
+
+**The isolated kernel runs at ~300 GFLOP/s and the model at ~23 GFLOP/s -- a 13x efficiency gap
+that `n_seq` does not explain and that scaling by query count does not remove.** The two are not
+consistent once both are expressed per unit of work, and the earlier "they agree" reading came from
+scaling an isolated *call* by token count, which is not the same as scaling by pairs.
+
+**So the gap is real, `n_seq` is excluded, and the kernel itself is capable of 300 GFLOP/s on this
+hardware.** Whatever the model does differently costs it 13x on the same arithmetic -- and the
+remaining differences between the two call sites are the arguments and the cache layout:
+`kv_base = seq * state.kv_stride()` with a stride derived from `max_position_embeddings` (262,144)
+against the isolated test's compact cache, and the model's `start` advancing across four chunks
+within one cache while the isolated test allocates fresh.
+
+**Both are now cheap to test and neither requires touching the kernel.** `kv_stride` is the first:
+if the stride is `max_position_embeddings` rather than the live context, the cache for one sequence
+is spread over 262,144 rows and every K/V access lands on a different page -- which is exactly the
+kind of effect that costs an order of magnitude on a unified-memory part and shows up nowhere in a
+phase timer.
