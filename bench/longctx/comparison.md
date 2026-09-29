@@ -8352,3 +8352,75 @@ for a fresh mapping each time, which is why the same buffers measure 1.9x faster
 
 **None of these three has been attempted in this session, and each is worth more at 8K than
 everything the attention work delivered (1.58x on a 1.4 s kernel).**
+
+## CORRECTION: `alloc_zeros` is NOT a per-call cost -- the model already caches those buffers
+
+**The previous section is wrong and must not be acted on.** It read `gb10-bench tc-phase`'s
+`alloc_zeros (w,x,y) 4.489 ms` as the model's per-GEMM pipeline and concluded that hoisting the
+buffers out of the per-call path was the 8K win. Both halves of that are mistaken.
+
+**`tc-phase` is a synthetic reconstruction, not the model's path.** It allocates its own scaffolding
+up front and then times each stage as a separate closure:
+
+```rust
+let mut wb = dev.stream().alloc_zeros::<bf16>(n * k)?;   // bench scaffolding
+let mut xb = dev.stream().alloc_zeros::<bf16>(t * k)?;
+let mut yb = dev.stream().alloc_zeros::<bf16>(t * n)?;
+let mut yf = dev.stream().alloc_zeros::<f32>(t * n)?;
+...
+let mut time = |label: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<f64> { ... };
+```
+
+The `alloc_zeros` line it prints is **its own closure**, timed for comparison against the real
+stages. It is a measurement of what allocation costs, not a measurement of what the model spends.
+
+**And the model does not spend it, because the fix was already implemented.** `forward_prefill_tensor_core`
+in `crates/gb10-model/src/weights.rs` does exactly what the previous section proposed:
+
+```rust
+// Grow the shared scratch to fit, then split it so the three buffers can
+// be borrowed independently. Each is only ever allocated once and then
+// grown, which is what removes the per-call allocator cost.
+let mut sc = dev.tc_scratch();
+if sc.w.as_ref().map_or(true, |b| b.len() < n * k) {
+    sc.w = Some(stream.alloc_zeros::<bf16>(n * k)?);
+}
+if sc.x.as_ref().map_or(true, |b| b.len() < t * k) { sc.x = Some(stream.alloc_zeros::<bf16>(t * k)?); }
+if sc.x2.as_ref().map_or(true, |b| b.len() < t * k) { sc.x2 = Some(stream.alloc_zeros::<bf16>(t * k)?); }
+if sc.x3.as_ref().map_or(true, |b| b.len() < t * k) { sc.x3 = Some(stream.alloc_zeros::<bf16>(t * k)?); }
+```
+
+The buffers live in a persistent device scratch (`dev.tc_scratch()`), are grown only when a shape
+needs more room, and are otherwise reused. The `alloc_zeros` call happens **once**, on the first
+call and on growth, not per GEMM. A comment in the same file records that this was a deliberate
+change and even names the next step ("hoist them into one 321 MB shared scratch"), which is what
+`tc_scratch` is.
+
+**The reconciliation in the previous section only appeared to work because it included the bench's
+scaffolding.** Using the model's actual per-call pipeline -- dequant 1.686 ms + cast 0.274 ms +
+GEMM 4.866 ms + epilogue 0.943 ms = 7.769 ms, a factor of 1.60 on the GEMM, not 2.52 -- the 8K
+prediction is `4.4 x 1.60 + 1.4 = 8.4 s`, against a measured 12.68 s. **The model does not reconcile;
+it is 4.3 s slower than its own instrumented stages predict, and that gap is the real open question.**
+
+**This is the same failure this document has now recorded three times.** A quantity was measured
+(`alloc_zeros` really is 4.489 ms in that bench), a cause was assumed (that the model pays it per
+call), and the two were treated as one. The check that would have caught it -- opening
+`forward_prefill_tensor_core` and reading the twelve lines above -- was one `sed` away.
+
+**What survives from the previous section, and what does not.**
+
+* **Does not survive:** `alloc_zeros` as the 8K win; the 2.52 pipeline factor; the 12.5 s
+  reconciliation; the claim that the objective is 2.4 s from a fix.
+* **Survives:** the GEMM itself runs at **75 TFLOP/s, i.e. full bf16 peak** -- that is a direct
+  measurement of the GEMM stage and is unaffected. The dequant (13.8%), cast (2.2%) and epilogue
+  (7.7%) are real per-call costs in the model's path too, and together they are **1.60x the GEMM**.
+  And the cublas-gemm bench's `(same buffers)` rows remain valid as a statement about the allocator,
+  just not about this model.
+
+**The corrected open question.** At 8K the measured prefill is 12.68 s. The instrumented stages
+account for the GEMM (4.4-4.6 s, matching the `cublas gemm` share of 36.4% at 16K), the
+cast/stage/epilogue (17%, 2.2 s) and the attention kernel (1.4 s) -- about 8.2 s. **The remaining
+~4.5 s, roughly 35% of the 8K prefill, is non-GEMM work that the phase instrument does not name**,
+and it is the same "non-GEMM remainder 46.7%" the 16K run reported. That remainder, not buffer
+allocation, is where the 8K win has to come from, and **nothing in this session has yet identified
+what it is.**
