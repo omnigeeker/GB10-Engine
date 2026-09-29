@@ -11909,3 +11909,46 @@ product gets away with fp16 because its operands are Q and K, which are already 
 **This is now the best-understood remaining target, and the next step is to find out whether the gate
 actually rejects an fp16 `P`** -- if `tol_norm`/`tol_rel` admit it, the change is worth ~40%; if not,
 the PV stays scalar and the kernel is close to its floor.
+
+## The tensor-core PV is closed by precision -- fp16 P fails the gate
+
+The previous entry measured the PV accumulation at 41.8% of the kernel and named the tensor cores as
+the only way to make it cheaper, with the open question being whether the gate would admit an fp16
+`P`. **Answered: it will not.** Rounding `P` to fp16 precision while keeping the accumulation in fp32
+
+```cuda
+a = fmaf(__half2float(__float2half(prow[j])), vr[j], a);
+```
+
+fails the gate at every shape, with a **relative rms error of 1.7-1.85e-4**:
+
+```
+  511   128   1.141e-5   1.853e-4   MISMATCH
+ 2047    64   5.476e-6   1.847e-4   MISMATCH
+ 1000   200   8.114e-6   1.734e-4   MISMATCH
+Error: attn-tile gate FAILED
+```
+
+**So the PV stays scalar, and the attention kernel is close to its floor.** The reasoning is worth
+recording because it explains why this kernel is asymmetric: the score product gets away with fp16
+because its operands are `Q` and `K`, which arrive from the KV cache already fp16 -- **no precision is
+lost by using them.** `P` is different: it is the softmax output, computed in fp32, and it has never
+been rounded. Rounding it is a *new* error the kernel does not currently pay, and it is 1.8e-4
+relative against a gate that rejects it.
+
+### Where the attention kernel now stands
+
+| component | share of the kernel | status |
+|---|---|---|
+| K staging | was ~25% | **vectorised, -25% (landed)** |
+| V loads | was 30.9% | **staged via uint4, -18.9% (landed)** |
+| **PV accumulation** | **41.8%** | **at its floor -- fp16 fails the gate** |
+| mma score product | remainder | already tensor-core |
+
+**Both removable items have been removed, and the largest remaining one is provably irreducible
+without breaking correctness.** The kernel has fallen from 48,269 ms to 18,548 ms at 32K this session
+(**-61.6%**), and the remaining 41.8% is the required arithmetic.
+
+**This is the seventh path closed by measurement, and the first closed by the correctness gate rather
+than by timing** -- which is the right order: the gate decides what is allowed, and only then does
+timing decide what is worth it.
