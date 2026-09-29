@@ -8540,3 +8540,61 @@ small GEMMs are dominated by overhead that does not scale with their FLOPs.
 pipeline overhead**, which is not attention, not the recurrence, and not a tensor-core efficiency
 problem -- it is dequantisation and casting wrapped around GEMMs that already run at peak. And the
 second largest is **four small projection GEMMs that should be one**.
+
+## The new instrument is validated, and the 8K win is inside the MLP pipeline overhead
+
+A measurement instrument that has not been checked against its own perturbation is not an
+instrument. The DeltaNet bracket records six CUDA events per layer call, 48 calls per 8192-token
+chunk, so it is a real cost on the measured path and has to be shown not to move the number it
+reports. Same binary, same shape, alternating:
+
+| run | total (no events) | total (with events) |
+|---|---|---|
+| 1 | 12.30 s | 12.40 s |
+| 2 | 12.34 s | 12.36 s |
+
+**The instrumentation perturbs the prefill by at most 0.5%**, which is smaller than the run-to-run
+spread it is used to resolve. The phase readings repeat to about 1% across runs:
+
+| phase | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| proj in | 2173 ms | 2175 ms | 2171 ms |
+| conv + l2norm + gate | 404 ms | 410 ms | 407 ms |
+| delta rule chunk | 526 ms | 524 ms | 530 ms |
+| proj out | 651 ms | 654 ms | 638 ms |
+| mlp | 4501 ms | 4511 ms | 4528 ms |
+
+**So the instrument is sound and the attribution stands.**
+
+**The 8K win, priced against llama.cpp.** The objective needs the 8K prefill to go from ~12.3 s to
+llama.cpp's 10.91 s -- **1.39 s**. The measured components above that are candidates:
+
+| target | measured cost | removable part | basis |
+|---|---|---|---|
+| **MLP pipeline overhead** (dequant + cast + epilogue) | 35.4 ms per delta layer-call, 48 layers = **1.70 s** | up to 1.70 s | 93.8 ms measured vs 58.4 ms of GEMM at 75 TFLOP/s |
+| `proj in` above the pipeline factor | 2.17 s total, 0.99 s above | 0.99 s | 45.3 ms measured vs 18.4 ms of GEMM; 4 separate GEMMs, two with n = 48 |
+| `proj out` above the pipeline factor | 651 ms, 0.17 s above | 0.17 s | 13.6 ms vs 6.9 ms |
+| attention kernel | 1.4 s | 1.58x already taken | -- |
+| **the recurrence** | 526 ms | -- | 4.3%, not worth touching |
+
+**The MLP pipeline overhead alone (1.70 s in the DeltaNet layers, plus a proportional share in the
+16 attention layers) is larger than the 1.39 s the objective needs.** That is the first time in this
+session that a single measured, identified component has been sufficient on its own to close the 8K
+gap, and it is not attention, not the recurrence, and not a tensor-core efficiency problem -- it is
+dequantisation, activation casting and epilogue work wrapped around GEMMs that already run at peak.
+
+**The cheapest three sub-targets inside it, in order:**
+
+1. **Cache the dequantised bf16 weights.** `dequant_nvfp4_to_bf16` is 13.8% of the pipeline and the
+   weights are static for the whole prefill, so it is recomputed for every chunk and every layer
+   for no reason. Costs memory: the MLP weights of 64 layers are ~1.7e10 parameters, so a full bf16
+   cache is ~34 GB against 121 GB available.
+2. **Fuse `in_proj_qkv`/`z`/`a`/`b` into one GEMM.** Four per-call pipelines become one, and the
+   two `n = 48` GEMMs stop paying a full pipeline for 48 columns of work.
+3. **Fold the epilogue scale into the GEMM**, or have the accumulator written in f32 so
+   `bf16_to_f32_scaled` (7.7% of the pipeline) disappears.
+
+**None of these is a kernel change and none needs a new kernel.** All three act on components that
+are now measured, and all three can be checked the same way this session has learned to check
+things: `tc-phase` for the pipeline, `prefill-shape` for the phase split, and a same-session
+gb10-vs-llama.cpp TTFT pair for the end-to-end claim.
