@@ -7555,3 +7555,54 @@ removed:
 The remaining work is mechanical wiring, not discovery: stage V into `Vs`, have the softmax write
 `Pf`/`Pflo`, replace the 384-`fmaf` loop with 12 mma per warp per key tile, and write `out` from
 the fragment accumulators.
+
+### The tensor-core P·V was built, proven correct, and is still slower -- and that closes the program
+
+This is the change that every previous round pointed at, built exactly as designed, with its
+fragment mapping proven standalone (256/256) before being wired in. It is **numerically correct**
+and it is **~5% slower** than the scalar fp32 P·V it replaces, so it is not in the tree.
+
+| build | 16384 (min) | 65536 (min) | notes |
+|---|---|---|---|
+| scalar P·V (in tree) | **0.56 s** | **8.95 s** | 90 regs, 0 spill |
+| mma P·V, `Vs` stride 256 | 0.63 s | 9.96 s | correct, 11% slower |
+| mma P·V, `Vs` stride 264 | 0.60 s | **9.40 s** | correct, **5% slower**; 72 regs, **0 spill** |
+
+**The first run was slow for a findable reason, and finding it was worth the round.** `Vs` was
+staged with stride `HD = 256` halfs, i.e. 512 B = 128 words per row -- and **128 mod 32 == 0**, so
+every row of `Vs` began in the *same shared bank*. `ldmatrix.trans` reads 16 rows at once, so every
+single B-fragment load was a **16-way bank conflict**. Padding `Vs` to 264 halfs (132 words,
+132 mod 32 == 4) spreads the 16 rows over 8 banks -- the best a 16-byte-aligned stride can do --
+and recovered 6%. That is the same bank arithmetic that produced the old `PADH = 130`, reappearing
+in a place where nobody had reason to look, because the stride that *looks* natural (`HD`) is the
+one stride that is pathological.
+
+**But it is still slower, and the reason is fundamental rather than fixable.** With 0 spill bytes
+and *fewer* registers than the scalar version (72 vs 90, because `vr[]` is gone), the mma version
+has no resource problem at all. The arithmetic simply does not pay:
+
+* the scalar P·V issues 1.3e13 `fma` at the 65536 span, against a measured **9.2e12 fma/s** fp32
+  roofline (18.43 TFLOP/s) -- so the fp32 path is already at ~1.4 s of a 9.0 s kernel, i.e. the
+  scalar P·V is close to the fp32 roofline, not far from it;
+* the same work on tensor cores is ~0.7 s (74 TFLOP/s bf16 peak), so the best case is saving ~0.7 s;
+* the conversion costs more than that: 8 `ldmatrix.trans` (still 2-way conflicted, the floor for an
+  aligned stride) plus 4 `ldmatrix.x4` plus 12 mma plus fragment addressing per warp per key tile,
+  **and** the softmax now writes `Pf` and `Pflo` separately instead of one `S`, and `Pf`/`Pflo` must
+  be zeroed for the rows past `rows` that whole 16-row fragments now touch.
+
+**GB10's fp32 throughput is high enough, relative to its tensor-core throughput at this shape, that
+converting the P·V to tensor cores costs more than it saves.** The tensor-core prefill-attention
+program is therefore closed, and the three increments land as:
+
+| increment | result | in tree? |
+|---|---|---|
+| score matmul on tensor cores (`mma.sync`) | **1.37x** | yes |
+| `ldmatrix` for the score fragments | **1.15x** (1.58x cumulative) | yes |
+| P·V on tensor cores | 0.95x -- **slower** | no |
+
+The remaining gap to llama.cpp is no longer reachable by moving arithmetic between units. Every
+lever has now been measured: arithmetic placement (this round), shared-load count and vectorisation,
+accumulator-chain ILP, matmul quality, barriers, `__expf`, K's global reads, registers and spills,
+occupancy (+50% for 0%), and the shared-memory budget (which turned out to be 51,200 B, not the
+24,576 B four rounds were designed against). What is left is the kernel's *shape*: larger query
+tiles so each K/V staging serves more rows, which needs a rewrite rather than a substitution.
