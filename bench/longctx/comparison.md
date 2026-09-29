@@ -12060,3 +12060,47 @@ length, so the same factor applies at 128K and 256K where the gaps are largest.*
 (`CUDA_R_4F_E2M1` with the NVFP4 block-scale layout) instead of the dequantise-then-bf16-GEMM route.
 That is a real change, not a tuning knob -- but it is aimed at the largest component, at the format
 the weights are already in, and the only evidence against it was a test that measured something else.
+
+## The FP4 GEMM path exists in the bindings -- only the safe wrapper is missing
+
+Checked whether a native FP4 GEMM is reachable on this part. **It is: cudarc 0.19.9 ships a full
+`cublaslt` module, and every symbol an NVFP4 GEMM needs is already bound.**
+
+```
+cudarc-0.19.9/src/cublaslt/sys/mod.rs
+
+  CUDA_R_4F_E2M1 = 33                              <- the FP4 data type
+  CUBLASLT_MATMUL_DESC_A_SCALE_POINTER   = 17      <- activation block scales
+  CUBLASLT_MATMUL_DESC_B_SCALE_POINTER   = 18      <- weight block scales
+  CUBLASLT_MATMUL_DESC_C_SCALE_POINTER   = 19
+  CUBLASLT_MATMUL_DESC_D_SCALE_POINTER   = 20
+  CUBLASLT_MATMUL_DESC_SCALE_TYPE        = 1
+  CUBLASLT_MATMUL_DESC_AMAX_D_POINTER    = 21
+```
+
+**So cuBLASLt here can take FP4 operands with block scales directly -- the dequantise-to-bf16 step
+is not required by the hardware or by the bindings.**
+
+**The gap is only in the safe wrapper.** `cublaslt/safe.rs` exposes just `new()`; there is no safe
+matmul-descriptor builder or `matmul` call. So the change needs the raw `sys` FFI:
+
+```
+cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, ...)
+cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, ...)
+cublasLtMatmul(...)
+```
+
+**That is real implementation work -- a new GEMM path alongside the existing bf16 one, with the
+weight layout and scale layout that cuBLASLt expects -- not a tuning knob.** It is also the only
+change identified this session whose ceiling is set by the weight format rather than by the kernel,
+and the MLP it targets is 40.4% of the 32K prefill.
+
+**Recommended next step, in order:** (1) prototype it on a *single* matrix in isolation, comparing
+against the existing bf16 path for both accuracy and time, before touching the model; (2) if the
+isolated FP4 GEMM is genuinely faster, wire it behind the existing `GB10_TC_GEMM`-style switch so it
+can be A/B'd; (3) gate it on `generate`'s 16/16 exact match, which is the only gate covering the
+decode path, and on `GB10_MLP_EVENTS=1` for the prefill pricing.
+
+**Recorded because the evidence against this path was a test that measured the GEMV fallback, and
+because the opportunity is now the largest one in the objective.**
