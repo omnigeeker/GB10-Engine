@@ -11952,3 +11952,54 @@ without breaking correctness.** The kernel has fallen from 48,269 ms to 18,548 m
 **This is the seventh path closed by measurement, and the first closed by the correctness gate rather
 than by timing** -- which is the right order: the gate decides what is allowed, and only then does
 timing decide what is worth it.
+
+## Complete 32K cost breakdown: the MLP is now the largest component, not attention
+
+With the attention kernel at its arithmetic floor, the useful question is where the *rest* of the
+prefill goes. Both layer types instrumented together, same run:
+
+```
+[diag] DELTA n=192 | proj in (qkv/z/a/b) 5044ms (9.5%)  conv + l2norm + gate 1630ms (3.1%)
+                     delta rule chunk 2111ms (4.0%)  proj out 2310ms (4.4%)  mlp 15548ms (29.3%)
+                     total 26.64s of 53.08s (50.2%)
+[diag] ATTN  n=64  | proj + norm 1786ms (3.4%)  rope (tables + htod) 46ms (0.1%)
+                     kv cache append 29ms (0.1%)  attn kernel 18495ms (34.8%)
+                     o_proj + mlp 5908ms (11.1%)
+                     total 26.26s of 53.08s (49.5%)
+```
+
+**50.2% + 49.5% = 99.7% -- the accounting is now complete**, which it had not been: the attention
+instrument alone covers only half the prefill, and reading it in isolation had made the attention
+kernel look like the whole story.
+
+| component | time | share |
+|---|---|---|
+| **MLP (48 delta layers + 16 attention layers)** | **21,456 ms** | **40.4%** |
+| **attention kernel** | **18,495 ms** | **34.8%** |
+| delta `proj in` (qkv/z/a/b) | 5,044 ms | 9.5% |
+| delta `proj out` | 2,310 ms | 4.4% |
+| delta rule chunk | 2,111 ms | 4.0% |
+| attention `proj + norm` | 1,786 ms | 3.4% |
+| delta conv + l2norm + gate | 1,630 ms | 3.1% |
+| rope + kv append | 75 ms | 0.1% |
+
+**The MLP is the largest single component of the 32K prefill, and it is not the thing this session
+has been optimising.** After the two staging changes the attention kernel fell from 34.8% of the
+prefill... to 34.8% of the prefill -- because the total fell with it. **In absolute terms it went
+48,269 -> 18,495 ms, and the MLP's 21,456 ms is now larger than it.**
+
+### What the MLP's number means
+
+The MLP is `3 x (5120 x 17408)` MACs per token per layer = 267M MACs, so across 64 layers and 32,768
+tokens that is **1,122 TFLOP**. At the measured 21,456 ms that is **52 TFLOP/s**, against a measured
+bf16 tensor-core peak of ~75 TFLOP/s -- **so the MLP is running at ~70% of bf16 peak and is close to
+its floor on the bf16 path.**
+
+**But the weights are NVFP4.** If the native FP4 tensor cores could be used the ceiling would be
+several times higher -- and the session's earlier attempt (`GB10_TC_GEMM=0`, direct FP4) was 4.5x
+*slower*, which is evidence about that implementation, not about the hardware. **That is now the
+largest open question in the objective: the MLP is 40.4% of the prefill and runs at 70% of a peak
+that is several times below what the weight format allows.**
+
+**This is the first complete accounting of the prefill in this session, and it relocates the
+bottleneck.**
