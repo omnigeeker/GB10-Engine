@@ -7209,3 +7209,50 @@ The design rule that follows: **on this kernel, remove barriers and merge phases
 arithmetic.** That inverts the plan the earlier rounds were following, and it means the next
 attempt at the P·V should not be a separate mma phase at all -- it should fold into the existing
 score phase's warp work so no new barrier is needed.
+
+### ldmatrix: one instruction per fragment, and 1.58x cumulative
+
+Following the measured breakdown, the score phase's fragment loads were replaced with `ldmatrix`.
+A whole A fragment (16x16) or B fragment (8x16) now arrives in **one instruction** instead of six
+shared loads plus their address arithmetic, on both operands. The mapping was proven standalone
+first, again on the first attempt: an nvcc probe computing `D[16][8] = Q.K^T` via
+`ldmatrix.x4` + `ldmatrix.x2` + `mma` reported **128/128 exact** against a CPU reference.
+
+That required retiring the `PADH = HD/2 + 2` row gap. `PS = 2 * PADH = 260` halfs is 520 bytes,
+which is **not** a multiple of 16, so alternate rows were 8-byte misaligned and `ldmatrix`
+(the whole point of which is 16-byte row segments) could not be used at all. The stride is now
+`HD + 8 = 264` halfs (528 B, a clean multiple of 16) with no gap, and the `koff` correction the
+old fragment loads needed is gone with it. **The `PADH = 130` derivation still documented in the
+kernel was load-bearing for the scalar `sub * PADH` access pattern, and that access pattern no
+longer exists** -- nothing reads Q or K scalar-wise any more, and `ldmatrix` does its own
+conflict-free access, so the bank argument that produced 130 is simply obsolete.
+
+| span | original scalar | score mma (pk2) | + ldmatrix | cumulative |
+|---|---|---|---|---|
+| 16384 | 0.88 s | 0.65 s | **0.57 s** | **1.54x** |
+| 65536 | 14.20 s | 10.39 s | **9.01 s** | **1.58x** |
+
+Correctness is unchanged (`attn-tile: OK`, rms rel 1.0--1.6e-5 against the 1.2e-4 gate) and
+**round 411 PASS** across every gate: build, test, correctness at layer and 64-layer scale,
+longctx-follow, tc-parity, batch-parity, decode-bench, prefix cache, benchmark.
+
+**Where the remaining 7x has to come from.** Making *both* matmuls free is now worth only about
+1.5x more, so the gap cannot be closed by better matmuls. The measured shares are P·V ~34%,
+K global reads ~9%, `__expf` ~0%, score fragment loads ~15% (now largely removed), which leaves
+roughly 40% spread across the K staging's shared writes and address arithmetic, the score mma
+itself, the barrier waits, the softmax's non-expf work, and the epilogue. There is **no single
+dominant cost left** -- the classic signature of an instruction-throughput-bound kernel in which
+every phase contributes a little. That points at a structural change (fewer barriers, larger
+tiles, less re-staging) rather than another micro-optimisation.
+
+Two concrete structural candidates, both constrained by the 24,576 B/block shared budget that
+two-block occupancy imposes:
+
+* **A larger `BK`.** Four barriers are paid per 16 keys; `BK = 32` would halve that per key. It
+  does not fit today: `Ks` at `PS = 264` is 16,896 B for `BK = 32` against `Qs` 12,672 B.
+* **Transposing V with `ldmatrix.trans` instead of staging it transposed.** `O = P.V` needs `V^T`
+  because `mma`'s B operand is column-major, and last round's attempt paid a *new barrier* to
+  stage it -- which cost more than the arithmetic it saved. `ldmatrix.sync.aligned.m8n8.x4.trans`
+  produces a transposed fragment directly from the natural `[key][dim]` layout, so V could be
+  staged in the same phase as K with no extra barrier and no transpose pass at all. That is the
+  version worth trying, and it directly answers the design rule the ablation produced.
