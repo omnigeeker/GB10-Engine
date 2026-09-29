@@ -11354,3 +11354,65 @@ out to be a trade against decode.** The prefill attention kernel is 71.9% of the
 the whole objective is about prefill TTFT, which makes it easy to price a change on that number
 alone -- **and the decode path is where the objective's strongest existing result lives.** Both must
 be in the ledger.
+
+## Pricing the last path: K streaming trades a measured 1.4x for an unmeasured 8x transaction cost
+
+The remaining path is the occupancy change: 22,944 B -> 14,496 B by removing the K tile, 2 -> 3
+blocks/SM, ~1.4x by the measured occupancy curve. **The identified implementation replaces the
+`ldmatrix` B operand with direct global loads.** Reading the actual operand code makes the trade
+precise:
+
+```cuda
+const int brow = ntile * 8 + (lane & 7);
+const int bcol = ((lane & 8) != 0) ? 8 : 0;
+for (int kt = 0; kt < HD; kt += 16) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : ... : "r"(smem_addr(&Qs[arow * PS + kt + acol])));      // A: 16 rows x 16 cols
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : ... : "r"(smem_addr(&Ks[brow * PS + kt + bcol])));      // B: 8 rows x 16 cols
+}
+```
+
+**What the B operand costs today:** one `ldmatrix.x2` per k-step, reading 8 rows x 16 halves = 256
+bytes **from shared memory**, where the K tile was placed by two `uint4` global loads per thread per
+iteration. **One instruction, no global traffic.**
+
+**What direct global loads would cost:** each lane names row `s0 + n0 + (lane & 7)` -- **8 distinct
+rows, `n_kv_heads * head_dim = 1024` halves = 2048 bytes apart in global memory** -- and column
+`kt + bcol` with `bcol` in {0, 8}. So one warp-instruction touches **8 cache lines** to deliver 128
+useful bytes: **roughly 8 transactions where the shared-memory path took one.** That happens 16
+times per k-loop, twice per n-tile, per warp, per iteration.
+
+**So the trade is:**
+
+| | gain | cost |
+|---|---|---|
+| K streaming | 8,448 B smem, 2 -> 3 blocks/SM, **~1.4x measured** | mma B operands become 8-line uncoalesced global loads, **~8x transaction amplification** |
+
+**The 1.4x is measured; the 8x is not, and the two are the same order.** The K tile is read by all
+24 query-head blocks, so those transactions would mostly hit L2 rather than DRAM -- which is why
+this is genuinely uncertain rather than obviously bad. **But the session's dominant failure mode is
+exactly this shape: a measured gain on one side and an assumed cost on the other.** This one should
+not be implemented without first pricing the operand loads, and the way to price them is the
+`prefill-shape` probe (replace the B operand with a constant; the gate aborts early, the timing
+instrument does not).
+
+## The strictly safer alternative: stream Q, not K
+
+**Q streaming captures the same occupancy gain while leaving both mma operands in shared memory.**
+The Q tile is `PREFILL_BQ * PS * 2 = 24 * 264 * 2 = 12,672 B`, the largest single allocation.
+Staging 16 rows instead of 24 gives `16 * 264 * 2 = 8,448 B`, so:
+
+```
+8,448 (Q, 16 rows) + 8,448 (K) + 1,536 (S) + 288 (red) = 18,720 B   ->  3 blocks/SM
+```
+
+**Both A and B stay `ldmatrix` from shared memory, and the K staging stays vectorised.** The cost is
+that Q is staged twice per block instead of once -- and **Q is staged once per block, not once per
+key-tile iteration**, so doubling it is negligible against the per-iteration work that is 30.9% V
+and 25% K.
+
+**So Q streaming dominates K streaming on this analysis:** same smem result, no uncoalesced operand
+loads, no change to the K path that was just optimised. **It is the change to implement**, and the
+K-streaming variant should be considered only if Q streaming proves impossible -- which would
+happen only if the mma's A operand genuinely needs all 24 rows resident at once.
