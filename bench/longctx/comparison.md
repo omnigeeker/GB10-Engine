@@ -12174,3 +12174,46 @@ things, both attributed to the wrong cause.**
 **Concrete next action: write the isolated prototype** -- one `5120 x 17408` matrix, real weights,
 `CUDA_R_4F_E2M1` + `VEC16_UE4M3`, timed against the existing `cublas_gemm_bf16_f32` and checked for
 numerical agreement -- before any model change.
+
+## The NVFP4 recipe is complete -- the scale *mode* attributes were the missing piece
+
+The previous entry had the data type, the scale type and the scale mode enum, but not the attribute
+that carries the mode. Found it, adjacent to the scale pointers:
+
+```c
+// /usr/local/cuda/include/cublasLt.h
+/** Scaling mode that defines how the matrix scaling factor for matrix A is interpreted
+ *  int32_t, default: 0 */
+CUBLASLT_MATMUL_DESC_A_SCALE_MODE = 31,
+
+/** Scaling mode that defines how the matrix scaling factor for matrix B is interpreted
+ *  int32_t, default: 0 */
+CUBLASLT_MATMUL_DESC_B_SCALE_MODE = 32,
+```
+
+**So the full sequence is now pinned down exactly, and every symbol is already bound in
+`cudarc::cublaslt::sys`:**
+
+| # | call |
+|---|---|
+| 1 | `cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)` |
+| 2 | `cublasLtMatmulDescSetAttribute(desc, A_SCALE_MODE = 31, &VEC16_UE4M3 = 1, 4)` |
+| 3 | `cublasLtMatmulDescSetAttribute(desc, B_SCALE_MODE = 32, &VEC16_UE4M3 = 1, 4)` |
+| 4 | `cublasLtMatmulDescSetAttribute(desc, A_SCALE_POINTER = 17, &a_scale, 8)` |
+| 5 | `cublasLtMatmulDescSetAttribute(desc, B_SCALE_POINTER = 18, &b_scale, 8)` |
+| 6 | `cublasLtMatrixLayoutCreate(..., CUDA_R_4F_E2M1, ...)` for A, B and D |
+| 7 | `cublasLtMatmul(...)` with `CUDA_R_32F` accumulate |
+
+**There is nothing left to discover about whether this is supported: the data type, the scale type,
+the scale mode, the mode attributes, the scale pointers, and the library are all present.** What
+remains is writing it -- which is ordinary FFI work with a known signature list, not research.
+
+### The scale tensor layout, stated precisely
+
+`VEC16_UE4M3` means: **one `CUDA_R_8F_UE4M3` value per 16 elements along the innermost dimension** of
+the corresponding tensor. For a weight `W[17408][5120]` that is `17408 x (5120/16) = 17408 x 320`
+scale values. **The model already stores exactly this** -- `wscale` in `LinearData::NvFp4` -- so no
+re-quantisation is needed, only a layout check against what cuBLASLt expects.
+
+**This is the highest-value remaining action in the objective, and it is now fully specified rather
+than exploratory.**
