@@ -10529,3 +10529,53 @@ assumption about how the data is consumed that the next function down does not s
 **And the upper bound is unchanged and is the reason to do it:** the attention kernel is 45.6% of
 the 32K prefill, and the rest of the 32K prefill is 35.1 s against llama.cpp's whole 43.20 s. **If
 the kernel's latency were fully hidden, gb10 would win 32K outright instead of losing it 1.48x.**
+
+## The real shared-memory budget is ~65 KB, not 51 KB -- the required cut is 1.1 KB, not 5.9 KB
+
+Every occupancy figure in this session was computed against a 51,200 B per-SM budget. **That number
+is wrong, and the occupancy probe measures the real one.** Raising only the *declared* request (the
+kernel's arithmetic and its actual usage are unchanged, so an over-declaration is harmless) gives:
+
+| declared request | time (start 24576, ntok 8192) | implied blocks/SM |
+|---|---|---|
+| 22,944 B (default) | 0.81 s | 2 |
+| 30,000 B | 0.83 s | **2 -- unchanged** |
+| 40,000 B | 1.09 s | 1 |
+
+**A 51,200 B budget would have dropped to one block at 30,000 B** (51,200/30,000 = 1.7) **and so
+would a 102,400 B budget** (102,400/30,000 = 3.4, against 4 at the default). **Neither matches. The
+only budget consistent with `[2, 2, 1]` is between 60,000 and 68,832 B:**
+
+```
+budget 51200:  blocks at 22944/30000/40000 = [2, 1, 1]
+budget 65536:  blocks at 22944/30000/40000 = [2, 2, 1]   <-- MATCHES
+budget 102400: blocks at 22944/30000/40000 = [4, 3, 2]
+```
+
+**So the per-block ceiling for three blocks is between 20,000 and 22,944 B, not 17,066 B.** The
+current kernel is 22,944 B -- **the required cut is at most 2,944 B and may be as little as 1,099 B,
+not the 5,878 B this session has been planning around.** The objective's own note that "升到 3 需砍
+22%" was computed from the 51,200 figure and is wrong for the same reason.
+
+**And the first thing that cut should have been does not work.** `PS = HD + 8 = 264` looks like pure
+alignment padding -- `256` halves is already 512 B, comfortably 16-byte aligned for `ldmatrix`, and
+the comment's bank-conflict discussion describes the *scalar* kernel's `PADH = 130`, which the
+`ldmatrix` path supposedly retired. **It is not pure alignment.** Changing `PS` to `HD` saves the
+640 B and **passes the correctness gate**, and is slower:
+
+| shape | `PS = HD + 8` | `PS = HD` |
+|---|---|---|
+| ntok 65536 | 7.59 s | **10.13 s** |
+| start 20480, ntok 2048 | 0.16 s | **0.58 s** |
+| start 10240, ntok 2048 | 0.10 s | 0.12 s |
+
+**Up to 3.6x slower with identical arithmetic and identical results.** The `+8` is load-bearing: it
+breaks a bank conflict that `ldmatrix` does not avoid by itself. **Reverted; `attn-tile: OK` at
+`1d0e1ed`.**
+
+**So the cut has to come from elsewhere, and the budget is tighter than it looked:** 22,944 - 640 =
+22,304 B is not reachable by removing the padding, and the ceiling is somewhere in
+[20,000, 22,944). **Removing the Q tile entirely remains the only change large enough to be certain
+of clearing it** (10,016 B with `PS` intact), which is what the plan already said -- but the
+justification is now the *measured* budget rather than an assumed one, and the margin is smaller
+and better understood.
