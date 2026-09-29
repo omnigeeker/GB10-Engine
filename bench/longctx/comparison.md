@@ -7288,3 +7288,55 @@ balance, and **no single remaining phase pays for the gap**. Every lever tried h
 1.37x, 1.15x, 0.95x, or 1.00x -- which is the signature of a kernel that needs a different
 structure (larger query tiles so each K staging serves more rows, more reuse per byte) rather
 than another micro-optimisation of a phase that is already near its share.
+
+### The occupancy constraint was misattributed: it is REGISTERS, not shared memory
+
+Every design decision for four rounds has been made against a documented constraint of
+"2 blocks/SM, smem limited, budget ~24,576 B/block". Measured directly with
+`cudaGetDeviceProperties` on this GB10, that is wrong, and it has been wrong in the direction
+that costs the most:
+
+| resource | attention kernel's footprint | blocks/SM it allows |
+|---|---|---|
+| registers | 96 x 256 = 24,576 regs | **2  <- binding** |
+| shared memory | 24,544 B | 4 |
+| threads | 256 | 6 |
+
+```
+NVIDIA GB10  sm_121  SMs 48
+sharedMemPerBlock         49152 B
+sharedMemPerBlockOptin   101376 B
+sharedMemPerMultiprocessor 102400 B
+regsPerMultiprocessor 65536   maxThreadsPerMultiProcessor 1536
+```
+
+So occupancy is limited by **registers**: 65,536 / (96 x 256) = 2. Shared memory would allow four
+blocks at this footprint. The consequence is that the real per-block shared budget at two blocks
+is **102,400 / 2 = 51,200 B**, not 24,576 B -- **more than double** what every recent design
+assumed, with `sharedMemPerBlockOptin` at 101,376 B as the hard per-block ceiling.
+
+This matters because a whole class of design was rejected on smem grounds that did not exist.
+Specifically, **`Ks` and `Vt` aliasing was never required**: aliasing exists only to fit inside
+24,576 B, and un-aliasing them was correctly identified as the clean way to remove the extra
+barrier that made the P·V mma slower -- then dismissed as impossible. At 8,192 B for a
+non-transposed `Vs`, the full working set is 32,672 B, which fits two blocks with room to spare:
+
+```
+Qs  24 x 264 x 2 = 12,672
+Ks  16 x 264 x 2 =  8,448
+Vs  16 x 256 x 2 =  8,192   <- its own storage, no aliasing
+S   24 x  16 x 4 =  1,536
+red 3 x 24 x 4   =    288
+Pf, Pflo  2 x 24 x 16 x 2 = 1,536
+                     ------
+                     32,672 B  (of 51,200 available at 2 blocks)
+```
+
+Registers can also be traded deliberately: three blocks/SM would need <= 85 regs x 256 threads
+(65,280) *and* <= 34,133 B of shared per block. At 2 blocks the budget is 51,200 B. The right
+choice between those two is a measurement, not an assumption -- and the previous rounds never had
+the option because they believed the budget was 24,576 B.
+
+**Lesson, recorded because it has now cost four rounds:** an attributed cause is not a measured
+one. "2 blocks/SM" was measured; "smem limited" was inferred from it and never checked, and
+`cudaGetDeviceProperties` answers it in one call.
