@@ -10747,3 +10747,62 @@ only 1.1% of the 128K prefill, so it is not the objective, but **it is a phase w
 150x growth for 4x tokens means that work is scaling with something other than the table size.**
 At 256K it would be ~100 s if the trend holds, which is worth knowing before the next 256K
 measurement. **Recorded as a lead, not as a target: the objective is the 481 s, not the 6.8 s.**
+
+## The `rope` lead: a redundant `powf` per position, and a 38x per-invocation cost that depends only on `pos`
+
+The phase is `amark!(1)` to `amark!(2)` in `FullAttnLayer::forward_prefill`
+(`crates/gb10-model/src/layer.rs:677-690`) and covers exactly three things:
+
+```rust
+let pos = state.n_keys[seq];
+let (cos, sin) = rope_tables_range(cfg, pos, t);
+dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
+dev.stream().memcpy_htod(&sin, &mut sc.sin)?;
+ops.rope_neox_batched(dev, &mut sc.q, &mut sc.kb_ln, &sc.cos, &sc.sin, ...)?;
+```
+
+**`rope_tables_range` recomputes the inverse frequencies for every position:**
+
+```rust
+pub fn rope_tables_range(cfg: &TextConfig, start: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = cfg.rotary_dim() / 2;
+    for i in 0..n {
+        let (c, s) = rope_tables(cfg, start + i);   // rebuilds the whole table
+        ...
+    }
+}
+
+pub fn rope_tables(cfg: &TextConfig, pos: usize) -> (Vec<f32>, Vec<f32>) {
+    for (i, (c, s)) in ... {
+        let inv = 1.0 / theta.powf((2 * i) as f64 / rotary as f64);   // <-- pos-independent!
+        let angle = pos as f64 * inv;
+        *c = angle.cos() as f32;
+        *s = angle.sin() as f32;
+    }
+}
+```
+
+**`inv` does not depend on `pos`, yet it is recomputed inside the element loop for every position**,
+along with a fresh `vec![0.0f32; half]` per call. Hoisting `inv` out of both loops removes
+`n * half` `powf` calls, leaving `half`.
+
+**But that redundancy does not explain the scaling.** The measured per-invocation cost is:
+
+| | invocations | total | per invocation | `t` |
+|---|---|---|---|---|
+| 32K | 64 (16 layers x 4 chunks) | 45 ms | **0.70 ms** | 8192 |
+| 128K | 256 (16 layers x 16 chunks) | 6777 ms | **26.5 ms** | 8192 |
+
+**The chunk size `t` is the same in both, so the 38x per-invocation growth comes from `pos` alone**
+-- the only other input. `pos` enters `rope_tables` only through `angle = pos * inv`, and through
+`rope_neox_batched`'s table indexing. **So either `cos`/`sin` of the larger angles is pathologically
+slow, or `rope_neox_batched` is reading a table whose size or indexing changes with `pos`.** The
+latter is worth checking against the comment at `layer.rs:784`, which says the kernel "indexes its
+table by `gridDim.y`, so the table needs one row per sequence" -- `gridDim.y` is `n_seq`, which is
+constant, so the table's row stride is constant while `pos` is not.
+
+**This is recorded as a lead with a known shape (`powf` redundancy, measured) and an open question
+(38x from `pos`).** It is 1.1% of the 128K prefill so it is not the objective, but **if the trend is
+`pos`-driven it would be far larger at 256K**, and the objective needs 256K. The next round should
+either hoist `inv` and measure, or instrument the three parts of the phase separately -- which is
+cheap, because they are already bracketed by `amark!` calls.
