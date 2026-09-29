@@ -9150,3 +9150,40 @@ both buffers and needs no requantisation; the only real work is applying each pr
 line. Every one of them was a hypothesis about a kernel, and the question that was never asked was
 *which kernel runs*. The measurement that finally answered it was reading fifteen lines of the
 caller.
+
+## The finding is confirmed by A/B, and the fix is one line: 12.61 s -> 11.92 s at 8K
+
+The dispatch was made selectable (`GB10_TC_SMALL_N=1` forces the small-`n` projections onto the
+tensor-core GEMM path) and the same instrumented prefill was run both ways at 8192 tokens:
+
+| | `in_proj_a` | `in_proj_b` | `proj in` total | **prefill total** |
+|---|---|---|---|---|
+| **A: default** (`n < 256` -> batched GEMV) | 371 ms | 370 ms | 2.19 s | **12.61 s** |
+| **B: `GB10_TC_SMALL_N=1`** (`n < 256` -> GEMM) | **84 ms** | **83 ms** | **1.63 s** | **11.92 s** |
+
+**`in_proj_a` goes from 371 ms to 84 ms (4.4x) and `in_proj_b` from 370 ms to 83 ms (4.5x).**
+Together that is **560 ms removed from `proj in`**, and the whole prefill drops from 12.61 s to
+11.92 s -- **690 ms, 5.5% of the 8K prefill**, on a one-line change.
+
+**This confirms the finding exactly as predicted.** The `n < 256` clause sends a 48-column
+projection to a path that re-reads its weight once per token, and at `t = 8192` that is 4.0 GB of
+traffic against a GEMM that reads it once.
+
+**It also explains the comment that misled this investigation.** The comment says the GEMM path for
+`in_proj_a`/`in_proj_b` "measured 73.5 ms that way against 16.5 ms for the batched GEMV". That
+measurement must have been taken at a short `t`, where the GEMV genuinely wins -- the same
+crossover the `t <= 16` clause is built on. **The defect is that the `n < 256` clause was given no
+`t` dependence at all**, so a conclusion that is true at `t = 16` was applied unconditionally,
+including at `t = 8192` where the GEMV costs 4.4x more.
+
+**The correct form of the condition is therefore the same shape as the clause next to it:**
+small-`n` projections should take the GEMV only for short prompts, and the GEMM otherwise. The
+exact crossover for `n = 48` has not been measured, but the `t <= 16` crossover that was measured
+for the general case is the conservative starting point, and unlike the current code it is at least
+`t`-dependent.
+
+**And this does not replace the fusion -- it precedes it.** Forcing `a` and `b` onto the GEMM path
+still pays a full per-call pipeline for 48 columns, and still launches two more GEMMs per layer.
+Fusing all four projections into one `n = 16480` GEMM should recover the remaining 84 + 83 = 167 ms
+and two launches per layer on top of the 560 ms. **The A/B result is the floor of what the fix is
+worth, not the ceiling.**

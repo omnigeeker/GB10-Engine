@@ -305,7 +305,13 @@ impl Linear {
         // GEMV then re-reads every weight once per token, which outweighs its
         // better load pattern. The 8..16 range is unmeasured, so 8 is the
         // conservative cut.
-        if self.n < 256 || t <= 16 {
+        // A/B: `GB10_TC_SMALL_N=1` forces the small-n projections onto the
+        // tensor-core GEMM path so the two dispatch arms can be compared
+        // directly. The finding to test is that `n < 256` sends
+        // `in_proj_a`/`in_proj_b` to the batched GEMV at EVERY sequence
+        // length, where the GEMV re-reads a 0.49 MB weight once per token.
+        let small_n_gemm = std::env::var("GB10_TC_SMALL_N").is_ok();
+        if (self.n < 256 && !small_n_gemm) || t <= 16 {
             return self.forward(dev, x, y, t);
         }
         // Tensor-core prefill GEMM, on by default. Set `GB10_TC_GEMM=0` to fall
