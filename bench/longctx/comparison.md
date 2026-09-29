@@ -9704,3 +9704,55 @@ together up to **32x less K/V traffic**, against a quadratic term that is curren
 mechanism, and fix all follow from one measurement.** The objective's premise was right; it took
 two rounds of attributing the wrong kernel and one round of refuting a correct hypothesis with a
 diagnostic that could not see traffic to arrive back at it with numbers.
+
+## The `BQ` lever is closed; the K/V-sharing lever is smem-neutral and saves 40 s at 32K
+
+The two levers identified from the traffic model are not equivalent, and the shared-memory
+formula separates them. The launch computes
+
+```
+smem = (BQ * (hd + 8) + BK * (hd + 8)) * 2 + (BQ * BK + 3 * BQ) * 4
+```
+
+with `hd = 256`, `BK = 16`:
+
+| BQ | smem | blocks/SM at 51,200 B | fits the 48 KB default |
+|---|---|---|---|
+| **24 (current)** | **22,944 B (22.4 KB)** | **2** | yes |
+| 32 | 27,776 B (27.1 KB) | 1 | yes |
+| 48 | 37,440 B (36.6 KB) | 1 | yes |
+| 64 | 47,104 B (46.0 KB) | 1 | yes |
+| 128 | 85,760 B (83.8 KB) | 0 | **no** |
+
+**`BQ = 24` is exactly the value that keeps two blocks resident per SM. Every larger value drops
+to one block, and `BQ = 128` does not fit at all** -- the Q tile alone would be 67,584 B against a
+48 KB block budget. **The query-tile lever is closed, and it is closed for the reason the objective
+already recorded: the kernel is shared-memory bound at 2 blocks per SM.**
+
+**The K/V-sharing lever is not.** It requires no additional shared memory, because it changes
+*which* loop is inner: instead of one block per query head re-reading the whole K/V range, one
+block serves all six query heads that share a K/V head, keeping the K/V tile resident and streaming
+Q. Q is read once per tile either way, so streaming it costs nothing measurable.
+
+The saving is the `nh / nkv = 6` factor removed from every chunk:
+
+| chunk | cached keys | current | K/V shared | saving |
+|---|---|---|---|---|
+| 0 | 8192 | 4.82 s | 0.80 s | **4.02 s** |
+| 1 | 16384 | 9.64 s | 1.61 s | **8.04 s** |
+| 2 | 24576 | 14.47 s | 2.41 s | **12.06 s** |
+| 3 | 32768 | 19.29 s | 3.21 s | **16.07 s** |
+| | | | | **40.2 s** |
+
+**40.2 s out of the 65.31 s 32K prefill, from a loop reorder that needs no shared memory, no new
+tile size, and no change to the arithmetic.** The measured kernel is 29.910 s and the model says
+the current traffic costs 48.2 s, so the model over-attributes -- but the *ratio* is what the
+change acts on, and the measured increments (3.55, 3.87, 3.92 s per chunk) sit at 80% of the
+per-head-group prediction and 5x above the shared prediction. **The 6x factor is present in the
+measurement; this removes it.**
+
+**That makes this the next change, and it is the first one in this session whose target is both
+large and unblocked.** The alternative -- a tensor-core `mma.sync` rewrite at a 9x design point --
+remains the objective's stated path and is still the only thing that would help the *arithmetic*,
+but the arithmetic is 3260x from being the constraint. **The constraint is traffic, and traffic is
+what this fixes.**
