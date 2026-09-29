@@ -8753,3 +8753,49 @@ its measurement, not as a diagnosis.**
 was in tensor-core prefill attention, spent its entire budget there, and the two largest measured
 items in the model are now **the MLP's three GEMMs at 45.1%** and **a pair of 48-column projections
 that cost 150x their arithmetic**.
+
+## The `M = 48` cuBLAS hypothesis is refuted: the `proj in` cost scales with `t`
+
+The two candidate causes for the 7.7 ms-per-call `in_proj_a`/`in_proj_b` anomaly make opposite
+predictions. A **fixed per-call cost** -- a bad cuBLAS algorithm choice for `M = 48`, the scratch
+lock, launch overhead -- would be **independent of `t`**. A **data-proportional cost** -- the
+activation cast, the GEMM's memory traffic, the epilogue -- would be **linear in `t`**. No new code
+is needed to separate them: run the same instrumented prefill at two sequence lengths.
+
+| call | t = 2048 | t = 8192 | ratio (4x tokens) |
+|---|---|---|---|
+| `in_proj_qkv` | 331 ms | 938 ms | 2.83x |
+| `in_proj_z` | 145 ms | 501 ms | 3.46x |
+| **`in_proj_a`** | **94 ms** | **365 ms** | **3.88x** |
+| **`in_proj_b`** | **94 ms** | **367 ms** | **3.90x** |
+| MLP `gate` | 551 ms | 1697 ms | 3.08x |
+| MLP `up` | 550 ms | 1703 ms | 3.10x |
+| MLP `down` | 472 ms | 1737 ms | 3.68x |
+| `swiglu` | 131 ms | 534 ms | 4.08x |
+
+**Every phase scales roughly linearly with `t`** -- ratios of 2.8 to 4.1 for a 4x token increase,
+with the smallest and largest projections alike. **A fixed per-call cost would not scale, so the
+`M = 48` cuBLAS-algorithm hypothesis, the scratch lock, and launch overhead are all refuted.**
+
+**What this leaves, and it is a much narrower question.** The `in_proj_a` cost is proportional to
+`t`, so it lives in the data-proportional part of the pipeline. That part contains exactly three
+things, and the measured cost is about 4x the bandwidth-based estimate of all three combined:
+
+* the activation cast `f32 -> bf16` of `[t, 5120]`: at `t = 8192` that is 4.2e7 elements, 252 MB of
+  traffic, **~1.1 ms** at the measured 228 GB/s;
+* the GEMM's own traffic: 84 MB of bf16 activation in, 1.6 MB of f32 out, **~0.38 ms**;
+* the epilogue `f32_scale` over `t*n = 393,216` elements: negligible.
+
+That is ~1.5 ms against a measured 7.6 ms per call. **So the discrepancy is not a per-call constant
+and not a bad GEMM shape -- it is that the data-proportional work is running ~5x slower than this
+machine's measured bandwidth allows.** That is a different and more tractable claim than the one it
+replaces, and it is the first version of this question that has survived a test designed to break
+it.
+
+**A second result falls out of the same table, and it matters for the objective.** Every phase --
+not just the attention-free ones -- scales linearly with `t` at these lengths. At 8K there is no
+meaningful quadratic component left anywhere in the measured phases, which is consistent with the
+earlier finding that the attention kernel is 11% of the 8K prefill. **The 8K gap is a
+linear-work problem in every phase that has been instrumented**, and the phases that have been
+instrumented are now 45.5% (MLP) + 17.4% (`proj in`) + 5.3% (`proj out`) + 4.2% (delta rule chunk)
++ 3.4% (conv/l2norm/gate) = **75.8% of the prefill**, plus the attention kernel's 11%.
