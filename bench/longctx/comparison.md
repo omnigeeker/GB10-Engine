@@ -7340,3 +7340,43 @@ the option because they believed the budget was 24,576 B.
 **Lesson, recorded because it has now cost four rounds:** an attributed cause is not a measured
 one. "2 blocks/SM" was measured; "smem limited" was inferred from it and never checked, and
 `cudaGetDeviceProperties` answers it in one call.
+
+### Occupancy is not the limit either -- which frees the whole shared-memory budget
+
+The misattribution had a second half. Registers are binding at 2 blocks/SM, so if registers could be
+cut below 85 the kernel would get a third block. `ptxas` says it can be done for free:
+
+| `-maxrregcount` | registers | spills | blocks/SM |
+|---|---|---|---|
+| (unset) | 90 | 0 B | 2 |
+| **80** | **79** | **0 B** | **3** |
+| 72 | 72 | 28 B | 3 |
+| 64 | 64 | 44 B | 3 |
+
+So 79 registers with zero spills buys a third block. Measured, over six runs, minimum of each shape:
+
+    2 blocks/SM   0.56 s / 8.95 s
+    3 blocks/SM   0.57 s / 9.00 s
+
+**No improvement at all.** The register cap was reverted rather than kept. A 50% occupancy increase
+with zero spills changing nothing means the kernel is **not limited by occupancy or latency
+hiding** -- it already saturates whatever it is bound on with two blocks.
+
+That is a useful result rather than a dead end, because it removes the premise that forced the
+2-block design. Combined with the previous section, the shared-memory situation is now:
+
+* 2 blocks x 51,200 B is available, and occupancy does not care whether it is 2 or 3.
+* **1 block x 101,376 B is therefore also on the table**, and this kernel would not notice the
+  lost second block.
+
+That is four times the 24,576 B every design has been squeezed into, and it is the budget a
+FlashAttention-shaped kernel actually wants: `BQ` and `BK` large enough that each K staging serves
+many more query rows, which is the structural change the ablation pointed to. The earlier
+occupancy study concluded "2 blocks is better than 1" -- but it was measured on the *current*
+tile shape, where a second block of a small tile is the only source of parallelism. It does not
+say that a single much larger tile is worse, which is a different question and was never asked.
+
+**The complete list of things now measured and excluded as the explanation:** arithmetic (P·V mma,
+5% slower), shared-load count (three separate reductions), matmul quality (real but capped at
+1.37x and 1.15x), barriers (~1%), `__expf` (0%), K's global reads (~9%), registers and spills
+(0 B), and occupancy (0% from +50%). What is left is the kernel's *shape*.
