@@ -7256,3 +7256,35 @@ two-block occupancy imposes:
   produces a transposed fragment directly from the natural `[key][dim]` layout, so V could be
   staged in the same phase as K with no extra barrier and no transpose pass at all. That is the
   version worth trying, and it directly answers the design rule the ablation produced.
+
+### Barriers are not the cost either -- and the arithmetic-intensity ceiling
+
+The ablation produced a design rule ("remove barriers and merge phases before removing
+arithmetic"). It was tested directly: the fourth `__syncthreads()` of the key-tile loop was
+removed. It is genuinely redundant -- the only hazard reaching forward is the P·V loop's read of
+`S` against the next iteration's score writing `S`, and the barrier after the next K staging
+already sits between them, because the K staging touches only `Ks`, which the P·V never reads.
+
+    with 4 barriers   0.57 s / 9.01 s
+    with 3 barriers   0.56 s / 8.95 s     <- ~0.7% / ~1%
+
+`attn-tile: OK`, so the change is *correct* -- and worth under 1%. A sub-1% gain does not justify
+resting on a hand-verified absence of a race in a loop that now has three barriers and four
+shared arrays, so it was reverted rather than kept. **The design rule from the previous round is
+therefore not supported by measurement.** Barriers, like arithmetic, loads, and matmul quality
+before them, are not where the time is.
+
+What the numbers do say. Recomputing the arithmetic intensity honestly: the score and the P·V are
+each `BQ x BK x HD x 2` per (query tile, key tile) pair, so at the 65536 span the kernel performs
+**~5.3e13 FLOP in 9.0 s = ~5.9 TFLOP/s**. The tile's data movement is about 24 KB (16 KB of K and V
+from L2/global, the rest shared traffic), giving ~32 FLOP/byte -- and at the machine's measured
+228 GB/s that band would cap a purely DRAM-bound kernel at ~7.3 TFLOP/s. The kernel sits at 5.9,
+i.e. **in the same range as the memory-bandwidth ceiling**, while being ~7% of the tensor-core
+peak.
+
+That is the honest summary of where this stands: after four rounds of optimisation the kernel is
+no longer obviously compute-bound at all, it is close to a bandwidth/instruction-throughput
+balance, and **no single remaining phase pays for the gap**. Every lever tried has been worth
+1.37x, 1.15x, 0.95x, or 1.00x -- which is the signature of a kernel that needs a different
+structure (larger query tiles so each K staging serves more rows, more reuse per byte) rather
+than another micro-optimisation of a phase that is already near its share.
