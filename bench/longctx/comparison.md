@@ -9789,3 +9789,47 @@ still a **3x** improvement on the traffic-bound term -- which is 45.6% of the 32
 It is also a substantial kernel rewrite, and it should not be attempted without the budget to
 validate it: the gate is `attn-tile`, and the measurement is the `attn kernel` phase of
 `prefill-shape --limit 32768`, which currently reads **29,910 ms**.
+
+## The binding resource is the Q tile in shared memory, not the accumulators
+
+The previous section proposed serving six query heads from one block and priced it at ~221
+registers and 1 block per SM. **That was the wrong lever.** Separating the two resources shows
+that the shared-memory cost is almost entirely the *Q* tile, and that the accumulators have room:
+
+```
+smem = Q_tile + K_tile + S_tile
+     = BQ * (hd + 8) * 2  +  BK * (hd + 8) * 2  +  (BQ * BK + 3 * BQ) * 4
+```
+
+| Q staged in shared | smem | blocks/SM at 51,200 B |
+|---|---|---|
+| BQ=24 (current) | 22,944 B | **2** |
+| BQ=32 | 27,776 B | 1 |
+| BQ=48 | 37,440 B | 1 |
+
+| **Q streamed from global** | smem | blocks/SM by smem | regs (77 + BQ) | blocks/SM by regs |
+|---|---|---|---|---|
+| BQ=24 | 10,272 B | 4 | 101 | **2** |
+| **BQ=48** | **12,096 B** | **4** | **125** | **2** |
+| BQ=64 | 13,312 B | 3 | 141 | 1 |
+| BQ=96 | 15,744 B | 3 | 173 | 1 |
+
+**Streaming Q from global instead of staging it in shared memory lets `BQ` rise from 24 to 48 while
+keeping two blocks per SM and *dropping* shared memory from 22,944 B to 12,096 B.**
+
+**Q is the right operand to stream.** It is read exactly once per row-block, so staging it in
+shared memory buys no reuse at all -- it exists only as a convenient `ldmatrix` source. K and V are
+the operands that are re-read, and they are the ones that should stay resident.
+
+**Doubling `BQ` halves the number of row-blocks, and therefore halves the number of times each K/V
+head's cache is traversed:** the current 24 row-blocks over 4 K/V heads means **6 blocks read the
+same K/V cache**; at `BQ = 48` it is **3**. **The kernel is traffic-bound at 23 GFLOP/s, so halving
+the traffic should roughly halve the kernel: 29,910 ms to about 15,000 ms at 32K.**
+
+**And freeing 10.8 KB of shared memory makes room to raise `BK` as well** -- `BK = 32` brings smem to
+20,544 B, still two blocks per SM, with half as many K/V loop iterations.
+
+**This is a smaller and strictly better change than the six-head reorder**: it needs no extra
+registers, costs no occupancy, reduces shared memory rather than increasing it, and attacks the same
+6x factor. **The next change is to stream Q and set `BQ = 48`.** The gate is `attn-tile`; the
+measurement is the `attn kernel` phase of `prefill-shape --limit 32768`, currently **29,910 ms**.
