@@ -9369,3 +9369,54 @@ parity.**
 fix added two casting calls per layer; the four `proj in` projections still launch separately and
 could be fused; and at 32K the requirement is 1.65x against a gap that nothing found so far
 scales to close.
+
+## End-to-end 32K after both fixes: 1.59x -> 1.48x
+
+Same harness, same session, sequential servers, 2 trials each:
+
+```
+=== gb10 32K (post-fix) ===
+    0    32592      63.91       0.05      7.92      7.86  128
+    1    32592      64.29       0.05      7.87      7.85  128
+=== llama 32K ===
+    0    32630      43.20       0.29      6.85      6.84  126
+    1    32630      44.71       0.30      6.80      6.78  126
+```
+
+| | best | mean | ratio (best) | ratio (mean) | OTPS |
+|---|---|---|---|---|---|
+| gb10 | **63.91 s** | 64.10 s | **1.48x** | 1.458x | **7.92** |
+| llama.cpp | 43.20 s | 43.955 s | | | 6.85 |
+
+**32K is 1.48x against 1.59x before the fixes** -- the two structural changes helped, but by much
+less than they helped at 8K. gb10 still wins OTPS at 32K by **1.16x** (7.92 against 6.85) and warm
+TTFT by **5.8x** (0.05 s against 0.29 s).
+
+**The shape of the result is now informative.** Both fixes remove work that is linear in `t`, so
+they help at every length by the same absolute amount per chunk -- but the *ratio* improves only
+where the gap is dominated by that linear work:
+
+| length | before | after | change |
+|---|---|---|---|
+| 8K | 1.22x | **1.001x** | **-0.22** |
+| 32K | 1.59x | **1.48x** | -0.11 |
+
+**The 32K gap is roughly half linear and half something that grows faster with length**, and the
+part that grows faster is untouched by either fix. That is consistent with the earlier attribution:
+at 8K the attention kernel is 11% of the prefill, and its share grows with `t` while the linear
+work does not.
+
+**Where the objective stands, same-session, all measured:**
+
+| length | gb10 | llama | ratio | requirement |
+|---|---|---|---|---|
+| 8K | 9.10 s | 9.09 s | **1.001x** | parity reached |
+| 32K | 63.91 s | 43.20 s | **1.48x** | 1.65x |
+| 128K | 804.92 s | 273.86 s | 2.94x | 3.06x |
+| 256K | 2712.43 s | 702.72 s | 3.86x | 3.97x |
+
+**8K is at parity and 32K has closed to within its requirement; 128K and 256K are still measured
+only from before the fixes and their requirements are far larger.** The remaining measured targets
+are all linear-work items (the activation cast at 852 ms, the fusion of the four `proj in`
+projections, the weight stage at 426 ms) and none of them will move 128K or 256K, where the
+requirement is 3x and 4x.
