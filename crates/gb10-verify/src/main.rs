@@ -479,6 +479,11 @@ fn decode_bench(args: &Args) -> Result<bool> {
 }
 
 fn attn_tile(args: &Args) -> Result<bool> {
+    // ATTN_TILE_NO_GATE=1 keeps the timing sections reachable when a phase has
+    // been deliberately ablated. Without it, ablation timing is unmeasurable:
+    // breaking a phase breaks correctness, `ok` goes false, and every section
+    // that would report the cost of that phase is skipped.
+    let no_gate = std::env::var("ATTN_TILE_NO_GATE").is_ok();
     let cfg = load_config(&args.model)?;
     let t = cfg.text_config.clone();
     let dev = Device::new(0)?;
@@ -583,7 +588,7 @@ fn attn_tile(args: &Args) -> Result<bool> {
         let rms_ref = (rms_ref / av.len() as f64).sqrt();
         let rms_diff = (rms_diff / av.len() as f64).sqrt();
         let rel = (rms_diff / rms_ref.max(1e-30)) as f32;
-        let pass = rel < 1e-4;
+        let pass = no_gate || rel < 1e-4;
         ok &= pass;
         println!(
             "  {start:>5} {nt:>5}  {max_abs:>10.3e}  {rel:>10.3e}  rms|ref| {rms_ref:.3e}  {}",
@@ -638,7 +643,7 @@ fn attn_tile(args: &Args) -> Result<bool> {
                 rd += (d as f64) * (d as f64);
             }
             let rel = (rd / rr.max(1e-30)).sqrt() as f32;
-            let pass = rel < 1e-4;
+            let pass = no_gate || rel < 1e-4;
             ok &= pass;
             println!(
                 "  start {start:>6} ntok {nt:>5}  keys {keys:>6}  max|abs| {max_abs:.2e}  rms rel {rel:.2e}  {}",

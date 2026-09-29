@@ -7173,3 +7173,39 @@ multiple of 16) does not provide -- so it also means moving to a stride that is 
 halfs, and redoing the bank analysis, since the `PADH = 130` derivation in the kernel comments
 was written for the scalar `sub * PADH` access pattern that no longer exists. Cutting the fourth
 barrier means un-aliasing `Ks` and `Vt`, which the budget does not currently allow.
+
+### Phase breakdown by ablation (the measurement that was missing)
+
+Every previous round reasoned about where the time goes. This one measured it. `attn-tile` gates
+its timing sections behind correctness, so any deliberately-wrong ablation used to print no
+timings at all -- which is why four rounds of ablation attempts produced nothing. A one-line
+opt-out (`ATTN_TILE_NO_GATE=1`) now keeps the timings reachable, and the breakdown is:
+
+| ablation | 16384 (min) | 65536 (min) | share of the 65536 span |
+|---|---|---|---|
+| A baseline | 0.65 s | 10.39 s | -- |
+| B P·V inner loop 16 -> 1 iteration | 0.43 s | **6.90 s** | **P·V ~= 34%** |
+| C softmax without `__expf` | 0.64 s | 10.40 s | expf ~= 0% |
+| D K staging without its global loads | 0.61 s | 9.47 s | K global reads ~= 9% |
+
+Reading this:
+
+* **The scalar P·V is the largest named phase at ~34%.** It is 384 fma plus 384 shared loads per
+  thread, every thread working, no idling.
+* **`__expf` is free.** Removing it from the softmax changes nothing measurable, so the softmax's
+  cost is its *serialization* (24 of 256 threads working, the other 232 at a barrier), not its
+  arithmetic. Optimising the exponential would have been wasted effort.
+* **K's global reads are only ~9%**, so the global->shared staging traffic is not the wall either.
+
+**This finally explains the increment-2 regression.** The P·V loop body is 34% of the runtime, yet
+replacing all 384 fma and 384 loads with 16 mma per warp made the kernel 5% *slower*. The reason
+cannot be the arithmetic it removed, so it has to be what the mma version *added*: a fifth
+`__syncthreads()` per key tile, an extra serialized phase staging `Vt` into shared memory, and two
+dependent mmas per n-tile behind a rescale. On a kernel whose phases are barrier-separated and
+where the softmax already demonstrates that idle threads at a barrier are expensive, adding a
+phase costs more than removing arithmetic saves.
+
+The design rule that follows: **on this kernel, remove barriers and merge phases before removing
+arithmetic.** That inverts the plan the earlier rounds were following, and it means the next
+attempt at the P·V should not be a separate mma phase at all -- it should fold into the existing
+score phase's warp work so no new barrier is needed.
