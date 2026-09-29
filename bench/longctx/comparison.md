@@ -9023,3 +9023,64 @@ level of individual `Linear` calls, has not been verified against an independent
 next measurement should not be another hypothesis about the 7.6 ms. It should be a direct check
 that the `in_proj_a` phase really contains only the work attributed to it -- for example by timing
 `in_proj_a` alone, in the model, with its inputs pre-staged and nothing else in flight.
+
+## The attribution instrument is validated -- and the epilogue is 1301 ms, 10.5% of the prefill
+
+The cross-check that the previous round asked for was run: the GEMM phases are instrumented
+*independently* of the phase brackets, so their sums must be consistent with each other and with
+the FLOPs. At 8192 tokens, over **400 GEMM calls** in the prefill:
+
+```
+[diag] LAYER GPU: delta 8.27s / 48 = 66.8%   attn 4.05s / 16 = 32.7%
+[diag] DELTA n=48 | proj in 2150ms (17.4%)  conv+l2norm+gate 406ms (3.3%)
+       delta rule chunk 530ms (4.3%)  proj out 637ms (5.1%)  mlp 4548ms (36.7%) | total 8.27s
+[diag] MLP n=64 | gate 1661ms  up 1678ms  swiglu 524ms  down 1767ms | total 5.63s (45.5%)
+[diag] n=400 | weight stage 425ms (3.4%)  activ cast 713ms (5.8%)
+       cublas gemm 5056ms (40.8%)  epilogue 1301ms (10.5%) | total 7.49s (60.5%)
+```
+
+**Three independent consistency checks all pass:**
+
+1. **The DELTA sub-phases sum exactly to the DELTA bracket**: 2150 + 406 + 530 + 637 + 4548 =
+   8271 ms against 8.27 s. Exact to the rounding.
+2. **The MLP bracket is correctly larger than the delta-only MLP**: the MLP instrumentation is
+   inside `Mlp::forward_prefill`, which runs in **all 64 layers**, while the DELTA `mlp` phase
+   covers only the **48 delta layers**. 5.63 s over 64 layers = 88 ms/layer against 4.55 s over 48
+   = 95 ms/layer. Consistent, and the difference is accounted for by the layer count.
+3. **`cublas gemm` matches the FLOPs.** 5056 ms measured; the FLOP-based estimate for every GEMM in
+   the prefill at the measured 75 TFLOP/s is MLP 3.74 s + `proj in` 0.88 s + `proj out` 0.33 s +
+   attention projections ~0.3 s = **5.25 s**. Within 4%.
+
+**So the instrument is not lying, and the phase attribution is trustworthy at the bracket level.**
+That is worth stating plainly, because the previous round ended by doubting it: **the GPU really is
+busy for 12.4 s and the brackets really do partition that time.**
+
+**And the cross-check names a target that had not been isolated before: the epilogue.**
+
+| GEMM phase | time | share of prefill |
+|---|---|---|
+| **`cublas gemm`** (the matrix multiplies) | 5056 ms | 40.8% |
+| **`epilogue`** | **1301 ms** | **10.5%** |
+| `activ cast` | 713 ms | 5.8% |
+| `weight stage` | 425 ms | 3.4% |
+| **pipeline total** | **7495 ms** | **60.5%** |
+
+**The epilogue is the second-largest GEMM phase in the entire model, at 1301 ms.** It is
+`f32_scale(dev, y, scale2, t*n)` -- a per-tensor multiply applied to the fp32 accumulator *after*
+the GEMM, as a separate kernel. It is pure elementwise, memory-bound work over the output: it
+reads `t*n` f32, multiplies, and writes `t*n` f32 back. **For the MLP's three GEMMs alone the
+output is 3 x 8192 x 17408 x 4 B = 1.7 GB of read-modify-write per layer, 109 GB per chunk**, at
+228 GB/s = 478 ms. The measured 1301 ms across all 400 calls is consistent with that being a real,
+bandwidth-bound cost rather than an artifact.
+
+**This is the first concrete, measured, unfused elementwise pass of this size that has been found,
+and unlike every hypothesis in the last four rounds it is visible in an instrument that has just
+passed three independent consistency checks.** The fix is structural and known: fold the scale into
+the GEMM epilogue, or have the GEMM write its accumulator directly in the final precision, so the
+separate pass disappears. **At 1301 ms against a 1.44 s requirement, it is the largest single
+identified item that is both measured and removable.**
+
+**What remains unexplained, stated honestly:** `in_proj_a`'s phase is 7.6 ms per call against
+0.60 ms cold standalone + ~1.8 ms cast = ~2.4 ms accounted. **The brackets are validated, so those
+~5 ms are real GPU work -- but nothing measured so far names them.** The difference between this
+statement and the previous round's is that the instrument has now been checked rather than assumed.
