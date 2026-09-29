@@ -723,6 +723,13 @@ fn attn_tile(args: &Args) -> Result<bool> {
             (0, 2048),
             (10240, 2048),
             (20480, 2048),
+            // The model's own chunk shapes at 32K: chunk 0 and chunk 3, the
+            // smallest and largest attention calls in the 32K prefill. These
+            // are the rows that decide whether the 29.9 s the model spends in
+            // this kernel is a property of the kernel or of the call path --
+            // same kernel, same tiling, same arguments, measured in isolation.
+            (0, 8192),
+            (24576, 8192),
             (0, 65536),
         ] {
             let keys = start + nt;

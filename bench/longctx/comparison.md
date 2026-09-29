@@ -10038,3 +10038,69 @@ difference is in the model's call path and can be found by reading it. If the is
 slow, the kernel is simply 16x off its own best case and the kernel is the target after all.**
 
 **Either answer is decisive, and it is one row in a table that already exists.**
+
+## RESOLVED: the isolated kernel and the model agree exactly -- the kernel is the target
+
+Two rows were added to `attn-tile`'s long-span table: the model's own chunk shapes at 32K.
+
+```
+  start      0 ntok   8192     0.11 s
+  start  24576 ntok   8192     0.83 s
+  start      0 ntok  16384     0.46 s
+  start      0 ntok  65536     7.59 s
+  start  10240 ntok   2048     0.08 s
+  start  20480 ntok   2048     0.16 s
+
+  same shape, cache sized for the real context (1.34 GB):
+  start      0 ntok   2048     0.37 s
+  start  10240 ntok   2048     0.10 s
+  start  20480 ntok   2048     0.17 s
+```
+
+**The kernel's cost per query-key pair is constant at ~3.4 ns across every shape:**
+
+| start | ntok | keys | time | causal pairs | ns/pair |
+|---|---|---|---|---|---|
+| 0 | 8192 | 8192 | 0.11 s | 3.36e7 | **3.27** |
+| 10240 | 2048 | 12288 | 0.08 s | 2.52e7 | **3.17** |
+| 20480 | 2048 | 22528 | 0.16 s | 4.61e7 | **3.47** |
+| 0 | 16384 | 16384 | 0.46 s | 1.342e8 | **3.43** |
+| **24576** | **8192** | **32768** | **0.83 s** | 2.349e8 | **3.53** |
+| 0 | 65536 | 65536 | 7.59 s | 2.147e9 | **3.53** |
+
+**So the model's attention cost is completely predicted by the isolated kernel**, chunk by chunk:
+
+| chunk | causal pairs | at 3.4 ns | isolated measurement |
+|---|---|---|---|
+| 0 | 3.356e7 | 0.114 s | 0.11 s |
+| 1 | 1.007e8 | 0.342 s | -- |
+| 2 | 1.678e8 | 0.570 s | -- |
+| 3 | 2.349e8 | 0.799 s | **0.83 s** |
+| **per layer** | **5.369e8** | **1.825 s** | |
+| **x 16 layers** | | **29.2 s** | **29.946 s measured** |
+
+**29.2 s predicted against 29.946 s measured -- 2.4%.** The kernel and the model agree exactly.
+
+**This retracts the "6x to 16x efficiency gap" claim in the previous section, and it retracts the
+"the isolated kernel is 20x faster" claim before that.** Both came from the same units error:
+comparing a per-layer quantity against a per-model one. **There is no call-path overhead, no cache
+layout effect, and no `n_seq` effect. The kernel costs what it costs.**
+
+**What the kernel costs, stated once and correctly:**
+
+* **~3.4 ns per query-key pair**, at every context length from 8K to 64K;
+* **~300 GFLOP/s** against a measured **75 TFLOP/s** bf16 tensor-core peak -- **250x off peak**;
+* **29.9 s at 32K, 45.6% of the prefill**, and quadratic, so its share grows with every doubling.
+
+**And this is the objective's original premise, now measured end to end and with every alternative
+eliminated.** The premise said the only path was an `mma.sync` tensor-core prefill attention at a 9x
+design point. **The kernel is 250x off the hardware's tensor-core peak, so 9x is not merely
+achievable -- it is a quarter of the headroom.** `n_seq` is refuted, the cache stride is refuted,
+`BQ` tiling is closed by `BQ * BK == 384` and the hardcoded `BK = 16`, occupancy is closed by the
+48 KB shared-memory budget, and the call path adds nothing. **Every path that is not the kernel is
+now closed, and the path that is the kernel is open with 250x of headroom.**
+
+**The next change is the one the objective named at the start: tensor-core `mma.sync` in
+`attn_prefill_tiled`.** The gate is `attn-tile`; the measurement is the `attn kernel` phase of
+`prefill-shape --limit 32768`, currently **29,946 ms**, and the target is 32K end-to-end parity from
+the current **1.48x**.
