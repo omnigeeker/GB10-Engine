@@ -305,13 +305,31 @@ impl Linear {
         // GEMV then re-reads every weight once per token, which outweighs its
         // better load pattern. The 8..16 range is unmeasured, so 8 is the
         // conservative cut.
-        // A/B: `GB10_TC_SMALL_N=1` forces the small-n projections onto the
-        // tensor-core GEMM path so the two dispatch arms can be compared
-        // directly. The finding to test is that `n < 256` sends
-        // `in_proj_a`/`in_proj_b` to the batched GEMV at EVERY sequence
-        // length, where the GEMV re-reads a 0.49 MB weight once per token.
-        let small_n_gemm = std::env::var("GB10_TC_SMALL_N").is_ok();
-        if (self.n < 256 && !small_n_gemm) || t <= 16 {
+        // Small-n projections must take the batched GEMV only for SHORT
+        // prompts, and the tensor-core GEMM otherwise.
+        //
+        // This clause used to read `self.n < 256 || t <= 16`, with no `t`
+        // dependence on the `n` arm. The comment above it -- "re-reading it per
+        // token is far cheaper than starving 47 of the 48 SMs" -- is true at
+        // t = 16 and catastrophically false at t = 8192, where re-reading
+        // `in_proj_a`'s 0.49 MB weight once per token is 4.0 GB of traffic for
+        // 4.8 ms of arithmetic. Because the arm had no `t`, a conclusion that
+        // holds at t = 16 was applied at every length.
+        //
+        // Measured crossover for the two n = 48 projections, from
+        // `prefill-shape` with the PROJ instrument (GEMV -> GEMM, in_proj_a):
+        //
+        //     t =   32:  2 ms -> 11 ms   (GEMV wins; the GEMM number is
+        //     t =  128:  6 ms -> 10 ms    inflated by one-time cuBLAS init)
+        //     t =  512: 23 ms ->  5 ms   GEMM 4.6x
+        //     t = 2048: 96 ms -> 19 ms   GEMM 5.1x
+        //     t = 8192: 368 ms -> 82 ms  GEMM 4.5x
+        //
+        // The crossover is between 128 and 512. 256 is the conservative cut,
+        // matching the shape of the `t <= 16` clause rather than guessing an
+        // exact point between two measured samples.
+        let small_n_cut: usize = 256;
+        if t <= 16 || (self.n < 256 && t < small_n_cut) {
             return self.forward(dev, x, y, t);
         }
         // Tensor-core prefill GEMM, on by default. Set `GB10_TC_GEMM=0` to fall

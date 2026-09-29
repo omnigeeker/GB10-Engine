@@ -9187,3 +9187,46 @@ still pays a full per-call pipeline for 48 columns, and still launches two more 
 Fusing all four projections into one `n = 16480` GEMM should recover the remaining 84 + 83 = 167 ms
 and two launches per layer on top of the 560 ms. **The A/B result is the floor of what the fix is
 worth, not the ceiling.**
+
+## The fix is made permanent: the small-`n` arm now depends on `t`
+
+The dispatch is no longer `self.n < 256 || t <= 16`. It is:
+
+```rust
+let small_n_cut: usize = 256;
+if t <= 16 || (self.n < 256 && t < small_n_cut) {
+    return self.forward(dev, x, y, t);
+}
+```
+
+The `n` arm now has the same `t` dependence as the clause beside it, and the cut is placed at 256
+-- between the measured tie at `t = 128` and the measured 4.6x GEMM win at `t = 512`, and chosen as
+the conservative point between two samples rather than an invented one.
+
+**Measured with the same instrument, same session, default build:**
+
+| | before | after |
+|---|---|---|
+| `in_proj_a` (48 layers) | 371 ms | **84 ms** |
+| `in_proj_b` (48 layers) | 370 ms | **83 ms** |
+| `proj in` total | 2.19 s | **1.58 s** |
+| **8K prefill total** | **12.61 s** | **11.69 s** |
+
+**920 ms removed from the 8K prefill -- 7.3% -- and the short-prompt regime is preserved:** at
+`t = 32` the default build still routes to the batched GEMV (2 ms and 1 ms), which is where it
+wins. The correctness gate passes (`attn-tile: OK`).
+
+**This is the first change in this session that has made the prefill faster.** Every previous
+intervention -- six on the attention kernel, the weight cache on the MLP path -- either did nothing
+or made it slower. The difference is not that this one was cleverer; it is that this one was aimed
+by reading the dispatch instead of by hypothesising about a kernel.
+
+**And it is the floor, not the ceiling.** `a` and `b` still launch two extra GEMMs per layer and
+still pay a full per-call pipeline for 48 columns. Fusing all four projections into one
+`n = 16480` GEMM should recover the remaining 84 + 83 = 167 ms plus two launches per layer. The
+epilogue at 1301 ms and the activation cast at 713 ms remain untargeted.
+
+**Against the objective:** 8K needed 1.44 s and this is 0.92 s of it. 32K, 128K and 256K benefit
+too -- the same 48 layers per chunk -- but the requirement grows with length (1.65x, 3.06x, 3.97x),
+so this alone will not flip all four. **The next measurement is the end-to-end same-session cold
+TTFT against llama.cpp at 8K, to see whether it flips the first of the four.**
