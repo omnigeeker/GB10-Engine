@@ -7117,3 +7117,59 @@ With the aliasing, the host's request formula in `ops.rs` has to change from the
 `(BQ*(hd+4) + BK*(hd+4))*2 + (BQ*BK + 3*BQ)*4` to the aliased sum explicitly; if the two drift
 apart the kernel either over-requests (losing occupancy) or under-requests (out-of-bounds
 shared use).
+
+### Increment 2 was built, verified correct, and measured SLOWER -- so it was reverted
+
+The P·V accumulation was moved to tensor cores after all. It is **numerically correct** and it is
+**~5% slower**, so it is not in the tree. This is the single most informative result of the
+prefill-attention work so far, because it rules out the whole class of explanation that the
+previous three rounds were working within.
+
+| build | 16384 (min of 3) | 65536 (min of 3) | attn-tile |
+|---|---|---|---|
+| scalar score + scalar P·V | 0.88 s | 14.20 s | OK |
+| **mma score + scalar P·V (in tree)** | **0.65 s** | **10.41 s** | OK |
+| mma score + mma P·V | 0.68 s | 10.94 s | OK (rms rel 1.0--1.6e-5) |
+
+**The precision problem was real and had a clean fix.** With P staged as fp16 alone the error was
+`rms rel` 1.0--1.9e-4, just over the 1.2e-4 gate -- exactly fp16's 2^-11 on the softmax weights.
+Carrying a second term (`P = Pf + Pflo`, with `Pflo = fp16(p - fp16(p))`) restored ~22 mantissa
+bits and brought the error back to **1.0--1.6e-5**, identical to the score-only build. The split
+costs one extra mma per n-tile and is the right technique whenever a softmax feeds an mma.
+
+**Two aliasing hazards were found and are worth recording**, both of which would have produced
+plausible-looking wrong answers rather than crashes:
+
+* Placing `Pflo` over `S` (which is dead once the softmax has read it, so it looks free) is a
+  **race**: thread `i`'s stores land on the rows threads `~i/2` are still reading. It produced
+  `rms rel` ~0.7 starting at token 0 -- wrong, but not obviously so.
+* The second m-tile's fragment reads rows `24+gid`, i.e. past `BQ`. Clamping the row index is
+  free, because those lanes only feed output rows that are never written, and it avoids padding
+  both `Pf` and `Pflo` to 32 rows -- which the shared budget could not have afforded.
+
+**Now the important part: why it is slower.** Two phases on tensor cores, both reading their
+operands from shared memory, and the kernel got *slower*. Combined with the earlier results, the
+cost is not:
+
+* the score FLOPs -- putting them on tensor cores bought only 1.37x, not the ~5x that "the score
+  loop is ~80% of per-tile cycles" predicted;
+* the P·V FLOPs -- replacing 384 fma and 384 shared loads per thread with 16 mma per warp made it
+  worse;
+* shared-memory load *count* -- three separate reductions (BK=48, accumulator-chain splitting, and
+  32-bit fragment loads) each failed or regressed;
+* register pressure or occupancy -- `ptxas` reports **0 spill bytes and 96 registers**, and
+  2 x 24,544 B still fits two blocks in 48 KB.
+
+What is left is **per-iteration serialization and instruction count**: four `__syncthreads()` per
+key tile, a softmax that engages 24 of 256 threads while the other 232 wait at a barrier, a K/V
+staging pass that moves the same bytes through global->shared every tile, and ~6 fragment-load
+plus address instructions per mma. At the 65536 span the whole kernel runs at ~2.5 TFLOP/s, which
+is far below either fp32 CUDA cores or the tensor cores, i.e. it is not FLOP-bound at all.
+
+The lever that follows from that is **`ldmatrix`**: one instruction producing a whole fragment,
+replacing six shared loads and their address arithmetic, in both the score and the P·V. It needs
+16-byte-aligned fragment rows, which the current `PS = 2 * PADH = 260` halfs (520 bytes, not a
+multiple of 16) does not provide -- so it also means moving to a stride that is a multiple of 8
+halfs, and redoing the bank analysis, since the `PADH = 130` derivation in the kernel comments
+was written for the scalar `sub * PADH` access pattern that no longer exists. Cutting the fourth
+barrier means un-aliasing `Ks` and `Vt`, which the budget does not currently allow.
