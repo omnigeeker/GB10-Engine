@@ -11864,3 +11864,48 @@ ratio is dominated by variance in the reference, not only by our own kernel.**
 `10.53 -> 8.69 s`, 32K `64.61 -> 53.99 s`, 128K `631.31 -> 447.66 s`. **The remaining gap at 128K is
 now a single-trial measurement against a variable reference, and closing it needs the attention
 kernel to fall further -- it is still 71.9% of that prefill.**
+
+## The PV accumulation is 41.8% of the attention kernel -- the largest remaining item
+
+Priced the same way V was priced: remove it, time it, revert. The inner accumulation
+
+```cuda
+const float* prow = S + i * PREFILL_BK;
+for (int j = 0; j < PREFILL_BK; ++j)
+    a = fmaf(prow[j], vr[j], a);
+```
+
+was replaced with a two-instruction stub that keeps the loop's operands alive but does no work.
+
+```
+32K, PV accumulation removed:  attn kernel 10,798 ms   (baseline 18,548 ms)   -41.8%
+32K, V loads removed:          attn kernel 15,817 ms   (baseline 22,879 ms)   -30.9%
+```
+
+**The PV accumulation is 41.8% of the kernel -- the largest single item measured in this session,
+and larger than V's loads were before they were staged.** `attn-tile: OK` after reverting; the probe
+is not committed.
+
+### Why this one is harder than the last two
+
+K and V were both *loads*, and loads can be made cheaper by moving the same bytes in wider
+instructions -- which is exactly what worked twice. **The PV is 384 floating-point multiply-adds per
+thread, and that is the mathematically required work:** the block computes `P[24][16] . V[16][256]`
+= 6,144 outputs, each a 16-term dot product = 98,304 MACs, and with 256 threads that is 384 MACs
+each. There is no redundancy to remove.
+
+**So the only way to make it cheaper is to do the same arithmetic on different hardware -- the
+tensor cores.** The PV is exactly an `m16n8k16` shape (`M = 24`, `N = 256`, `K = 16`), so it maps
+onto the same `mma.sync` the score product already uses, at 64 `mma` instructions per block per
+iteration instead of 384 FMAs per thread.
+
+**The obstacle is precision, and it is the reason this has not been done.** `mma.sync` takes fp16
+operands, so `P` -- the softmax probabilities -- would have to be rounded to fp16, which carries
+~4.9e-4 relative precision. The probabilities are in [0,1] and sum to 1, so the relative error
+propagates straight to the output, and the gate's tolerance is far tighter than that. **The score
+product gets away with fp16 because its operands are Q and K, which are already fp16 in the cache;
+`P` is computed in fp32 and has never been rounded.**
+
+**This is now the best-understood remaining target, and the next step is to find out whether the gate
+actually rejects an fp16 `P`** -- if `tol_norm`/`tol_rel` admit it, the change is worth ~40%; if not,
+the PV stays scalar and the kernel is close to its floor.
