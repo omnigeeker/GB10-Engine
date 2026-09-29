@@ -8215,3 +8215,58 @@ llama.cpp's 10.91 s -- 2.5 s to find. DeltaNet is 8.43 s of gb10's prefill and h
 optimised; the attention kernel is 1.4 s and has already been made 1.58x faster. **The 8K gap is
 therefore a DeltaNet problem, not an attention problem**, and that is a concrete, unexamined target
 rather than a lever that has been measured and rejected.
+
+## Where the objective's remaining distance actually is: the MLP, and the 69% of time not spent in GEMM
+
+The DeltaNet layer's shape is in `config.json` -- `linear_key_head_dim` 128 x 16 key heads,
+`linear_value_head_dim` 128 x 48 value heads, conv kernel 4, `hidden_size` 5120,
+`intermediate_size` 17408. That is enough to decompose its cost at T = 8192:
+
+| component | FLOP | share of the layer |
+|---|---|---|
+| **MLP (gate/up/down)** | 4.381e12 | **90.58%** |
+| projections (q/k/v/gate/o) | 4.298e11 | 8.89% |
+| **recurrence (the O(D^2) scan)** | 2.577e10 | **0.53%** |
+
+**The Gated-DeltaNet recurrence -- the part that makes these layers architecturally distinctive, and
+the part any discussion of "the DeltaNet layers are 66% of the 8K prefill" naturally points at -- is
+half a percent of the work.** These layers are, for all practical purposes, **an MLP with a small
+token-mixing term attached**, exactly like the full-attention layers minus the attention kernel.
+
+And the whole prefill:
+
+| | FLOP at T=8192 | at the measured 84 TFLOP/s | actually measured |
+|---|---|---|---|
+| whole prefill | 3.299e14 | **3.93 s** | **12.68 s** |
+| DeltaNet layers alone | 2.321e14 | **2.76 s** | **8.43 s** |
+
+**The prefill runs at ~26 TFLOP/s while the same machine's GEMM path sustains 84 TFLOP/s.** That is
+the whole remaining distance, and it is not a property of any one layer type:
+
+* **The GEMMs are 91% of the FLOPs and get ~31% of the time** (3.93 s of 12.68 s, matching the
+  instrumented `cublas gemm` share of 36.4% at 16K).
+* **~69% of the prefill is spent not doing GEMM** -- the attention kernel (11% at 8K), and the
+  `epilogue` + `activ cast` + `weight stage` overhead around every GEMM (17%), and the norms,
+  gating and elementwise work that the phase instrument does not name.
+* **Even the GEMM has 1.75x of headroom**: 84 TFLOP/s is 57% of an FP4 peak, and closing that alone
+  would take 3.93 s to 2.23 s.
+
+**So there are two independent, quantified paths to the 8K win, which needs 12.68 s -> 10.9 s (1.16x):**
+
+1. **Make the MLP GEMMs faster.** They are 91% of the FLOPs and run at 57% of FP4 peak. Recovering
+   the full peak saves 1.7 s -- 12.68 -> 11.0 s, which is llama.cpp's number. This is a
+   tensor-core-efficiency problem in the MIXED_PRECISION path, and it has never been examined.
+2. **Cut the 69% of non-GEMM time.** `epilogue` + `activ cast` + `weight stage` alone are 17% of the
+   prefill (2.2 s at 8K) -- dequantisation, activation casting and weight staging wrapped around
+   every GEMM. Halving that is worth 1.1 s.
+
+**Both are larger than anything the attention work could have delivered at 8K (the attention kernel
+is 1.4 s, of which 1.58x has already been taken).** And neither has been touched.
+
+**A note on what this section is and is not.** The FLOP figures are derived from `config.json` and
+the standard 2-MAC-per-parameter accounting, so they are estimates of the work, not measurements of
+it. What *is* measured is the wall time of each phase (`cublas gemm` 36.4%/27.6%, the layer split
+58.2%/45.8%, the chunk timings) and the 84 TFLOP/s figure, which is 10.54 s of instrumented GEMM
+time against 8.85e14 FLOP at 16384 tokens. The conclusion -- that the prefill is GEMM-FLOP-dominated
+but not GEMM-TIME-dominated -- rests on those measurements and would survive a moderate error in the
+FLOP estimates.
