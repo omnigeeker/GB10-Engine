@@ -10215,3 +10215,59 @@ first was at 8K, where the two real wins turned out to be dispatch routing and t
 This one is larger: the objective's named path is not a path, because it is already walked. **The
 remaining 29.9 s at 32K is memory latency in a kernel that is idle 99.8% of the time, and no amount
 of tensor-core work addresses it.**
+
+## CONFIRMED: the kernel is occupancy-bound, and the path to 3 blocks/SM is removing the Q tile
+
+`layer.rs`/`ops.rs` already carry an occupancy probe built for exactly this question:
+`GB10_ATTN_SMEM_PROBE` raises the shared-memory request past the two-block threshold, forcing one
+block per SM **with not a line of kernel arithmetic changed and a numerically identical launch.**
+That makes occupancy a single-variable experiment, and it was run:
+
+| shape | 2 blocks/SM | 1 block/SM | ratio |
+|---|---|---|---|
+| start 0, ntok 8192 | 0.12 s | 0.26 s | **2.17x** |
+| **start 24576, ntok 8192** | **0.83 s** | **1.96 s** | **2.36x** |
+| start 0, ntok 65536 | 7.60 s | 17.94 s | **2.36x** |
+
+**Halving occupancy makes the kernel 2.2-2.4x slower while the arithmetic is bit-for-bit the
+same.** That is only possible if the kernel is limited by concurrency -- by having too few
+independent loads in flight -- and it is **impossible** if it were limited by compute (0.39% of
+peak) or bandwidth (24%). **The latency diagnosis is now measured, not inferred, and it agrees with
+the closed form `(t x keys / 384) x ~1100 ns` to the same factor.**
+
+**And the probe turns that into a quantified next step, because the two occupancy ceilings separate
+cleanly:**
+
+```
+registers: 77 (ptxas), 256 threads/block, 65,536 regs/SM  -> 3 blocks by registers
+shared:    22,944 B, 51,200 B/SM                          -> 2 blocks by shared   <-- BINDING
+```
+
+**Shared memory is the binding constraint, and the Q tile is more than half of it:**
+
+| | bytes |
+|---|---|
+| Q tile (BQ=24, stride 264, fp16) | **12,672** |
+| K tile (BK=16, stride 264, fp16) | 8,448 |
+| S (BQ x BK fp32) | 1,536 |
+| red (3 x BQ fp32) | 288 |
+| **total** | **22,944** |
+
+**No tiling of `BQ * BK = 384` can get under the 17,066 B that three blocks need** -- the minimum
+over every factorisation is 22,848 B, at `BQ=16, BK=24`. **The tiling is closed and the Q tile is
+the only thing large enough to matter.**
+
+**Removing the Q tile gives 10,272 B, which is 4 blocks by shared memory and 3 by registers -- so 3
+blocks per SM.** From the measured occupancy curve (2 -> 1 costs 2.36x), 2 -> 3 is worth roughly
+**1.4x**, and that is before any latency hiding.
+
+**So the two changes are now ordered and both are justified by measurement:**
+
+1. **stream Q from global instead of staging it in shared memory** -- frees 12,672 B, takes the
+   kernel from 2 to 3 blocks per SM, worth ~1.4x, and needs the `ldmatrix` Q path reworked;
+2. **double-buffer the K tile** -- hides the ~1100 ns per iteration that the closed form
+   identifies, which the occupancy result now shows is exposed rather than intrinsic.
+
+**Neither is tensor cores, and the kernel already uses tensor cores.** The objective's named path
+is complete; what remains is that the kernel is idle 99.8% of the time waiting for loads, and the
+two changes above are what stop it waiting.
