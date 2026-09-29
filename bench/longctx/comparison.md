@@ -10467,3 +10467,65 @@ The attention kernel is **45.6% of the 32K prefill**, and the rest of the 32K pr
 against llama.cpp's whole 43.20 s -- so **if the attention kernel's latency were fully hidden, gb10
 would win 32K outright rather than lose it 1.48x.** That is the target, and the first change toward
 it is free.
+
+## Correction to the correction: the 8-key split cannot be a pipeline stage
+
+The previous section proposed double-buffering at 8-key granularity because the kernel already
+splits `BK = 16` into two 8-key n-tiles (`ntile = warp & 1`). **Reading the softmax and PV phases
+shows that split is a *writer* split, not a *consumer* split, and cannot be used as a pipeline
+stage:**
+
+```cuda
+// Online softmax, one thread per row.
+if (tid < PREFILL_BQ && tid < rows) {
+    const float m = red[i], l = red[PREFILL_BQ + i];
+    float mt = m;
+    for (int j = 0; j < PREFILL_BK; ++j)          // <-- the whole BK=16 row
+        mt = fmaxf(mt, S[i * PREFILL_BK + j]);
+    ...
+}
+
+// acc[i] = acc[i] * c_i + P[i] . Vs
+for (int i = 0; i < PREFILL_BQ; ++i) {
+    ...
+    const float* prow = S + i * PREFILL_BK;
+    for (int j = 0; j < PREFILL_BK; ++j)          // <-- the whole BK=16 row
+        a = fmaf(prow[j], vr[j], a);
+}
+```
+
+**Both phases consume the full `BQ x BK` score tile.** The online softmax needs the row maximum
+and row sum over all 16 keys before it can rescale, and the PV needs all 16 probabilities. **A
+pipeline stage that produced only 8 keys' scores would force the softmax to run twice per tile and
+rescale twice, which changes the arithmetic and the numerical behaviour the `attn-tile` gate
+validates.**
+
+**So the two n-tiles are two *writers* of one score tile, not two stages, and the granularity of a
+K double-buffer is necessarily the full `BK = 16` tile.** That costs 8,448 B:
+
+| variant | smem | blocks/SM |
+|---|---|---|
+| current | 22,944 B | 2 |
+| **K double-buffered at BK=16** | **31,392 B** | **1** |
+| Q streamed first, then K double-buffered | 18,720 B | 2 |
+
+**The previous section's conclusion is retracted: the double-buffer cannot go first, and
+Q-streaming is required before it.** The ordering constraint from two sections ago was right, and
+the "free double-buffer" was an artefact of assuming a consumer split that the softmax forbids.
+
+**This is the fourth time in this investigation that a plan has been corrected by reading the code
+instead of the resource arithmetic -- and the first time the correction went the other way.** It is
+recorded because the failure mode is the session's dominant one: a resource argument that is
+locally valid (the 8-key split exists; the buffers would be the same size) combined with an
+assumption about how the data is consumed that the next function down does not support.
+
+**The plan stands as it was two sections ago, with the arithmetic unchanged:**
+
+1. **stream Q** -- 22,944 B -> 10,272 B, taking the kernel from 2 to 3 blocks per SM, worth ~1.4x
+   on the measured occupancy curve;
+2. **then double-buffer the K tile at BK = 16** -- 10,272 B -> 18,720 B, still 2 blocks per SM, so
+   the latency hiding is added without giving back the occupancy.
+
+**And the upper bound is unchanged and is the reason to do it:** the attention kernel is 45.6% of
+the 32K prefill, and the rest of the 32K prefill is 35.1 s against llama.cpp's whole 43.20 s. **If
+the kernel's latency were fully hidden, gb10 would win 32K outright instead of losing it 1.48x.**
