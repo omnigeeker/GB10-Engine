@@ -11416,3 +11416,49 @@ and 25% K.
 loads, no change to the K path that was just optimised. **It is the change to implement**, and the
 K-streaming variant should be considered only if Q streaming proves impossible -- which would
 happen only if the mma's A operand genuinely needs all 24 rows resident at once.
+
+## Correction: the Q tile is already minimal -- it is the union of two overlapping m16 windows
+
+The previous entry proposed streaming Q as the safer alternative to K streaming: stage 16 of 24 Q
+rows, keeping both mma operands on `ldmatrix`. **Reading the mma's warp assignment shows that is not
+a simple staging change:**
+
+```cuda
+const int mt    = warp >> 1;   // 0 -> rows 0..15, 1 -> rows 8..23
+const int ntile = warp & 1;    // 0 -> keys 0..7,  1 -> keys 8..15
+const int m0    = mt * 8;
+```
+
+**The two m-tiles are not sequential passes -- they run concurrently in different warps** (warps 0-1
+do `mt=0`, warps 2-3 do `mt=1`). And `mt=0` needs rows 0-15 while `mt=1` needs rows 8-23, so **the
+24-row tile is the union of two overlapping 16-row windows, stored once with rows 8-15 shared.** The
+kernel's own comment says exactly this:
+
+> the two writers of rows 8..15 compute the identical value from identical inputs, so the duplicate
+> store is benign
+
+**So `PREFILL_BQ = 24` is not padding and not waste -- it is the minimum that serves two
+simultaneous m16 windows.** Streaming it to 16 rows would require either
+
+* **serialising the two m-tiles** -- stage rows 0-15, run `mt=0`'s k-loop, re-stage rows 8-23, run
+  `mt=1`'s k-loop -- which needs an extra barrier per iteration and halves the number of warps doing
+  mma per block from 4 to 2; or
+* **duplicating rows 8-15**, which costs exactly the 8 rows the streaming was meant to save.
+
+**The first is not obviously bad and is worth stating precisely, because the arithmetic is
+favourable even though the warp count falls.** Today: 2 blocks/SM x 4 mma warps = **8 mma warps per
+SM**, with the Q tile at 12,672 B. With serialised m-tiles and 3 blocks/SM: 3 x 2 = **6 mma warps per
+SM**, with the Q tile at 8,448 B and the total at **18,720 B**. **Six mma warps against eight is a
+real loss of mma parallelism, bought with a 2 -> 3 block increase in the thing that actually
+matters** -- the number of independent K/V staging streams per SM, which is what the closed form
+says the kernel is waiting on.
+
+**So the change is still plausible, but it is not the "same smem result, no downside" edit the
+previous entry described.** It trades mma warps for occupancy, and that trade has to be measured
+rather than assumed -- which is the same discipline that killed the K-streaming variant and the V
+transpose. **The instrument is the occupancy probe** (`start 24576, ntok 8192`), which distinguishes
+2 from 3 blocks directly: 0.82 s today, and ~0.58 s if the change reaches 3 blocks.
+
+**This is the third consecutive entry where reading the actual code changed the plan.** The Q tile
+looked like the largest single allocation and therefore the obvious thing to shrink; it is in fact
+already minimal for the work it does.
