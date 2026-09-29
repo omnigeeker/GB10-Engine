@@ -7844,3 +7844,54 @@ arithmetically incapable of paying for its own precision requirement on this har
 
 **So the P·V is a dead end in both directions**: too small a share to save much (17%), and the only
 mechanism that removes it carries a precision overhead larger than the saving.
+
+### Neither ALU nor memory: eliminating all K/V DRAM traffic buys only 10%
+
+The "work reduction backfires" pattern had two possible readings -- either the kernel is
+latency-bound and the arithmetic was hiding memory, or the arithmetic itself is the cost. The
+experiment that separates them is to attack the **memory** instead of the arithmetic, by pinning the
+K and V staging to keys 0..15, which stay L2-resident, rather than streaming keys `s0..s0+15` from
+DRAM. The scores stay the same magnitude (still `Q . K` over 256 dims), so this changes *where the
+bytes come from*, not the data flowing through the arithmetic:
+
+| build | 65536 | vs baseline |
+|---|---|---|
+| baseline | 9.20 / 9.21 / 9.24 s | -- |
+| **K staged from L2-resident keys** | **8.44 / 8.51 / 8.52 s** | **-8%** |
+| **V loaded from L2-resident keys** | **9.87 / 9.90 s** | **+7%** |
+| **both K and V L2-resident** | **8.28 / 8.29 s** | **-10%** |
+
+**Eliminating essentially every byte of K/V DRAM traffic buys 10%.** Not 50%, not 80% -- 10%. This
+is the single most informative number in the whole investigation, because it **rules out the
+memory system as the binding constraint**, just as the inverted P·V ablation ruled out the ALU.
+
+So the accounting now stands at:
+
+| component | share of the 9.2 s kernel | how measured |
+|---|---|---|
+| P·V `fmaf` | **~17%** | doubling it (inverted ablation) |
+| K staging (latency + bandwidth) | **~8%** | L2-pinned staging |
+| V staging | **~2%** | L2-pinned (K-pinned baseline) |
+| **everything else** | **~73%** | by subtraction |
+
+**~73% of this kernel is neither arithmetic nor K/V memory traffic.** And the two structural
+measurements already taken constrain what it can be: removing a barrier was worth 0.7%, and raising
+occupancy 50% was worth 0%, so it is not the barrier count and not the resident-block count either.
+
+The surviving candidates are the ones nothing has yet touched: **shared-memory throughput and bank
+behaviour** (the score's `ldmatrix` reads, the `S` scatter writes and the softmax's `S` reads, the
+K staging's shared stores, the P·V's broadcast reads -- all of which scale with the key-tile
+iteration count), and **instruction issue bandwidth** as distinct from ALU utilisation. Both are
+consistent with the pattern that has now been observed four times: *removing arithmetic makes this
+kernel slower*, because the arithmetic is not what it is waiting on.
+
+**Note also the fourth appearance of the backfire pattern**: V pinned to L2 is **7% slower** than
+leaving V streaming from DRAM. Making a memory access cheaper, like making arithmetic cheaper, makes
+this kernel slower. That is not explicable by any model in which the kernel is bound by the cost of
+the thing being removed, and it is now the strongest single argument that the binding constraint has
+not yet been identified at all.
+
+**One caveat, stated plainly:** these three ablations change which keys are attended, so the scores
+themselves change. The magnitudes do not (still `Q . K` over 256 dims, still ~O(1) after `scale`),
+which is what the earlier invalid ablation violated -- but a reader should treat the 8%/2% split as
+indicative of magnitude rather than exact.
