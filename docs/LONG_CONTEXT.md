@@ -110,9 +110,12 @@ original 32K/128K/256K run is committed as
 > `--no-prefix-cache` / `PREFILL_CHUNK` / `enable_thinking` setting. Every one of
 > those observations was read as evidence of *not a regression*, and every one of
 > them was equally consistent with "one flipped argmax at long context". It was
-> found by `git bisect run`, and it is fixed: the fp32 prefill GEMM is the
-> default again, and `loop/run_round.sh` now runs a long-prompt gate
-> (`longctx-follow`) so it cannot come back silently. Full record in
+> found by `git bisect run`, and the cause turned out not to be numerical at all: the
+> tensor-core path was **truncating work**, skipping every element past 16,776,960
+> because eight element-wise kernels had no grid-stride loop under a 65535-block cap.
+> Fixed, and the tensor-core GEMM is on by default again. `loop/run_round.sh` now runs
+> both a long-prompt gate (`longctx-follow`) and a direct arithmetic gate
+> (`tc-parity`) so it cannot come back silently. Full record in
 > `bench/longctx/TC_GEMM_REGRESSION.md`.
 >
 > **llama.cpp never failed.** It answers these prompts in `reasoning_content`
@@ -124,14 +127,29 @@ original 32K/128K/256K run is committed as
 > convict an innocent engine — and a control that fails is a reason to doubt the
 > harness, not a reason to exonerate the subject.
 
-The timings above are slower than the pre-regression scorecard at the same
-length, and that is expected: the 2.48x the tensor-core GEMM bought was bought
-with the numerical error that caused this whole failure, so it was given back.
-Cold TTFT at the 32 K class is currently ~307 s against llama.cpp's ~70 s (~4.4x)
-— the honest post-fix baseline, and much worse than the 1.80x the scorecard
-recorded while the broken GEMM was in place. Recovering it needs a lever that
-does not change the numerics (see the `mma.sync` prefill-attention plan in
-`bench/longctx/comparison.md`).
+The timings above were taken with the fp32 prefill GEMM, i.e. with the fast path
+switched off, and they are superseded. The tensor-core GEMM is now both fast **and**
+correct: its failure was never numerical precision but a truncated grid in eight
+element-wise kernels, which silently skipped every element past 16,776,960 — and that
+is also the *reason* those timings were slow, not a price that had to be paid. See
+`bench/longctx/TC_GEMM_REGRESSION.md` for the root cause and `gb10-bench tc-parity`
+for the gate that now pins it down.
+
+The current same-session cold-TTFT picture (`bench/longctx/results-ttft-fixed.log`,
+`--ctx 262144` on both engines) is
+
+| context | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| 8K | 18.90 s | 13.45 s | 1.41x slower |
+| 32K | 120.15 s | 56.94 s | 2.11x slower |
+| 128K | 1224.16 s | 290.63 s | 4.21x slower |
+
+and decomposes into a linear term within 7.5% of llama.cpp and a quadratic
+(attention) term 11.18x slower. **The remaining work is prefill attention, and the
+target is 11.2x** — the same at every context length, because the condition reduces to
+`gb10_quad / k < llama_quad`. The `mma.sync` plan in `bench/longctx/comparison.md` is
+the right lever; note it must be specified to ~12x rather than 9x, since 9x leaves 32K
+and 128K still losing.
 
 
 Two operational traps cost real time here, both invisible from the code.
