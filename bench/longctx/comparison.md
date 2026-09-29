@@ -12426,3 +12426,62 @@ effort.
 cost is the per-iteration work -- staging, barriers, and 384 PV MACs per thread -- not occupancy,
 not bandwidth, and not the tile size.** Those are the terms a further breakthrough would have to
 attack.
+
+## Handoff: the two remaining levers, and why delegation did not deliver
+
+Two subagents were given the tensor-core PV and neither produced a result: the first spent eight
+rounds on cuBLASLt API research for the FP4 question and left only `/tmp/ref_fp4.cu`; the second read
+the kernel for three rounds, changed nothing, and was stopped without a closing message. **Both were
+given complete briefs; neither was blocked on information.** The lesson is that a kernel change of
+this size needs the whole context of the person making it, and a subagent brief is not a substitute.
+
+**Both remaining levers are fully specified. Here is exactly what a fresh attempt needs.**
+
+### Lever 1 -- tensor-core PV (worth 1.46x on the attention kernel; 32K -> ~1.09x)
+
+* **File**: `kernels/elementwise.cu`, `attn_prefill_tiled_kernel`, the PV block at ~line 617.
+* **What it is now**: `acc[i] = acc[i]*c + sum_j S[i*BK + j] * vr[j]`, scalar fp32, **41.8% of the
+  kernel** (measured by removing it: 18,548 -> 10,798 ms at 32K).
+* **Target**: `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` with `P` as A and `V` as B.
+  `P[24][16] . V[16][256]`; the mma shape is exact. **The A-operand and B-operand `ldmatrix` calls
+  are already in this same kernel** at ~lines 549-559 for the score product -- copy those patterns.
+* **Precision is settled**: fp16 `P` gives `generate` 16/16 exact and PPL 6.5217 vs 6.5212 (+0.008%).
+* **`attn-tile` WILL FAIL. That is expected and must not veto the change.** It is a differential test
+  against a scalar reference; `generate` and `perplexity` are the acceptance tests.
+* **Acceptance**: `generate` 16/16 exact; PPL < ~6.55; 32K `attn kernel` < 18,548 ms.
+* **Trap**: if the smem layout changes, `crates/gb10-cuda/src/ops.rs` ~line 1816 must change with it
+  (currently 31,392 B) or the kernel faults. `GB10_ATTN_OCCUPANCY=1` reports the runtime occupancy.
+* **Note**: `S` currently holds post-`exp`, pre-normalisation probabilities in fp32; the per-row
+  normalisation is deferred to the epilogue and the online-softmax rescale is the `* c` factor. Any
+  fp16 staging must preserve that.
+
+### Lever 2 -- FP4 MLP (worth ~2x on 40.4% of the 32K prefill; 32K -> ~0.85x, a WIN)
+
+* **File**: `crates/gb10-model/src/weights.rs`, `forward_prefill_tensor_core` (~line 207).
+* **What it is now**: `dequant_nvfp4_to_bf16(...)` materialises the whole weight matrix in bf16, then
+  `cublas_gemm_bf16_f32(...)`. **The MLP is 40.4% of the 32K prefill and runs at ~52 TFLOP/s on a
+  bf16 path, while the weights are NVFP4.**
+* **The cuBLASLt recipe, verified in `/usr/local/cuda/include/cublasLt.h`**:
+  * A/B data type `CUDA_R_4F_E2M1` (33)
+  * A/B scale type `CUDA_R_8F_UE4M3`
+  * matrix scale mode `CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3` = 1, attached with
+    `CUBLASLT_MATMUL_DESC_A_SCALE_MODE` = 31 and `..._B_SCALE_MODE` = 32 (int32_t)
+  * scale tensors attached with `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` = 17 / `..._B_` = 18
+  * `cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)`; accumulate in fp32
+  * `cudarc::cublaslt::sys` binds all of these; `cublaslt/safe.rs` exposes only `new()`, so the
+    descriptor and the matmul call need raw FFI
+  * **The scale layout is implied, not settable** -- there is no `A/B_SCALE_LAYOUT` attribute. Pin it
+    from the official cuBLAS block-scaling docs before writing code; guessing it is the failure mode.
+* **Acceptance**: `generate` 16/16 exact; PPL ~6.52; `GB10_MLP_EVENTS=1` shows the mlp phase falling.
+
+### The honest bound, restated
+
+| length | status | what it needs |
+|---|---|---|
+| **8K** | **WON** 0.925-0.963x | nothing |
+| **32K** | reachable | both levers -> ~0.85x |
+| **128K** | not reachable | both levers -> ~1.36x; needs a third breakthrough |
+| **256K** | not reachable | both levers, then more |
+
+**Lever 1 and Lever 2 together would make two of the four lengths wins and take 128K from 1.96x to
+~1.36x.** That is the largest remaining step available, and it is fully specified above.
