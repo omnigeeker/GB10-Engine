@@ -20,7 +20,11 @@ FILLER = (
     "The archive room contains many boxes of old records. Each box is labelled "
     "with a number and a date, and the shelves are dusted every second Tuesday. "
 )
-CHUNK = 2048
+# Must match PREFILL_CHUNK in crates/gb10-server/src/main.rs -- it is only used
+# to report how many chunks the prompt is prefilled in, i.e. how many passes the
+# prompt makes through the chunked prefill path under test. It was 2048 while
+# the server had moved to 8192, so the column understated the count 4x.
+CHUNK = 8192
 
 # Depths as a fraction of the document, so a pass is not an artefact of the
 # needle sitting at the very end where recency alone could carry it. Override

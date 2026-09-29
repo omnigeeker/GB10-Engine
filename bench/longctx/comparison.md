@@ -6753,3 +6753,68 @@ python bench/longctx/ttft.py --port 8080 --reps 231  --trials 3 --max-tokens 128
 - **The unattributed ~23% OTPS gain at 128K and 256K** (4.25 -> 5.29 and 2.99 -> 3.66, while 8K/32K
   reproduced their recorded values exactly). **Worth identifying**: whatever it is, it may also carry
   256K the last 5.3%.
+
+# Precision check after the session's changes (requested at the end of the session)
+
+The question was whether the engine's precision is still normal after `PREFILL_CHUNK` 2048 -> 8192
+and the rest of the session's changes. **Two answers, and they are different.**
+
+## 1. Perplexity: normal, and unchanged. 7.1006 against a recorded 7.0988.
+
+Re-run with the recorded configuration, reproduced exactly from `bench/ppl/engine.json`
+(`--tokens bench/ppl/wiki.tokens.txt --text bench/ppl/wiki.test.raw --ctx 512 --chunks 580`,
+297,054 tokens, 580 windows, 255 predictions per window, 147,900 predictions):
+
+| implementation | weights | perplexity |
+|---|---|---|
+| **gb10-engine (re-run today)** | **NVFP4** | **7.1006** |
+| gb10-engine (recorded) | NVFP4 | 7.0988 |
+| llama.cpp | NVFP4 (same GGUF) | 7.2088 |
+| transformers | BF16 (base model) | 7.0506 |
+
+- **Today against the recorded run: 0.0025% apart** (mean NLL 1.960181 vs 1.959924, i.e. 0.013%).
+  The residual difference is unchanged numerics, not a regression.
+- **Against llama.cpp on the identical NVFP4 weights: gb10 is 1.5% better** (7.1006 vs 7.2088).
+- **Against the BF16 reference: 0.71% worse** (7.1006 vs 7.0506), which is the expected cost of
+  NVFP4 quantization and the number that says the engine is not losing accuracy to a bug.
+- **The tokenizer cross-check in the harness reports 0 mismatches over all 297,054 tokens** against
+  `llama-tokenize`, so the comparison is not a tokenization artefact.
+
+**So on the standard precision metric the engine is normal: it matches its own recorded value to
+within 0.003%, beats llama.cpp on the same weights, and sits the expected distance from BF16.**
+
+## 2. Long-context needle: NOT reproducible, on gb10 AND on llama.cpp -- flagged, not attributed
+
+`bench/longctx/run_validation.sh` records 3/3 at 32K, 1/1 at 128K and 1/1 at 256K
+(`bench/longctx/results-32k-128k-256k.log`, round 251, 09-27 13:43). **Re-running the identical 32K
+leg today gives 0/3 on gb10**, so this was investigated rather than reported as a regression -- and
+the investigation does not implicate the engine:
+
+| test | result | what it rules out |
+|---|---|---|
+| 32K leg (reps 1054, depths 0.1/0.5/0.9), gb10 | **0/3**, `' 10000000000000000000000'` | -- |
+| **the same prompts on llama.cpp** | **0/3**, empty content | **the engine** |
+| reps 20 / 100 / 200 / 400 / 800 / 1054 | PASS / MISS / MISS / PASS / PASS / MISS | a monotone precision loss |
+| `temperature: 0` vs default | **identical** | sampling |
+| `--no-prefix-cache` | **identical** | the prefix cache |
+| `PREFILL_CHUNK = 2048` vs `8192` | both fail | this session's chunk change |
+| `enable_thinking` omitted / false / true | all `completion_tokens: 0` | the thinking switch |
+
+**The failures are deterministic (`finish_reason: stop`, `completion_tokens: 0`, i.e. the model emits
+EOS as its first token), erratic in length rather than monotone, and identical on llama.cpp.** A
+monotone precision loss is what a KV-precision regression would look like, and this is not that.
+The fp16 KV cache did land on 09-28 (rounds 346-353) *after* the last passing needle run, so it
+remained the leading suspect until llama.cpp failed the same prompts -- **which is the control that
+takes the engine out of the frame.**
+
+**What this means, stated plainly:** the engine's precision on the standard metric is normal, but
+**long-context retrieval is not currently certified by this harness, in either direction.** The
+needle result should not be cited as passing, and should not be read as an engine regression, until
+the harness produces non-degenerate output on a known-good implementation. **That is an open issue,
+not a conclusion.**
+
+**One real bug was found and fixed while investigating:** `needle.py:23` had `CHUNK = 2048` as a
+hardcoded mirror of the server's `PREFILL_CHUNK`, which is now 8192, so its `chunks` column
+understated the number of passes through the chunked prefill path by 4x. It is a reporting constant
+only -- nothing functional depended on it -- but it described the very path under test, so it is
+corrected to 8192 with a comment pointing at `crates/gb10-server/src/main.rs`.
