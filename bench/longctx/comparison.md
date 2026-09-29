@@ -7679,3 +7679,45 @@ this program has tried is now accounted for: score mma **1.37x** (kept), `ldmatr
 (rejected). The kernel is at a local optimum with respect to every axis anyone has proposed, and
 the 8K/32K/128K requirements of 1.31x / 1.65x / 3.06x are not reachable by any single substitution
 tried here.
+
+## The complete four-length same-session cold-TTFT set (8K / 32K / 128K / 256K)
+
+All four lengths measured with the identical protocol, each pair back-to-back within one session,
+gb10 `--ctx 262144` with `GB10_TC_GEMM` on, llama.cpp `-c 262144 -ngl 99 -fa on`, unique marker per
+trial so every cold TTFT is a genuine full prefill.
+
+| length | server | prompt tok | cold TTFT | warm TTFT | OTPS cold | ratio |
+|---|---|---|---|---|---|---|
+| 8K | gb10 | 7,109 | 13.41 s | 0.03 s | 7.41 | **1.22x** |
+| 8K | llama.cpp | 7,147 | 10.91 s | 0.26 s | 6.16 | |
+| 32K | gb10 | 32,530 | 83.86 s | 0.05 s | 6.79 | **1.59x** |
+| 32K | llama.cpp | 32,568 | 52.72 s | 0.30 s | 5.75 | |
+| 128K | gb10 | 130,832 | 804.92 s | 0.15 s | 4.51 | **2.94x** |
+| 128K | llama.cpp | 130,870 | 273.86 s | 0.49 s | 4.88 | |
+| 256K | gb10 | 254,274 | **2712.43 s** | 0.26 s | 3.10 | **3.86x** |
+| 256K | llama.cpp | 254,312 | **702.72 s** | 0.65 s | 3.93 | |
+
+**gb10's 256K prefill is 2712 s = 45.2 minutes**, against llama.cpp's 702 s. Against the objective's
+original figures the four lengths have gone from 1.09x/1.80x/3.24x/4.54x to
+**1.22x/1.59x/2.94x/3.86x** -- note that 8K is *worse* than the objective's original 1.09x, which
+is the session-drift point again: the original numbers came from a different session, and llama.cpp
+moves by ~1.2x between sessions on an unchanged binary. Only the four rows above are mutually
+comparable.
+
+**The requirement at each length, computed from the least-squares decomposition:**
+
+| length | attention share | gb10 = L + A | needs `A'` | further attention speedup |
+|---|---|---|---|---|
+| 8K | 79% | 13.41 = 2.82 + 10.59 | 8.09 | **1.31x** |
+| 32K | 94% | 83.86 = 5.03 + 78.83 | 47.69 | **1.65x** |
+| 128K | 98% | 804.92 = 16.10 + 788.82 | 257.76 | **3.06x** |
+| 256K | 99% | 2712.43 = 27.12 + 2685.31 | 675.60 | **3.97x** |
+
+So the requirement grows **1.31x -> 3.97x** across a 32x range of context, not the
+1.29x -> 8.82x the objective was written against. The growth is real but strongly sub-linear in the
+attention share, because 1.58x of attention speedup is already banked and the linear term is small.
+
+**Result: 0/4, all four now certified same-session.** gb10 wins warm TTFT at every length
+(0.03/0.05/0.15/0.26 s vs 0.26/0.30/0.49/0.65 s) and OTPS at 8K and 32K, but **loses OTPS at 128K
+and 256K** (4.51 vs 4.88, 3.10 vs 3.93) -- and the OTPS gap widens with length, which is the same
+quadratic deficit showing up in the decode-time KV path rather than in prefill.
