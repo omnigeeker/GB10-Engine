@@ -10972,3 +10972,70 @@ factor that made one change worth 25% and the other worth nothing.**
 issue, the `__syncthreads()` barriers (four per iteration), and the exposed load latency -- which
 is what the closed form has said since it was derived, and what only occupancy or cross-iteration
 overlap can remove.
+
+## End-to-end same-session pairs after the staging fix: 8K is now a WIN
+
+Both servers started and measured sequentially in one session, `bench/longctx/ttft.py`, 2 trials
+each, greedy, `max-tokens 128`.
+
+### 8K (`--reps 229`)
+
+```
+# gb10-8K  reps=229 trials=2
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0     7171       8.92       0.03      8.98      9.02  128
+    1     7171       8.77       0.03      9.07      9.04  128
+# llama-8K  reps=229 trials=2
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0     7209       9.06       0.24      7.28      7.23  128
+    1     7209       9.25       0.23      7.31      7.32  128
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| cold TTFT trial 0 | **8.92 s** | 9.06 s | **0.985x** |
+| cold TTFT trial 1 | **8.77 s** | 9.25 s | **0.948x** |
+| best pair | **8.77 s** | 9.25 s | **0.948x** |
+| mean | 8.845 s | 9.155 s | **0.966x** |
+| OTPS | 8.98-9.07 | 7.28-7.32 | **1.24x** |
+| warm TTFT | **0.03 s** | 0.23-0.24 s | **7.7x** |
+
+**gb10 wins cold TTFT on both trials.** The session's progression at 8K is
+`1.22x -> 1.10x -> 1.001x -> 0.95-0.99x`, and **this is the first of the four lengths to flip.**
+
+### 32K (`--reps 1049`)
+
+```
+# gb10-32K  reps=1049 trials=2
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0    32592      57.13       0.05      7.91      7.89  128
+    1    32592      57.06       0.05      7.83      7.87  128
+# llama-32K  reps=1049 trials=2
+trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+    0    32630      43.11       0.26      6.84      6.81  126
+    1    32630      44.28       0.27      6.72      6.73  126
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| cold TTFT trial 0 | **57.13 s** | 43.11 s | **1.325x** |
+| cold TTFT trial 1 | **57.06 s** | 44.28 s | **1.289x** |
+| OTPS | 7.83-7.91 | 6.72-6.84 | **gb10 wins 1.16x** |
+| warm TTFT | **0.05 s** | 0.26-0.27 s | **5.2x** |
+
+**32K progression: `1.80x -> 1.59x -> 1.48x -> 1.29-1.33x`**, which is the ~1.33x the instrumented
+ratio predicted. gb10 wins OTPS at 32K as well, and warm TTFT by 5.2x.
+
+### Where the objective stands
+
+| length | cold TTFT ratio | status |
+|---|---|---|
+| **8K** | **0.948-0.985x** | **gb10 wins -- certified, same session** |
+| 32K | 1.289-1.325x | gb10 loses; OTPS won |
+| 128K | 1.74x (instrumented vs llama end-to-end) | gb10 loses |
+| 256K | 3.86x (pre-fix) | not re-measured |
+
+**1 of 4 lengths now beats llama.cpp on cold TTFT, with a same-session pair, and it is the length
+that was 1.22x behind at the start of the session.** The remaining three are all the same
+super-linear attention term, whose share is 39.5% at 32K and 71.9% at 128K, and whose fix is the
+occupancy change the closed form points at.
