@@ -7721,3 +7721,38 @@ attention share, because 1.58x of attention speedup is already banked and the li
 (0.03/0.05/0.15/0.26 s vs 0.26/0.30/0.49/0.65 s) and OTPS at 8K and 32K, but **loses OTPS at 128K
 and 256K** (4.51 vs 4.88, 3.10 vs 3.93) -- and the OTPS gap widens with length, which is the same
 quadratic deficit showing up in the decode-time KV path rather than in prefill.
+
+### A softmax ablation that changed the data instead of the work -- and why it cannot be used
+
+The P·V mma was correct yet 5% slower, and its one genuinely added cost was that the softmax had to
+write **two** arrays (`Pf` + `Pflo`) instead of one. Since the softmax runs on **a single warp** --
+one thread per row, so 24 of 256 threads -- while the other seven warps wait at a barrier, on every
+key-tile iteration, that made the softmax the obvious next suspect. The ablation was meant to price
+it: reduce the softmax's inner loop from 16 iterations to 1.
+
+    full softmax        9.10 / 9.17 / 9.10 s
+    softmax 1/16       12.17 / 11.99 / 12.31 s
+
+**Making the softmax cheaper made the kernel 33% slower, consistently.** That is not a real effect;
+it is a broken control, and it is worth recording as a hazard because the shape of the mistake is
+easy to repeat.
+
+Cutting the loop to one iteration does not remove 15/16 of the softmax's *work* -- it removes the
+*renormalisation*. `S[i][1..15]` keeps the **raw attention scores** rather than probabilities, so the
+P·V goes on to multiply by values roughly 16x larger, while the denominator `red[PREFILL_BQ+i]`
+loses 15 of its 16 terms and collapses toward zero. The result is a chain of much larger
+intermediates divided by a much smaller number. The control is "correct" in the sense that it still
+executes and still terminates, but the *data* it operates on is no longer the data the kernel is
+about -- and on this hardware that changed the runtime by a third.
+
+**The rule this re-establishes:** an ablation must remove *work* while leaving the *values* in the
+range the real kernel produces. Any ablation that alters the magnitudes flowing through the
+arithmetic is measuring the arithmetic's sensitivity to its inputs, not the cost of the work
+removed. This is the same failure mode as the four rounds lost to the smem/occupancy
+misattribution, one level down: there, a real measurement was attached to an assumed cause; here, a
+measurement is attached to a control that silently changed the subject.
+
+The softmax's true cost therefore remains **unmeasured**, and pricing it properly needs an ablation
+that keeps `S` a valid probability row -- e.g. keep all 16 iterations and all 16 stores, but replace
+the `__expf` and the `S` load with a constant, so `ls`, `red`, and the P·V all still see sane
+magnitudes.
