@@ -691,3 +691,36 @@ extern "C" __global__ void f32_split_bf16_kernel(const float* __restrict__ x,
         lo[i] = __float2bfloat16_rn(v - __bfloat162float(h));
     }
 }
+
+// ---- fp32 -> bf16 hi/mid/lo three-way split ------------------------------
+//
+// The two-way split above carries ~16 mantissa bits and was still not enough:
+// like bf16 (8) and fp16 (10) before it, it flipped the long-context argmax to
+// EOS where the fp32 path answers. Three bf16 parts carry ~24, which is fp32's
+// own significand width, so the activation operand is no longer the difference.
+//
+// The residual chain is the point: each part rounds the REMAINDER of the
+// previous one, so `hi + mid + lo` reconstructs x to ~24 bits rather than
+// re-rounding the same magnitude three times.
+//
+// Cost is three bf16 tensor-core GEMMs instead of one fp32 CUDA-core GEMM.
+// bf16 tensor cores measure ~11x the fp32 CUDA-core rate on this box, so this
+// is still ~3.7x cheaper than fp32 while reproducing its precision -- which is
+// the whole reason to do it rather than fall back.
+extern "C" __global__ void f32_split3_bf16_kernel(const float* __restrict__ x,
+                                                  __nv_bfloat16* __restrict__ hi,
+                                                  __nv_bfloat16* __restrict__ mid,
+                                                  __nv_bfloat16* __restrict__ lo,
+                                                  int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = __ldg(x + i);
+        const __nv_bfloat16 h = __float2bfloat16_rn(v);
+        const float r1 = v - __bfloat162float(h);
+        const __nv_bfloat16 m = __float2bfloat16_rn(r1);
+        const float r2 = r1 - __bfloat162float(m);
+        hi[i] = h;
+        mid[i] = m;
+        lo[i] = __float2bfloat16_rn(r2);
+    }
+}

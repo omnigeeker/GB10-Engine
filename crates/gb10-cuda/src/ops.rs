@@ -57,6 +57,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "f32_to_bf16_kernel",
     "f32_to_f16_kernel",
     "f32_split_bf16_kernel",
+    "f32_split3_bf16_kernel",
     "bf16_to_f32_scaled_kernel",
     "f32_scale_kernel",
     "u16_to_bf16_kernel",
@@ -118,6 +119,7 @@ pub struct Ops {
     f32_to_bf16: CudaFunction,
     f32_to_f16: CudaFunction,
     f32_split_bf16: CudaFunction,
+    f32_split3_bf16: CudaFunction,
     bf16_to_f32_scaled: CudaFunction,
     f32_scale: CudaFunction,
     u16_to_bf16: CudaFunction,
@@ -189,6 +191,7 @@ impl Ops {
             f32_to_bf16: take(map, "f32_to_bf16_kernel")?,
             f32_to_f16: take(map, "f32_to_f16_kernel")?,
             f32_split_bf16: take(map, "f32_split_bf16_kernel")?,
+            f32_split3_bf16: take(map, "f32_split3_bf16_kernel")?,
             bf16_to_f32_scaled: take(map, "bf16_to_f32_scaled_kernel")?,
             f32_scale: take(map, "f32_scale_kernel")?,
             u16_to_bf16: take(map, "u16_to_bf16_kernel")?,
@@ -1051,6 +1054,40 @@ impl Ops {
                 .arg(out)
                 .arg(s2)
                 .arg(&hs)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Split `n` fp32 values into bf16 high / mid / low parts, so
+    /// `hi + mid + lo` reconstructs them to ~24 bits -- fp32's own width.
+    pub fn f32_split3_bf16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        hi: &mut CudaSlice<half::bf16>,
+        mid: &mut CudaSlice<half::bf16>,
+        lo: &mut CudaSlice<half::bf16>,
+        n: usize,
+    ) -> Result<()> {
+        need(
+            x.len() >= n && hi.len() >= n && mid.len() >= n && lo.len() >= n,
+            "f32_split3_bf16",
+        )?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.f32_split3_bf16)
+                .arg(x)
+                .arg(hi)
+                .arg(mid)
+                .arg(lo)
                 .arg(&n_i)
                 .launch(LaunchConfig {
                     grid_dim: (grid, 1, 1),

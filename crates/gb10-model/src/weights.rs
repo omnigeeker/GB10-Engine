@@ -150,6 +150,9 @@ impl Linear {
         if sc.x2.as_ref().map_or(true, |b| b.len() < t * k) {
             sc.x2 = Some(stream.alloc_zeros::<bf16>(t * k)?);
         }
+        if sc.x3.as_ref().map_or(true, |b| b.len() < t * k) {
+            sc.x3 = Some(stream.alloc_zeros::<bf16>(t * k)?);
+        }
         // A literal 1.0, passed to the fp8 dequant so it does not fold the
         // per-tensor scale into the bf16 weights (see below).
         if sc.one.is_none() {
@@ -162,11 +165,12 @@ impl Linear {
         //
         // There is no `sc.y`: the GEMM writes fp32 directly into the caller's
         // `y`, so the accumulator is never rounded on the way out.
-        let TcScratch { w: sw, x: sx, x2: sx2, one, .. } = &mut *sc;
-        let (wb, xhi, xlo) = (
+        let TcScratch { w: sw, x: sx, x2: sx2, x3: sx3, one, .. } = &mut *sc;
+        let (wb, xhi, xmid, xlo) = (
             sw.as_mut().unwrap(),
             sx.as_mut().unwrap(),
             sx2.as_mut().unwrap(),
+            sx3.as_mut().unwrap(),
         );
         let one = one.as_ref().unwrap();
 
@@ -214,15 +218,20 @@ impl Linear {
         }
         mark!(1);
         // Split the activation instead of rounding it to one 16-bit format.
-        // bf16 alone (8 mantissa bits) and fp16 alone (10) each flipped the
-        // long-context greedy argmax; hi+lo carries ~16, and the weights are
-        // untouched because 4-bit NVFP4 / FP8 is already exact in bf16.
-        kern.f32_split_bf16(dev, x, xhi, xlo, t * k)?;
+        // bf16 alone (8 mantissa bits), fp16 alone (10) and a two-way bf16 split
+        // (~16) each flipped the long-context greedy argmax to EOS; three bf16
+        // parts carry ~24, which is fp32's own width. The weights are untouched
+        // because 4-bit NVFP4 / FP8 is already exact in bf16, so the whole loss
+        // was in the activation.
+        kern.f32_split3_bf16(dev, x, xhi, xmid, xlo, t * k)?;
         mark!(2);
-        // Two GEMMs, both accumulating in fp32 straight into the caller's `y`.
-        // The first starts from zero; the second accumulates the residual term
-        // on top, so the result is W*(hi + lo) with one rounding at the end.
+        // Three GEMMs accumulating in fp32 straight into the caller's `y`: the
+        // first starts from zero and the other two add their residual terms, so
+        // the result is W*(hi + mid + lo) with no intermediate rounding to 16
+        // bits. This is the price of fp32-grade precision on tensor cores --
+        // three bf16 GEMMs against one fp32 CUDA-core GEMM, still ~3.7x cheaper.
         kern.cublas_gemm_bf16_f32(dev, wb, xhi, y, n, k, t, 0.0)?;
+        kern.cublas_gemm_bf16_f32(dev, wb, xmid, y, n, k, t, 1.0)?;
         kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0)?;
         mark!(3);
 

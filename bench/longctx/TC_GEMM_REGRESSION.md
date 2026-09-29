@@ -189,3 +189,90 @@ attention**, not the GEMM: attention keeps an fp32 softmax and fp32 accumulation
 so it can be made much faster without touching the numerics that this model is
 sensitive to. The tensor-core GEMM code is kept behind `GB10_TC_GEMM=1` as a
 record of the search, not as a candidate.
+
+## The three-way split, and what it rules out
+
+A three-way bf16 split (`hi`/`mid`/`lo`, each rounding the remainder of the
+previous part) carries ~24 mantissa bits, which is fp32's own significand width.
+It was expected to be the fix. It is not:
+
+| operands | effective mantissa bits | first generated token |
+|---|---|---|
+| bf16 | 8 | EOS |
+| fp16 (fp32 accum, fp32 out) | 10 | EOS |
+| bf16 two-way split | ~16 | EOS |
+| bf16 two-way split + fp8 scale on the accumulator | ~16 | EOS |
+| **bf16 three-way split** | **~24** | **EOS** |
+| **fp32 CUDA core (reference)** | **24+** | `"We need answer user's request..."` |
+
+At ~24 bits the activation operand is fp32-grade, so **this is no longer a
+precision problem.** Something else systematically separates the two paths.
+
+### What the reference path actually computes
+
+Reading the fp32 prefill GEMM rather than assuming its precision:
+
+* `kernels/gemm.cu:104,143` -- the **weights** are staged as bf16
+  (`__bfloat16_as_ushort(__float2bfloat16_rn(...))`). That is lossless here:
+  4-bit NVFP4 / FP8 has fewer mantissa bits than bf16 carries, so both paths
+  agree on W exactly.
+* `kernels/gemm.cu:232` -- the **activation** is only rounded to bf16 under
+  `#ifdef GB10_SIM_BF16_ACT`, an explicitly-labelled diagnostic that is **off by
+  default**. So the reference computes `bf16(W) x fp32(x)`, accumulated in fp32.
+
+So the two paths should now agree to ~1e-7 relative, which is the same order as
+the reference's own run-to-run variation. Yet fp32 is 5/5 on the long-prompt
+battery and every tensor-core variant is 0/5, reproducibly, in one direction.
+
+That is a contradiction, and it means one of two things: either there is a
+systematic difference between the paths that has **not** been found (candidates
+not yet excluded: the per-tensor scale value used for the fp8 layers, the
+accumulation order interacting with a very tight argmax, or something in the
+layernorm/DeltaNet numerics that only the tensor-core path perturbs), or the
+decision margin at this prompt is below ~1e-7 and effectively arbitrary.
+
+The fp32 path's own non-determinism (1 of 7 repeats diverged once) is evidence
+for the second, but a 5/5-vs-0/5 split in a *consistent direction* is evidence
+against it. **This is the open question, and it is now the blocker for reusing
+the tensor-core GEMM at all.** It is recorded as unresolved rather than guessed.
+
+What is *not* in doubt: the fp32 default is correct, and every reduced-precision
+variant tried is not.
+
+## The reframing: this is a bug, not a precision floor
+
+The measurements above were read for a while as "this model needs more than 24 bits of
+activation precision". That reading is wrong, and llama.cpp is the counter-example that
+kills it:
+
+**llama.cpp reaches 13.62 s at 8K and 57.23 s at 32K on this same model (NVFP4 GGUF) by
+running tensor-core MMA over quantized weights.** Its activation operand is quantized to
+roughly 8 bits with per-block scales -- *lower* nominal precision than the bf16 path that
+fails here -- and it answers correctly at 34.8K, 3/3, while the engine's bf16 path emits
+EOS. So:
+
+* a fast tensor-core path that is accurate enough for this model **demonstrably exists**;
+* the engine's tensor-core path is **wrong for a reason that has not been identified**;
+* and "16 bits is not enough, 24 works" was measuring a symptom, not the cause.
+
+That makes the tensor-core GEMM a **debugging target rather than a dead end**, which
+matters because the measured scaling (see the scorecard in `comparison.md`) shows the cold
+TTFT deficit at 8K/32K is dominated by exactly this O(T) work -- attention is only 7% of
+8K and 23% of 32K prefill, so faster attention alone cannot close a 4.71x/5.40x gap.
+
+Candidates not yet excluded, in the order worth testing:
+
+1. **The per-tensor scale value used for the fp8 layers.** The reference reads `s1` inside
+   the kernel (`__ldg(s1)`); the tensor-core path passes `LinearData::Fp8.scale`. Nothing
+   has verified that these are the same quantity rather than two similarly-named ones.
+2. **The `s2` path for NVFP4** -- same question, applied to the accumulator after the GEMM.
+3. **A shape- or layer-dependent defect.** The tensor-core path is gated on `n >= 256 &&
+   t > 16`; if some layer that the reference handles per-tile is mishandled at larger `t`,
+   it would look exactly like this (fine on the 59-token oracle, broken past ~970 tokens).
+4. **Accumulation order interacting with a genuinely tight argmax.** This is the
+   explanation the data currently favours *least*, because the failure is 5/5 vs 0/5 in a
+   consistent direction rather than scattered -- but the fp32 path's own non-determinism
+   (1 of 7 repeats diverged once) means it cannot be dismissed.
+
+A direct numerical comparison of the two paths' GEMM output on a real layer -- not a
+48x32x17 integer fixture -- is the tool that is missing, and is the first thing to build.

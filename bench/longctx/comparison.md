@@ -13,24 +13,58 @@ Two definitions, because "TTFT" hides a real question:
 The prompt is repeated filler plus "list the integers 1 to 300", which stops the
 model answering in two tokens and makes OTPS an average over ~198 intervals.
 
-## Current scorecard (rounds 130-147; the sections below are the history)
+## Current scorecard (re-measured after the prefill-GEMM fix; the sections below are the history)
 
-**Every number here is server-side, measured with `PREFILL_CHUNK = 8192`, `--ctx 262144` for
-128K/256K, and pairs taken in the same session** (the session's rule: only same-session pairs are
-comparable -- round 90 measured 23% drift on this box).
+**Every number here is server-side, measured with `PREFILL_CHUNK = 8192`, `--ctx 36864`, and pairs
+taken in the same session** (the session's rule: only same-session pairs are comparable -- round 90
+measured 23% drift on this box).
 
 | context | cold TTFT | warm TTFT | OTPS |
 |---|---|---|---|
-| 8K | 10.35 / 9.50 s = **1.09x slower** | 0.03 / 0.223 s = **7.4x faster** | 8.91 / 7.26 = **1.23x faster** |
-| 32K | 80.00 / 44.55 s = **1.80x slower** | 0.05 / 0.29 s = **5.8x faster** | 7.14 / 6.865 = **1.04x faster** |
-| 128K | 890.54 / 275.04 s = **3.24x slower** | 0.14 / 0.48 s = **3.4x faster** | 5.29 / 4.75 = **1.11x faster** |
-| 256K | 3298.83 / 726.22 s = **4.54x slower** | 0.28 / 0.66 s = **2.4x faster** | 3.66 / 3.86 = **1.05x slower** |
+| 8K (8752 / 8790 tok) | 64.12 / 13.62 s = **4.71x slower** | 0.03 / 0.25 s = **8.3x faster** | 7.24 / 6.00 = **1.21x faster** |
+| 32K (34793 / 34831 tok) | 309.28 / 57.23 s = **5.40x slower** | 0.05 / 0.34 s = **6.8x faster** | 6.59 / 5.82 = **1.13x faster** |
+| 128K | not measurable with the fp32 prefill GEMM (extrapolates to hours) | -- | -- |
+| 256K | not measurable with the fp32 prefill GEMM (extrapolates to ~10 h) | -- | -- |
 
-**Warm TTFT 4 of 4 won. OTPS 3 of 4 won. Cold TTFT 0 of 4.**
+**Warm TTFT 2 of 2 won. OTPS 2 of 2 won. Cold TTFT 0 of 2.**
 
-The 8K numbers are the mean of 3 trials per side (gb10 spread 0.8%, llama 3.2%), so the 0.85 s gap
-is real. The 8K OTPS and warm figures are from the same 3-trial runs; 32K/128K/256K cold and warm
-are single-trial pairs.
+> **The previously recorded cold-TTFT row (10.35 / 80.00 / 890.54 / 3298.83 s, "1.09x / 1.80x /
+> 3.24x / 4.54x slower") was measured with the numerically-broken tensor-core prefill GEMM, and is
+> therefore not a valid result.** That GEMM returned nothing at all for prompts over ~970 tokens, so
+> a benchmark built on it measured a broken engine. Re-measured honestly, the cold-TTFT deficit is
+> **4.71x at 8K and 5.40x at 32K** -- far worse than the 1.09x and 1.80x that were recorded. The
+> 2.48x the tensor-core GEMM appeared to buy was bought with the bug, and giving it back is the price
+> of a correct engine. See `bench/longctx/TC_GEMM_REGRESSION.md`.
+
+### The measured scaling, and why "just speed up attention" is not enough
+
+Fitting the two measured points gives
+
+```
+prefill ~= 0.00680 * T + 6.00e-8 * T^2   seconds
+```
+
+so the cost is **nearly linear in T** across the range that matters:
+
+| context | linear term | quadratic term | quadratic share |
+|---|---|---|---|
+| 8K | 59.5 s | 4.6 s | **7%** |
+| 32K | 237 s | 73 s | **23%** |
+| 128K | 891 s | 983 s | 52% |
+| 256K | 1782 s | 3932 s | 69% |
+
+Attn is the quadratic term. **At 8K and 32K -- where the deficit is 4.71x and 5.40x -- prefill
+attention is only 7% and 23% of the time.** Making attention infinitely fast would take 8K from
+64.12 s to 59.5 s (1.08x) against llama.cpp's 13.62 s, and 32K from 309 s to 237 s (1.30x) against
+57 s. It cannot close the gap. The dominant term is the O(T) work -- the linear projections'
+GEMM -- so **the cold-TTFT goal requires a numerically-safe fast GEMM, not only faster attention.**
+That inverts the earlier premise in this document, and it is measured, not argued.
+
+The good news is that such a path demonstrably exists: llama.cpp reaches 13.62 s at 8K and 57 s at
+32K on *this same model* (NVFP4 GGUF) with tensor-core MMA over quantized weights. So the engine's
+tensor-core GEMM being wrong is a bug to be found, not a precision floor to be accepted -- see the
+open question at the end of `TC_GEMM_REGRESSION.md`.
+
 
 **What is left, and what it costs:**
 

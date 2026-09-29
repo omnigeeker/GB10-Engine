@@ -66,10 +66,12 @@ pub struct TcScratch {
     pub w: Option<CudaSlice<half::bf16>>,
     /// Activations `[t, k]`, bf16 **high** part.
     pub x: Option<CudaSlice<half::bf16>>,
-    /// Activations `[t, k]`, bf16 **low** (residual) part. Together with `x` this
-    /// carries ~16 mantissa bits, which is what the long-context greedy argmax
-    /// needs; see `forward_prefill_tensor_core`.
+    /// Activations `[t, k]`, bf16 **mid** part.
     pub x2: Option<CudaSlice<half::bf16>>,
+    /// Activations `[t, k]`, bf16 **low** part. `x + x2 + x3` carries ~24
+    /// mantissa bits, i.e. fp32's width; 16 bits was not enough for the
+    /// long-context greedy argmax. See `forward_prefill_tensor_core`.
+    pub x3: Option<CudaSlice<half::bf16>>,
     /// bf16 GEMM output, `[t, n]`.
     pub y: Option<CudaSlice<half::bf16>>,
     /// One fp32 element, passed to the epilogue when there is no `s2` to apply.
