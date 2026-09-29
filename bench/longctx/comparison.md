@@ -13,57 +13,67 @@ Two definitions, because "TTFT" hides a real question:
 The prompt is repeated filler plus "list the integers 1 to 300", which stops the
 model answering in two tokens and makes OTPS an average over ~198 intervals.
 
-## Current scorecard (re-measured after the prefill-GEMM fix; the sections below are the history)
+## Current scorecard: tensor-core prefill GEMM, grid-clamp bug FIXED
 
-**Every number here is server-side, measured with `PREFILL_CHUNK = 8192`, `--ctx 36864`, and pairs
-taken in the same session** (the session's rule: only same-session pairs are comparable -- round 90
-measured 23% drift on this box).
+**Every number here is server-side, measured with `PREFILL_CHUNK = 8192`, `--ctx 262144`, and
+pairs taken in the same session** (the session's rule: only same-session pairs are comparable --
+round 90 measured 23% drift on this box). gb10 runs `GB10_TC_GEMM` on by default with
+`GB10_TC_SPLIT=1` (a single bf16 operand).
 
 | context | cold TTFT | warm TTFT | OTPS |
 |---|---|---|---|
-| 8K (8752 / 8790 tok) | 64.12 / 13.62 s = **4.71x slower** | 0.03 / 0.25 s = **8.3x faster** | 7.24 / 6.00 = **1.21x faster** |
-| 32K (34793 / 34831 tok) | 309.28 / 57.23 s = **5.40x slower** | 0.05 / 0.34 s = **6.8x faster** | 6.59 / 5.82 = **1.13x faster** |
-| 128K | not measurable with the fp32 prefill GEMM (extrapolates to hours) | -- | -- |
-| 256K | not measurable with the fp32 prefill GEMM (extrapolates to ~10 h) | -- | -- |
+| 8K (8752 / 8790 tok) | 18.90 / 13.45 s = **1.41x slower** | 0.03 / 0.28 s = **9.3x faster** | 7.25 / 6.18 = **1.17x faster** |
+| 32K (34793 / 34831 tok) | 120.15 / 56.94 s = **2.11x slower** | 0.05 / 0.31 s = **6.2x faster** | 6.42 / 5.79 = **1.11x faster** |
+| 128K (136474 / 136512 tok) | 1224.16 / 290.63 s = **4.21x slower** | 0.16 / 0.47 s = **2.9x faster** | 4.28 / 4.68 = **1.09x slower** |
+| 256K | not measured (extrapolates to ~65 min cold) | -- | -- |
 
-**Warm TTFT 2 of 2 won. OTPS 2 of 2 won. Cold TTFT 0 of 2.**
+**Warm TTFT 3 of 3 won. OTPS 2 of 3 won. Cold TTFT 0 of 3.**
 
-> **The previously recorded cold-TTFT row (10.35 / 80.00 / 890.54 / 3298.83 s, "1.09x / 1.80x /
-> 3.24x / 4.54x slower") was measured with the numerically-broken tensor-core prefill GEMM, and is
-> therefore not a valid result.** That GEMM returned nothing at all for prompts over ~970 tokens, so
-> a benchmark built on it measured a broken engine. Re-measured honestly, the cold-TTFT deficit is
-> **4.71x at 8K and 5.40x at 32K** -- far worse than the 1.09x and 1.80x that were recorded. The
-> 2.48x the tensor-core GEMM appeared to buy was bought with the bug, and giving it back is the price
-> of a correct engine. See `bench/longctx/TC_GEMM_REGRESSION.md`.
+> Three scorecards exist for this section and only the third is valid.
+>
+> * `10.35 / 80.00 / 890.54 / 3298.83 s` ("1.09x / 1.80x / 3.24x / 4.54x slower") was measured
+>   with the tensor-core prefill GEMM **truncating work** -- it skipped every element past
+>   16,776,960 (see `TC_GEMM_REGRESSION.md`), so it was fast because it was wrong.
+> * `64.12 / 309.28 s` was the fp32 fallback after that bug was found but before its cause was,
+>   i.e. the price of a correct engine with the fast path switched off.
+> * **The table above is the honest one**: the fast path is on *and* correct.
 
-### The measured scaling, and why "just speed up attention" is not enough
+### What is left, and exactly how much of it
 
-Fitting the two measured points gives
+Fitting the three measured points:
 
 ```
-prefill ~= 0.00680 * T + 6.00e-8 * T^2   seconds
+gb10   prefill ~= 1.577e-3 * T + 5.417e-8 * T^2   s
+llama  prefill ~= 1.468e-3 * T + 4.845e-9 * T^2   s
+
+       linear term: gb10 is 1.075x slower   <- essentially at parity
+    quadratic term: gb10 is 11.18x slower   <- this is the whole deficit
 ```
 
-so the cost is **nearly linear in T** across the range that matters:
+| context | gb10 linear | gb10 quad | llama total | gap | quad share of gap | attention speedup needed |
+|---|---|---|---|---|---|---|
+| 8K | 12.9 | 3.6 | 12.3 | 4.2 | 79% | 11.2x (with the linear term at parity) |
+| 32K | 51.7 | 58.2 | 53.3 | 56.6 | 94% | 11.2x |
+| 128K | 206.7 | 930.6 | 275.6 | 861.7 | 98% | 11.2x |
+| 256K | 413.5 | 3722.4 | 717.6 | 3418.2 | 99% | 11.2x |
 
-| context | linear term | quadratic term | quadratic share |
-|---|---|---|---|
-| 8K | 59.5 s | 4.6 s | **7%** |
-| 32K | 237 s | 73 s | **23%** |
-| 128K | 891 s | 983 s | 52% |
-| 256K | 1782 s | 3932 s | 69% |
+Two things fall out of this, and both are cleaner than the earlier version of this section:
 
-Attn is the quadratic term. **At 8K and 32K -- where the deficit is 4.71x and 5.40x -- prefill
-attention is only 7% and 23% of the time.** Making attention infinitely fast would take 8K from
-64.12 s to 59.5 s (1.08x) against llama.cpp's 13.62 s, and 32K from 309 s to 237 s (1.30x) against
-57 s. It cannot close the gap. The dominant term is the O(T) work -- the linear projections'
-GEMM -- so **the cold-TTFT goal requires a numerically-safe fast GEMM, not only faster attention.**
-That inverts the earlier premise in this document, and it is measured, not argued.
+1. **The prefill GEMM is no longer the problem.** Making the tensor-core path both fast *and*
+   correct moved the linear term to within 7.5% of llama.cpp. The remaining linear excess is
+   worth at most a 1.075x win and is not where the work is.
+2. **The target is a single number: 11.2x on prefill attention.** Because the condition reduces
+   to `gb10_quad / k < llama_quad`, the requirement is *the same at every context length* --
+   it is just the ratio of the two quadratic coefficients. That is also why the previously
+   recorded requirements (1.29x / 5.98x / 8.40x / 8.82x) were wrong: they were computed against
+   the broken GEMM's inflated linear term, which made attention look like a 1.29x problem at 8K
+   and hid that it is an 11.2x problem everywhere.
 
-The good news is that such a path demonstrably exists: llama.cpp reaches 13.62 s at 8K and 57 s at
-32K on *this same model* (NVFP4 GGUF) with tensor-core MMA over quantized weights. So the engine's
-tensor-core GEMM being wrong is a bug to be found, not a precision floor to be accepted -- see the
-open question at the end of `TC_GEMM_REGRESSION.md`.
+**So the objective's "designed for 9x" is ~20% short of what the measurement requires.** An
+`mma.sync` prefill attention at 9x would leave 8K at ~13.3 s against 13.45 s (a knife-edge win),
+32K at ~58.2 s against 56.94 s (still a loss), and 128K at ~310 s against 290.63 s (still a
+loss). At 11.2x all four win. The design should be specified to 12x for margin, and the
+`ex2.approx.f16x2` and fp32-accumulation constraints from the original plan still hold.
 
 
 **What is left, and what it costs:**

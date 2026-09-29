@@ -1,0 +1,41 @@
+# Cold/warm TTFT + OTPS, gb10 (tensor-core prefill GEMM, grid-clamp bug FIXED) vs llama.cpp
+#
+# Same session, same harness (bench/longctx/ttft.py), same box. Only same-session
+# pairs are comparable: round 90 measured 23% drift on this machine.
+# gb10: --ctx 262144, PREFILL_CHUNK 8192, GB10_TC_GEMM on by default, GB10_TC_SPLIT=1
+# llama: llama-server -c 262144 -ngl 99 -np 1
+#
+# This runs on the CORRECT fast path. It supersedes two earlier tables:
+#   10.35/80.00/890.54/3298.83 s -- measured with the GEMM TRUNCATING WORK
+#                                    (fast because wrong; see TC_GEMM_REGRESSION.md)
+#   64.12/309.28 s              -- the fp32 fallback, correct but with the fast
+#                                    path switched off
+#
+# ===== gb10-engine =====
+# gb10-8K  reps=280 trials=1 max_tokens=128
+# trial   prompt  cold_ttft  warm_ttft otps_cold otps_warm  tok
+#     0     8752      18.90       0.03      7.25      7.05  128
+# gb10-32K  reps=1120 trials=1 max_tokens=128
+#     0    34793     120.15       0.05      6.42      6.46  128
+# gb10-128K  reps=4400 trials=1 max_tokens=128
+#     0   136474    1224.16       0.16      4.28      4.27  128
+#
+# ===== llama.cpp (control, same prompts, same session) =====
+# llama-8K  reps=280 trials=1 max_tokens=128
+#     0     8790      13.45       0.28      6.18      6.19  128
+# llama-32K  reps=1120 trials=1 max_tokens=128
+#     0    34831      56.94       0.31      5.79      5.81  128
+# llama-128K  reps=4400 trials=1 max_tokens=128
+#     0   136512     290.63       0.47      4.68      4.69  126
+#
+# ===== ratios (gb10 / llama) =====
+#   context   prompt (gb/ll)      cold TTFT           warm TTFT        OTPS
+#   8K        8752 / 8790         18.90 / 13.45 = 1.41x slower   9.3x faster   1.17x faster
+#   32K      34793 / 34831       120.15 / 56.94 = 2.11x slower   6.2x faster   1.11x faster
+#   128K    136474 / 136512     1224.16 / 290.63 = 4.21x slower  2.9x faster   1.09x slower
+#
+# ===== decomposition (least-squares over the three points) =====
+#   gb10   prefill ~= 1.577e-3 * T + 5.417e-8 * T^2
+#   llama  prefill ~= 1.468e-3 * T + 4.845e-9 * T^2
+#   linear 1.075x slower  (at parity)   quadratic 11.18x slower  (the whole deficit)
+#   => an 11.2x prefill-attention speedup wins at every context length

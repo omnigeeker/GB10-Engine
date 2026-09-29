@@ -217,12 +217,6 @@ impl Linear {
             }
         }
         mark!(1);
-        // Split the activation instead of rounding it to one 16-bit format.
-        // bf16 alone (8 mantissa bits), fp16 alone (10) and a two-way bf16 split
-        // (~16) each flipped the long-context greedy argmax to EOS; three bf16
-        // parts carry ~24, which is fp32's own width. The weights are untouched
-        // because 4-bit NVFP4 / FP8 is already exact in bf16, so the whole loss
-        // was in the activation.
         // How many bf16 parts the activation is split into.
         //
         // This was 3 for a while, on the theory that the long-context failure
