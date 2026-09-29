@@ -7476,3 +7476,42 @@ gb10 wins warm TTFT decisively at both lengths (0.03/0.05 s vs 0.26/0.30 s) and 
 Still not a win: **0/4 remains, now 0/2 measured, at 1.22x and 1.59x.** 128K and 256K have not been
 re-measured since the attention work; the 128K leg alone is ~800 s for gb10 and ~290 s for
 llama.cpp, so it needs its own round.
+
+### The P·V is fp32 fma throughput, and nothing but an mma will fix it
+
+Two experiments have now bracketed the P·V's 34%, and between them they rule out every explanation
+except one.
+
+**Its loads are not the cost.** Explicit `float4` reads (legal -- `S` is 16-byte aligned with 64 B
+rows -- and bit-identical) measured **~2% slower**, because the compiler had already merged those
+adjacent shared reads. Reverted.
+
+**Its dependency chain is not the cost.** The inner loop is one 16-deep dependent `fmaf` chain per
+row, and the fma latency is a few cycles, so a single chain ought to leave the pipeline empty. It
+was split into four independent partial sums (three extra registers, same terms grouped by stride
+4, so only the last bits change -- far inside the 1e-4 gate, which sits at ~1e-5):
+
+    16384   0.57 / 0.58 s   (baseline 0.56)
+    65536   8.98 / 9.11 / 9.14 / 9.18 s   (baseline 8.95 / 9.01)
+
+**No improvement either.** Reverted.
+
+What is left is arithmetic throughput. The P·V issues 384 `fmaf` per thread per key tile. At the
+65536 span that is 1.34e8 tile-pairs x 98,304 fma = **1.3e13 fma**, and the machine's measured fp32
+rate is 18.43 TFLOP/s = 9.2e12 fma/s, so the P·V's fma alone is ~1.4 s of a 9.0 s kernel. The
+ablation attributed 34% (3.06 s) to it, which means the loop is running at roughly **40% of the
+chip's fp32 peak** -- respectable for a real kernel, and not improvable by rescheduling, because
+the work is already issued as densely as the fp32 pipes allow.
+
+**The only remaining move is to stop doing the arithmetic on the fp32 pipes at all**, i.e. the mma,
+which replaces 384 `fmaf` per *thread* with 16 mma per *warp*. Both costs that made the first
+attempt slower are now known to be avoidable, so that is the change to make:
+
+* the extra barrier existed only because `Vs` aliased `Ks` to fit 24,576 B -- and the real budget is
+  **51,200 B**, so `Vs` gets its own storage and the barrier disappears;
+* the transpose pass existed only because `mma`'s B operand is column-major -- and
+  `ldmatrix.sync.aligned.m8n8.x4.trans` builds the transposed fragment straight from V's natural
+  `[key][dim]` layout, so there is no transpose pass at all.
+
+The full working set is `Qs` 12,672 + `Ks` 8,448 + `Vs` 8,192 + `S` 1,536 + `red` 288 +
+`Pf`/`Pflo` 1,536 = **32,672 B**, comfortably inside 51,200 B.
