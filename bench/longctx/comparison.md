@@ -11166,3 +11166,39 @@ therefore:
 **So the V transpose -- the ~25% instruction-count win -- is attemptable with a real safety net, and
 the safety net is stronger than the one the objective names.** Recorded here so the next round does
 not have to re-derive that the decode path is covered.
+
+## How to measure a single staging loop's cost (and how not to)
+
+Before committing to the V transpose -- a layout change spanning three append kernels, the prefill
+kernel and the decode attention -- the question was whether V's sixteen loads are actually worth
+~25% the way K's were. **The obvious probe is to delete the loads and time the kernel:**
+
+```cuda
+for (int j = 0; j < PREFILL_BK; ++j)
+    vr[j] = 0.0f;   // PROBE: V loads removed
+```
+
+**This does not work through `attn-tile`.** The gate compares the tiled kernel against the legacy
+reference and **aborts at the first mismatching shape**, so it never reaches the large `ntok 65536`
+case whose timing is the whole point:
+
+```
+first diff at flat 0 (tok 0 head 0 dim 0): legacy -3.813477e-1 tiled 0.000000e0
+  0     1  4.990e-1  1.000e0  rms|ref| 2.846e-1  MISMATCH
+  0     7  4.995e-1  1.000e0  rms|ref| 1.756e-1  MISMATCH
+  ...
+```
+
+**The right instrument is `prefill-shape`, which reports the attention kernel's ms without
+verifying the output**, so a deliberately incorrect kernel can still be timed:
+
+```
+GB10_ATTN_EVENTS=1 ./target/release/gb10-verify prefill-shape \
+    --model models/Qwen3.8-27B-NVFP4 --limit 32768 --max-seq 32768
+```
+
+**The probe was reverted** (`kernels/elementwise.cu` restored, `attn-tile: OK`, tree clean at
+`eeb0c73`). **Recording the instrument choice because it generalises: to price a loop, time it with
+the instrument that does not check correctness, and verify correctness with the instrument that
+does.** The two roles are separate and `attn-tile` deliberately does both, which makes it unusable
+for this kind of ablation.
