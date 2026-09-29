@@ -12003,3 +12003,60 @@ that is several times below what the weight format allows.**
 
 **This is the first complete accounting of the prefill in this session, and it relocates the
 bottleneck.**
+
+## The MLP pays bf16 GEMM rates for FP4 weights -- and the FP4 tensor cores have never been tested
+
+Reading the actual prefill GEMM path, rather than trusting the earlier conclusion about it:
+
+```rust
+// crates/gb10-model/src/weights.rs, forward_prefill_tensor_core
+/// Three kernels per matrix: dequantise W to bf16, cast the activations to
+/// bf16, then one cuBLAS GEMM that accumulates in fp32 and **writes fp32** ...
+match &self.data {
+    LinearData::NvFp4 { w: qw, wscale, .. } => {
+        kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
+    }
+    ...
+}
+// then: kern.cublas_gemm_bf16_f32(...)
+```
+
+**The NVFP4 weights are dequantised to bf16 -- the full matrix materialised at 2 bytes per
+parameter -- and then multiplied by a *bf16* cuBLAS GEMM.** The MLP is 40.4% of the 32K prefill and
+it runs at ~52 TFLOP/s, which is ~70% of the ~75-80 TFLOP/s bf16 ceiling the code comment itself
+records:
+
+> cuBLAS bf16 measures ~80 TFLOP/s at these exact shapes -- an 11-12x step -- and the prefill is
+> 75-93% GEMM, so this is the whole remaining gap.
+
+**So the session already knew the prefill is GEMM-bound and that bf16 gets ~80 TFLOP/s. What it did
+not do is use the format the weights are actually stored in.** 4-bit weights are being spent at
+16-bit throughput.
+
+### The correction that matters
+
+**The earlier "direct FP4 is 4.5x slower" result (`GB10_TC_GEMM=0` -> 8K prefill 47.51 s vs 10.61 s)
+was not an FP4 tensor-core GEMM.** The module header says the fallback path dequantises "on the fly
+by the GEMV kernels" -- so that test compared a **GEMV** path against a **GEMM** path and measured
+the difference between a matrix-vector kernel and a matrix-matrix kernel. **It says nothing about FP4
+tensor cores, and the FP4 tensor cores have never been exercised in this session.**
+
+That is the same failure mode this session has hit repeatedly and already named: *a measured effect
+is real, an attributed cause is assumed, and the two are treated as one.* The 4.5x was real; the
+attribution to FP4 hardware was not.
+
+### Why this is the largest remaining opportunity
+
+| | now | if FP4 GEMM is 2x bf16 | if 4x |
+|---|---|---|---|
+| MLP (40.4% of 32K prefill) | 21,456 ms | 10,728 ms | 5,364 ms |
+| 32K prefill total | 53.08 s | ~42.4 s | ~37.0 s |
+| 32K ratio vs llama (43.25 s) | 1.24x | **~0.98x** | **~0.86x** |
+
+**Even the 2x case would bring 32K to parity, and the MLP is the largest single component of every
+length, so the same factor applies at 128K and 256K where the gaps are largest.**
+
+**The concrete next step is to find whether cuBLASLt on this part can take FP4 operands directly**
+(`CUDA_R_4F_E2M1` with the NVFP4 block-scale layout) instead of the dequantise-then-bf16-GEMM route.
+That is a real change, not a tuning knob -- but it is aimed at the largest component, at the format
+the weights are already in, and the only evidence against it was a test that measured something else.
