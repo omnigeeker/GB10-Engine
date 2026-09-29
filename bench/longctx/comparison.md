@@ -9590,3 +9590,58 @@ intuition.** The 1.17 s estimate for the 32K attention kernel was derived by sca
 65536-token figure by query-key pair count. The `START_ZERO` result is consistent with it: making
 the key range constant per chunk did not remove 3.5 s per chunk, because the kernel was never
 costing that. **The isolated kernel and the model agree; the growth is somewhere else.**
+
+## FOUND: the attention kernel IS the quadratic term -- 29.9 s at 32K, 45.6% of the prefill
+
+The attention layer's prefill was instrumented (`GB10_ATTN_EVENTS`, six events / five phases),
+with the phases chosen to separate the three `pos`-scaling candidates from the kernel:
+
+```
+=== 8K (1 chunk) ===
+[diag] ATTN n=16 | proj + norm 456ms (4.2%)  rope (tables + htod) 13ms (0.1%)
+       kv cache append 7ms (0.1%)  attn kernel 1825ms (16.9%)  o_proj + mlp 1526ms (14.1%)
+       | total 3.83s of 10.79s (35.5%)
+=== 32K (4 chunks) ===
+[diag] ATTN n=64 | proj + norm 1830ms (2.8%)  rope (tables + htod) 45ms (0.1%)
+       kv cache append 29ms (0.0%)  attn kernel 29910ms (45.6%)  o_proj + mlp 6113ms (9.3%)
+       | total 37.93s of 65.59s (57.8%)
+```
+
+| phase | 8K (n=16) | 32K (n=64) | ratio (4x tokens) | shape |
+|---|---|---|---|---|
+| proj + norm | 456 ms | 1830 ms | **4.01x** | linear |
+| rope (tables + htod) | 13 ms | 45 ms | 3.5x | linear |
+| kv cache append | 7 ms | 29 ms | 4.1x | linear |
+| **attn kernel** | **1825 ms** | **29910 ms** | **16.4x** | **quadratic** |
+| o_proj + mlp | 1526 ms | 6113 ms | 4.01x | linear |
+| **total** | 3.83 s | **37.93 s** | **9.9x** | super-linear |
+
+**The attention kernel is 29,910 ms at 32K -- 45.6% of the entire prefill -- and it grows 16.4x for
+a 4x token increase, which is fully quadratic.** Every other phase in the attention layer is
+linear to within 3%, and so was every phase in the delta path. **This is the super-linear term. It
+was the attention kernel all along.**
+
+**And it refutes the estimate in the previous two sections.** That estimate took `attn-tile`'s
+65536-token figure of 7.50 s and scaled it by query-key pair count to get 1.17 s. **The measured
+value is 29.9 s -- 25x higher.** The scaling was invalid because the model's chunked attention does
+not cover the pair count that the arithmetic assumed: the kernel's cost per chunk grows with `pos`,
+so the total is quadratic in the number of chunks rather than proportional to the pair sum. **The
+isolated kernel and the model do NOT agree, which is exactly what the `GB10_ATTN_START_ZERO`
+comment said an earlier session had suspected.**
+
+**And that diagnostic now has a sharper meaning.** `GB10_ATTN_START_ZERO` makes the attention
+ignore the cached prefix -- but it did not change the timing by more than 1.4%. So the kernel's cost
+grows with `pos` **even when it does not read the keys it is skipping**. The growth is therefore
+not in the key *range* being traversed. It is in something about the kernel's launch geometry,
+tiling, or addressing that is a function of `pos`.
+
+**This also retracts the claim two sections ago that the objective's premise is wrong at 32K.** It
+is right at 32K: the quadratic term is the attention kernel, it is 45.6% of the prefill, and it is
+the only thing that grows faster than the token count. **The rebuttal was correct for the *linear*
+half of the gap and for the 8K end-to-end ratio, where the kernel is only 16.9% of the prefill --
+and it was wrong to generalise it to 32K.**
+
+**The search space is now one kernel and one question.** `attn_prefill` costs 1.8 s at 8K and 29.9 s
+at 32K. The `attn-tile` benchmark says the same kernel at 65536 tokens costs 7.50 s. **The model is
+4x slower than its own isolated kernel at comparable work, and the gap grows with `pos`.** That is
+the measurement to explain, and it is a single, bounded, already-instrumented question.

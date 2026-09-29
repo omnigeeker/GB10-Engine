@@ -306,6 +306,17 @@ fn prefill_shape(args: &Args) -> Result<()> {
                 println!("  [diag] PROJ CPU time {:.2}s vs GPU {:.2}s  -> CPU/GPU = {:.2}", cpu, tot / 1e3, cpu / (tot / 1e3));
             }
         }
+        {
+            let (ap, an) = gb10_model::layer::attn_event_snapshot();
+            if an > 0 {
+                let tot: f64 = ap.iter().sum();
+                let mut line = String::new();
+                for (i, name) in gb10_model::layer::ATTN_PHASES.iter().enumerate() {
+                    line.push_str(&format!("{} {:.0}ms ({:.1}%)  ", name, ap[i], 100.0 * ap[i] / (wall * 1e3)));
+                }
+                println!("  [diag] ATTN n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", an, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
+            }
+        }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
         if n > 0 {
             let tot: f64 = ph.iter().sum();

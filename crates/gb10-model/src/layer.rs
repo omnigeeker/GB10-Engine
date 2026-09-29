@@ -25,6 +25,32 @@ pub const DELTA_PHASES: [&str; 5] = [
     "proj out",
     "mlp",
 ];
+/// Per-phase GPU events for the full-attention layer's prefill, gated by
+/// `GB10_ATTN_EVENTS`. Six events bracket five phases, chosen because the
+/// per-chunk cost that grows with `pos` is not the attention's key range and
+/// the remaining candidates all scale with `pos` rather than with `t`.
+pub static ATTN_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
+pub const ATTN_PHASES: [&str; 5] = [
+    "proj + norm",
+    "rope (tables + htod)",
+    "kv cache append",
+    "attn kernel",
+    "o_proj + mlp",
+];
+pub fn attn_event_snapshot() -> ([f64; 5], usize) {
+    let mut v = ATTN_EVENTS.lock().unwrap();
+    let n = v.len();
+    let mut acc = [0.0f64; 5];
+    for ev in v.drain(..) {
+        for i in 0..5 {
+            if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
+                acc[i] += ms as f64;
+            }
+        }
+    }
+    (acc, n)
+}
+
 /// Per-projection GPU events for the DeltaNet `proj in` block, gated by
 /// `GB10_PROJ_EVENTS`. Five events bracket the four separate GEMM calls.
 pub static PROJ_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
@@ -618,6 +644,23 @@ impl FullAttnLayer {
         let hd = cfg.head_dim;
         let rotary = cfg.rotary_dim();
 
+        let aev_ctx = dev.stream().context().clone();
+        let mut aevs: Option<Vec<CudaEvent>> = None;
+        if std::env::var("GB10_ATTN_EVENTS").is_ok() {
+            let mut tv = Vec::with_capacity(6);
+            let mut ok = true;
+            for _ in 0..6 {
+                match aev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+                    Ok(e) => tv.push(e),
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            if ok { aevs = Some(tv); }
+        }
+        macro_rules! amark {
+            ($i:expr) => { if let Some(t) = &aevs { let _ = t[$i].record(dev.stream()); } };
+        }
+        amark!(0);
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
         self.q_proj.forward_prefill(dev, &sc.hidden, &mut sc.fused, t)?;
         self.k_proj.forward_prefill(dev, &sc.hidden, &mut sc.kb, t)?;
@@ -629,6 +672,7 @@ impl FullAttnLayer {
         ops.rmsnorm_zero_centered_inplace(dev, &mut sc.q, &self.q_norm, t * nh, hd, eps)?;
         ops.rmsnorm_zero_centered(dev, &sc.kb, &self.k_norm, &mut sc.kb_ln, t * nkv, hd, eps)?;
 
+        amark!(1);
         let pos = state.n_keys[seq];
         let (cos, sin) = rope_tables_range(cfg, pos, t);
         dev.stream().memcpy_htod(&cos, &mut sc.cos)?;
@@ -646,6 +690,7 @@ impl FullAttnLayer {
             t,
         )?;
 
+        amark!(2);
         let kv_base = seq * state.kv_stride();
         ops.kv_cache_append_batched(
             dev,
@@ -661,6 +706,7 @@ impl FullAttnLayer {
         )?;
         state.n_keys[seq] = pos + t;
 
+        amark!(3);
         let scale = 1.0 / (hd as f32).sqrt();
         // Attend over the whole cache: queries are the `t` new rows of `sc.q`,
         // and `k`/`v` are this sequence's slice of the cache (offset by
@@ -687,6 +733,7 @@ impl FullAttnLayer {
             kv_base,
         )?;
 
+        amark!(4);
         ops.sigmoid_mul(dev, &mut sc.attn, &sc.gate, t * nh * hd)?;
         self.o_proj.forward_prefill(dev, &sc.attn, &mut sc.proj, t)?;
 
@@ -695,6 +742,10 @@ impl FullAttnLayer {
         self.mlp
             .forward_prefill(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
+        amark!(5);
+        if let Some(t) = aevs {
+            ATTN_EVENTS.lock().unwrap().push(t);
+        }
         Ok(())
     }
 
