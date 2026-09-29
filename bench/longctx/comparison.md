@@ -7515,3 +7515,43 @@ attempt slower are now known to be avoidable, so that is the change to make:
 
 The full working set is `Qs` 12,672 + `Ks` 8,448 + `Vs` 8,192 + `S` 1,536 + `red` 288 +
 `Pf`/`Pflo` 1,536 = **32,672 B**, comfortably inside 51,200 B.
+
+### The P·V fragment mapping is proven -- the last unknown before wiring it in
+
+Both previous fragment mappings were proven standalone before being wired into the kernel, and both
+were then exact on the first attempt. The same was done for the P·V, in the orientation that keeps
+the A operand simple, and it passed **256/256 against a CPU reference on the first run**
+(`bench/longctx/probe_pv_mapping.cu`):
+
+```
+O[16 rows][16 dims] = P[16 rows][16 keys] . V[16 keys][16 dims]
+
+A = P    via ldmatrix.x4        on P[row][key]        (row-major, stride 16)
+B = V^T  via ldmatrix.x2.trans  on V[key][dim]        (NATURAL layout, stride 24)
+         lanes 0-7  -> &V[key=lane][n0]      (keys 0-7)
+         lanes 8-15 -> &V[key=lane][n0]      (keys 8-15)
+D = mma  -> O[m0+gid][n0+2*t4], +1, and rows m0+gid+8
+```
+
+`ldmatrix.trans` is what makes this work: `mma`'s B operand is column-major, so `O = P.V` needs
+`V^T`, and `ldmatrix.sync.aligned.m8n8.x2.trans` produces that transposed fragment **directly from
+V's natural `[key][dim]` layout**. That is the transpose pass that the first P·V attempt paid a
+barrier for, and it does not exist.
+
+So the complete, verified design for the tensor-core P·V is now on the table, with every unknown
+removed:
+
+| element | status |
+|---|---|
+| A fragment (P, `ldmatrix.x4`) | proven 128/128 in the score phase, in the kernel |
+| B fragment (V^T, `ldmatrix.x2.trans`) | **proven 256/256 standalone** |
+| mma + output fragment layout | **proven 256/256 standalone** |
+| `Vs` storage, no aliasing | fits: full working set 32,672 B of 51,200 B |
+| no extra barrier | V stages in the same phase as K |
+| `Pf` + `Pflo` two-term split | proven correct in the earlier attempt (1.0--1.6e-5) |
+| m-tile overlap (rows 8-15 twice) | harmless: both tiles compute identical values; write once |
+| accumulator registers | 8 mma-tiles/warp x 4 = 32 regs, vs `acc[24]` today |
+
+The remaining work is mechanical wiring, not discovery: stage V into `Vs`, have the softmax write
+`Pf`/`Pflo`, replace the 384-`fmaf` loop with 12 mma per warp per key tile, and write `out` from
+the fragment accumulators.
