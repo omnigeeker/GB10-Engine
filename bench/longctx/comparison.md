@@ -11536,3 +11536,72 @@ timing inference, so it can confirm both the current 2 and the post-change 4 dir
 
 **Recorded as the highest-value open lead: it is cheap, it is a one-line change, and if it holds it
 dissolves the constraint that every other path in this session has been fighting.**
+
+## The carveout hypothesis is refuted -- and "smem is binding" was wrong
+
+The previous entry proposed that the ~66 KB achievable budget was a discrete 64 KB L1/shared
+carveout step, and that requesting the maximum carveout would take the kernel from 2 to 4 blocks per
+SM. **Tested directly with a self-contained program, and it is wrong.**
+
+```cuda
+// stub with the real kernel's static shared memory: 22,944 B = Q 12,672 + K 8,448 + S 1,536 + red 288
+__global__ void __launch_bounds__(256) stub_22944(const float* in, float* out) {
+    __shared__ __half buf[11472];      // 22,944 bytes
+    ...
+}
+```
+
+```
+-- default carveout --
+  launch_bounds(256)   regs  10  smem 22944 B  -> 4 blocks/SM
+-- carveout MaxShared on launch_bounds(256) -> cudaSuccess --
+  launch_bounds(256)   regs  10  smem 22944 B  -> 4 blocks/SM
+```
+
+**22,944 B of shared memory already permits 4 blocks per SM, and the carveout attribute changes
+nothing** (it returns `cudaSuccess` and the occupancy is unchanged). Four blocks need
+`4 x 22944 = 91,776 B <= 102,400`, which fits the device limit without any carveout request. **So
+shared memory was never the binding constraint, and every "cut 811-944 B to reach 3 blocks"
+calculation in this session was solving the wrong problem.**
+
+### What the real constraint is
+
+An occupancy probe run earlier in the session -- whose output had been superseded in the narrative by
+the smem-based reasoning -- reported the actual kernel footprint:
+
+```
+attention kernel footprint: 96 regs x 256 thr, 24544 B smem
+  blocks/SM  by smem 4   by regs 2   by threads 6  -> binding = REGS
+  max smem for 2 blocks 51200 B, for 3 blocks 34133 B
+```
+
+**Registers are binding: 96 x 256 = 24,576 registers per block, and `65536 / 24576 = 2.67 -> 2
+blocks`.** Shared memory allows 4. **The narrative and the probe disagreed, and the probe was
+right.**
+
+### But capping registers does not help either
+
+The obvious fix is `__launch_bounds__(256, 3)`, which asks the compiler to fit three blocks (<= 85
+registers). **Applied and measured:**
+
+| 32K | attention kernel | prefill total |
+|---|---|---|
+| baseline | 22,879 ms | 58.42 s |
+| `__launch_bounds__(256, 3)` | **22,955 ms** | 58.10 s |
+
+**No change within noise, `attn-tile: OK`, change reverted.** That matches the session's earlier
+`-maxrregcount=80 -> 0%` result.
+
+**The two facts together are informative:** shared memory allows 4 blocks, registers allow 2, and
+forcing the register cap to reach 3 changes nothing. **Either the kernel is already achieving the
+occupancy that matters, or the register cap is paid for in spills that cancel the gain.** The
+occupancy probe's 2 -> 1 transition (0.82 -> 1.08 s) remains the one solid measurement: **halving
+concurrency costs 2.36x, so concurrency matters -- but it cannot be increased by the two levers
+tried, and the reason is now that neither smem nor the register cap is the operative limit.**
+
+**Note also that the build compiles to PTX and JITs at load**, so `ptxas -v`'s 80 registers is not
+what runs; the runtime reports 96. Any future register reasoning must use the runtime number.
+
+**This is the fifth path closed by measurement, and the second where the session's own recorded
+conclusion contradicted its own instrument.** The durable lesson is the one already written down:
+read the instrument, and check which constraint it is actually measuring.
