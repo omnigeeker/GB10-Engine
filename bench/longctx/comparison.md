@@ -9985,3 +9985,56 @@ if the stride is `max_position_embeddings` rather than the live context, the cac
 is spread over 262,144 rows and every K/V access lands on a different page -- which is exactly the
 kind of effect that costs an order of magnitude on a unified-memory part and shows up nowhere in a
 phase timer.
+
+## The cache-stride hypothesis is refuted, and the efficiency gap needs a direct measurement
+
+`kv_stride` is not `max_position_embeddings`:
+
+```rust
+pub fn kv_stride(&self) -> usize {
+    self.k_cache.len() / self.n_seq.max(1)
+}
+```
+
+**The stride is the cache length divided by the sequence count, so each sequence's K/V rows are
+contiguous rather than spread across 262,144 rows.** For `n_seq = 1`, `kv_base = 0` and the
+attention reads rows `0..pos+t` compactly. **The page-spread hypothesis is refuted, and with it the
+last cheap explanation.**
+
+**The efficiency gap itself needs restating, because it has now been computed three ways and I got
+it wrong twice.** Done as carefully as the arithmetic allows, treating the model's attention as the
+causal triangular sum it is:
+
+```
+model 32K, causal pairs (exact triangular sum)   5.369e8   FLOP 5.498e11  in 29.946 s -> 18.4 GFLOP/s
+attn-tile ntok=16384, causal pairs               1.342e8   FLOP 1.374e11  in  0.46 s -> 298.8 GFLOP/s
+```
+
+| | ns per query-key pair |
+|---|---|
+| the model, 32K | **55.78** |
+| `attn-tile`, ntok 16384 | **3.43** |
+| ratio | **16.3x** |
+
+**If the kernel is not in fact causal per query but attends the full window for every query -- which
+the isolated timing cannot distinguish -- both figures scale together and the ratio falls to about
+6.5x.** The gap is therefore **between 6x and 16x**, it is real either way, and the uncertainty is
+in the accounting rather than in the existence of the effect.
+
+**What is not in doubt, and what matters for the objective:**
+
+* the model's attention kernel costs **29.9 s at 32K, 45.6% of the prefill**;
+* `n_seq` does not cause it (refuted by direct measurement);
+* the cache stride does not cause it (refuted by reading the code);
+* the same kernel reaches **300 GFLOP/s** on the isolated benchmark and **18 GFLOP/s** in the model.
+
+**The next measurement is direct and does not require a hypothesis.** `attn-tile`'s long-span table
+tests `start = 10240, ntok = 2048` and `start = 20480, ntok = 2048`, but never the model's actual
+chunk shape: **`start = 24576, ntok = 8192`**, which is chunk 3 and the single largest attention
+call in the 32K prefill. Adding that row -- and the matching `start = 0, ntok = 8192` for chunk 0 --
+makes the isolated benchmark reproduce the model's workload exactly, with the same kernel, the same
+tiling and the same arguments. **If the isolated call is fast and the model's is slow, the
+difference is in the model's call path and can be found by reading it. If the isolated call is also
+slow, the kernel is simply 16x off its own best case and the kernel is the target after all.**
+
+**Either answer is decisive, and it is one row in a table that already exists.**
