@@ -6976,3 +6976,64 @@ precisely the resource `mma.sync` removes: its A and B fragments live in registe
 `ldmatrix`, so the tensor core consumes 16x8x16 MACs per instruction instead of one MAC per fma
 per shared load. The rewrite is therefore targeting the right resource rather than the most
 recently suspected one.
+
+### Increment 1 landed: the score matmul runs on tensor cores
+
+`attn_prefill_tiled_kernel`'s score loop is now `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`
+instead of scalar fma, verified and measured. Round 410 PASS, all gates green.
+
+**The fragment mapping was validated on its own before being wired in.** A standalone nvcc
+program computed `D[16][8] = Q[16][k] * K[8][k]^T` both ways and reported **128/128 exact**.
+For `row.col`, B is held column-major, i.e. *both* operands k-contiguous -- which is exactly
+`Q . K^T` here, because a key's `head_dim` is already contiguous in the global layout and in the
+staged tile. Getting this wrong would have cost several debug cycles inside a kernel that fails
+subtly, so it was worth proving in isolation:
+
+```
+A: a0 = {Qs[m0+gid][kt+c], Qs[m0+gid][kt+c+1]}, a1 = row gid+8, a2/a3 = same rows at kt+c+8
+B: b0 = {Ks[n0+gid][kt+c], Ks[n0+gid][kt+c+1]}, b1 = same at kt+c+8
+D: d0 = S[m0+gid][n0+t4*2], d1 = col+1, d2/d3 = row gid+8
+```
+
+**The bug that first attempt exposed is worth recording.** The staged rows are not a flat
+padded array: `PS = 2 * PADH` with `PADH = HD/2 + 2`, a layout built for the scalar kernel's
+`sub * PADH` addressing. Element `d >= HD/2` therefore lives at index `d + 2`, and slots 128 and
+129 are **never written**. Reading `kt + c` straight through pulls two slots of uninitialised
+shared memory into every score. The symptom was 256 NaN in the output -- exactly one head of one
+token -- plus a real numerical error at token 1. Because `kt` is a multiple of 16 and the halves
+split at 128, the gap lands exactly on a k-step boundary (the largest index below the split is
+`112 + 6 + 9 == 127`), so a single per-k-step `koff` is exact rather than approximate.
+
+Two other design points, both deliberate:
+
+* **The m-tiles overlap rather than padding Qs to 32 rows.** `mt=0` covers rows 0..15 and `mt=1`
+  covers rows 8..23, so rows 8..15 are written twice by different warps with identical values
+  from identical inputs. That is benign and keeps the shared tile at its current size; padding
+  would have cost 4 KB and possibly an occupancy step.
+* **Only four of the eight warps run the score mma**, one per (m-tile, n-tile) pair, with no
+  cross-warp reduction. The other four idle in that phase and rejoin for the softmax. Four warps
+  of mma is already far past the scalar loop, so there is nothing to win by splitting it.
+
+Result (`gb10-verify attn-tile`, reproducible across runs):
+
+| span | scalar score | mma score | speedup |
+|---|---|---|---|
+| 16384 | 0.88 s | **0.64 s** | 1.37x |
+| 65536 | 14.20 s | **10.38 s** | 1.37x |
+| 20480 + 2048 | 0.29 s | **0.23 s** | 1.26x |
+
+Correctness: `attn-tile: OK`, `rms rel` 1.0--1.6e-5 against the 1.2e-4 gate.
+
+> `attn-tile`'s timings need care. One run reported 30.45 s for the 65536 span where two
+> repeats then gave 10.38 s and 10.43 s, and the "long spans" section is not comparable with the
+> "cache sized for the real context" section below it, because the former pays for a cache sized
+> for the largest span. Only like-for-like spans in like-for-like sections are comparable, and a
+> number should be repeated before it is believed.
+
+The 1.37x is well short of the 11.2x target, and the arithmetic says why: the score loop was
+~80% of the per-tile cycles, so even making it free caps the win at 5x. The remainder is the
+**P·V accumulation** (scalar, `vr[]` in registers, 384 fma per thread per tile) and the
+softmax, neither of which this increment touched. That is increment 2, and its design is
+already pinned by the same fragment rule: P·V needs `A = P[16][BK]` in fp16 and
+`B_mem = V^T[HD][BK]` with k=BK contiguous, i.e. V staged transposed (256x16 fp16 = 8 KB), plus
+the online-softmax rescale applied to fp32 accumulator fragments.
