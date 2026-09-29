@@ -25,6 +25,24 @@ pub const DELTA_PHASES: [&str; 5] = [
     "proj out",
     "mlp",
 ];
+/// Per-projection GPU events for the DeltaNet `proj in` block, gated by
+/// `GB10_PROJ_EVENTS`. Five events bracket the four separate GEMM calls.
+pub static PROJ_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
+pub const PROJ_PHASES: [&str; 4] = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"];
+pub fn proj_event_snapshot() -> ([f64; 4], usize) {
+    let mut v = PROJ_EVENTS.lock().unwrap();
+    let n = v.len();
+    let mut acc = [0.0f64; 4];
+    for ev in v.drain(..) {
+        for i in 0..4 {
+            if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
+                acc[i] += ms as f64;
+            }
+        }
+    }
+    (acc, n)
+}
+
 /// Per-phase GPU events for the prefill MLP, gated by `GB10_MLP_EVENTS`.
 /// Five events bracket four phases. Same pattern as `DELTA_EVENTS`.
 pub static MLP_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
@@ -353,12 +371,36 @@ impl DeltaNetLayer {
         macro_rules! dmark {
             ($i:expr) => { if let Some(t) = &evs { let _ = t[$i].record(dev.stream()); } };
         }
+        let pev_ctx = dev.stream().context().clone();
+        let mut pevs: Option<Vec<CudaEvent>> = None;
+        if std::env::var("GB10_PROJ_EVENTS").is_ok() {
+            let mut tv = Vec::with_capacity(5);
+            let mut ok = true;
+            for _ in 0..5 {
+                match pev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+                    Ok(e) => tv.push(e),
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            if ok { pevs = Some(tv); }
+        }
+        macro_rules! pmark {
+            ($i:expr) => { if let Some(t) = &pevs { let _ = t[$i].record(dev.stream()); } };
+        }
+        pmark!(0);
         dmark!(0);
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
         self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
+        pmark!(1);
         self.in_proj_z.forward_prefill(dev, &sc.hidden, &mut sc.z, t)?;
+        pmark!(2);
         self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
+        pmark!(3);
         self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
+        pmark!(4);
+        if let Some(t) = pevs {
+            PROJ_EVENTS.lock().unwrap().push(t);
+        }
         dmark!(1);
 
         let conv_base = seq * state.conv_stride();

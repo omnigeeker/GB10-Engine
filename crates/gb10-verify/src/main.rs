@@ -293,6 +293,17 @@ fn prefill_shape(args: &Args) -> Result<()> {
                 println!("  [diag] MLP n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", mn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
             }
         }
+        {
+            let (pp, pn) = gb10_model::layer::proj_event_snapshot();
+            if pn > 0 {
+                let tot: f64 = pp.iter().sum();
+                let mut line = String::new();
+                for (i, name) in gb10_model::layer::PROJ_PHASES.iter().enumerate() {
+                    line.push_str(&format!("{} {:.0}ms ({:.1}%)  ", name, pp[i], 100.0 * pp[i] / (wall * 1e3)));
+                }
+                println!("  [diag] PROJ n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", pn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
+            }
+        }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
         if n > 0 {
             let tot: f64 = ph.iter().sum();

@@ -8696,3 +8696,60 @@ strictly less work than before.
 1.61x the bench pipeline predicted, and the same bench whose dequant stage turned out to be 6x
 overstated. The three MLP GEMMs are close to as good as they can be without fusing the SwiGLU into
 the gate/up GEMMs. **The MLP is not where the remaining slack is; `proj in` is.**
+
+## The `proj in` block, per call: two of the four projections cost 733 ms for 4.8 ms of arithmetic
+
+The `proj in` block was instrumented per call (`GB10_PROJ_EVENTS`, five events / four phases). At
+8192 tokens, 48 layers:
+
+```
+[diag] PROJ n=48 | in_proj_qkv 939ms (7.6%)  in_proj_z 490ms (4.0%)
+       in_proj_a 368ms (3.0%)  in_proj_b 365ms (3.0%)  | total 2.16s of 12.36s (17.5%)
+```
+
+| call | measured | its GEMM FLOPs | at 75 TFLOP/s | ratio |
+|---|---|---|---|---|
+| `in_proj_qkv` (n = 10240) | 939 ms | 5.5e13 | 552 ms | 1.70x |
+| `in_proj_z` (n = 6144) | 490 ms | 2.5e13 | 331 ms | 1.48x |
+| **`in_proj_a` (n = 48)** | **368 ms** | **1.2e11** | **2.4 ms** | **153x** |
+| **`in_proj_b` (n = 48)** | **365 ms** | **1.2e11** | **2.4 ms** | **152x** |
+
+**`in_proj_a` and `in_proj_b` together cost 733 ms -- 5.9% of the entire 8K prefill -- to do
+4.8 ms of arithmetic.** Each is a `[48, 5120]` weight, so each call is 7.7 ms per layer of which
+essentially none is the matrix multiply.
+
+**What is known about that 7.7 ms, and what is not.** The per-call pipeline for a `[48, 5120]`
+projection at `t = 8192` contains:
+
+* activation cast `f32 -> bf16` of `[8192, 5120]`: 4.2e7 elements, 252 MB of traffic at the measured
+  228 GB/s = **~1.1 ms** -- and it is the *same* activation for all four calls, so three of the four
+  casts are pure duplication;
+* weight dequantisation of `[48, 5120]`: 245,760 elements, well under 0.01 ms;
+* the GEMM itself: reads 84 MB of bf16 activation + 0.5 MB of weight, writes 1.6 MB = **~0.38 ms**;
+* epilogue `f32_scale` over `t*n = 393,216` elements: negligible.
+
+**That accounts for ~1.5 ms of the 7.7 ms. The other ~6 ms per call is not explained by anything
+this session has measured**, and it is 733 ms of the prefill -- over half of what the objective
+needs at 8K. Candidate causes, none yet tested: cuBLAS choosing a poor algorithm for `M = 48`
+(a very plausible failure mode for a GEMM whose M dimension is 48 and whose N is 8192); the
+per-call scratch lock; or launch and event overhead. **This is exactly the situation in which this
+session has been wrong seven times by assuming a cause, so it is recorded as an open question with
+its measurement, not as a diagnosis.**
+
+**Two fixes are now available and they are not equivalent:**
+
+1. **Hoist the activation cast.** All four projections consume the same `sc.hidden`, so one
+   `f32_to_bf16` would serve all four. Saves three of four casts: ~3.3 ms per layer, ~158 ms.
+   Bounded, cheap, and cannot regress the cold path.
+2. **Fuse the four projections into one GEMM** against a row-concatenated weight. The NVFP4 format
+   is row-major (`[N, K/2]` plus group scales `[N, K/16]`), so **concatenating along `n` is a row
+   memcpy of both buffers** and needs no requantisation. The obstacle is `scale2`, the per-tensor
+   scale, which is applied to the fp32 accumulator *after* the GEMM and therefore differs per
+   projection; a fused GEMM would need the four scales applied to row ranges of `y` instead of the
+   whole buffer. **Expected saving if it works: most of the 1276 ms of `proj in` overhead.**
+
+**A note on where this leaves the objective.** `in_proj_a` + `in_proj_b` alone are 733 ms against a
+1.44 s requirement, and they are 48-column matrices. The session began with the premise that the gap
+was in tensor-core prefill attention, spent its entire budget there, and the two largest measured
+items in the model are now **the MLP's three GEMMs at 45.1%** and **a pair of 48-column projections
+that cost 150x their arithmetic**.
