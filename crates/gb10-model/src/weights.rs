@@ -142,18 +142,33 @@ impl Linear {
         // grown, which is what removes the per-call allocator cost.
         let mut sc = dev.tc_scratch();
         if sc.w.as_ref().map_or(true, |b| b.len() < n * k) {
-            sc.w = Some(stream.alloc_zeros::<half::f16>(n * k)?);
+            sc.w = Some(stream.alloc_zeros::<bf16>(n * k)?);
         }
         if sc.x.as_ref().map_or(true, |b| b.len() < t * k) {
-            sc.x = Some(stream.alloc_zeros::<half::f16>(t * k)?);
+            sc.x = Some(stream.alloc_zeros::<bf16>(t * k)?);
+        }
+        if sc.x2.as_ref().map_or(true, |b| b.len() < t * k) {
+            sc.x2 = Some(stream.alloc_zeros::<bf16>(t * k)?);
+        }
+        // A literal 1.0, passed to the fp8 dequant so it does not fold the
+        // per-tensor scale into the bf16 weights (see below).
+        if sc.one.is_none() {
+            let mut one = stream.alloc_zeros::<f32>(1)?;
+            dev.stream().memcpy_htod(&[1.0f32], &mut one)?;
+            sc.one = Some(one);
         }
         // Named with an `s` prefix because `x` and `y` are already the fp32
         // input and output of this function.
         //
-        // There is no longer a bf16 `sc.y`: the GEMM writes fp32 directly into
-        // the caller's `y`, so the accumulator is never rounded on the way out.
-        let TcScratch { w: sw, x: sx, .. } = &mut *sc;
-        let (wb, xb) = (sw.as_mut().unwrap(), sx.as_mut().unwrap());
+        // There is no `sc.y`: the GEMM writes fp32 directly into the caller's
+        // `y`, so the accumulator is never rounded on the way out.
+        let TcScratch { w: sw, x: sx, x2: sx2, one, .. } = &mut *sc;
+        let (wb, xhi, xlo) = (
+            sw.as_mut().unwrap(),
+            sx.as_mut().unwrap(),
+            sx2.as_mut().unwrap(),
+        );
+        let one = one.as_ref().unwrap();
 
         // Gated: the server shares this path and only `gemm_event_snapshot`
         // drains the Vec, so unconditional recording would retain events for
@@ -182,27 +197,43 @@ impl Linear {
         mark!(0);
         match &self.data {
             LinearData::NvFp4 { w: qw, wscale, .. } => {
-                kern.dequant_nvfp4_to_f16(dev, qw, wscale, wb, n, k)?;
+                kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
             }
-            LinearData::Fp8 { w: qw, scale } => {
-                kern.dequant_fp8_to_f16(dev, qw, scale, wb, n, k)?;
+            LinearData::Fp8 { w: qw, .. } => {
+                // Deliberately dequantise with a 1.0 scale and apply the real
+                // per-tensor scale to the fp32 accumulator below. fp8's scale is
+                // a single fp32 constant, so folding it into the bf16 weight
+                // rounds every weight to 8 mantissa bits for no reason -- the
+                // reference (`stage_wtile_fp8`) applies it in fp32 during
+                // staging. These are the attention projections.
+                kern.dequant_fp8_to_bf16(dev, qw, one, wb, n, k)?;
             }
             LinearData::Bf16 { w: qw } => {
-                kern.u16_to_f16(dev, qw, wb, n * k)?;
+                kern.u16_to_bf16(dev, qw, wb, n * k)?;
             }
         }
         mark!(1);
-        kern.f32_to_f16(dev, x, xb, t * k)?;
+        // Split the activation instead of rounding it to one 16-bit format.
+        // bf16 alone (8 mantissa bits) and fp16 alone (10) each flipped the
+        // long-context greedy argmax; hi+lo carries ~16, and the weights are
+        // untouched because 4-bit NVFP4 / FP8 is already exact in bf16.
+        kern.f32_split_bf16(dev, x, xhi, xlo, t * k)?;
         mark!(2);
-        // fp32 straight into the caller's `y`: cuBLAS still accumulates in
-        // fp32, but the result is no longer rounded to bf16 before we see it.
-        kern.cublas_gemm_f16_f32(dev, wb, xb, y, n, k, t)?;
+        // Two GEMMs, both accumulating in fp32 straight into the caller's `y`.
+        // The first starts from zero; the second accumulates the residual term
+        // on top, so the result is W*(hi + lo) with one rounding at the end.
+        kern.cublas_gemm_bf16_f32(dev, wb, xhi, y, n, k, t, 0.0)?;
+        kern.cublas_gemm_bf16_f32(dev, wb, xlo, y, n, k, t, 1.0)?;
         mark!(3);
 
-        // Only NVFP4 defers a per-tensor scale; every other dtype folded its
-        // scale into the weights during the dequant above, so it is done.
-        if let LinearData::NvFp4 { scale2, .. } = &self.data {
-            kern.f32_scale(dev, y, scale2, t * n)?;
+        // The per-tensor scales are applied to the fp32 accumulator, never
+        // folded into a 16-bit weight: NVFP4's `s2` and fp8's `scale` both are
+        // single constants, and the reference applies both in fp32. `bf16` rows
+        // have no scale and are already done.
+        match &self.data {
+            LinearData::NvFp4 { scale2, .. } => kern.f32_scale(dev, y, scale2, t * n)?,
+            LinearData::Fp8 { scale, .. } => kern.f32_scale(dev, y, scale, t * n)?,
+            LinearData::Bf16 { .. } => {}
         }
         mark!(4);
         if let Some(t) = evs.take() {

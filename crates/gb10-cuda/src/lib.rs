@@ -61,13 +61,15 @@ pub type Result<T> = std::result::Result<T, CudaError>;
 /// included. Held here so each buffer is allocated once and then only grown.
 #[derive(Default)]
 pub struct TcScratch {
-    /// Dequantised weights, `[n, k]`, fp16. See `cublas_gemm_f16_f32`.
-    pub w: Option<CudaSlice<half::f16>>,
-    /// fp16 activations, `[t, k]`.
-    ///
-    /// fp16 and not bf16: bf16's 8 mantissa bits were not enough for the
-    /// long-context greedy argmax. See `cublas_gemm_bf16_f16_f32`.
-    pub x: Option<CudaSlice<half::f16>>,
+    /// Dequantised weights, `[n, k]`, bf16. Lossless for the 4-bit NVFP4 / FP8
+    /// weights, so this operand never needs splitting.
+    pub w: Option<CudaSlice<half::bf16>>,
+    /// Activations `[t, k]`, bf16 **high** part.
+    pub x: Option<CudaSlice<half::bf16>>,
+    /// Activations `[t, k]`, bf16 **low** (residual) part. Together with `x` this
+    /// carries ~16 mantissa bits, which is what the long-context greedy argmax
+    /// needs; see `forward_prefill_tensor_core`.
+    pub x2: Option<CudaSlice<half::bf16>>,
     /// bf16 GEMM output, `[t, n]`.
     pub y: Option<CudaSlice<half::bf16>>,
     /// One fp32 element, passed to the epilogue when there is no `s2` to apply.

@@ -56,6 +56,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "dequant_fp8_to_bf16_kernel",
     "f32_to_bf16_kernel",
     "f32_to_f16_kernel",
+    "f32_split_bf16_kernel",
     "bf16_to_f32_scaled_kernel",
     "f32_scale_kernel",
     "u16_to_bf16_kernel",
@@ -116,6 +117,7 @@ pub struct Ops {
     dequant_fp8_to_bf16: CudaFunction,
     f32_to_bf16: CudaFunction,
     f32_to_f16: CudaFunction,
+    f32_split_bf16: CudaFunction,
     bf16_to_f32_scaled: CudaFunction,
     f32_scale: CudaFunction,
     u16_to_bf16: CudaFunction,
@@ -186,6 +188,7 @@ impl Ops {
             dequant_fp8_to_bf16: take(map, "dequant_fp8_to_bf16_kernel")?,
             f32_to_bf16: take(map, "f32_to_bf16_kernel")?,
             f32_to_f16: take(map, "f32_to_f16_kernel")?,
+            f32_split_bf16: take(map, "f32_split_bf16_kernel")?,
             bf16_to_f32_scaled: take(map, "bf16_to_f32_scaled_kernel")?,
             f32_scale: take(map, "f32_scale_kernel")?,
             u16_to_bf16: take(map, "u16_to_bf16_kernel")?,
@@ -1058,6 +1061,42 @@ impl Ops {
         Ok(())
     }
 
+    /// Split `n` fp32 values into a bf16 high part and a bf16 low part, so
+    /// `hi + lo` carries ~16 mantissa bits.
+    ///
+    /// This is the activation operand of the split-precision prefill GEMM. bf16
+    /// (8 bits) and fp16 (10 bits) each broke this model on their own; see
+    /// `forward_prefill_tensor_core`.
+    pub fn f32_split_bf16(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        hi: &mut CudaSlice<half::bf16>,
+        lo: &mut CudaSlice<half::bf16>,
+        n: usize,
+    ) -> Result<()> {
+        need(
+            x.len() >= n && hi.len() >= n && lo.len() >= n,
+            "f32_split_bf16",
+        )?;
+        let n_i = n as i32;
+        let grid = cdiv(n, 256).min(65535) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.f32_split_bf16)
+                .arg(x)
+                .arg(hi)
+                .arg(lo)
+                .arg(&n_i)
+                .launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     /// Cast `n` fp32 values to fp16 (round to nearest).
     ///
     /// The activation operand of the tensor-core prefill GEMM. fp16 rather than
@@ -1209,6 +1248,7 @@ impl Ops {
         n: usize,
         k: usize,
         t: usize,
+        beta_in: f32,
     ) -> Result<()> {
         use cudarc::cublas::sys::{
             cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
@@ -1219,7 +1259,7 @@ impl Ops {
             "cublas_gemm_bf16_f32",
         )?;
         let alpha = 1.0f32;
-        let beta = 0.0f32;
+        let beta = beta_in;
         let status = unsafe {
             cublasGemmEx(
                 *dev.blas().handle(),

@@ -152,3 +152,40 @@ The 2.48x was bought with this bug, so it is gone: the 32 K class is ~307 s
 against llama.cpp's ~70 s (~4.4x), where the scorecard recorded 1.80x with the
 broken GEMM in place. The lever that can get it back without changing the
 numerics is the `mma.sync` prefill attention, which keeps fp32 accumulation.
+
+## Why the speed cannot simply be bought back from the GEMM
+
+The obvious response to "the fp32 GEMM is 2.48x slower" is to find a
+reduced-precision GEMM that is numerically good enough. Five operand formats
+were tried, all behind the same opt-in flag, all measured on the same
+958-token templated prompt:
+
+| operands | effective mantissa bits | first generated token |
+|---|---|---|
+| bf16 (the original, default-on regression) | 8 | **EOS** — nothing generated |
+| fp16, fp32 accumulator, fp32 output | 10 | **EOS** |
+| bf16 hi+lo split (split-precision) | ~16 | **EOS** |
+| bf16 hi+lo split, fp8 scale moved to the accumulator | ~16 | **EOS** |
+| **fp32 CUDA core (the reference)** | **24** | `"We need answer user's request..."` |
+
+Each step was a real improvement in accuracy and each one still flipped the
+argmax. The fp8 fix in particular is a genuine bug that was fixed along the way:
+the fp8 per-tensor scale is a single fp32 constant, and the tensor-core path was
+folding it into the bf16 weights -- rounding every attention projection to 8
+mantissa bits -- where the reference applies it to the fp32 accumulator. That is
+now applied on the accumulator, like NVFP4's `s2`.
+
+So the requirement is not a few more bits: 16 bits of activation precision is
+still not enough where 24 works. That is consistent with the prompt sitting on a
+genuine near-tie at the first generated position -- the fp32 path is *itself* not
+deterministic here (1 of 7 repeats diverged once) -- and it means **no
+reduced-precision GEMM is going to reproduce the fp32 path's behaviour on this
+model.** The weights are already lossless in bf16 (4-bit NVFP4 / FP8), so the
+loss is entirely in the activation, and the activation needs effectively full
+precision.
+
+That is why the remaining lever for cold TTFT is the `mma.sync` **prefill
+attention**, not the GEMM: attention keeps an fp32 softmax and fp32 accumulation,
+so it can be made much faster without touching the numerics that this model is
+sensitive to. The tensor-core GEMM code is kept behind `GB10_TC_GEMM=1` as a
+record of the search, not as a candidate.

@@ -661,3 +661,33 @@ extern "C" __global__ void u16_to_f16_kernel(const uint16_t* __restrict__ x,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __ushort_as_half(__ldg(x + i));
 }
+
+// ---- fp32 -> bf16 hi/lo split (split-precision activation) ---------------
+//
+// bf16 operands broke this model (8 mantissa bits; see
+// `forward_prefill_tensor_core`) and fp16 operands (10 bits) still broke it, so
+// the activation needs more precision than a single 16-bit format carries.
+//
+// Splitting restores it: `hi` is the bf16 rounding of x and `lo` is the bf16
+// rounding of the residual, so `hi + lo` carries ~16 mantissa bits -- six more
+// than fp16, and the residual is exact enough that the pair is close to fp32 for
+// this purpose. The GEMM is then run twice, W(hi) + W(lo), accumulating into the
+// same fp32 output, so the weights stay a single bf16 operand (they are 4-bit
+// NVFP4 / FP8 and therefore already lossless in bf16) and only the activation is
+// doubled.
+//
+// This costs one extra GEMM on the tensor cores instead of the ~11x slower fp32
+// CUDA-core GEMM, which is the point: it buys the precision back without giving
+// back the speed.
+extern "C" __global__ void f32_split_bf16_kernel(const float* __restrict__ x,
+                                                 __nv_bfloat16* __restrict__ hi,
+                                                 __nv_bfloat16* __restrict__ lo,
+                                                 int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = __ldg(x + i);
+        const __nv_bfloat16 h = __float2bfloat16_rn(v);
+        hi[i] = h;
+        lo[i] = __float2bfloat16_rn(v - __bfloat162float(h));
+    }
+}
