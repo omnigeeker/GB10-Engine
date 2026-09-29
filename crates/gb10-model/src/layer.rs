@@ -29,6 +29,15 @@ pub const DELTA_PHASES: [&str; 5] = [
 /// `GB10_PROJ_EVENTS`. Five events bracket the four separate GEMM calls.
 pub static PROJ_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
 pub const PROJ_PHASES: [&str; 4] = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"];
+/// CPU wall-clock nanoseconds spent inside the four `proj in` calls, gated by
+/// `GB10_PROJ_EVENTS`. If the GPU phase time is enqueue-bound rather than
+/// work-bound, this will be comparable to the GPU elapsed time: the GPU is
+/// idle waiting for the CPU to submit, so the event delta measures the wait.
+pub static PROJ_CPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn proj_cpu_snapshot() -> f64 {
+    PROJ_CPU_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+}
+
 pub fn proj_event_snapshot() -> ([f64; 4], usize) {
     let mut v = PROJ_EVENTS.lock().unwrap();
     let n = v.len();
@@ -389,6 +398,7 @@ impl DeltaNetLayer {
         }
         pmark!(0);
         dmark!(0);
+        let cpu_t0 = if pevs.is_some() { Some(std::time::Instant::now()) } else { None };
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
         self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
         pmark!(1);
@@ -398,6 +408,9 @@ impl DeltaNetLayer {
         pmark!(3);
         self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
         pmark!(4);
+        if let Some(t0) = cpu_t0 {
+            PROJ_CPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(t) = pevs {
             PROJ_EVENTS.lock().unwrap().push(t);
         }

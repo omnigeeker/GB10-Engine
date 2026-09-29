@@ -8901,3 +8901,66 @@ less and the 733 ms is somewhere that has not yet been looked at.
 value of the last two rounds is that the search space is no longer "somewhere in the prefill" but
 "either enqueue overhead in the `proj in` phase, or a cost that the standalone benchmark cannot
 see."
+
+## The enqueue hypothesis is refuted too: CPU 0.12 s against GPU 2.21 s
+
+The enqueue explanation made a specific, cheap prediction: if the `proj in` phase were launch- or
+enqueue-bound, the CPU time spent submitting those four calls would be comparable to the GPU
+elapsed time, because the GPU would be idle waiting for the CPU. Both were measured, with a CPU
+wall-clock timer around the same four calls that the CUDA events already bracket:
+
+```
+[diag] PROJ n=48 | in_proj_qkv 961ms (7.7%)  in_proj_z 515ms (4.1%)
+       in_proj_a 367ms (2.9%)  in_proj_b 366ms (2.9%)  | total 2.21s of 12.48s (17.7%)
+[diag] PROJ CPU time 0.12s vs GPU 2.21s  -> CPU/GPU = 0.06
+```
+
+**The CPU spends 0.12 s submitting work that the GPU spends 2.21 s executing -- the CPU is 18x
+faster than the GPU on this phase.** The GPU is not starved, the launches are not the bottleneck,
+and the event deltas are measuring real GPU execution. **Ninth refuted hypothesis.**
+
+**So the GPU genuinely spends 2.21 s inside `proj in`, and every candidate cause for it has now been
+eliminated:**
+
+| hypothesis | how it was refuted |
+|---|---|
+| fixed per-call cost | phase scales 3.88x with `t` (4x tokens) |
+| per-call cuBLAS algorithm choice | handle is cached, parameters verified correct |
+| scratch `Mutex` contention | would be a fixed cost, and it is not |
+| launch overhead | CPU/GPU = 0.06 |
+| activation cast | ~1.1 ms of the 7.6 ms per call, bandwidth-bound standalone |
+| weight dequantisation | fixed per call and tiny; cannot scale with `t` |
+| split-K on `m = 48` | swapped orientation is not faster (0.48 vs 0.44 ms) |
+| the GEMM itself | 0.44 ms standalone at this exact shape |
+| enqueue starvation | CPU 0.12 s against GPU 2.21 s |
+
+**What that leaves is a single, consistent explanation that has been visible in the numbers since
+the MLP was instrumented and has not been named: every phase in the model is uniformly ~1.4x to
+2.5x slower than its own warm, standalone kernel measurement.**
+
+* MLP: 1.35x its GEMM FLOPs at the measured peak.
+* `proj in`: 2.44x.
+* `proj out`: 1.97x.
+* `in_proj_a` alone: 7.6 ms in the model against 0.44 ms standalone -- **17x**.
+
+**The difference between the two kinds of measurement is the cache, and it is not subtle.** Every
+standalone figure in this document is a back-to-back repetition of one kernel on buffers that stay
+resident. In the model, each of these GEMMs runs once per layer with the layer's other work -- and
+178 MB of MLP weights -- streaming through between consecutive uses of the same buffer. **The warm
+measurement is the lower bound; the model pays the cold cost, and the gap is the cache, not the
+kernel.**
+
+**This is the first explanation that is consistent with all nine refutations rather than surviving
+by elimination**, and it has an immediate consequence for the objective: **if the model's kernels
+are cold, then the lever is not arithmetic and not launch count -- it is locality.** The
+`GB10_WEIGHT_CACHE` experiment two rounds ago is the same phenomenon seen from the other side: it
+tried to keep a dequantised weight resident, and it *did* help in steady state (2.2%) while costing
+1.71 s of cold start. **A cache that is filled lazily and evicted deliberately is a different design
+from a cache that is filled eagerly for every `Linear` at once.**
+
+**What is not yet established, and must be before this is called a finding:** the cold-versus-warm
+claim has not been measured directly. The test is straightforward and cheap -- time a single kernel
+back to back (warm) and then time it again after streaming an MLP-sized buffer through the device
+between iterations (cold), and compare. **Until that is run, this is the tenth hypothesis, not the
+first finding.** But it is the first one that is consistent with every measurement already taken
+rather than with a subset of them.

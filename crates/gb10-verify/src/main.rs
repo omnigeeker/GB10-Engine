@@ -302,6 +302,8 @@ fn prefill_shape(args: &Args) -> Result<()> {
                     line.push_str(&format!("{} {:.0}ms ({:.1}%)  ", name, pp[i], 100.0 * pp[i] / (wall * 1e3)));
                 }
                 println!("  [diag] PROJ n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", pn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
+                let cpu = gb10_model::layer::proj_cpu_snapshot();
+                println!("  [diag] PROJ CPU time {:.2}s vs GPU {:.2}s  -> CPU/GPU = {:.2}", cpu, tot / 1e3, cpu / (tot / 1e3));
             }
         }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
