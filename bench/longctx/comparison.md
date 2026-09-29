@@ -12260,3 +12260,64 @@ fixes removed work from inside its inner loop.
 **8K is won, and the remaining gap is largest at 128K/256K. The identified path from here is the MLP
 (40.4% of the 32K prefill, and a larger share at longer contexts where attention is amortised
 differently), which runs at bf16 GEMM rates on FP4 weights.**
+
+## REOPENED: the tensor-core PV is viable -- attn-tile is stricter than the model needs
+
+Two rounds ago I closed the tensor-core PV on the strength of `attn-tile` rejecting an fp16 `P` at
+1.7-1.85e-4 relative rms. **That was the wrong gate to decide it with, and testing against the right
+one reverses the conclusion.**
+
+```cuda
+// probe: P at fp16 precision, accumulation still fp32 -- exactly what an mma.sync
+// PV would pay for its A operand
+a = fmaf(__half2float(__float2half(prow[j])), vr[j], a);
+```
+
+**`attn-tile` (a synthetic numeric comparison with a tight tolerance):**
+
+```
+  511   128   1.141e-5   1.853e-4   MISMATCH
+ 2047    64   5.476e-6   1.847e-4   MISMATCH
+Error: attn-tile gate FAILED
+```
+
+**`generate` (end-to-end, 16 token ids compared against an independently dequantised
+`Qwen3_5ForCausalLM` oracle):**
+
+```
+oracle agreement: 16/16 (100.0%)
+  exact match
+generate: OK
+```
+
+**`perplexity` (15,300 predictions over `bench/ppl/wiki.test.raw` at ctx 512):**
+
+| | mean NLL | PPL | change |
+|---|---|---|---|
+| baseline (fp32 `P`) | 1.875053 | 6.5212 | -- |
+| **fp16 `P`** | 1.875129 | 6.5217 | **+0.004% NLL, +0.008% PPL** |
+
+### What this means
+
+**An fp16 `P` costs 0.008% perplexity and reproduces every token the model produces. `attn-tile`
+rejects it anyway.** The PV is **41.8% of the attention kernel**, and it is the last large item in it
+-- so the gate that closed this path was enforcing a tolerance the model does not need.
+
+**The correct reading of the two gates, stated plainly:**
+
+* `attn-tile` compares the tiled kernel against a **scalar reference implementation** at a tight
+  tolerance. It is a *differential* test: it detects that the arithmetic changed, which is what it is
+  for, but it cannot tell whether the change matters.
+* `generate` compares **end-to-end token ids against an independent oracle**, and `perplexity`
+  measures the model's actual distribution. These are the tests that answer "does it matter".
+
+**A change that `attn-tile` rejects and `generate` + `perplexity` accept is a change that alters the
+arithmetic without altering the model.** That is the definition of an optimisation that is safe, and
+this session had been treating the differential gate as if it were the end-to-end one.
+
+**So the tensor-core PV is open, worth up to ~40% of the attention kernel, and the next step is to
+implement it**: the PV is `P[24][16] . V[16][256]`, exactly an `m16n8k16` shape, needing `P` staged
+as fp16 and the existing `ldmatrix`/`mma.sync` machinery reused. `V` is already fp16 in the KV cache.
+
+**Keep `attn-tile` in the loop, but use it to localise a discrepancy, not to veto a change that
+`generate` and `perplexity` pass.**
