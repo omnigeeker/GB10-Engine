@@ -8058,3 +8058,58 @@ measurements were *internally consistent* -- two builds were always compared und
 -- so the direction of every finding stands. But the magnitudes were wrong by a factor that nobody
 had checked, and the check was one `sed` away for many rounds. **When a measurement is the
 instrument, the instrument has to be read, not assumed.**
+
+## THE ATTENTION KERNEL CANNOT ACHIEVE THIS OBJECTIVE -- the premise is wrong
+
+The clean timing harness made it possible to price attention honestly for the first time, and the
+result invalidates the assumption the whole optimisation program was built on.
+
+Per-layer attention cost, from the fixed harness (0.46 s at 16384, quadratic):
+
+| length | tokens | per-layer attention | x 16 full-attention layers |
+|---|---|---|---|
+| 8K | 7,109 | 0.09 s | **1.4 s** |
+| 32K | 32,530 | 1.81 s | **29.0 s** |
+| 128K | 130,832 | 29.33 s | **469.3 s** |
+| 256K | 254,274 | 110.80 s | **1,772.7 s** |
+
+The model has 64 layers, of which 16 are full attention (the other 48 are Gated-DeltaNet, which is
+linear in `T`). Subtracting the attention time from gb10's measured end-to-end prefill:
+
+| length | gb10 prefill | attention (16L) | attention share | **gb10 NON-attention** | llama.cpp total | verdict |
+|---|---|---|---|---|---|---|
+| 8K | 13.41 s | 1.4 s | 10.3% | **12.0 s** | 10.91 s | **EXCEEDS** |
+| 32K | 83.86 s | 29.0 s | 34.6% | **54.8 s** | 52.72 s | **EXCEEDS** |
+| 128K | 804.92 s | 469.3 s | 58.3% | **335.6 s** | 273.86 s | **EXCEEDS** |
+| 256K | 2712.43 s | 1,772.7 s | 65.4% | **939.7 s** | 702.72 s | **EXCEEDS** |
+
+**At every one of the four lengths, gb10's non-attention prefill alone is already slower than
+llama.cpp's ENTIRE prefill.** Setting the attention kernel to *zero* would still leave gb10 behind
+llama.cpp at 8K, 32K, 128K and 256K. The tensor-core prefill-attention program -- the program this
+session has spent its entire budget on -- **could not have achieved the objective even if every
+optimisation in it had succeeded perfectly.**
+
+**What went wrong, and it is a modelling error, not a measurement error.** The requirement figures
+in this document were derived by fitting `gb10 prefill = a*T + b*T^2` to end-to-end timings and then
+attributing the whole quadratic term `b*T^2` to attention. That attribution was never justified: the
+quadratic term of the *total* is not the attention term. It happened to look plausible because
+attention is also quadratic, and because at long context attention really does dominate -- but at
+8K it is **10%**, not the 79% the fit implied, and the fit's `b*T^2` at 8K (10.59 s) is eight times
+the actual attention time (1.4 s).
+
+**Where the time actually goes.** The non-attention prefill is 12 s at 8K and 940 s at 256K -- 90%
+of the total at 8K and 35% at 256K. That is the GEMM path (MIXED_PRECISION NVFP4/FP8/BF16), the 48
+Gated-DeltaNet layers, and the norms. At 32K it is 54.8 s against llama.cpp's 52.72 s for the whole
+prefill, so gb10's GEMM-and-DeltaNet path is running at roughly llama.cpp's *total* prefill speed
+while llama.cpp is also paying for its own attention. **The optimisation target is the GEMM path,
+not attention.**
+
+**What this means for the objective as written.** The stated requirement was "prefill attention
+speedup of 1.29x / 5.98x / 8.40x / 8.82x". No attention speedup, however large, satisfies the
+objective. The requirement as written is unsatisfiable, and the work delivered against it (1.58x on
+the attention kernel, in tree and verified) is real but cannot reach the goal on its own.
+
+**This also re-prices everything measured this session.** The six backfires, the 22% P·V share, the
+10% K staging -- all were measured on a kernel that is 10-65% of the prefill, not the 79-99% the
+program assumed. That does not make them wrong; it makes them **optimisations of a minority of the
+runtime**, which is why none of them moved the end-to-end numbers enough to matter.
