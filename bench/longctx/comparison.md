@@ -9482,3 +9482,50 @@ attention kernel entirely would reach parity at 32K and no further.
 component wins, because two independent halves each need to improve. The objective's "attention
 only" path cannot reach a win at 32K, and neither can the linear-work path this session has been
 mining. **Both are required.**
+
+## The attention kernel is ~2% of the 32K prefill -- the super-linear term is not the kernel
+
+The previous section estimated the attention kernel at 32K as "~1.4 s at 8K, so ~22 s at 32K" by
+assuming it quadruples. **That assumption is wrong, and this session's own data says so.**
+
+`attn-tile` measures the kernel standalone: **65536 tokens in 7.50 s.** But the model does not
+attend over 65536 keys in one shot. `prefill-shape` chunks at 8192, so the 32K prefill runs four
+chunks, and chunk `k` attends over `8192 x (k+1)` query-key pairs:
+
+```
+8192 x (8192 + 16384 + 24576 + 32768) = 6.7e8 pairs
+```
+
+against `65536 x 65536 = 4.3e9` pairs for the single-shot 65536 measurement. **So the model's 32K
+attention kernel is about `7.50 x 6.7e8 / 4.3e9 = 1.17 s` -- 1.8% of the 65.04 s prefill.**
+
+**And the layer bracket says the attention layers are 38.08 s.** Subtracting the kernel leaves
+**~36.9 s of non-kernel work in 16 attention layers over 4 chunks** -- 58% of the entire prefill,
+in work that is not the attention kernel.
+
+**So the objective's premise is wrong at 32K as well as at 8K.** It is not that the gap is
+attention *attention*; the attention layers are indeed the super-linear term (9.27x for 4x
+tokens), but **the kernel inside them is ~2% of the prefill.** Whatever is growing
+super-linearly lives in the attention layers' *other* work: their projections, their norms, their
+MLP, and -- the one thing in that list that has any reason to grow with context -- **their
+interaction with the K/V cache, which grows with the cumulative token count.**
+
+**That is a concrete, falsifiable hypothesis with a specific mechanism, and it is the first one
+this session has had for the super-linear term.** With chunked prefill, chunk `k` must write its
+own 8192 tokens of K and V into a cache that already holds `8192k` tokens, and read all of it back.
+If any part of that path re-reads or re-writes the whole cache per chunk, the cost is quadratic in
+the number of chunks while every phase this session has instrumented stays linear -- **which is
+exactly the pattern in the table two sections above.**
+
+**It has not been measured, and it is not being called a finding.** What *is* established:
+
+* every instrumented sub-phase is linear or sub-linear (3.18x to 4.10x for 4x tokens);
+* the attention layers are super-linear (9.27x) and are 58.5% of the 32K prefill;
+* the attention kernel inside them is ~1.17 s, or 1.8%;
+* therefore **~36.9 s -- 58% of the 32K prefill -- is inside the attention layers and outside the
+  kernel**, and nothing this session has instrumented accounts for it.
+
+**The next measurement is inside the attention layer**, and it is the same instrument that has now
+worked three times: bracket the attention layer's own phases -- q/k/v/o projections, the norm
+before attention, the kernel, and the cache read/write -- and see which one is super-linear. That
+is where the 36.9 s is, and it is 58% of the prefill that has never been attributed.
