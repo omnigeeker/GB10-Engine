@@ -9084,3 +9084,69 @@ identified item that is both measured and removable.**
 0.60 ms cold standalone + ~1.8 ms cast = ~2.4 ms accounted. **The brackets are validated, so those
 ~5 ms are real GPU work -- but nothing measured so far names them.** The difference between this
 statement and the previous round's is that the instrument has now been checked rather than assumed.
+
+## FOUND IT: `in_proj_a`/`in_proj_b` never take the GEMM path at all
+
+The answer was in the source the entire time, at `crates/gb10-model/src/weights.rs:307`, in the
+first line of the dispatch:
+
+```rust
+// The GEMM tiles N in blocks of 64. Below that the whole grid collapses
+// to a single block on a single SM: `in_proj_a/b` are [48, 5120], which
+// measured 73.5 ms that way against 16.5 ms for the batched GEMV. For a
+// matrix this small, re-reading it per token is far cheaper than
+// starving 47 of the 48 SMs.
+if self.n < 256 || t <= 16 {
+    return self.forward(dev, x, y, t);      // <-- batched GEMV
+}
+// Tensor-core prefill GEMM, on by default.
+```
+
+**`in_proj_a` and `in_proj_b` have `n = 48`. `48 < 256`. So they *always* take the batched GEMV
+path -- at every sequence length, including 8192, where the GEMV re-reads its weight once per
+token.** No GEMM is ever launched for them.
+
+**This is why every hypothesis failed.** The last four rounds benchmarked, evicted, and reasoned
+about a tensor-core GEMM that the model never calls for these two projections. The standalone
+`in_proj_a` figure of 0.44 ms was a correct measurement of a kernel that is not in the path. The
+`M = 48` split-K question, the swapped orientation, the cold/warm eviction test -- all of them
+measured the wrong kernel, and none of them could have explained the model.
+
+**And it explains the 7.6 ms exactly.** The batched GEMV streams the weight once per token:
+`in_proj_a`'s weight is `48 x 5120 x 2 B = 0.49 MB`; over 8192 tokens that is **4.0 GB of weight
+traffic**, which at the measured 228 GB/s is **17.5 ms** -- the right order for the 7.6 ms observed,
+with the difference accounted for by L2 hits. It also explains, with no further assumptions:
+
+* **the linear scaling with `t`** (3.88x for 4x tokens) -- the GEMV's traffic is exactly
+  proportional to the token count;
+* **the independence from cuBLAS** -- cuBLAS is not called;
+* **CPU/GPU = 0.06** -- the GPU really is doing that work;
+* **the cold/warm result of 1.31x** -- that test was run on the GEMM, not on the GEMV;
+* **the 150x ratio against arithmetic** -- it is a memory-bound kernel doing 4.0 GB of traffic for
+  4.8 ms of FLOPs.
+
+**The routing condition is also wrong on its own terms.** The `t <= 16` clause is justified by a
+measured crossover ("the crossover is between 8 and 16"). **The `n < 256` clause has no `t`
+dependence at all**, so it applies the short-prompt reasoning to every prompt length. The comment
+justifies it with "re-reading it per token is far cheaper than starving 47 of the 48 SMs" -- true
+at `t = 16`, and catastrophically false at `t = 8192`, where the re-reading is 4.0 GB and the
+arithmetic is 4.8 ms.
+
+**The fix, and it is now unambiguous.** Neither path is right for a `n = 48` projection at long
+context: the GEMM collapses to one block, and the GEMV re-reads the weight per token. **The correct
+fix is to stop treating `a` and `b` as separate projections.** `in_proj_qkv` (n = 10240),
+`in_proj_z` (n = 6144), `in_proj_a` (n = 48) and `in_proj_b` (n = 48) all consume the same
+`sc.hidden`. Fused into one GEMM with `n = 16480`, the 96 columns of `a` and `b` ride along inside a
+GEMM whose block count is driven by 16480, so they cost essentially nothing extra and their weight
+is read once per layer instead of once per token.
+
+**Expected saving: most of the 733 ms** that `in_proj_a` and `in_proj_b` cost at 8K -- **5.9% of
+the prefill, and more than half of the 1.44 s the objective needs.** The NVFP4 format is row-major
+(`[N, K/2]` weights plus `[N, K/16]` group scales), so concatenating along `n` is a row memcpy of
+both buffers and needs no requantisation; the only real work is applying each projection's
+`scale2` to its own row range of `y` instead of to the whole buffer.
+
+**The lesson, stated for the record.** Ten hypotheses were refuted before anyone read the dispatch
+line. Every one of them was a hypothesis about a kernel, and the question that was never asked was
+*which kernel runs*. The measurement that finally answered it was reading fifteen lines of the
+caller.
