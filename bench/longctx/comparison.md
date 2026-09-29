@@ -9645,3 +9645,62 @@ and it was wrong to generalise it to 32K.**
 at 32K. The `attn-tile` benchmark says the same kernel at 65536 tokens costs 7.50 s. **The model is
 4x slower than its own isolated kernel at comparable work, and the gap grows with `pos`.** That is
 the measurement to explain, and it is a single, bounded, already-instrumented question.
+
+## The quadratic term is K/V re-read traffic: the kernel runs at 23 GFLOP/s
+
+The dispatcher answers which kernel runs: `attn_prefill` forwards everything to
+`attn_prefill_tiled`, whose shared memory is constant (the legacy kernel's `shared_mem_bytes:
+(start + n_tokens) * 4` was the `pos`-dependent geometry, and it is no longer on the path).
+
+So the `pos` dependence is not shared memory. It is the **work the tiled kernel does**, and the
+arithmetic identifies it immediately.
+
+**The kernel is running at 23 GFLOP/s.** At 32K the chunked causal attention covers
+
+```
+8192 x (8192 + 16384 + 24576 + 32768) = 6.711e8 query-key pairs
+```
+
+which at 256 head dimensions and two matmuls (QK and PV) is `6.711e8 x 1024 = 6.872e11` FLOP.
+Measured: **29.910 s**. That is **23 GFLOP/s against a 75 TFLOP/s bf16 peak -- 3260x off peak.**
+
+**23 GFLOP/s is not a compute kernel. It is a memory-bound one.** And the memory it is bound on is
+the K/V cache, because the kernel re-reads the whole cache for every query tile -- and, on this
+evidence, for every query-head group within a tile as well. K/V is `4 kv_heads x 256 dim x 2 (K,V)
+x 2 B = 4096 B` per key per layer:
+
+| cached keys | K/V cache | once per query tile | **per query-head group** |
+|---|---|---|---|
+| 8192 | 33.6 MB | 0.80 s | **4.82 s** |
+| 16384 | 67.1 MB | 1.61 s | **9.64 s** |
+| 24576 | 100.7 MB | 2.41 s | **14.47 s** |
+| 32768 | 134.2 MB | 3.21 s | **19.29 s** |
+
+**The per-head-group model predicts a constant increment of 4.83 s per chunk. The measured
+increments are 3.55, 3.87, 3.92 s** -- about 80% of the prediction, which is the right agreement
+for a first-order traffic model that ignores overlap and L2 hits.
+
+**And this explains every observation that had been puzzling:**
+
+* **why the cost grows linearly with `pos`** -- the cache it re-reads grows by 8192 keys per chunk;
+* **why the total is quadratic** -- a constant increment per chunk;
+* **why `GB10_ATTN_START_ZERO` changes nothing** -- the mask suppresses *scores*, but the kernel
+  still **loads** every K/V row it is going to mask. Ignoring the prefix removes no traffic at all;
+* **why the model is 4x slower than `attn-tile`** -- `attn-tile` measures at `start = 0`, where the
+  cache is 8192 keys and the re-reads are 16x cheaper than at 32768.
+
+**The fix is query reuse per K/V load, and it is the objective's own design.** The kernel's
+`BQ = 24` and the 24 query heads against 4 K/V heads mean the same K/V bytes are fetched
+`(t / BQ)` times per chunk and, apparently, a further `nh / nkv = 6` times per tile. Both factors
+are removable:
+
+* raising `BQ` from 24 to 128 divides the tile-level re-reads by **5.3x**;
+* processing all 24 query heads against one K/V load divides the head-group re-reads by **6x**;
+
+together up to **32x less K/V traffic**, against a quadratic term that is currently **45.6% of the
+32K prefill** and **the entire super-linear component of every length above 8K**.
+
+**This is the first time in this session that a target has been identified whose size, growth rate,
+mechanism, and fix all follow from one measurement.** The objective's premise was right; it took
+two rounds of attributing the wrong kernel and one round of refuting a correct hypothesis with a
+diagnostic that could not see traffic to arrive back at it with numbers.
