@@ -9756,3 +9756,36 @@ large and unblocked.** The alternative -- a tensor-core `mma.sync` rewrite at a 
 remains the objective's stated path and is still the only thing that would help the *arithmetic*,
 but the arithmetic is 3260x from being the constraint. **The constraint is traffic, and traffic is
 what this fixes.**
+
+## The 6x K/V re-read is in the launch geometry, and the reorder has a known register cost
+
+The mechanism is confirmed at the source, not only inferred from timing:
+
+```rust
+grid_dim: (n_q_heads as u32, tiles, 1),     // one block per query head
+block_dim: (head_dim as u32, 1, 1),          // 256 threads = one d column each
+shared_mem_bytes: smem as u32,               // 22,944 B -> 2 blocks/SM
+```
+
+**One block per query head per query tile.** With 24 query heads and 4 K/V heads, the six query
+heads that share a K/V head are six separate blocks, and each reads the entire K/V range for that
+head. **The `nh / nkv = 6` factor is in the grid, not in the arithmetic.**
+
+**The reorder's cost is now known too.** The kernel compiles to **77 registers, 0 spill stores,
+0 spill loads** at `block_dim = 256`, and the mapping is one `d` column per thread, so each thread
+holds one accumulator per query row: 24 accumulators at `BQ = 24`. Serving six query heads from one
+block means 6 x 24 = **144 accumulators per thread**, or roughly **221 registers**.
+
+| | registers/thread | registers/block (256 thr) | blocks/SM by registers (65,536) | blocks/SM by smem (51,200) |
+|---|---|---|---|---|
+| current (1 head) | 77 | 19,712 | 3 | 2 |
+| shared (6 heads) | ~221 | 56,576 | **1** | 2 |
+
+**So the reorder trades occupancy for traffic: 6x less K/V traffic against 2 blocks per SM down to
+1.** The smem ceiling still permits 2, so the binding constraint becomes registers, and the net is
+still a **3x** improvement on the traffic-bound term -- which is 45.6% of the 32K prefill.
+
+**That is a quantified, implementable design with a known tradeoff, and it is the next change.**
+It is also a substantial kernel rewrite, and it should not be attempted without the budget to
+validate it: the gate is `attn-tile`, and the measurement is the `attn kernel` phase of
+`prefill-shape --limit 32768`, which currently reads **29,910 ms**.
