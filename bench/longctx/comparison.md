@@ -8270,3 +8270,85 @@ it. What *is* measured is the wall time of each phase (`cublas gemm` 36.4%/27.6%
 time against 8.85e14 FLOP at 16384 tokens. The conclusion -- that the prefill is GEMM-FLOP-dominated
 but not GEMM-TIME-dominated -- rests on those measurements and would survive a moderate error in the
 FLOP estimates.
+
+## FOUND IT: the GEMM is at full peak -- the pipeline around it is not, and `alloc_zeros` is the largest single item
+
+`gb10-bench tc-phase` decomposes the MLP gate/up GEMM pipeline (n=17408, k=5120, t=2048):
+
+```
+alloc_zeros (w,x,y)                    4.489 ms
+dequant_nvfp4_to_bf16 (w)              1.686 ms
+f32_to_bf16 (x)                        0.274 ms
+cublas_gemm_bf16                       4.866 ms
+bf16_to_f32_scaled (epilogue)          0.943 ms
+sum-------------------------------    12.258 ms
+GEMM is 39.7% of the pipeline; the non-GEMM work is 1.52x the GEMM
+```
+
+**The GEMM is not the problem, and the earlier "57% of FP4 peak" reading was an artefact of
+attributing all FLOPs to the `cublas gemm` phase.** The GEMM itself does
+`2 x 2048 x 17408 x 5120 = 3.65e11` FLOP in 4.866 ms = **75 TFLOP/s, which is the bf16 peak
+essentially exactly.** It is running at full speed.
+
+**Everything wrapped around it is the problem:**
+
+| stage | time | share of the pipeline |
+|---|---|---|
+| **`alloc_zeros` (w, x, y)** | **4.489 ms** | **36.6%** |
+| `dequant_nvfp4_to_bf16` (weights) | 1.686 ms | 13.8% |
+| `f32_to_bf16` (activations) | 0.274 ms | 2.2% |
+| `cublas_gemm_bf16` | 4.866 ms | **39.7%** |
+| `bf16_to_f32_scaled` (epilogue) | 0.943 ms | 7.7% |
+| **total** | **12.258 ms** | 100% |
+
+**Non-GEMM work is 1.52x the GEMM.** And the largest single line item in the entire MLP pipeline is
+**`alloc_zeros` at 36.6%** -- allocating and zeroing the weight, input and output buffers *on every
+GEMM call*. The `gb10-bench cublas-gemm` bench says the same thing independently, in its own format:
+
+```
+mlp gate/up                4.78 ms   76.3 TFLOP/s
+  (same buffers)           2.48 ms
+mlp down                   4.35 ms   83.8 TFLOP/s
+  (same buffers)           2.47 ms
+attn q_proj                1.45 ms   88.9 TFLOP/s
+  (same buffers)           0.95 ms
+attn o_proj                1.55 ms   82.9 TFLOP/s
+  (same buffers)           0.96 ms
+```
+
+**Reusing the buffers takes the MLP gate/up GEMM from 4.78 ms to 2.48 ms -- a 1.93x speedup -- and
+every other shape shows the same ~1.5-1.9x.** The "76.3 TFLOP/s" column is the GEMM alone; the 4.78 ms
+is the GEMM plus allocating and zeroing three buffers.
+
+**This closes the arithmetic on the 8K prefill.** At T=8192 the prefill is 3.30e14 GEMM FLOP. At the
+measured 75 TFLOP/s that is 4.4 s of actual GEMM. Multiply by the measured pipeline factor of 2.52
+(12.258/4.866) and add the attention kernel's 1.4 s: **4.4 x 2.52 + 1.4 = 12.5 s, against a measured
+12.68 s.** The model reconciles to within 2%.
+
+**So the 8K prefill is: 4.4 s of GEMM, 6.7 s of pipeline overhead around it, 1.4 s of attention.**
+The overhead is **53% of the prefill**, and `alloc_zeros` is ~19% of the prefill on its own.
+
+**The objective needs 12.68 s -> 10.9 s, i.e. 1.16x. Removing the per-call allocation and zeroing is
+worth ~2.4 s, which alone takes the 8K prefill to ~10.3 s -- past llama.cpp.** This is not a kernel
+optimisation, not a tensor-core problem and not an attention problem: it is a buffer-lifetime
+problem. The buffers are allocated, zeroed and freed on every GEMM call, and none of that work
+survives into the next call.
+
+**Why the zeroing is pure waste, and why it is safe to remove.** The weight buffer `w` is immediately
+overwritten by `dequant_nvfp4_to_bf16`, the input `x` by `f32_to_bf16`, and the output `y` by the
+GEMM's beta=0 write. `alloc_zeros` is paying to write zeros into three buffers that are then
+completely overwritten before anything reads them. It is also paying the allocator and the driver
+for a fresh mapping each time, which is why the same buffers measure 1.9x faster.
+
+**The three candidate fixes, in order of expected value:**
+
+1. **Hoist the buffers out of the per-call path and reuse them.** `Scratch` already exists in the
+   model and is threaded through `prefill_seq`, so there is a place to put them. Expected: ~2.4 s at
+   8K, i.e. the 8K win on its own.
+2. **Cache the dequantised weights** instead of re-running `dequant_nvfp4_to_bf16` (13.8% of the
+   pipeline) on every call. The weights are static across the whole prefill; this trades memory for
+   time. Expected: ~0.9 s at 8K.
+3. **Fuse the epilogue** (`bf16_to_f32_scaled`, 7.7%) into the GEMM's output path. Expected: ~0.5 s.
+
+**None of these three has been attempted in this session, and each is worth more at 8K than
+everything the attention work delivered (1.58x on a 1.4 s kernel).**
