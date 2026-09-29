@@ -10392,3 +10392,37 @@ attn-tile: OK
 
 **The root cause is settled and confirmed by experiment; the remaining work is the two kernel
 staging changes, both with measured payoffs.**
+
+## The two changes are coupled: Q-streaming is the enabler for the K double-buffer
+
+The two staging changes were listed as independent. **They are not, and doing the second one first
+would be a regression.** The shared-memory budget decides it:
+
+| variant | smem | blocks/SM at 51,200 B |
+|---|---|---|
+| current | 22,944 B | **2** |
+| **K double-buffered alone** | 31,392 B | **1** |
+| Q streamed alone | 10,272 B | 4 by smem, 3 by registers |
+| **Q streamed + K double-buffered** | **18,720 B** | **2** |
+
+**Adding a second K buffer without freeing the Q tile takes the kernel from 2 blocks per SM to 1,
+and the probe measured that as a 2.36x loss.** Hiding the latency with double-buffering is worth
+less than that -- so **the double-buffer on its own would be a regression, and it is the same
+mistake shape as the seven backfires earlier in this session: a real effect (latency hiding)
+applied without accounting for the resource it consumes.**
+
+**Q-streaming frees 12,672 B, which is more than the 8,448 B the second K buffer needs.** So the
+sequence is forced:
+
+1. **stream Q** -- 22,944 B -> 10,272 B. This alone takes the kernel from 2 blocks per SM to 3
+   (registers cap it there), worth roughly 1.4x on the measured occupancy curve.
+2. **then double-buffer K** -- 10,272 B -> 18,720 B, which still allows 2 blocks per SM, so the
+   latency hiding is added **without giving back the occupancy**.
+
+**Together they are worth the occupancy gain plus the latency hiding, and the latency hiding is the
+larger term**: the closed form says the kernel's entire 29.9 s is `(t x keys / 384)` iterations at
+~1100 ns each, and that 1100 ns is an un-overlapped load. **If the overlap works, most of the
+29.9 s is recoverable, and at 32K that is 45.6% of the prefill.**
+
+**This is the plan, and the order in it is not a preference -- it is arithmetic.** The next commit
+is Q-streaming; the one after it is the K double-buffer.
