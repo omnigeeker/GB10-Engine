@@ -7415,3 +7415,27 @@ been re-measured since the attention work.
 13.45 s in the earlier session to 10.91 s now -- **1.23x on an unchanged binary**. Any comparison
 built from numbers taken in different sessions would have mis-stated this result by more than the
 effect being claimed, in either direction.
+
+### The P·V's shared loads are already vectorised -- the compiler got there first
+
+The P·V is still the largest named phase (~34%), and its inner loop reads S scalar-wise: 16 fma and
+16 shared loads per row, 24 rows, per thread. Replacing the scalar reads with explicit `float4`
+loads is legal (`S` begins 16-byte aligned and each row is 64 B) and bit-identical (the four fma
+are issued in the same ascending order), so it was tried:
+
+    16384   0.57 / 0.58 s   (baseline 0.56)
+    65536   9.15 / 9.19 / 9.25 s   (baseline 8.95 / 9.01)
+
+**~2% slower, with bit-identical correctness.** The obvious reading is that the compiler had
+already merged those adjacent shared reads -- the loop is fully unrolled and `S` is a plain
+aligned array -- so the explicit `float4` saved no instructions and only added the register
+pressure of the live vector temporaries. It was reverted.
+
+This narrows the P·V's 34% decisively. It is not its loads (just shown), not its count of
+instructions that the compiler can coalesce, and not its precision handling (unchanged). What
+remains is the **384 dependent `fmaf` per thread** -- the arithmetic itself. That is exactly the
+work an mma removes outright rather than reshapes, which is why the tensor-core P·V keeps being
+the right target even though the first attempt at it measured slower: that attempt paid a new
+barrier and a transpose pass, and those two costs are now known to be avoidable (`Vs` fits in its
+own storage under the corrected 51,200 B budget, and `ldmatrix.trans` builds the transposed
+fragment directly).
