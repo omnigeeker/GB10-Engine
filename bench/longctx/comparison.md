@@ -11126,3 +11126,43 @@ from the K result. **The two are independent and both are still on the table:**
 
 **Neither is reachable by a micro-cut:** the required 811-944 B for occupancy has no precision-safe
 source (recorded above), and the V pattern is not widen-able in place (recorded here).
+
+## The decode-path gate exists and is exact -- the V transpose is safely attemptable
+
+The V cache is shared between prefill and decode, so a transposed layout has to be consistent across
+the writer and *every* reader, and `attn-tile` only compares the two **prefill** implementations
+against each other. **A decode-path break would pass `attn-tile`.** So before touching the layout,
+the question was whether a decode gate exists.
+
+**It does, and it is stronger than `attn-tile`:**
+
+```
+$ ./target/release/gb10-verify generate --model models/Qwen3.8-27B-NVFP4 \
+      --prompt "What is the capital of France?" --n 24
+prompt: 59 tokens
+prompt ids match the oracle (59 tokens)
+TTFT 773.0 ms (59 prompt tokens)
+decoded 16 tokens in 1.702s -> 9.40 tok/s
+ids:  [1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]
+text: "User asks: \"What is the capital of France?\" Simple factual question. Answer"
+oracle agreement: 16/16 (100.0%)  reference=Qwen3_5ForCausalLM, weights dequantized from NVFP4 to bf16
+  exact match
+generate: OK
+```
+
+**It checks the prompt ids against the oracle, then requires the generated ids to match an
+independent `Qwen3_5ForCausalLM` reference dequantised to bf16, exactly.** That is a much tighter
+constraint than `attn-tile`'s 1.5e-5 rms relative tolerance: **one wrong token fails it, and the
+generated ids depend on the whole forward pass, the KV cache, and the decode attention.**
+
+**This baseline is the reference the V transpose must reproduce.** The gate pair for that change is
+therefore:
+
+1. **`attn-tile`** -- the prefill attention must stay correct (this is the objective's named gate);
+2. **`generate`** -- the 16 ids above must still be produced exactly, which is what proves the
+   transposed cache is consistent between the prefill writer, the prefill reader, and the decode
+   reader.
+
+**So the V transpose -- the ~25% instruction-count win -- is attemptable with a real safety net, and
+the safety net is stronger than the one the objective names.** Recorded here so the next round does
+not have to re-derive that the decode path is covered.
