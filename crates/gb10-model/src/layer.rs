@@ -10,7 +10,34 @@
 
 use anyhow::{Context, Result};
 use gb10_core::config::TextConfig;
-use gb10_cuda::{CudaSlice, Device};
+use gb10_cuda::{CudaEvent, CUevent_flags, CudaSlice, Device};
+use std::sync::Mutex;
+
+/// Per-phase GPU events for the prefill DeltaNet layer, gated by
+/// `GB10_DELTA_EVENTS`. Six events bracket five phases. Same pattern as
+/// `weights::GEMM_EVENTS`: recorded only when the env var is set, drained by
+/// `delta_event_snapshot` so the server never accumulates them.
+pub static DELTA_EVENTS: Mutex<Vec<Vec<CudaEvent>>> = Mutex::new(Vec::new());
+pub const DELTA_PHASES: [&str; 5] = [
+    "proj in (qkv/z/a/b)",
+    "conv + l2norm + gate",
+    "delta rule chunk",
+    "proj out",
+    "mlp",
+];
+pub fn delta_event_snapshot() -> ([f64; 5], usize) {
+    let mut v = DELTA_EVENTS.lock().unwrap();
+    let n = v.len();
+    let mut acc = [0.0f64; 5];
+    for ev in v.drain(..) {
+        for i in 0..5 {
+            if let Ok(ms) = ev[i].elapsed_ms(&ev[i + 1]) {
+                acc[i] += ms as f64;
+            }
+        }
+    }
+    (acc, n)
+}
 use gb10_cuda::ops::{DELTA_KEY_HEAD_DIM, DELTA_VALUE_HEAD_DIM};
 
 use crate::rope::{rope_tables, rope_tables_range};
@@ -268,11 +295,29 @@ impl DeltaNetLayer {
         let conv_dim = qk_dim * 2 + cfg.linear_value_dim();
         let group = nv / nk;
 
+        let ev_ctx = dev.stream().context().clone();
+        let mut evs: Option<Vec<CudaEvent>> = None;
+        if std::env::var("GB10_DELTA_EVENTS").is_ok() {
+            let mut tv = Vec::with_capacity(6);
+            let mut ok = true;
+            for _ in 0..6 {
+                match ev_ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT)) {
+                    Ok(e) => tv.push(e),
+                    Err(_) => { ok = false; break; }
+                }
+            }
+            if ok { evs = Some(tv); }
+        }
+        macro_rules! dmark {
+            ($i:expr) => { if let Some(t) = &evs { let _ = t[$i].record(dev.stream()); } };
+        }
+        dmark!(0);
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
         self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
         self.in_proj_z.forward_prefill(dev, &sc.hidden, &mut sc.z, t)?;
         self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
         self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
+        dmark!(1);
 
         let conv_base = seq * state.conv_stride();
         ops.conv1d_prefill_silu(
@@ -304,6 +349,7 @@ impl DeltaNetLayer {
         )?;
 
         let rec_base = seq * state.rec_stride();
+        dmark!(2);
         ops.gated_delta_rule_chunk(
             dev,
             &sc.conv_ln,
@@ -321,15 +367,21 @@ impl DeltaNetLayer {
             group,
             rec_base,
         )?;
+        dmark!(3);
 
         ops.rmsnorm_gated(dev, &sc.attn, &sc.z, &self.norm, &mut sc.gnorm, t * nv, vd, eps)?;
         self.out_proj.forward_prefill(dev, &sc.gnorm, &mut sc.proj, t)?;
+        dmark!(4);
 
         ops.add(dev, x, &sc.proj, &mut sc.res, t * hidden)?;
         ops.rmsnorm_zero_centered(dev, &sc.res, &self.post_ln, &mut sc.mlp_in, t, hidden, eps)?;
         self.mlp
             .forward_prefill(dev, &sc.mlp_in, &mut sc.down, &mut sc.inter, &mut sc.inter2, t)?;
         ops.add(dev, &sc.res, &sc.down, out, t * hidden)?;
+        dmark!(5);
+        if let Some(t) = evs {
+            DELTA_EVENTS.lock().unwrap().push(t);
+        }
         Ok(())
     }
 

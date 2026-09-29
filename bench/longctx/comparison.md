@@ -8465,3 +8465,78 @@ optimisation**: put a CUDA event around each kernel launch inside the layer, or 
 `prefill_seq` with events until every millisecond of the 12.68 s has an owner. **Until the 3.50 s is
 named, any optimisation of it is a guess, and this session has already demonstrated four times what
 guesses cost.**
+
+## The DeltaNet layer is attributed: it is the MLP, and the recurrence is 4.3%
+
+New instrumentation was added rather than another optimisation -- an env-gated
+(`GB10_DELTA_EVENTS`) six-event / five-phase bracket around the prefill DeltaNet layer, following
+the existing `GB10_GEMM_EVENTS` pattern, drained by `layer::delta_event_snapshot` and printed by
+`prefill_shape`. At 8192 tokens:
+
+```
+chunk  0 ( 8192 tok, start      0):   12.35s
+[diag] LAYER GPU: delta 8.25s / 48 = 66.8%   attn 4.06s / 16 = 32.9%
+[diag] DELTA n=48 | proj in (qkv/z/a/b) 2173ms (17.6%)  conv + l2norm + gate 404ms (3.3%)
+       delta rule chunk 526ms (4.3%)  proj out 651ms (5.3%)  mlp 4501ms (36.4%)
+       | total 8.25s of 12.35s (66.8%)
+```
+
+| DeltaNet layer phase | time | share of the whole prefill |
+|---|---|---|
+| **mlp** | **4501 ms** | **36.4%** |
+| proj in (qkv / z / a / b) | 2173 ms | 17.6% |
+| proj out | 651 ms | 5.3% |
+| **delta rule chunk (the recurrence)** | **526 ms** | **4.3%** |
+| conv + l2norm + gate | 404 ms | 3.3% |
+| **total (48 layers)** | **8250 ms** | **66.8%** |
+
+**The Gated-DeltaNet recurrence is 4.3% of the prefill.** That confirms the FLOP analysis (0.53% of
+the layer's FLOPs) from a completely different direction: the part of these layers that is
+architecturally distinctive is, in time as well as in FLOPs, negligible. **It is not, and never was,
+the 3.50 s the previous section was looking for.**
+
+**The MLP is the largest single component in the prefill: 4.50 s, 36.4%, from the DeltaNet layers
+alone.** The attention layers contribute a proportional MLP on top of that (16 layers against 48),
+so the MLP is roughly **half the entire 8K prefill**.
+
+**And the MLP is fully explained.** Its GEMM FLOPs are
+`2 x 8192 x (5120x17408x2 + 17408x5120) = 4.38e12`, which is 58.4 ms per layer at the measured
+75 TFLOP/s, so 93.8 ms measured / 58.4 ms of GEMM = **1.61x -- exactly the bench's pipeline factor of
+1.60x.** There is no mystery left in the MLP: it is 58.4 ms of GEMM plus 35.4 ms of
+dequant + cast + epilogue, per layer, 48 times.
+
+**The same accounting localises the previous section's "unaccounted 73 ms per call".** It was not
+unaccounted; the per-layer GEMM estimate it was compared against was too low. Measured per phase
+against its own FLOPs:
+
+| phase | measured per call | GEMM at 75 TFLOP/s | ratio |
+|---|---|---|---|
+| mlp | 93.8 ms | 58.4 ms | **1.61x** |
+| proj in (qkv/z/a/b) | 45.3 ms | 18.4 ms | **2.46x** |
+| proj out | 13.6 ms | 6.9 ms | **1.97x** |
+| delta rule chunk | 11.0 ms | -- | (0.53% of FLOPs) |
+| conv + l2norm + gate | 8.4 ms | -- | -- |
+
+**The MLP sits exactly at the pipeline factor; the projections are worse, and `proj in` is much
+worse at 2.46x.** The reason is visible in the shapes: `proj in` is **four separate GEMMs**
+(`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`), and two of them (`a` and `b`, `n = 48`) are
+tiny. Each pays the full per-call pipeline -- weight dequant, activation cast, epilogue -- so the
+small GEMMs are dominated by overhead that does not scale with their FLOPs.
+
+**So the ranked, measured targets for the 8K prefill are now:**
+
+1. **The MLP pipeline overhead** -- 35.4 ms per delta layer-call, 48 layers, ~1.70 s, and the same
+   proportion again in the 16 attention layers. This is dequant + cast + epilogue around GEMMs that
+   are already at peak. **The largest single target in the model.**
+2. **The four `proj in` GEMMs at 2.46x** -- 2.17 s, of which 0.99 s is above the pipeline factor.
+   Two of the four are `n = 48`. **Fusing them into one GEMM would remove three of the four
+   per-call pipelines.**
+3. **`proj out` at 1.97x** -- 651 ms.
+4. The attention kernel, 1.4 s, already 1.58x faster than it was.
+5. The recurrence, 526 ms, 4.3% -- **not worth touching.**
+
+**Note what this does to the session's whole framing.** The objective named tensor-core prefill
+*attention* as "the only path". The largest measured component of gb10's prefill is the **MLP
+pipeline overhead**, which is not attention, not the recurrence, and not a tensor-core efficiency
+problem -- it is dequantisation and casting wrapped around GEMMs that already run at peak. And the
+second largest is **four small projection GEMMs that should be one**.

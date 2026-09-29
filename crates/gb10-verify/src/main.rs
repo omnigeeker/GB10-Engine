@@ -271,6 +271,17 @@ fn prefill_shape(args: &Args) -> Result<()> {
                     ams / 1e3, an, 100.0 * ams / 1e3 / wall);
             }
         }
+        {
+            let (dp, dn) = gb10_model::layer::delta_event_snapshot();
+            if dn > 0 {
+                let tot: f64 = dp.iter().sum();
+                let mut line = String::new();
+                for (i, name) in gb10_model::layer::DELTA_PHASES.iter().enumerate() {
+                    line.push_str(&format!("{} {:.0}ms ({:.1}%)  ", name, dp[i], 100.0 * dp[i] / (wall * 1e3)));
+                }
+                println!("  [diag] DELTA n={} | {}| total {:.2}s of {:.2}s ({:.1}%)", dn, line, tot / 1e3, wall, 100.0 * tot / 1e3 / wall);
+            }
+        }
         let (ph, n) = gb10_model::weights::gemm_event_snapshot();
         if n > 0 {
             let tot: f64 = ph.iter().sum();
