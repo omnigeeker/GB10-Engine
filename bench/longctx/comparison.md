@@ -13619,3 +13619,28 @@ llama.cpp computes `ncols2` from `gqa_ratio` and can only use powers of two, so 
 picks **`ncols2 = 8` and throws away 2 of 8 GQA slots -- ~25% of its KQ and P*V FLOPs.**
 **A kernel that groups exactly 6 query heads per KV head beats llama.cpp's arithmetic on this shape**, and
 we own the kernel so we can do it.
+
+## The second gap: the MLP is at 43-45% of the corrected ceiling, not at a "bf16 floor"
+
+The session concluded earlier that "the MLP is at its bf16 floor; there is no 2x to find within bf16."
+**That conclusion was drawn against a 75 TFLOP/s peak, and the measured `mma.sync` ceiling on this box is
+~115 TFLOP/s. Re-priced against the correct number:**
+
+| length | MLP GEMM time | FLOPs | achieved | **% of the 115 TFLOP/s ceiling** |
+|---|---|---|---|---|
+| 32K | 21,456 ms | 1,121.5 TFLOP | 52.3 TFLOP/s | **45%** |
+| 128K | 89,781 ms | 4,486 TFLOP | 50.0 TFLOP/s | **43%** |
+
+**So the MLP GEMM has roughly the same headroom as the attention kernel does** -- both sit near 45% of what
+this part can actually retire through `mma.sync`. The MLP is also a large share of the total: **20% at
+128K but 40% at 32K**, so at 32K it is the single biggest component.
+
+**This matters for the objective's shape.** The plan so far has been "fix attention and the rest follows."
+That is still the right first move (attention is 67.6% at 128K), but **the 32K row is different: there the
+MLP is 40% and attention is 34.8%, so 32K needs both.** And 32K is the row with the smallest required win
+(2.13x), so it may be reachable from the attention fix alone -- but it should be checked, not assumed.
+
+**Note the direction of the error.** Both of this session's "we are at the floor" conclusions -- the PV's
+41.8% ceiling and the MLP's bf16 floor -- came from comparing against a peak that was too low, or from
+accepting the kernel's own structure as the frame of reference. **The lesson is the same both times: price
+against what the hardware can actually retire, measured, and never against a structure you have assumed.**
