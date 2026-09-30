@@ -12720,3 +12720,26 @@ have an FP4 GEMM on sm_121 under MXFP4 (32-element blocks) rather than NVFP4. **
 require repacking the weights' 16-element UE4M3 scales into 32-element UE8M0 scales** -- a load-time
 conversion, and only worth doing if the mode-2 configuration can first be made to return a heuristic.
 **It is recorded as an unresolved possibility, not as a closed door.**
+
+### An unfinished measurement: the isolated bf16 ceiling
+
+The probe's second half times the **same shape on bf16 cuBLASLt in isolation**, to answer a question the
+FP4 closure leaves open: **the MLP runs at ~52 TFLOP/s, but is that a weight-format problem or simply
+where a bf16 GEMM lands on this part?** If isolated bf16 already reaches the ~75-80 TFLOP/s ceiling,
+then FP4 was never the MLP's problem and closing lever 2 costs nothing.
+
+**That measurement did not complete.** With the FP4 heuristic removed from the path, the bf16 leg
+faults:
+
+```
+FP4 unavailable (status 15, results 0) -- timing the bf16 leg only
+heuristic OK (workspace 0)
+FAIL cudaEventSynchronize(e1) -> an illegal memory access was encountered
+```
+
+The fault survives using a fresh `cublasLtMatmulPreference_t` for the bf16 leg, so it is not the
+preference object being consumed by the failed FP4 call. The layout arguments for the bf16 leg are the
+same shape and leading dimensions as the FP4 leg, so the difference is the data type alone.
+
+**Left undone and recorded as such.** The probe source is committed (`bench/longctx/fp4_probe.cu`);
+the bf16-only variant and the crash were not.
