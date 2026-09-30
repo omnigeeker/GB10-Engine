@@ -40,3 +40,6 @@ tools/llama.cpp/
 __pycache__/
 *.pyc
 /bench/mmlu/data/
+
+# Run artifacts: per-engine server logs from bench/longctx runs
+bench/longctx/server-*.log
