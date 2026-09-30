@@ -1415,7 +1415,7 @@ fn tc_mlp() -> Result<()> {
                 wbytes / 1e6
             );
 
-            let mut time = |lbl: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+            let time = |lbl: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
                 f()?;
                 dev.synchronize()?;
                 let mut best = f64::MAX;
