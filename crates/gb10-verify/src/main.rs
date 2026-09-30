@@ -223,7 +223,11 @@ fn prefill_shape(args: &Args) -> Result<()> {
     let tok = QwenTokenizer::from_model_dir(&args.model)?;
 
     // Matches the server's PREFILL_CHUNK, which is the shape under test.
-    let chunk = 8192usize;
+    // GB10_CHUNK overrides it for the chunk-size sweep; the server default stays 8192.
+    let chunk = std::env::var("GB10_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192usize);
     let total = args.limit.max(1) as usize;
     let ctx = args.max_seq;
     // The sequence count is the one harness parameter that changes what the

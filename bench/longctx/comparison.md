@@ -12608,3 +12608,37 @@ llama-32K  trial 0  cold 43.34  trial 1  cold 44.48
 
 **The two lengths the objective can actually reach are now measured four times each, and the
 conclusion does not move.**
+
+## Chunk size: the exclusion was right, but for a different reason than stated
+
+The objective excludes "chunk 调参" on the grounds that **8K is already one chunk**, which only
+reasons about 8K. A larger chunk means fewer, larger GEMMs, so it was worth checking at 32K and 128K.
+`GB10_CHUNK` now overrides the verify tool's chunk size (the server's `PREFILL_CHUNK` stays 8192).
+
+**32K, first pass** -- which looked like a 2.8% win:
+
+| chunk | total | attn kernel | o_proj + mlp |
+|---|---|---|---|
+| 8192 | 53.37 s | 18,431 ms | 6,013 ms |
+| 16384 | 53.58 s | 18,497 ms | 6,104 ms |
+| **32768** | **51.89 s** | 18,411 ms | **5,782 ms** |
+
+**32K, repeated -- and the win does not survive:**
+
+| run | chunk 8192 | chunk 32768 |
+|---|---|---|
+| 1 | 51.72 s | **50.16 s** (3.0% faster) |
+| 2 | 50.17 s | **62.77 s** (25% *slower*) |
+
+**A 32,768-token chunk swings between 50.16 s and 62.77 s at the same shape.** The 51.89 s that
+looked like a win was a favourable draw. The attention kernel is unchanged across all chunk sizes
+(18,411-18,497 ms), so the whole effect is in the GEMM phases -- consistent with a memory-pressure or
+allocator effect rather than a compute effect, which is also why it is unstable.
+
+**So chunk tuning is closed -- but the stated reason was wrong.** It is not that "8K is already one
+chunk"; it is that **the chunk size does not change the attention kernel at all, and its effect on the
+GEMM phases is unstable in both directions.** A 25% regression on some runs is far worse than a 3%
+gain on others, so 8192 stays.
+
+`GB10_CHUNK` is kept as a diagnostic knob on the verify tool. The server's `PREFILL_CHUNK` is
+unchanged at 8192.
