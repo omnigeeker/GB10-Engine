@@ -1,0 +1,21 @@
+token stream cross-check
+  engine tokenizer   297054 tokens
+  llama-tokenize     297054 tokens
+  first divergence   None
+  mismatches         0 / 297054
+
+perplexity: 297054 tokens
+  n_ctx=512 first=256 preds/window=255 windows=60 (max 580)
+  model loaded in 38.8s
+  [0] ppl=4.5004  1.81s/window  eta 1.8 min
+  [10] ppl=7.5017  1.51s/window  eta 1.2 min
+  [20] ppl=6.8292  1.48s/window  eta 1.0 min
+  [30] ppl=5.6998  1.51s/window  eta 0.7 min
+  [40] ppl=6.1069  1.57s/window  eta 0.5 min
+  [50] ppl=6.2929  1.56s/window  eta 0.2 min
+  [59] ppl=6.5217  1.53s/window  eta 0.0 min
+
+Final estimate: PPL = 6.5217
+  predictions   15300
+  mean nll      1.875132
+  wall          91.6s

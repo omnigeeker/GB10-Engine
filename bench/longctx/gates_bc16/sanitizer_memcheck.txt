@@ -1,0 +1,31 @@
+========= COMPUTE-SANITIZER
+q heads 24, kv heads 4, head_dim 256
+  start  ntok    max|abs|     rms rel
+      0     1    2.384e-7    2.618e-8  rms|ref| 2.846e-1  ok
+    first diff at flat 6170 (tok 1 head 0 dim 26): legacy -2.904618e-1 tiled -2.905951e-1
+      0     7    2.099e-4    1.880e-4  rms|ref| 1.756e-1  MISMATCH
+    first diff at flat 6155 (tok 1 head 0 dim 11): legacy 3.357752e-1 tiled 3.358954e-1
+      0     8    2.251e-4    1.960e-4  rms|ref| 1.674e-1  MISMATCH
+    first diff at flat 6165 (tok 1 head 0 dim 21): legacy -2.753444e-1 tiled -2.754475e-1
+      0     9    2.012e-4    1.961e-4  rms|ref| 1.621e-1  MISMATCH
+    first diff at flat 6153 (tok 1 head 0 dim 9): legacy 3.047222e-1 tiled 3.045950e-1
+      0    16    2.077e-4    2.036e-4  rms|ref| 1.325e-1  MISMATCH
+    first diff at flat 6195 (tok 1 head 0 dim 51): legacy 4.228617e-1 tiled 4.227337e-1
+      0    17    2.584e-4    2.113e-4  rms|ref| 1.295e-1  MISMATCH
+    first diff at flat 6150 (tok 1 head 0 dim 6): legacy 4.610828e-1 tiled 4.612053e-1
+      0    64    2.311e-4    2.636e-4  rms|ref| 7.908e-2  MISMATCH
+    first diff at flat 6159 (tok 1 head 0 dim 15): legacy -3.063636e-1 tiled -3.065043e-1
+      0   129    2.185e-4    2.974e-4  rms|ref| 5.877e-2  MISMATCH
+    first diff at flat 5542 (tok 0 head 21 dim 166): legacy -1.549584e-1 tiled -1.548349e-1
+     37    16    1.555e-4    3.873e-4  rms|ref| 4.213e-2  MISMATCH
+    first diff at flat 17286 (tok 2 head 19 dim 134): legacy -7.174648e-2 tiled -7.185064e-2
+    100    33    1.503e-4    5.201e-4  rms|ref| 2.726e-2  MISMATCH
+    first diff at flat 130121 (tok 21 head 4 dim 73): legacy 3.859931e-2 tiled 3.871505e-2
+    511   128    1.164e-4    9.663e-4  rms|ref| 1.154e-2  MISMATCH
+    first diff at flat 149138 (tok 24 head 6 dim 146): legacy 1.822271e-2 tiled 1.833668e-2
+   2047    64    1.140e-4    1.727e-3  rms|ref| 6.292e-3  MISMATCH
+    first diff at flat 39953 (tok 6 head 12 dim 17): legacy -2.319276e-2 tiled -2.329865e-2
+   1000   200    1.163e-4    1.269e-3  rms|ref| 9.070e-3  MISMATCH
+Error: attn-tile gate FAILED
+========= Target application returned an error
+========= ERROR SUMMARY: 0 errors
