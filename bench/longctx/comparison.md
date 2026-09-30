@@ -12642,3 +12642,55 @@ gain on others, so 8192 stays.
 
 `GB10_CHUNK` is kept as a diagnostic knob on the verify tool. The server's `PREFILL_CHUNK` is
 unchanged at 8192.
+
+## Lever 2 is CLOSED: cuBLASLt has no FP4 block-scaled GEMM for sm_121
+
+Wrote a self-contained probe (`bench/longctx/fp4_probe.cu`, build with
+`nvcc -arch=sm_121 -O3 -std=c++17 -o /tmp/fp4t bench/longctx/fp4_probe.cu -lcublasLt -lcublas`) and
+ran the exact recipe that had been recorded from the headers.
+
+**The result, and the distinction that makes it conclusive:**
+
+| configuration | `cublasStatus_t` | meaning |
+|---|---|---|
+| scale modes **omitted** | **7** | `CUBLAS_STATUS_INVALID_VALUE` -- the API *demands* them |
+| scale modes set to `VEC16_UE4M3`, scale pointers attached | **15** | `CUBLAS_STATUS_NOT_SUPPORTED`, **0 heuristic results** |
+
+**Status 7 without the scale attributes proves the recipe was transcribed correctly** -- the library
+recognises the FP4 types and requires exactly the scale attributes that were recorded. With them
+supplied, it returns `NOT_SUPPORTED` and finds no algorithm at all.
+
+**And it is not the shape.** `cublasLtMatmulAlgoGetHeuristic` returns 0 results at every size tried:
+
+```
+M=128   N=128   K=128     -> status 15, results 0
+M=256   N=256   K=256     -> status 15, results 0
+M=4096  N=4096  K=4096    -> status 15, results 0
+M=256   N=5120  K=5120    -> status 15, results 0   (the engine's gate/up shape)
+```
+
+Device reports `NVIDIA GB10`, compute capability **12.1**; `libcublasLt.so.13.1.0.3`, CUDA 13.0.88.
+
+### What this means
+
+**The FP4 MLP is not available on this platform through cuBLASLt.** The weights are already NVFP4 and
+the opportunity was real -- the MLP is 40.4% of the 32K prefill and runs at bf16 rates -- **but the
+library that would have done the block-scaled FP4 GEMM does not provide a kernel for sm_121.**
+
+**This is a library limitation, not a hardware verdict**: the probe shows the *library* refuses, and it
+says nothing about whether the tensor cores could do it. Hand-writing an NVFP4 GEMM is possible in
+principle but is a research project, not a change to land here.
+
+**So both remaining levers are now closed:**
+
+| lever | share | verdict |
+|---|---|---|
+| tensor-core PV | 41.8% of the attention kernel | needs a rewrite of the kernel's output path (accumulator layout) |
+| FP4 MLP via cuBLASLt | 40.4% of the 32K prefill | **closed -- `CUBLAS_STATUS_NOT_SUPPORTED` at every shape** |
+
+**With both closed, the projection in the "what the objective actually needs now" section is
+withdrawn: 32K does not reach ~0.85x, and 128K/256K stay at 1.96x/2.51x.** The honest final state is
+the measured one -- **8K won 4/4 trials, and the other three lengths remain behind by the margins
+recorded above.**
+
+The probe is committed so the negative is reproducible rather than asserted.
