@@ -232,3 +232,38 @@ The state that was captured this way, for the record: `crates/gb10-cuda/build.rs
 `kind::mxf4nvf4.block_scale` and that `sm_121a` is a strict superset. **That comment asserts the arch change
 was verified by an exact `generate` match — that assertion has not yet been independently confirmed in this
 session and should be re-run before being relied on.**
+
+## MEASURED FA target numbers (replaces the derived ones)
+
+llama.cpp's `test-backend-ops` was built for sm_121a and its `FLASH_ATTN_EXT` perf cases for `hsk=256` were
+run on this exact GB10: `/tmp/fa_res/fa_perf_256.txt` (54 cases, `Backend CUDA0: OK`). **Measured, not
+derived.** Prefill cases, `nb=4096` query tokens against `kv=65536`, `hsk=hsv=256`, f16 K/V, f32 compute:
+
+| case | us/run | TFLOP/run | **TFLOPS** |
+|---|---|---|---|
+| `nh=8, nr23=[1,1]` — **no GQA batching** | 154,818.86 | 2.20 | **14.20** |
+| `nh=8, nr23=[4,1]` — GQA x4 | 226,546.80 | 8.80 | **38.83** |
+| `nh=8, nr23=[8,1]` — GQA x8 | 431,993.33 | 17.59 | **40.72** |
+
+**GQA batching is worth 14.20 -> 40.72 = 2.87x, measured on this hardware.** Our kernel is at **0.85
+TFLOPS with no GQA batching at all**, so it sits in the `nr2=1` regime: **16.7x below llama.cpp's
+*unbatched* number and 48x below its batched one.** This is the strongest confirmation that GQA
+head-sharing is the dominant lever — ahead of the P-in-registers work — and it is not optional.
+
+**Read 40.72 TFLOPS as an achievable-rate ceiling, not as a prediction of llama.cpp's 128K TTFT.** The case
+is `nb=4096` vs `kv=65536` (a chunked-prefill shape), it reports **uncausal** FLOPs while `mask=1` makes the
+real work roughly half, and it excludes long-context scheduling. Calibration: llama.cpp's total 128K cold
+TTFT is 228.2 s, and if its attention really ran at 40.7 TFLOPS then 211 TFLOP would take 5.2 s, leaving
+223 s of non-attention — more than our measured 144.9 s, which is not credible.
+
+**The acceptance targets are unchanged: 2.13x at 32K, 3.63x at 128K/256K** (attention must come in under
+`llama_total - non_attention`). The headroom is far larger than those targets require, so **the risk is no
+longer "can we find the speedup" but "can we land a correct kernel at all".** Two implementation attempts
+so far have produced designs but no landed kernel.
+
+### Also available: a llama.cpp MUL_MAT benchmark
+
+The same binary, `/tmp/fa_res/llamacpp/build/bin/test-backend-ops`, benchmarks `MUL_MAT` too — e.g.
+`perf -o MUL_MAT -p nvfp4` — so a real reference number for llama.cpp's NVFP4 GEMM is obtainable. Treat it
+as optional: it measures llama.cpp's kernel in llama.cpp's harness with llama.cpp's shapes, and the
+acceptance criterion for our FP4 work is our own in-session A/B against the bf16 path.
