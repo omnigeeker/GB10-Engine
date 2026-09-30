@@ -216,3 +216,19 @@ ceiling" assumed the kernel's structure was fixed, and the MLP's "bf16 floor" wa
 that was 35% too low. **Price against what the hardware can actually retire, measured — never against a
 structure you have assumed.** Compute the efficiency number (FLOP/s vs the measured ceiling) FIRST; the
 missing 1.25%-of-peak check is what made an entire round of analysis wrong.
+
+## Process note: while subagents are working, never `git add -A`
+
+During this session a `git add -A` used for a documentation commit **swept up an in-progress subagent edit**
+(`crates/gb10-cuda/build.rs`, the `sm_121` → `sm_121a` change) and committed it under an unrelated message.
+Nothing was lost, but the commit history became misleading and the agent's own commit was pre-empted.
+
+**Rule: while any subagent is working in the repo, stage explicitly** —
+`git add HANDOFF.md bench/longctx/comparison.md` — and never `git add -A` or `git add .`.
+Run `git status --short` first and check that every path you are about to stage is one you edited.
+
+The state that was captured this way, for the record: `crates/gb10-cuda/build.rs` now sets
+`CUDA_ARCH = "sm_121a"`, with a comment noting that `sm_121` cannot assemble
+`kind::mxf4nvf4.block_scale` and that `sm_121a` is a strict superset. **That comment asserts the arch change
+was verified by an exact `generate` match — that assertion has not yet been independently confirmed in this
+session and should be re-run before being relied on.**
