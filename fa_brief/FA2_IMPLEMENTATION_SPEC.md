@@ -162,3 +162,67 @@ Start simple, then improve — but keep the K/V staging efficient because it was
 3. `generate` 16/16 exact and `perplexity` ≈ 6.5212 with `GB10_FA2=1`.
 4. A same-session A/B of the 32K attention-kernel time (old vs new).
 5. Committed with a message stating what was measured, and pushed.
+
+---
+
+# ADDENDUM: the concrete fragment-level design (decided, not yet coded)
+
+This design was worked out against the llama.cpp brief and verified against our kernel's indexing. It is
+**better than llama.cpp's in one specific way** and should be followed.
+
+## The key trick: use the M=qcols orientation for QK^T so P needs NO movmatrix
+
+llama.cpp uses the **M=keys** orientation for QK^T, which is why it needs
+`get_transposed` = `movmatrix.sync.aligned.m8n8.trans.b16` to turn the KQ accumulator into the PV
+A-operand. **We can avoid that instruction entirely:**
+
+* **QK^T: M = qcols (16), N = keys (8 per mma n-tile).** Then `A = Q` (16x16, row-major) and
+  `B = K` (8x16, row-major) -- **both load as plain row-major `ldmatrix` fragments**, and the fp32 KQ
+  accumulator comes out **already in `[qcols][keys]` order**.
+* That ordering is exactly the PV A-operand layout, so:
+  **`A_PV = get_half2(KQ_C)` -- plain `make_half2` pairing, NO transpose, NO movmatrix.**
+* **P*V: M = qcols (16), N = dv (8 per mma n-tile), K = keys (16 per mma k-step).**
+  `B = V^T`, loaded with `ldmatrix.sync.aligned.m8n8.x4.trans.b16` **directly on the `[key][dv]` tile**
+  -- so **V is not stored transposed**, exactly as llama.cpp does it.
+
+## Geometry
+
+| item | value |
+|---|---|
+| `ncols1` (query rows) | 8 |
+| `ncols2` (query heads per KV head) | **6 -- exact GQA, no zero padding, no wasted FLOPs** |
+| `ncols` (qcols) | **48** = 3 warps x 16 qcols |
+| threads | **96 (3 warps)** |
+| key tile (`nbatch_fa`) | 32 |
+| head dim | 256, one tile |
+| warps | **exactly 3 -- no idle warp, no wasted work** |
+
+llama.cpp must use `ncols2 = 8` (powers of two) and throws away 2 of 8 GQA slots = **25% of its KQ and P*V
+FLOPs.** We do not.
+
+## Shared memory
+
+`K` 16 KB + `V` 16 KB = **32 KB**, XOR-swizzled with `stride = 128` half2 and **no padding**
+(`fattn-swizzle.cuh:6-47`), giving **3 CTAs/SM = 98,304 B**, under the 101,376 B limit.
+
+**`Q` lives in registers** (64 regs) -- so there is **no Q shared-memory buffer and no combine buffer**,
+which is what keeps the footprint at 32 KB.
+
+## Softmax (all of llama.cpp's numerical tricks, which the fp16 PV accumulator requires)
+
+* `KQ_max` offset `3*ln2` (`FATTN_KQ_MAX_OFFSET`); FTZ bit-trick at `-20.0f`.
+* **In-place `half2` rescale of the fp16 VKQ accumulator fragments.**
+* `rowsum` reduction via `__shfl_xor_sync` over offsets **1 and 2 only** -- the qcol row is held by lanes
+  with equal `lane/4`, so only bits 0-1 need shuffling (2 shuffles, not 3).
+* Mask by **adding `-inf` to masked scores** and initialise `KQ_max` to `-FLT_MAX/2` (llama.cpp's choice)
+  **so an all-masked row cannot produce NaN.**
+* Final divide by `rowsum` at the very end.
+
+## Dispatch
+
+`GB10_FA2=1` selects the new kernel **inside `attn_prefill_tiled`** (so the existing `attn-tile`
+differential test also exercises it when the flag is set -- useful for debugging). **Fall back to the old
+kernel whenever `head_dim != 256` or `n_q_heads != 6 * n_kv_heads`.**
+
+Confirmed against our source: `kh = h/group`, the 6 heads are `h = kh*6 + j`, and the causal rule is key
+`s <= start + t0 + i` **with `start` possibly non-zero**.
