@@ -14161,3 +14161,25 @@ either the `cp.async` pipeline or the MLP path.
 
 **Status of this measurement:** pass 1 only, 8K only. The 32K pass and pass 2 were still running when this was
 recorded. Do not treat the 1.07x total as final until the 32K pair and pass 2 land.
+
+### Clean 32K baseline (OLD kernel), pass 1
+
+`prefill-shape` at 32768 tokens, OLD kernel, same invocation as the 8K pair above:
+
+| 32K, pass 1 | total prefill | attn kernel | attn share |
+|---|---|---|---|
+| OLD (`attn_prefill_tiled`) | **67.91 s** | **22,184 ms** | 32.7% |
+
+Other components from the same diagnostic line: `proj + norm` 2,229 ms (3.3%), `o_proj + mlp` 8,069 ms
+(11.9%), rope 82 ms, kv append 31 ms. `ATTN n=64`.
+
+**This resolves the contaminated run.** The discarded pair had OLD at 41,643 ms (pass 1) and 22,224 ms
+(pass 2). The clean measurement gives **22,184 ms**, which matches pass 2 to within **0.2%** and is inside the
+previously known clean range of 18,400-21,700 ms. So **pass 2's OLD was the trustworthy half and pass 1's
+41,643 ms was the contaminated one** -- exactly the reading the 1.87x disagreement implied. It also means the
+provisional NEW figure of 11,251/11,283 ms was measured against a valid baseline, so **the ~1.97x provisional
+speedup at 32K is consistent with a clean baseline** -- but it is still not evidence until the NEW half of
+this same clean invocation lands.
+
+**The 32K NEW half was still running when this was recorded.** Expected, if FA2 behaves as at 8K: attn kernel
+near 11,000 ms and total near 56.7 s.
