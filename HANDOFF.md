@@ -297,6 +297,33 @@ The same binary, `/tmp/fa_res/llamacpp/build/bin/test-backend-ops`, benchmarks `
 as optional: it measures llama.cpp's kernel in llama.cpp's harness with llama.cpp's shapes, and the
 acceptance criterion for our FP4 work is our own in-session A/B against the bf16 path.
 
+## Current scorecard (after the FA2 kernel landed)
+
+The FA2 prefill attention kernel is **landed** (`59df192`, OOB fix `c084854`) and its speedup is
+**reproduced twice in one session**: **2.00x on the attention component at 32K** (22,184 -> 11,110 ms and
+22,035 -> 11,025 ms) and 2.07/2.01x at 8K. 32K total prefill improves 1.18-1.24x. Full numbers and the
+instrument caveat are in `bench/longctx/comparison.md` (grep it).
+
+| context | status | what it needs |
+|---|---|---|
+| 8K | **WON** | nothing -- was already 0.925-0.972x, FA2 widened it |
+| 32K | **borderline on attention alone** | required 1.19x total, got 1.18-1.24x; believe the minimum, so still ~1.01-1.04x behind. **A 2x MLP drops the requirement to 0.95x and wins it** |
+| 128K | **open** | needs 3.80x on attention (2.43x with a 2x MLP); at 2.0x it is still 1.31x behind |
+| 256K | **open** | needs 3.62x (2.86x with a 2x MLP) |
+
+**The two remaining levers are (a) the `cp.async` pipeline in the FA2 kernel** -- the one structural item from
+the original brief that has not landed, and attention is 67% of 128K -- **and (b) the MLP path**, where the
+three GEMMs are 22.8 s of the 25.6 s MLP, so the dequantise is worth only a few percent.
+
+**Do not double-buffer K+V in the pipeline:** it needs 64 KB and takes 3 CTAs/SM down to 1, and the old
+kernel's own measurement says 3->1 costs +114.9%. Use `cp.async` into the same buffer with
+`cp.async.wait_group` and a narrowed `__syncthreads()`.
+
+**The final four-context proof has NOT been run.** It is `python3 bench/longctx/ab_all.py --contexts
+8192,32768,131072,262144 --out <md>` -- multi-hour, needs the GPU exclusively, and is the only instrument that
+measures gb10 and llama.cpp the same way. `prefill-shape` totals are NOT TTFT and must not be substituted into
+a TTFT ratio.
+
 ## Live workstreams (so they can be continued via send_message)
 
 Two subagents were running when this note was written. Both have their own context budgets, so they can
