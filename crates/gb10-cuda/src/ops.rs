@@ -2047,7 +2047,19 @@ impl Ops {
         const THREADS: u32 = 96;
         debug_assert_eq!(head_dim, 256);
         // K tile + V tile, both BC * STRIDE_H2 half2, swizzled with no padding.
-        let smem = 2 * BC * STRIDE_H2 * 4;
+        let mut smem = 2 * BC * STRIDE_H2 * 4;
+        // Occupancy probe: request MORE dynamic shared memory than the kernel
+        // uses, which lowers blocks/SM without touching a single instruction.
+        // Isolates "does this kernel want more resident blocks?" from every
+        // other effect. `GB10_FA2_SMEM_PROBE=<bytes>`; 49152 forces 2 CTAs/SM
+        // (102400/49152 = 2) where 32768 gives 3 (102400/32768 = 3).
+        if let Ok(v) = std::env::var("GB10_FA2_SMEM_PROBE") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > smem {
+                    smem = n;
+                }
+            }
+        }
         if std::env::var("GB10_ATTN_OCCUPANCY").is_ok() {
             use cudarc::driver::sys::CUfunction_attribute_enum as A;
             let f = &self.attn_prefill_fa2;
