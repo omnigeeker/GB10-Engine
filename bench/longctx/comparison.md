@@ -14256,3 +14256,34 @@ are the MLP path and the missing `cp.async` pipeline.
 
 **Instrument caveat still applies:** these are `prefill-shape` totals, not cold TTFT (67.91 s vs the TTFT
 accounting's 53.08 s for the same context). Ratios transfer; absolute seconds do not.
+
+## CORRECTION: the FA2 occupancy budget is 96 threads, not 256 -- SMEM binds, not registers
+
+**A wrong constraint was carried into this workstream and has to be killed explicitly.** Earlier in the
+session the FA2 kernel was budgeted as "regs <= 85, smem <= 34,133 B", derived from the OLD kernel's
+**256-thread** block: `65536/(85*256) = 3.01`. **The FA2 kernel uses 96 threads, so that derivation does not
+apply to it.**
+
+The correct limits for 3 CTAs/SM at 96 threads:
+
+| resource | limit for 3 CTAs/SM | actual | binding? |
+|---|---|---|---|
+| registers | `65536/(96*3)` = **227** | **168** (`by_regs` = 4) | no -- **59 registers of headroom** |
+| smem | **34,133 B** | **32,768 B** (`by_smem` = 3) | **yes -- SMEM is the binding constraint at exactly 3** |
+| threads | 1536/96 = 16 | 96 | no |
+
+**So the binding constraint is SMEM at exactly 3 CTAs/SM, and there is real register headroom.** Two
+consequences, both of which change the plan:
+
+1. **The `cp.async` pipeline in the same-buffer form costs no occupancy at all** -- it needs no extra smem and
+   the register cost fits in the 59-register headroom. The earlier worry that the pipeline might force a drop
+   from 3 CTAs/SM (which the old kernel measured at +114.9% for 3->1) **does not apply to this form.**
+2. **Do not re-derive occupancy limits from a thread count you did not check.** The failure mode is the one
+   this session keeps hitting: a measured number from one context (the old kernel, 256 threads) reused as a
+   constraint in a different context (the FA2 kernel, 96 threads) without re-deriving it. Use
+   `GB10_ATTN_OCCUPANCY=1`, which reports the runtime values, rather than a hand calculation from the wrong
+   block size.
+
+**Note the general form of the lesson**, because it is the same mistake as the withdrawn "provably
+unreachable" proof: a number that was *measured* somewhere is not automatically a *constraint* somewhere else.
+The measurement is real; the transfer is the assumption.
