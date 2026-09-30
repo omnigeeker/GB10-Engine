@@ -14717,3 +14717,193 @@ The small unclaimed levers that could plausibly matter at 128K but have NOT been
 suffice: the deferred FA2 micro-opt (issue `K(s0+32)` one phase earlier so it hides under softmax + P*V at the
 same barrier count), and hoisting the duplicated gate/up activation cast (~1.1% at 32K). Both are refinements;
 neither is a route to 256K's 18%.
+
+## 2026-09-30 — 128K/256K verdict: FA2 barrier move + shared-cast hoist
+
+Two changes landed and were measured: the deferred FA2 micro-opt (the mid-loop
+barrier moved to just after QK^T) and a caller-scoped hoist of the duplicated
+fp32->bf16 activation cast. Same-session three-engine cold-TTFT proof in
+`bench/longctx/TTFT_PROOF_128K.md`, one session, two trials each, minimum
+reported:
+
+| context | gb10-fa2off (warm) | gb10-fa2on | llama.cpp | fa2on/llama | verdict |
+|---|---|---|---|---|---|
+| 8192 | 9.67 | **9.25** | 10.61 | 0.872 | **WON 1.147x** |
+| 32768 | 52.14 | **39.78** | 43.72 | 0.910 | **WON 1.099x** |
+| 131072 | 441.59 | **231.71** | 226.76 | **1.022** | **LOST by 2.2%** |
+
+Both trials agree tightly (fa2on 231.71 / 232.03; llama 226.76 / 227.21), so the
+**4.95 s gap at 128K is real, not noise. 128K did not flip.** 8K and 32K both
+improved (1.13x -> 1.147x, 1.078x -> 1.099x).
+
+### WITHDRAWAL: the `fa2off` column of `TTFT_PROOF.md` is a cold-cache artifact
+
+`TTFT_PROOF.md` reports fa2off at 12.57 / 65.96 / 522.49 s. Re-measured in a
+later session with the same engine: **9.67 / 52.14 / 441.59 s** — 15-23% faster.
+Over the same two sessions `fa2on` moved <1% (9.29->9.25, 40.41->39.78,
+233.46->231.71) and `llama` moved <1% (10.46->10.61, 43.57->43.72,
+226.93->226.76). **Session drift would move all three engines; it moved only
+`fa2off`.** The mechanism is that `fa2off` was the FIRST engine started in the
+proof run, so it paid first-touch/page-cache cost on the 21.9 GB model file,
+while the later two arms ran warm. (GPU contention was checked and ruled out:
+the other agent on the box finished 76 s before the proof started.)
+
+Consequences, both of which matter:
+
+* **The `fa2off` column of `TTFT_PROOF.md` must not be quoted, and the ratios
+  derived from it (1.202 / 1.514 / 2.302 / 2.512) are void.** The warm column
+  above supersedes it.
+* **The pipeline-speedup figures recorded earlier (1.33x / 1.63x / 2.23x /
+  2.14x) are also void** — they compared a cold first arm against warm later
+  arms. The warm numbers are **1.045x / 1.311x / 1.903x** for fa2off/fa2on at
+  8K / 32K / 128K.
+* `fa2on` vs `llama` is untouched by this: both arms ran warm, both reproduce
+  to ~1%, and that is the comparison the objective rests on.
+
+### What was changed, and what each is worth
+
+**1. FA2 barrier move (A1).** The mid-loop `cp.async.wait_group 0` +
+`__syncthreads()` moved from after the P packing to immediately after QK^T, so
+`K(s0+32)` is in flight across mask + softmax + P packing + P*V instead of P*V
+alone, at the same two barriers. Attention kernel, same-session, two passes
+each, minimum:
+
+| ctx | baseline | A1 | change |
+|---|---|---|---|
+| 8K | 350 ms | 343 ms | −2.0% |
+| 32K | 5,763 ms | 5,601 ms | −2.8% |
+| 128K | 94,435 ms | 92,063 ms | −2.5% |
+
+`generate` is an exact 16/16 match; the change reorders no arithmetic.
+
+**2. A5 REJECTED — overlapping the K and V fetches is not better.** The
+alternative form adds a third barrier (`__syncthreads` after QK^T, then
+`cp.async.wait_group 1` before P*V) so that V(s0) and K(s0+32) are in flight
+together, giving K the same window as A1 while restoring V's full slack:
+
+| variant | 8K attn | 32K attn |
+|---|---|---|
+| two-barrier baseline | 350 ms | 5,763 ms |
+| **A1 (K's window extended)** | **343 ms** | **5,601 ms** |
+| A5 (both fetches overlapped, 3 barriers) | 347 ms | 5,773 ms |
+
+**The win is specifically K's window, and an extra barrier is not worth paying
+for.** Do not retry the overlap.
+
+**3. Shared-cast hoist.** `Linear::forward_prefill_tensor_core` always staged
+its fp32 input to bf16 into the one shared `sc.x` scratch, so every group of
+projections reading the same activation re-staged it. Three groups share an
+input: the MLP `gate`/`up` pair, the attention `q`/`k`/`v`, and the four
+DeltaNet `in_proj_{qkv,z,a,b}` — 3,840 redundant `t x 5120` staging passes at
+128K. `weights::forward_prefill_shared_input` stages once and runs the GEMMs.
+
+This is a **caller-scoped fusion, not a cache**: the cast is produced and
+consumed inside one function call, so there is no key and nothing to
+invalidate. A pointer-keyed cache would be unsafe because `sc.hidden` is
+rewritten between layers — the same address holds different data at different
+points in the forward pass. The two halves of the pair are module-private so
+`forward_prefill_shared_input` is the only thing that can establish the
+invariant.
+
+Clean **same-binary** A/B (`GB10_CAST_HOIST=1|0`), 2 passes each, 32K:
+
+| | hoist on | hoist off | saving |
+|---|---|---|---|
+| total, p1 / p2 | 38.40 / 38.34 s | 41.02 / 40.22 s | |
+| **minimum total** | **38.34 s** | **40.22 s** | **−1.88 s (−4.7%)** |
+| delta `proj in` | 4,353 / 4,378 ms | 5,326 / 5,149 ms | −0.80 s |
+| attn `proj + norm` | 1,591 / 1,611 ms | 1,792 / 1,855 ms | −0.20 s |
+| attn kernel | 5,525 / 5,539 ms | 5,631 / 5,686 ms | unchanged (as expected) |
+
+`generate` is still an exact 16/16 match: hoisting is bit-identical, because the
+bf16 bytes fed to each GEMM are the same bytes.
+
+**Unresolved anomaly, flagged rather than explained.** The 32K same-binary A/B
+says the hoist is worth 1.88 s, and the saving is per-chunk, so 16 chunks vs 4
+predicts **~7.5 s at 128K**. It does not materialise: the measured 128K
+improvement is **~1.75 s on cold TTFT** (233.46 -> 231.71) and ~3.2 s on
+`prefill-shape` (233.58 -> 230.43). The hoist's 128K benefit is bounded by
+something other than chunk count, and that is not identified here.
+
+### 256K: NOT REACHABLE — the arithmetic
+
+Measured breakdown at 256K (`prefill-shape`, `GB10_PREFILL_NSEQ=1`, FA2, chunk
+8192, all instruments). Total **709.28 s**, which matches the cold-TTFT 709.52 s:
+
+| phase | ms | % of total |
+|---|---|---|
+| **attn kernel** | **443,018** | **62.5%** |
+| MLP (gate 81.2k + swiglu 16.6k + down 51.8k) | 149,560 | 21.1% |
+| delta `proj in` | 34,710 | 4.9% |
+| delta `proj out` | 18,670 | 2.6% |
+| delta rule | 17,025 | 2.4% |
+| attn `proj + norm` | 13,042 | 1.8% |
+| conv + l2norm + gate | 12,912 | 1.8% |
+| `o_proj` | ~9,380 | 1.3% |
+
+Attention is 62.5% of 256K (it was 40% at 128K), because its FLOPs grow as
+O(n^2) while everything else is O(n).
+
+| ctx | attn TFLOP | attn s | **TFLOP/s** | **% of 115 TFLOP/s** |
+|---|---|---|---|---|
+| 8K | 13.2 | 0.340 | 38.81 | 33.7% |
+| 32K | 211.1 | 5.525 | 38.21 | 33.2% |
+| 128K | 3,377.7 | 92.328 | 36.58 | 31.8% |
+| **256K** | **13,510.9** | **443.018** | **30.50** | **26.5%** |
+
+**The gap is 109.25 s** (709.28 - 600.03).
+
+* **Attention alone cannot close it.** It would have to reach
+  `13,510.9 / (443.018 - 109.25)` = **40.48 TFLOP/s**. That is llama.cpp's own
+  measured FA rate on this exact box (40.72 TFLOP/s, hsk=256, GQA x8) — a number
+  that reports **uncausal** FLOPs for work that ran causal (`mask=1`), so the
+  rate actually delivered in that test is roughly half. Matching it with a
+  causal kernel is not achievable, and it would leave **zero** margin.
+* **Even the best realistic attention win leaves 35.5 s to find.** Restoring
+  128K's 36.58 TFLOP/s at 256K gives `13,510.9 / 36.58` = 369.2 s, saving
+  **73.8 s** — still 35.5 s short.
+* **That residual is not available in non-attention.** Non-attention is 266.3 s
+  and already runs at the measured cuBLAS bf16 floor: MLP **60.0 TFLOP/s** at
+  256K (56.8 at 128K) against cuBLAS's measured 55.7-67.9, and delta `proj in`
+  ~60.8 TFLOP/s. Closing 35.5 s needs a **13.3% cut of non-attention**; the
+  measured recoverable amount on bf16 is **under 3%**.
+
+**Verdict: 256K is not reachable by refining what exists.** It needs a different
+attention algorithm or a lower-precision path, not a tuning pass.
+
+**Why attention efficiency falls at 256K (30.50 vs 36.58 TFLOP/s) — inference,
+not measurement.** The KV working set at 256K is 4 heads x 262144 keys x 256
+dims x 2 bytes x 2 (K and V) = 1.07 GB, so the shared prefix that the ~144
+concurrent CTAs stream no longer fits in L2 and the `cp.async` loads
+increasingly miss. This is offered as a hypothesis only: `ncu` cannot be used on
+this box (`RmProfilingAdminOnly: 1`, no root), so **there are no hardware stall
+counters anywhere in this section** — every number above is wall-clock or
+CUDA-event timing.
+
+### Attention is near the achievable rate, not near the ceiling
+
+The 115 TFLOP/s `mma.sync` ceiling is a `ptxas` microbenchmark figure. Against
+the only real competitor kernel measured on this hardware — llama.cpp's
+`test-backend-ops` flash attention, 40.72 TFLOP/s at hsk=256 / GQA x8 — the
+kernel runs at **88-93%**. Combined with the fact that efficiency is flat
+(38.8 / 38.2 / 36.6 TFLOP/s at 8K / 32K / 128K), the residual on attention is
+**~10%, not 3x**. There is no amortisation or load imbalance left to recover;
+only the per-key-tile cost can improve.
+
+### Correctness gates, new binary (after both changes)
+
+| gate | baseline | new | result |
+|---|---|---|---|
+| `generate` | exact 16/16 | exact 16/16 | identical |
+| `perplexity --ctx 512 --chunks 60` | mean nll 1.875067 | **1.875067** | bit-identical |
+| `perplexity --ctx 4096 --chunks 60` | mean nll 1.877331 | **1.877331** | bit-identical |
+| `attn-tile` | rc=1 | rc=1 | unchanged (pre-existing tiled-vs-legacy mismatch) |
+
+The ctx-4096 baseline was built and measured **before** the new binary, because
+the PTX is loaded from `OUT_DIR` at runtime and a rebuild overwrites it -- an old
+binary and new PTX cannot coexist.
+
+Both changes are bit-identical by construction (the hoist feeds the same bf16
+bytes to the same GEMMs; the FA2 change reorders no arithmetic), and ctx512 and
+ctx4096 perplexity confirm that. **This does not certify memory safety** -- an
+out-of-bounds store has passed these exact gates in this project before.
