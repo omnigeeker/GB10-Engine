@@ -51,12 +51,21 @@ run ppl4096 ./target/release/gb10-verify perplexity --model "$MODEL" \
 echo "--- attn-tile rc=$? (1 is expected: fp16 P*V accumulator)"
 
 # ---- memory safety: the staging loop is indexing code --------------------
-run sanitizer_memcheck compute-sanitizer --tool memcheck --error-exitcode 9 \
-    ./target/release/gb10-verify attn-tile --model "$MODEL"
-run sanitizer_racecheck compute-sanitizer --tool racecheck --error-exitcode 9 \
-    ./target/release/gb10-verify attn-tile --model "$MODEL"
-run sanitizer_memcheck_generate compute-sanitizer --tool memcheck --error-exitcode 9 \
-    ./target/release/gb10-verify generate --model "$MODEL" \
+# `--report-api-errors no` is REQUIRED for this to be a memory-safety check.
+# gb10_cuda::Device::new looks up 9 kernel names that live in a different PTX
+# module (the dequant/gemm ones), so every Device creation emits 9
+# CUDA_ERROR_NOT_FOUND "named symbol not found" API errors -- pre-existing,
+# independent of the kernel under test, and unrelated to memory access. With
+# the default `--report-api-errors yes` those are counted in ERROR SUMMARY, so
+# memcheck reports ~114 "errors" and exits 9 on a kernel that has ZERO memory
+# errors. That is a false failure in an abort-by-default gate, i.e. the same
+# class of bug as the <defunct> zombie false positive in ab_all.py.
+run sanitizer_memcheck compute-sanitizer --tool memcheck --report-api-errors no \
+    --error-exitcode 9 ./target/release/gb10-verify attn-tile --model "$MODEL"
+run sanitizer_racecheck compute-sanitizer --tool racecheck --report-api-errors no \
+    --error-exitcode 9 ./target/release/gb10-verify attn-tile --model "$MODEL"
+run sanitizer_memcheck_generate compute-sanitizer --tool memcheck --report-api-errors no \
+    --error-exitcode 9 ./target/release/gb10-verify generate --model "$MODEL" \
     --prompt "What is the capital of France?" --n 24
 
 echo

@@ -89,9 +89,11 @@ def swap_ptx(path):
     return hashlib.sha256(open(dst, "rb").read()).hexdigest()[:12]
 
 
-def run_once(ctx):
+def run_once(ctx, extra_env=None):
     env = dict(os.environ)
     env.update({"GB10_FA2": "1", "GB10_PREFILL_NSEQ": "1", "GB10_ATTN_EVENTS": "1"})
+    if extra_env:
+        env.update(extra_env)
     cmd = [VERIFY, "prefill-shape", "--model", MODEL,
            "--limit", str(ctx), "--max-seq", str(ctx)]
     t0 = time.time()
@@ -110,7 +112,11 @@ def run_once(ctx):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", required=True,
-                    help="comma-separated name=ptxpath")
+                    help="comma-separated name=ptxpath, optionally with a "
+                         "per-arm env suffix: name=ptxpath@KEY=VAL;KEY2=VAL2. "
+                         "The env travels with the arm so a knob that must "
+                         "match the kernel (e.g. the host's dynamic smem "
+                         "request) cannot be desynchronised from it.")
     ap.add_argument("--contexts", default="8192,32768")
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--out", default=None)
@@ -118,10 +124,17 @@ def main():
 
     arms = []
     for spec in args.arms.split(","):
-        name, _, path = spec.partition("=")
+        name, _, rest = spec.partition("=")
+        path, _, envspec = rest.partition("@")
+        env = {}
+        for kv in envspec.split(";"):
+            kv = kv.strip()
+            if kv:
+                k, _, v = kv.partition("=")
+                env[k.strip()] = v.strip()
         if not path or not os.path.isfile(path):
             sys.exit(f"bad arm {spec!r}")
-        arms.append((name.strip(), path))
+        arms.append((name.strip(), path, env))
     contexts = [int(c) for c in args.contexts.split(",") if c.strip()]
 
     lines = []
@@ -138,26 +151,27 @@ def main():
          f"GB10_ATTN_EVENTS=1, chunk 8192 (the server's PREFILL_CHUNK)")
     emit(f"- contexts {contexts}")
     emit()
-    emit("| arm | ptx sha256[:12] | file |")
-    emit("|---|---|---|")
+    emit("| arm | ptx sha256[:12] | file | extra env |")
+    emit("|---|---|---|---|")
     shas = {}
-    for name, path in arms:
+    for name, path, env in arms:
         h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
         shas[name] = h
-        emit(f"| {name} | `{h}` | {os.path.basename(path)} |")
+        es = " ".join(f"`{k}={v}`" for k, v in sorted(env.items())) or "-"
+        emit(f"| {name} | `{h}` | {os.path.basename(path)} | {es} |")
     emit()
 
     results = {}
     for ctx in contexts:
         for p in range(args.passes):
-            for name, path in arms:
+            for name, path, env in arms:
                 busy = gpu_busy()
                 if busy:
                     sys.exit(f"GPU BUSY before {name} ctx={ctx} pass={p}: {busy}")
                 got = swap_ptx(path)
                 assert got == shas[name], f"ptx sha mismatch {got} != {shas[name]}"
                 log(f"ctx={ctx} pass={p} arm={name} ptx={got} ...")
-                r = run_once(ctx)
+                r = run_once(ctx, env)
                 if r is None or r["attn_ms"] is None:
                     log(f"  FAILED: {r}")
                     continue
@@ -170,11 +184,11 @@ def main():
 
     emit("## attn kernel (ms, minimum of passes)")
     emit()
-    emit("| context | " + " | ".join(n for n, _ in arms) + " |")
+    emit("| context | " + " | ".join(n for n, _, _ in arms) + " |")
     emit("|---|" + "---|" * len(arms))
     for ctx in contexts:
         cells = []
-        for n, _ in arms:
+        for n, _, _ in arms:
             v = results.get((n, ctx))
             cells.append(f"{min(x['attn_ms'] for x in v)}" if v else "n/a")
         emit(f"| {ctx} | " + " | ".join(cells) + " |")
@@ -182,13 +196,13 @@ def main():
     emit("## attn kernel speedup vs the first arm")
     emit()
     base = arms[0][0]
-    emit("| context | " + " | ".join(n for n, _ in arms if n != base) + " |")
+    emit("| context | " + " | ".join(n for n, _, _ in arms if n != base) + " |")
     emit("|---|" + "---|" * (len(arms) - 1))
     for ctx in contexts:
         b = results.get((base, ctx))
         bm = min(x["attn_ms"] for x in b) if b else None
         cells = []
-        for n, _ in arms:
+        for n, _, _ in arms:
             if n == base:
                 continue
             v = results.get((n, ctx))
@@ -201,7 +215,7 @@ def main():
     emit("| context | arm | attn kernel ms | total s |")
     emit("|---|---|---|---|")
     for ctx in contexts:
-        for n, _ in arms:
+        for n, _, _ in arms:
             for x in results.get((n, ctx), []):
                 emit(f"| {ctx} | {n} | {x['attn_ms']} | {x['total_s']} |")
     emit()

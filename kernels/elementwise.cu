@@ -700,7 +700,10 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
 // ---------------------------------------------------------------------------
 
 #define FA2_HD         256
-#define FA2_BC         32      // key rows per tile (nbatch_fa)
+#define FA2_BC         16      // key rows per tile (nbatch_fa)
+// Key n-tiles of 8 keys each: 4 at BC=32, 2 at BC=16. Everything sized by the
+// tile width is expressed through this so the two configurations are one source.
+#define FA2_NT         (FA2_BC / 8)
 #define FA2_NROWS      8       // ncols1: query rows per block
 #define FA2_GQA        6       // ncols2: query heads per KV head
 #define FA2_NCOLS      48      // qcols = 8 * 6
@@ -762,7 +765,8 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int start, int kv_base) {
-    // 32 KB dynamic: K then V, both FA2_BC * FA2_STRIDE_H2 half2.
+    // FA2_BC * FA2_STRIDE_H2 * 4 bytes per tile: K then V. 32 KB at BC=32
+    // (3 CTAs/SM, the shipped config) or 16 KB at BC=16 (4 CTAs/SM).
     extern __shared__ __align__(16) unsigned char fa2_raw[];
     unsigned char* tile_K = fa2_raw;
     unsigned char* tile_V = fa2_raw + (size_t)FA2_BC * FA2_STRIDE_H2 * 4;
@@ -856,16 +860,16 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
         fa2_stage_async(tile_V, v, s0, win_max, kh, n_kv_heads, kv_base, tid);
 
         // ---- QK^T: KQ_C[qcol][key] = Q . K^T (scale already in Q) --------
-        float KQ_C[4][4];
+        float KQ_C[FA2_NT][4];
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < FA2_NT; ++nt) {
 #pragma unroll
             for (int l = 0; l < 4; ++l) KQ_C[nt][l] = 0.0f;
         }
 #pragma unroll
         for (int kt = 0; kt < 16; ++kt) {
 #pragma unroll
-            for (int np = 0; np < 2; ++np) {
+            for (int np = 0; np < FA2_NT / 2; ++np) {
                 // One x4 covers two 8-key n-tiles: r0/r1 = b0/b1 of n-tile
                 // 2*np, r2/r3 = b0/b1 of n-tile 2*np+1.
                 const int krow = np * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);
@@ -916,7 +920,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
         // x[0]/x[1] are row `gid`, x[2]/x[3] are row `gid+8`; both are the
         // same query row, so one boundary (`row_key_max`) serves all four.
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < FA2_NT; ++nt) {
             const int key0 = s0 + nt * 8 + t4 * 2;
             if (!row_ok || key0 > row_key_max) {
                 KQ_C[nt][0] = -INFINITY;
@@ -931,7 +935,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
         // ---- online softmax ----------------------------------------------
         float KQ_max_new[2] = {KQ_max[0], KQ_max[1]};
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < FA2_NT; ++nt) {
             KQ_max_new[0] = fmaxf(KQ_max_new[0], KQ_C[nt][0] + FA2_KQ_OFFSET);
             KQ_max_new[0] = fmaxf(KQ_max_new[0], KQ_C[nt][1] + FA2_KQ_OFFSET);
             KQ_max_new[1] = fmaxf(KQ_max_new[1], KQ_C[nt][2] + FA2_KQ_OFFSET);
@@ -949,7 +953,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
 
         float KQ_rowsum_add[2] = {0.0f, 0.0f};
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < FA2_NT; ++nt) {
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
                 const float p = __expf(KQ_C[nt][l] - KQ_max_new[l >> 1]);
@@ -990,9 +994,9 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
 
         // ---- P fragments: plain make_half2 pairing, no transpose ----------
         // A_PV = get_half2(KQ_C): k-step kk uses KQ n-tiles 2kk and 2kk+1.
-        unsigned P[2][4];
+        unsigned P[FA2_NT / 2][4];
 #pragma unroll
-        for (int kk = 0; kk < 2; ++kk) {
+        for (int kk = 0; kk < FA2_NT / 2; ++kk) {
             P[kk][0] = fa2_pk2f(KQ_C[kk * 2][0], KQ_C[kk * 2][1]);
             P[kk][1] = fa2_pk2f(KQ_C[kk * 2][2], KQ_C[kk * 2][3]);
             P[kk][2] = fa2_pk2f(KQ_C[kk * 2 + 1][0], KQ_C[kk * 2 + 1][1]);
@@ -1001,7 +1005,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
 
         // ---- P*V: VKQ_C += P . V, fp16 accumulate -------------------------
 #pragma unroll
-        for (int kc = 0; kc < 2; ++kc) {
+        for (int kc = 0; kc < FA2_NT / 2; ++kc) {
 #pragma unroll
             for (int dc = 0; dc < 16; ++dc) {
                 const int vrow = kc * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);

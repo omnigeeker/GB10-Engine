@@ -2042,12 +2042,28 @@ impl Ops {
         kv_base: usize,
     ) -> Result<()> {
         const NROWS: usize = 8;
-        const BC: usize = 32;
+        // Key rows per tile, mirroring FA2_BC in kernels/elementwise.cu. The
+        // dynamic smem request must match the tile the kernel was built with:
+        // too small overflows the tile, too large wastes a resident block. The
+        // two are therefore one knob -- `GB10_FA2_BC` selects both the kernel
+        // (via the PTX) and this request.
+        //
+        // THE DEFAULT MUST MATCH THE COMPILED KERNEL. The shipped kernel is
+        // built at FA2_BC=16, which is the 4-CTAs/SM configuration worth
+        // 1.41-1.47x on attention (bench/longctx/comparison.md). Leaving this
+        // at 32 would request 32 KB for a 16 KB tile, silently drop occupancy
+        // back to 3 CTAs/SM, and lose the entire win without any error. If you
+        // rebuild the kernel at a different FA2_BC, change this default in the
+        // same commit.
+        let bc: usize = std::env::var("GB10_FA2_BC")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16);
         const STRIDE_H2: usize = 128;
         const THREADS: u32 = 96;
         debug_assert_eq!(head_dim, 256);
         // K tile + V tile, both BC * STRIDE_H2 half2, swizzled with no padding.
-        let mut smem = 2 * BC * STRIDE_H2 * 4;
+        let mut smem = 2 * bc * STRIDE_H2 * 4;
         // Occupancy probe: request MORE dynamic shared memory than the kernel
         // uses, which lowers blocks/SM without touching a single instruction.
         // Isolates "does this kernel want more resident blocks?" from every

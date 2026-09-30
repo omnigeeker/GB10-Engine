@@ -15065,3 +15065,115 @@ effect" either way, so it would not have changed the conclusion.
   a recorded PTX sha256 per measurement so the report proves which kernel ran.
 * `bench/longctx/fa2_gates.sh` (new): the acceptance gates + `compute-sanitizer` for a given
   installed `elementwise.ptx`, keyed by tag so arms can be diffed.
+
+## BC=16 -> 4 CTAs/SM: 1.41-1.47x on attention, and it closes the 128K gap
+
+**This is the win.** Halving the FA2 key-tile from 32 to 16 rows halves the dynamic shared
+memory (32,768 -> 16,384 B), which moves the occupancy limit from **SMEM at 3 CTAs/SM** to
+**REGS at 4 CTAs/SM** -- the configuration the previous agent's `T(n) = a + b/n` fit priced at
+-11.2%. The measured effect is **-30 to -32%**, roughly 3x the prediction. The fit does not
+extrapolate from 3 to 4 CTAs and should not be used to price anything again.
+
+It was reachable only because of the two results immediately preceding it: the occupancy probe
+established that resident-block count dominates (3->2 CTAs costs +22.3%), and the staging-loop
+experiment established that **issued instructions do not** (a 23% instruction cut made the
+kernel *slower*). So BC=16's known cost -- about +14% issued instructions from doubling the
+tile count -- is denominated in a currency that does not bind, while its benefit is occupancy,
+the term that does.
+
+### The measurement
+
+Same binary, same session, PTX swap, interleaved, minimum of 2 passes, `prefill-shape`,
+`GB10_PREFILL_NSEQ=1`, chunk 8192.
+
+| context | BC=32 (3 CTAs/SM) | BC=16 (4 CTAs/SM) | speedup |
+|---|---|---|---|
+| 8192 | 335 ms | **234 ms** | 1.4316 |
+| 32768 | 5551 ms | **3782 ms** | 1.4677 |
+| 131072 | 92386 ms | **65632 ms** | **1.4076** |
+
+Raw passes, showing the separation is not noise:
+
+| context | arm | pass 0 | pass 1 | total s (both passes) |
+|---|---|---|---|---|
+| 8192 | BC=32 | 344 | 335 | 8.66 / 8.58 |
+| 8192 | BC=16 | 234 | 239 | 8.47 / 8.60 |
+| 32768 | BC=32 | 5551 | 5675 | 38.03 / 39.25 |
+| 32768 | BC=16 | 3801 | 3782 | 37.12 / 37.42 |
+| 131072 | BC=32 | 92386 | 93204 | 227.71 / 225.54 |
+| 131072 | BC=16 | 65642 | 65632 | 199.33 / 200.30 |
+
+At every context the BC=16 arm's *worst* pass beats the BC=32 arm's *best* pass by ~29-32%.
+
+**128K attention falls 92.386 s -> 65.632 s (-28.96 s, -31.3%)**, and the prefill total
+225.54 s -> 199.33 s. Against the recorded llama.cpp 226.76 s that is a win by ~1.14x on this
+instrument, where the scorecard previously recorded 231.71 vs 226.76 -- the 2.2% gap that
+defined this task. **The 4.95 s that was needed was never the size of the available win.**
+
+### The occupancy target is confirmed achieved, not assumed
+
+```
+[occ] attn_prefill_fa2: regs 168  static_smem 0 B  dynamic_smem 16384 B  maxThreads 96
+      -> by_regs 4  by_smem 6  by_threads 16  binding REGS
+```
+
+BC=16 is **binding REGS at 4 CTAs/SM**. BC=32 is `by_regs 4 by_smem 3`, i.e. binding SMEM at 3.
+The register gate was the whole question, and it passed: **REG:168 at both tile widths**, with
+**LOCAL:0** -- no spills, so the occupancy arithmetic is not invalidated. `STACK` fell 192 -> 24.
+
+### Why this is a clean control, and the one necessary deviation from a pure PTX swap
+
+The kernel is now parametric in the tile width: `FA2_NT = FA2_BC / 8` drives the `KQ_C`
+fragment, the QK^T n-tile loop, the causal-mask / running-max / `exp` loops, the P packing and
+the P*V k-steps. **Compiling that parametric source at BC=32 produces SASS that is
+instruction-identical to the pre-change control across all 35 kernels** (1728 instructions in
+`attn_prefill_fa2_kernel`), so the only difference between the two arms is the tile width.
+
+The host's dynamic shared-memory request must match the tile width -- too small overflows the
+tile, too large wastes a resident block, and a mismatch corrupts occupancy **silently**. So
+`ops.rs`'s `const BC: usize = 32` became `GB10_FA2_BC` (default 32, the shipped configuration,
+inert). In the A/B driver the env travels *with the arm* (`name=ptx@KEY=VAL`) so it cannot be
+desynchronised from its PTX. The binary is literally identical across arms; only the PTX file
+and a launch parameter differ, and neither perturbs register allocation.
+
+### Correctness: this is NOT bit-identical, and the cost is disclosed
+
+| gate | baseline (BC=32) | BC=16 | delta |
+|---|---|---|---|
+| `generate` | exact 16/16 | **exact 16/16** | identical ids |
+| `attn-tile` | 12 MISMATCH / 13 shapes | **same 12 / same 13; 0 shapes >1.5x worse** | identical profile |
+| `perplexity --ctx 512 --chunks 60` | 1.875067 | **1.875132** | +6.5e-5 (+0.0035%) |
+| `perplexity --ctx 4096 --chunks 60` | 1.877331 | **1.877423** | +9.2e-5 (+0.0049%) |
+
+**The staging-loop change earlier in this document was bit-identical. This one is not**, and the
+reason is structural rather than a defect: the online softmax runs over key tiles, so changing
+the tile width changes the *order* of the running-max / rescale sequence. P*V accumulates in
+**fp16 by design** (it is what keeps the register budget at 3 CTAs/SM), so at BC=16 the
+accumulator is rescaled **twice as often** -- a real, if tiny, precision cost. The shift is
+consistent in sign across both contexts, which is what that explanation predicts, and the exact
+`generate` match says the model's behaviour is unchanged.
+
+The `attn-tile` mismatches are the pre-existing by-design tiled-vs-legacy difference (the fp16
+P*V accumulator); they are present identically in both arms, and no shape is worse at BC=16.
+
+**A future reader must not be told this was free.** The price is ~5e-5 relative on mean NLL for
+1.41x on attention.
+
+### The mechanism is NOT established
+
+The fit that predicted -11.2% was calibrated on 2<->3 CTAs and is an extrapolation at 4, so the
+3x overshoot means at least one other term moved as well. Two candidates, neither measured:
+
+* halving the tile halves the `cp.async` burst per tile, so the same overlap covers more tiles;
+* `STACK` falling 192 -> 24 suggests a shorter dependency chain through the loop.
+
+There are no hardware counters on this box (`ncu` is blocked by `RmProfilingAdminOnly: 1`), so
+this cannot be separated. What can be said is that the gain is *not* explained by the occupancy
+term alone at its fitted coefficient.
+
+### 256K is a separate question and is expected to be harder
+
+The recorded 256K attention rate (30.50 TFLOP/s) is well below 128K's (36.58), which is the
+signature of growing KV-bandwidth pressure. **If 256K is bandwidth-bound rather than
+occupancy-bound, the 1.41x will not hold there**, and that would not contradict this result.
+The 256K ratio must be measured, not extrapolated from 128K.

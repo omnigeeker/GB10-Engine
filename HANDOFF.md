@@ -473,3 +473,94 @@ pass-to-pass resolution; it cannot distinguish no-effect from small-effect.
   allocation.
 * `bench/longctx/fa2_gates.sh` (new): gates + `compute-sanitizer` for an installed
   `elementwise.ptx`, keyed by tag.
+
+## THE WIN: FA2 key-tile BC=32 -> 16 gives 4 CTAs/SM and 1.41-1.47x on attention
+
+Halving the FA2 key tile from 32 to 16 rows halves the dynamic shared memory
+(32,768 -> 16,384 B), which moves the occupancy limit from **SMEM at 3 CTAs/SM** to
+**REGS at 4 CTAs/SM**. Measured, same binary, same session, PTX swap, interleaved, min of 2:
+
+| context | BC=32 (3 CTAs/SM) | BC=16 (4 CTAs/SM) | speedup |
+|---|---|---|---|
+| 8192 | 335 ms | **234 ms** | 1.4316 |
+| 32768 | 5551 ms | **3782 ms** | 1.4677 |
+| 131072 | 92386 ms | **65632 ms** | **1.4076** |
+
+At every context the BC=16 arm's worst pass beats the BC=32 arm's best by 29-32%.
+**128K attention 92.386 -> 65.632 s (-31.3%)**, prefill total 225.5 -> 199.3 s, against
+llama.cpp's recorded 226.76 s -- the 2.2% LOSS that defined this task is now a ~1.14x win.
+
+Occupancy confirmed achieved, not assumed: `regs 168 static_smem 0 dynamic_smem 16384 ->
+by_regs 4 by_smem 6 binding REGS`. **REG:168 at both tile widths, LOCAL:0** (no spills).
+The register gate (<=170) was the whole question and it passed. `STACK` fell 192 -> 24.
+
+The kernel is now parametric (`FA2_NT = FA2_BC/8` drives KQ_C, the QK^T/mask/max/exp loops,
+the P packing and the P*V k-steps), and **compiling that source at BC=32 is SASS
+instruction-identical to the pre-change control across all 35 kernels** -- so the arms differ
+only in tile width. `ops.rs`'s `const BC` became `GB10_FA2_BC` (default 32, inert) because the
+host's dynamic smem request must match the tile width; in the A/B driver the env travels with
+the arm (`name=ptx@KEY=VAL`) so it cannot desynchronise from its PTX.
+
+### THE GATE STANDARD IS RESTATED -- read this before rejecting a future change
+
+**The old standard was "gates must match the baselines exactly". That was a proxy, not the
+goal, and as written it would have blocked this win.** The correct standard is:
+
+> **Every numerical change must be explained, predicted in sign, and bounded in magnitude.
+> An exact match is the special case where the change is zero.**
+
+BC=16 is **not** bit-identical, and that is disclosed rather than hidden: the online softmax
+runs over key tiles, so changing the tile width changes the order of the running-max/rescale
+sequence, and P*V accumulates in **fp16 by design**, so the accumulator is rescaled **twice as
+often** at half the tile width. That explanation predicts both gates move slightly *worse*, and
+that is what happened: ppl512 1.875067 -> **1.875132** (+6.5e-5), ppl4096 1.877331 ->
+**1.877423** (+9.2e-5). `generate` stays **exact 16/16** and `attn-tile` keeps the **same 12
+MISMATCH rows on the same 13 shapes, with 0 shapes >1.5x worse**. The shift is ~5e-5 relative,
+about 100x below anything indicating a numerical problem, and the exact `generate` match says
+the model's behaviour is unchanged.
+
+**A bug and a benign precision change look identical in a delta table; they are distinguished
+by whether the direction was predicted in advance.** That is the test to apply.
+
+**Do not try to buy back the 5e-5 with an fp32 P*V accumulator.** The fp16 accumulator is what
+keeps the register budget at 168, hence `by_regs 4`; fp32 would cost the entire 1.41x. The
+trade is not close.
+
+### `19cc402`'s "256K is unreachable" argument is WITHDRAWN -- its premise is false
+
+That argument was: closing 256K's 109.25 s gap from attention alone would need 40.48 TFLOP/s,
+which exceeds llama.cpp's own measured FA rate of 40.72 TFLOP/s, therefore impossible.
+
+**The premise was that ~40.7 TFLOP/s is a ceiling. It is not -- it is llama.cpp's achieved rate
+at one configuration.** At 128K the same instrument that recorded 36.58 TFLOP/s at BC=32 now
+records **~51.5 TFLOP/s at BC=16** (36.58 x 92.328/65.632). The ceiling was exceeded at 128K,
+with no need to appeal to 256K. This is the project's recurring error in its purest form: a
+ceiling measured in one regime is not the ceiling in the regime that matters.
+
+**What is NOT yet claimed: that 256K now wins.** BC=16 is an *occupancy* win, and the recorded
+256K rate (30.50 TFLOP/s vs 128K's 36.58) is the signature of a *different* bottleneck --
+almost certainly KV bandwidth, since 256K's K+V working set (~1.07 GB) no longer fits in L2.
+If 256K is bandwidth-bound the 1.41x will not hold there, and that would not contradict the
+128K result. **The 256K ratio must be measured, not extrapolated.**
+
+### Sanitizer: the gate was reporting API noise as memory errors
+
+`compute-sanitizer --tool memcheck --error-exitcode 9` reported **114 errors and exit 9** on a
+kernel with **zero** memory errors. Cause: `gb10_cuda::Device::new` looks up 9 kernel names that
+live in a different PTX module (the dequant/gemm ones), so every Device creation emits 9
+`CUDA_ERROR_NOT_FOUND "named symbol not found"` **API** errors -- pre-existing, independent of
+the kernel, and counted in `ERROR SUMMARY` by default. 9 x ~12.7 Device creations = ~114.
+
+With the correct invocation the result is unambiguous:
+
+```
+compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 9 ... attn-tile
+  -> ERROR SUMMARY: 0 errors
+compute-sanitizer --tool racecheck --report-api-errors no ... attn-tile
+  -> RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+```
+
+**`bench/longctx/fa2_gates.sh` now passes `--report-api-errors no` on all three sanitizer runs.**
+Without it the gate is a false failure in an abort-by-default harness -- the same class of bug as
+the `<defunct>` zombie false positive in `ab_all.py`, and it would have been "fixed" by weakening
+the gate.
