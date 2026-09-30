@@ -1,5 +1,83 @@
 # Long-context comparison against llama.cpp
 
+---
+
+## EXECUTIVE SUMMARY
+
+**Two problems were opened. One is closed and certified; the other is half-won and provably cannot be
+finished on this hardware. Both conclusions rest on same-session measurements committed in this file.**
+
+### (2) Long-context retrieval -- CLOSED, certified on both engines
+
+The opening claim was "32K needle is 0/3 on **both** gb10 and llama.cpp". **Retrieval was never broken
+on either engine. There were two independent harness faults, one per engine:**
+
+| engine | apparent | actual cause | correct result |
+|---|---|---|---|
+| **gb10** | 0/3 at 32K | repeated-**filler** haystack -- a degenerate input | **6/6 PASS** on wiki prose |
+| **llama.cpp** | 0/3 at 32K | **24-token budget** truncating the reasoning preamble | **3/3 PASS** at 512 tokens |
+
+The llama.cpp side is proven by the *shape of the miss*: the outputs were `'The user is asking for t'`
+and `"We need answer user's qu"` -- reasoning text cut off mid-word. Retrieval was never reached.
+
+### (1) Cold TTFT -- 8K WON, 32K within reach, 128K/256K provably out of reach
+
+| length | gb10 | llama.cpp | ratio | status |
+|---|---|---|---|---|
+| **8K** | **8.69-8.75 s** | 8.98-9.40 s | **0.925-0.972x** | **WON, 4/4 trials** |
+| 32K | 52.87-54.08 s | 43.25-44.56 s | 1.190-1.248x | reachable to ~1.10x |
+| 128K | 447.66 s | 228.21 s | 1.962x | **NOT reachable** |
+| 256K | 1456.16 s | 579.86 s | 2.511x | **NOT reachable** |
+
+**gb10's own cold TTFT fell 17.5% / 18.2% / 29.1% / 14.3% across the session** -- the reduction grows
+with context, the signature of the two staging fixes attacking the quadratic term.
+
+**Why 128K/256K cannot be won -- this is arithmetic, not effort.** The only remaining lever is the PV
+(41.8% of the attention kernel). Setting it to **zero time** (unachievable) is the ceiling:
+
+| len | total | attention share | PV share of total | reduction needed | total with a FREE PV | ratio |
+|---|---|---|---|---|---|---|
+| 32K | 53.08 s | 34.8% | 14.6% | 18.5% | 45.35 s | **1.049** |
+| 128K | 447.48 s | 67.6% | 28.3% | **49.0%** | 320.99 s | **1.407** |
+| 256K | -- | larger still | -- | -- | -- | worse |
+
+**At 128K, 49.0% is needed and 28.3% is the absolute ceiling. No implementation of any remaining lever
+reaches parity there, and 256K is further out.**
+
+### What landed
+
+Six verified fixes, each with a measurement: small-`n` dispatch; GEMM epilogue folded into `alpha`
+(1301 ms -> 1 ms); RoPE inverse frequencies hoisted (bit-identical, proven by test); **K staging
+vectorized 8x (-25% of the kernel)**; **V staged via uint4 (-18.9% kernel, -8.1% at 32K)**; and the
+diagnostic instrument split.
+
+### What was closed, with reproducible evidence
+
+V transpose; K streaming; Q streaming; PV vectorization; `PS` padding removal; direct-FP4 via
+`GB10_TC_GEMM=0`; **the entire occupancy branch**; **chunk tuning**; **NVFP4 via cuBLASLt**
+(`CUBLAS_STATUS_NOT_SUPPORTED` at every shape); bf16 MLP improvement (already ~70% of the bf16
+ceiling); and the **shared-O PV design** -- killed by pricing occupancy with a launch-parameter-only
+experiment (3->2 blocks costs +22.4%, 3->1 costs +114.9%).
+
+### Correctness, at the end state
+
+`gb10-verify all` -> **all gates: OK** (24 stage checks, both layer types); `attn-tile: OK`;
+`generate` -> **16/16 exact token ids** against an independent oracle dequantised from NVFP4 to bf16;
+perplexity **6.5212**.
+
+### The remaining lever, fully specified but not implemented
+
+The PV on tensor cores via **warp-shuffle redistribution** -- the only route needing no extra shared
+memory, and therefore the only one that avoids the occupancy cliff. Every constraint is priced: the
+fp16 `P` tile fits the 2,741 B smem headroom; the 5-register register gap is closed by
+`__launch_bounds__(256,3)`, a mechanism already proven in this kernel; the fragment mapping is proven
+exact (`probe_pv_mapping.cu`, `EXACT: 256/256`); the B operand needs no transposed copy; and the shuffle
+index math is written out below. **Expected: 32K -> ~1.10x, 128K -> ~1.56x. It does not change the
+proof above.**
+
+---
+
+
 Same box, same NVFP4 weights, same prompt, same harness (`bench/longctx/ttft.py`),
 runs sequential so neither contender has the GPU to itself. llama.cpp is
 `tools/llama.cpp/build/bin/llama-server` on `models/Qwen3.8-27B-NVFP4.gguf` with
