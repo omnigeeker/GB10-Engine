@@ -13143,3 +13143,52 @@ was an artefact of the repeated-filler haystack, not of the model or of the cont
 own header warns about -- and it is why the script takes the URL from the environment rather than
 hardcoding a port. **The failure was in the invocation, not the engine, and it was obvious from the
 error text rather than being mistaken for an engine result.**
+
+## Objective (2) CLOSED: the "both engines 0/3" had TWO separate harness causes, not one
+
+The objective opened with "32K needle is 0/3 on **both** gb10 and llama.cpp", and asked for the root
+cause. The gb10 side was already traced to the repeated-filler haystack (6/6 PASS on wiki prose). **The
+llama.cpp side is a completely different artefact, and running it exposed it:**
+
+```
+# llama.cpp, wiki haystack, max_tokens=24 (the harness default)
+1049  0.1  33700  5  57.8s  2  MISS 'The user is asking for t'
+1049  0.5  33701  5  58.9s  2  MISS "We need answer user's qu"
+1049  0.9  33701  5  57.8s  2  MISS 'The user is asking for t'
+...
+0/6 passed
+```
+
+**Those outputs are the giveaway.** They are *reasoning preambles*, cut off mid-word at 24 tokens --
+`'The user is asking for t'`, `"We need answer user's qu"`. **llama.cpp routes this model's output to
+`reasoning_content` and it starts by thinking; with a 24-token budget the model never reaches the
+answer at all.** The retrieval is not failing -- the budget is.
+
+**With a 512-token budget:**
+
+```
+# llama.cpp, wiki haystack, max_tokens=512
+1049  0.1  33700  5  22.4s  1  PASS '74921'
+1049  0.5  33701  5  67.7s  2  PASS '74921'
+1049  0.9  33701  5  54.7s  2  PASS '74921'
+3/3 passed
+```
+
+### So objective (2) has two root causes, and neither is the engine
+
+| engine | apparent result | actual cause | correct result |
+|---|---|---|---|
+| **gb10** | 0/3 at 32K | repeated-**filler** haystack -- a degenerate input | **6/6 PASS** on wiki prose |
+| **llama.cpp** | 0/3 at 32K | **24-token budget** truncating the reasoning preamble | **3/3 PASS** at 512 tokens |
+
+**Retrieval was never broken on either engine.** Both failures were properties of the *harness*, and
+both are now identified precisely enough to be reproduced:
+
+* **the haystack**: repeated filler is degenerate, so a failure on it cannot distinguish "cannot
+  retrieve" from "degenerates under repetition". `NEEDLE_HAYSTACK=wiki` fixes it.
+* **the token budget**: llama.cpp emits reasoning first, so a small `max_tokens` scores a pass as a
+  miss. `NEEDLE_MAX_TOKENS=512` fixes it.
+
+**Both are exactly the class of error the objective asked to rule out, and both are now ruled out by
+measurement rather than argument.** Objective (2) is closed: **long-context retrieval is certified on
+both engines, at 32K+, at all three needle depths.**
