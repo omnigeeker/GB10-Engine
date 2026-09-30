@@ -13435,3 +13435,91 @@ llama.cpp's own head_dim=256 FA MMA kernel (`ggml_cuda_flash_attn_ext_mma_f16_ca
 symptom in the 256 path on exactly this hardware.** If llama.cpp is also falling back for head_dim=256 on
 GB10, then its 2x end-to-end advantage at 128K is **not** coming from a superior FA kernel, and the
 question "where does llama.cpp's advantage actually come from" is reopened. **This is being chased now.**
+
+## llama.cpp's FA prefill design -- the answer to "what does it do that we don't"
+
+Source: `tools/llama.cpp` @ `42609036`, analysed in `fa_brief/llamacpp_fa_prefill_brief.md`.
+
+### The single decisive fact: P NEVER goes to shared memory
+
+In `fattn-mma-f16.cuh:961-973` the fp32 `KQ_C` accumulator fragments are converted to **fp16 in
+registers** and fed straight into the P*V mma as the B operand:
+
+```cuda
+T_B_VKQ B[nbatch_fa/(np*2*T_B_VKQ::J)];
+for (int k = 0; k < nbatch_fa/(np*2*T_B_VKQ::J); ++k) {
+    B[k] = get_transposed(get_half2(KQ_C[k]));   // get_half2 = make_half2, get_transposed = movmatrix
+}
+```
+
+`get_half2` is `make_half2` in-register (`mma.cuh:711-720`); `get_transposed` is
+`movmatrix.sync.aligned.m8n8.trans.b16` (`mma.cuh:722-728`). **Register-only -- no smem, no FFMA.**
+
+**And the brief confirms the diagnosis of our kernel exactly:** llama.cpp's *non-mma* kernels do what
+ours does -- `fattn-vec.cuh:126-129` declares `__shared__ half KQ[...]`, stores at `:303`, and consumes
+with scalar FFMA at `:351`; `fattn-tile.cuh:662` comments "write to shared KQ buffer", writes at
+`:707-709`, and does SIMT `VKQ += KQ_k*V_k` from `:713`. **Our kernel is the vec/tile design; the fast
+design keeps P in registers as fp16 mma fragments.**
+
+### Both matmuls on tensor cores
+
+* **QK^T**: `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` (fp32 accumulate).
+* **P*V**: `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` -- **fp16 accumulate**, which is what makes
+  the register budget work.
+* **The whole head dim is ONE tile**: `nbatch_K2 = nbatch_V2 = 128 = DKQ/2`, so the k-loop over the head
+  dimension runs exactly once. No inner k-loop.
+
+### The config that actually runs for Qwen3.5-27B (gqa_ratio 6)
+
+From the Ampere table (`fattn-mma-f16.cuh:70-73`), selected by `fattn.cu:160-166` and `:242-245`:
+
+| parameter | value |
+|---|---|
+| `ncols1` (query rows) | **8** |
+| `ncols2` (Q heads batched per KV head) | **8** (6 real, 2 zero-padded -- 25% wasted QK work) |
+| `ncols` | **64** |
+| `nbatch_fa` (KV rows/tile) | **32** |
+| threads | **128** (4 warps), `__launch_bounds__(128,2)` |
+| occupancy | 2 |
+| `nstages` | 2 |
+| `Q_in_reg` | true |
+
+Register footprint: `Q_B[16] x tile<16,8,half2>` (4 regs) = **64**, `VKQ_C[16] x 4` = **64**,
+`KQ_C[2] x tile<16,16,float>` (8 regs) = **16** → ~144 live registers, occupancy 2.
+Shared memory for this config: Q 33,792 B + KV 2-stage 32,768 B + mask 640 B → **~33.8 KB dynamic**,
+which fits comfortably under our 101,376 B opt-in ceiling.
+
+### Arithmetic intensity is the real limiter, not tensor-core issue rate
+
+**Each 32x256 K/V tile (32 KB) feeds ~2.1 MFLOP = 64 FLOP per byte of K/V.** Our kernel has `BQ = 24`,
+i.e. **24 FLOP/byte**. On a 228 GB/s LPDDR5X part, that reuse ratio -- not the mma issue rate -- is what
+binds. Raising it is the whole game.
+
+### Other design elements worth copying
+
+* **Online softmax in registers**: `KQ_max`/`KQ_rowsum` per thread (2 columns each); warp reduce with
+  `__shfl_xor_sync` at offsets 2 then 1; **the rescale is an in-place `half2` multiply on the fp16 VKQ
+  fragments** (`fattn-mma-f16.cuh:891-927`).
+* **Two numerical tricks that make fp16 P safe**: `FATTN_KQ_MAX_OFFSET = 3*ln2` shifts the running max so
+  `exp()` stays fp16-representable (`fattn-common.cuh:19`), and a bit-trick FTZ at
+  `SOFTMAX_FTZ_THRESHOLD = -20.0f` (`fattn-common.cuh:11`).
+* **Memory pipeline**: `cp.async.cg` 16-byte with an `L2::64B` hint, XOR swizzle with **no row padding
+  when `nbatch % 32 == 0`** (`fattn-swizzle.cuh:6-47`), exactly 2 stages.
+* **V is NOT stored transposed** -- `ldmatrix.sync.aligned.m8n8.x4.trans.b16` on load. Store V
+  head-dim-contiguous and transpose on the ldmatrix.
+* **Stream-k is ON unconditionally for cc >= Ada**, so the KV dimension is split across blocks with a
+  separate combine kernel -- relevant on a 48-SM part.
+* **Dispatch**: `fattn.cu:613-635` -- **any prefill (`Q->ne[1] >= 2`) goes to the MMA kernel.** The
+  tile/vec kernels are only for non-tensor-core hardware. So llama.cpp is definitely on the MMA path.
+
+### An honest caveat the brief raises against my own framing
+
+> "On sm_121 mma.sync is supported but is NOT the peak-throughput path; the bf16 peak you compare
+> against is likely the tcgen05 number, so an mma.sync implementation will top out below it. llama.cpp
+> is a correct, well-tuned mma.sync reference, **not a Blackwell-optimal one.**"
+
+**So "1.25% of peak" overstates the gap** -- part of that peak is unreachable on sm_121 without
+tcgen05. The actionable target is therefore **llama.cpp's mma.sync design**, not an absolute FLOP/s
+number. That also means beating llama.cpp is a fair goal: we would be porting the same instruction set,
+and we have one structural advantage available that it does not use -- **`ncols2 = 6` exactly**, since
+we own the kernel, versus its power-of-two `ncols2 = 8` that wastes 25% of QK^T work.
