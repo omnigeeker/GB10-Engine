@@ -13814,3 +13814,56 @@ What is actually measured: llama.cpp's 32K cold TTFT is **43.25-44.56 s** agains
 MLP component at 32K is **21,456 ms** (45% of the 115 TFLOP/s `mma.sync` ceiling). That bounds the entire
 non-attention difference at 32K to about 10 s but does not isolate the MLP. **The in-session A/B against
 our own bf16 path is therefore the measure that matters, and it is the one the objective requires anyway.**
+
+## THE REAL TARGET, MEASURED: llama.cpp's head_dim=256 FA on this exact GB10
+
+The reference-analysis pass built llama.cpp's `test-backend-ops` for sm_121a and ran its
+`FLASH_ATTN_EXT` perf cases for `hsk=256` on this box. Output: `/tmp/fa_res/fa_perf_256.txt`, 54 cases,
+`Backend CUDA0: OK`. **These are measured numbers, not derived ones.**
+
+**The prefill cases (nb=4096 query tokens against kv=65536), all `hsk=hsv=256`, f16 K/V, f32 compute:**
+
+| case | us/run | TFLOP/run | **TFLOPS** |
+|---|---|---|---|
+| `nh=8, nr23=[1,1]` — **no GQA batching** | 154,818.86 | 2.20 | **14.20** |
+| `nh=8, nr23=[4,1]` — GQA x4 | 226,546.80 | 8.80 | **38.83** |
+| `nh=8, nr23=[8,1]` — GQA x8 | 431,993.33 | 17.59 | **40.72** |
+
+### The decisive result: GQA batching is worth 2.87x, MEASURED
+
+**14.20 -> 40.72 TFLOPS, purely from batching more query heads per KV head.** This is the single most
+important number in this document, because it converts the "GQA sharing is the bandwidth lever" argument
+from a roofline inference into a measurement on this exact hardware.
+
+**Our kernel has no GQA batching at all** -- `blockIdx.x` is the query head, so six blocks re-read the same
+K/V independently. **We are in the `nr2=1` regime.** And our kernel measures **0.85 TFLOP/s**:
+
+| | TFLOPS |
+|---|---|
+| llama.cpp, no GQA (`nr2=1`) | 14.20 |
+| llama.cpp, GQA x8 (`nr2=8`) | **40.72** |
+| **our kernel** | **0.85** |
+
+**So our attention kernel is 16.7x below llama.cpp's *unbatched* number and 48x below its batched one.**
+
+### How to read this against the 2x total-TTFT gap
+
+These do **not** contradict each other, and the reason matters. llama.cpp's *total* 128K cold TTFT is
+228.2 s. If its attention really ran at 40.7 TFLOPS, 211 TFLOP of attention would take **5.2 s**, leaving
+**223 s** of non-attention -- far more than our measured 144.9 s. That is not credible, so the
+microbenchmark is **not** the same shape as the real 128K prefill. The case is `nb=4096` queries against
+`kv=65536` (a chunked-prefill shape), it reports **uncausal** FLOPs while `mask=1` makes the real work
+roughly half, and it does not include llama.cpp's long-context scheduling behaviour.
+
+**So treat 40.72 TFLOPS as an achievable-rate ceiling for the kernel on this hardware, not as a prediction
+of llama.cpp's 128K TTFT.** It still settles the question it was asked to settle: **a correct FA2
+mma.sync kernel for head_dim=256 can reach tens of TFLOPS on this part, and GQA batching is worth ~2.9x of
+that.** Our 0.85 TFLOP/s is not a hardware limit -- it is 16-48x below what the same instruction set
+demonstrably achieves.
+
+### A caution that follows from this
+
+The 2.13x/3.63x targets in this document were computed from *total TTFT* ratios, and they remain the
+acceptance criteria. **This benchmark says the headroom is far larger than those targets require** -- which
+is good news, but it also means the risk is no longer "can we find the speedup" but "can we land a correct
+kernel at all". The two implementation attempts so far have produced designs but no landed kernel.
