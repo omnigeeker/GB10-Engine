@@ -14130,3 +14130,34 @@ so a ~2x attention kernel is not sufficient there** -- 128K and 256K still need 
 
 **Do not treat any of this as a result.** The re-measurement, in a window where `pgrep -x gb10-verify` shows
 only the measuring process, is the evidence.
+
+## CLEAN A/B, 8K, pass 1: FA2 is 2.07x on attention and 1.07x on total prefill
+
+From the post-fix re-measurement (`/tmp/fa2_ab2.log`), `prefill-shape` at 8192 tokens, OLD then NEW in one
+invocation:
+
+| 8K, pass 1 | total prefill | attn kernel | attn share |
+|---|---|---|---|
+| OLD (`attn_prefill_tiled`) | 12.27 s | **1,311 ms** | 10.7% |
+| NEW (`attn_prefill_fa2`) | 11.47 s | **634 ms** | 5.5% |
+
+* **Attention kernel: 1,311 -> 634 ms = 2.07x faster.**
+* **Total prefill: 12.27 -> 11.47 s = 1.07x faster.**
+
+**This refutes a specific worry, which is why it was worth measuring.** The concern was that FA2's per-block
+fixed cost (Q gathered into registers across 16 k-steps x 2 heads before any key tile is touched, only 96
+threads per block) would make it *slower* than the old kernel at short contexts, where it is amortised over
+only 64 key tiles instead of 256. **It does not: FA2 is 2.07x faster at 8K, so the fixed cost is not the
+dominant term even there.** A 32K-only A/B would have left this open.
+
+**Combined with the provisional ~1.97x at 32K, the FA2 kernel gives about 2x on the attention component
+across both contexts.** That is a consistent, structural result rather than a context-specific one.
+
+**What it implies for the objective:** at 8K, attention is only 10.7% of prefill, so a 2.07x attention
+speedup moves the total by 1.07x -- and 8K was *already* a win (0.925-0.972x on TTFT), so this widens it. At
+32K, attention is ~35% of the total, so ~2x there is worth roughly 1.2x on the total, which is close to the
+1.19x deficit. **The remaining gaps at 128K (3.80x) and 256K (3.62x) are the ones that still need work** --
+either the `cp.async` pipeline or the MLP path.
+
+**Status of this measurement:** pass 1 only, 8K only. The 32K pass and pass 2 were still running when this was
+recorded. Do not treat the 1.07x total as final until the 32K pair and pass 2 land.
