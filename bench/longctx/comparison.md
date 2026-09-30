@@ -13317,3 +13317,62 @@ both are now identified precisely enough to be reproduced:
 **Both are exactly the class of error the objective asked to rule out, and both are now ruled out by
 measurement rather than argument.** Objective (2) is closed: **long-context retrieval is certified on
 both engines, at 32K+, at all three needle depths.**
+
+## THE ROOT CAUSE: the kernel is laid out like a GEMV, not a GEMM
+
+Reading the kernel's own header comment (`kernels/elementwise.cu`, ~line 344) answers the user's question
+directly:
+
+> "One block covers `BQ` query rows of a single query head, **one thread per head dimension**
+> (blockDim.x == head_dim), so each thread owns the output for its dimension across all BQ rows and keeps
+> those BQ accumulators in registers."
+
+> "PREFILL_BQ * PREFILL_BK MUST divide evenly into the score loop's passes. That loop uses **two threads
+> per (query, key) pair through `__shfl_xor_sync`** ... the block is head_dim = 256 threads, so one pass
+> consumes 128 pairs. 8 * 16 = 128 is exactly one pass, **which is why this blocking was chosen.**"
+
+**That is the whole problem.** The kernel is organised as **one thread per output dimension** with a
+`__shfl_xor_sync`-based score loop -- a **GEMV/outer-product layout**, which is the right shape for
+*decode* (one query row, weight-bandwidth-bound) and the wrong shape for *prefill*.
+
+Concretely, the four structural consequences:
+
+1. **Arithmetic intensity is pinned to BQ = 24.** A flash-attention block reads its K/V tile once and
+   reuses it across all its query rows, so its arithmetic intensity is *approximately BQ* FLOP per byte
+   of K/V. **With BQ = 24 that is 24 FLOP/byte.** llama.cpp's FA tiles are an order of magnitude larger,
+   which is where its efficiency comes from. **`BQ` is the single most important number in the kernel
+   and it is 24.**
+2. **The tile size was chosen to satisfy a shuffle-pairing constraint, not the hardware.**
+   `BQ * BK == 3 * 128 == 384` exists because 256 threads at two threads per (query,key) pair consume 128
+   pairs per pass, and 384 is exactly 3 passes. **This is an artefact of a superseded non-tensor-core
+   score loop, not a hardware limit** -- the comment even records that retuning to `24 * 11 = 264` was 5x
+   slower *for exactly this reason* (uneven lane passes), which is a symptom of the layout, not a law.
+3. **GQA is not exploited at all.** The model has 24 query heads over 4 KV heads, so **6 query heads
+   share each KV head. `blockIdx.x` is the query head, so six separate blocks each re-read the same K/V
+   independently.** K/V traffic is therefore **6x higher than it needs to be** before any tiling change.
+4. **The PV never touches the tensor cores** -- 384 shared-memory loads plus 384 FFMA per thread per key
+   tile (41.8% of the kernel), while the score product does use `mma`.
+
+### Why this produces exactly 1.25% of peak
+
+The measured component split (V loads 30.9% + K staging 25% = **55.9% memory/staging**, PV **41.8%
+scalar FFMA**, softmax 4.7%) is the signature of a GEMV-shaped kernel: **more than half the time is
+moving K/V, and nearly all the rest is scalar arithmetic that never reaches a tensor core.** Nothing in
+that split is a hardware limit -- every part of it is a consequence of the layout.
+
+**This is why the earlier "the PV is 41.8% so the ceiling is 28.3%" reasoning was wrong: it accepted a
+GEMV-shaped kernel as the frame of reference and then optimised inside it.**
+
+### What the fix looks like (to be confirmed against llama.cpp's `fattn-mma-f16`)
+
+* **GEMM-style 2D tiling** -- threads own `(row, col)` fragments, not one whole output dimension.
+* **`mma` on BOTH matmuls**, with **P kept in fp16 register fragments** between them (no shared-memory
+  round trip, no scalar FFMA).
+* **Much larger `BQ`** (and larger `BK`), which is what raises arithmetic intensity.
+* **GQA-aware blocking** -- process the query heads that share a KV head together so the K/V tile staged
+  in shared memory is reused 6x instead of once.
+* **`cp.async` double-buffering** across key tiles so staging overlaps compute.
+* **Online softmax with the rescale applied directly to the accumulator fragments.**
+
+**Order of magnitude available:** at 30% of bf16 peak the 128K attention kernel would take ~12.5 s instead
+of 302.6 s, putting 128K at ~157 s against llama.cpp's 228 s -- **a 1.45x win, not a 1.96x loss.**
