@@ -12774,3 +12774,41 @@ of the 32K prefill, and there is no cheaper substitute hiding inside the phase.
 
 **It also retires the earlier hope that the MLP might be improvable by 2x within bf16** -- at 70% of
 ceiling there is no 2x to find.
+
+## The PV mapping is already solved and verified -- the rewrite is integration, not research
+
+The "accumulator layout" obstacle recorded earlier is **half solved already**, and the solution is
+committed: `bench/longctx/probe_pv_mapping.cu`, run this round.
+
+```
+$ nvcc -arch=sm_121 -O3 -o /tmp/pvm bench/longctx/probe_pv_mapping.cu && /tmp/pvm
+P.V mapping: A=ldmatrix.x4(P[row][key])  B=ldmatrix.x2.trans(V[key][dim] stride 24)
+  EXACT: 256/256 match the CPU reference
+```
+
+**It establishes, and proves, exactly the two things the earlier section said were unknown:**
+
+1. **The B operand works from V's *natural* `[key][dim]` layout with `ldmatrix.x2.trans`** -- no
+   transposed copy of V is needed, and the stride only has to be a multiple of 8 (the probe uses 24;
+   the engine's `PS = HD + 8 = 264` is also a multiple of 8).
+2. **The D-fragment to `O[row][col]` mapping is known and exact:**
+
+   ```cuda
+   O[gid*16 + n0 + t4*2]         = d[0];   // gid = lane >> 2, t4 = lane & 3, c = t4*2
+   O[gid*16 + n0 + t4*2 + 1]     = d[1];
+   O[(gid+8)*16 + n0 + t4*2]     = d[2];
+   O[(gid+8)*16 + n0 + t4*2 + 1] = d[3];
+   ```
+
+   with `A = P` loaded by `ldmatrix.x4` from a row-major `[row][key]` tile of stride 16, and two
+   `n`-tiles of 8 dims per warp.
+
+**So the remaining work is integration, not discovery:** the kernel's `acc[PREFILL_BQ]` must become
+`d[4]`-shaped fragments, and the online-softmax rescale (`acc[i] * c`), the row normalisation
+(`/ red[PREFILL_BQ + i]`) and the final store must be rewritten around the mapping above. **The
+instruction sequence and the fragment mapping are no longer open questions** -- which is a much
+smaller task than the earlier section implied, and it is the last lever that has not been disproven.
+
+**It also means the 41.8% is reachable without any new research**, and the acceptance criteria are
+unchanged: `generate` 16/16 exact and PPL ~6.52 (`attn-tile` will fail; it is a differential test and
+must not veto the change).
