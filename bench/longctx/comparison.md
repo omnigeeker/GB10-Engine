@@ -12861,3 +12861,48 @@ be trusted -- **the session's rule is that the gate is `generate` and perplexity
 
 **Recorded so the next attempt can start from a design that keeps the epilogue, instead of one that
 rewrites it.**
+
+## Occupancy priced properly -- and it KILLS the shared-O PV design
+
+The smem-round-trip design above has one risk: the O tile raises shared memory and drops occupancy.
+**Dynamic shared memory is a launch parameter, so that risk can be priced without touching a single
+instruction** -- just request more than the kernel uses. `GB10_ATTN_PAD_SMEM=<bytes>` now does this.
+
+32K prefill, same kernel, same code, only the dynamic smem request inflated:
+
+| smem requested | blocks/SM (by_smem) | binding | attn kernel | vs 3 blocks |
+|---|---|---|---|---|
+| **31,392 B** (real) | **3** | SMEM | **21,874 ms** | -- |
+| 43,692 B (fp16 O tile) | **2** | SMEM | 26,779 ms | **+22.4%** |
+| 55,992 B (fp32 O tile) | **1** | SMEM | 47,002 ms | **+114.9%** |
+
+*(The absolute times are inflated relative to the 18,411-18,548 ms baseline because
+`GB10_ATTN_OCCUPANCY=1` prints on every one of the ~256 launches. The comparison is valid -- the
+overhead is identical in all three rows.)*
+
+### This closes the shared-O route, and corrects an earlier conclusion
+
+**Dropping from 3 blocks to 2 costs 22.4% of the attention kernel; dropping to 1 costs 114.9%.** The
+PV is 41.8% of the kernel, so the *best case* for moving it to tensor cores is `1/(1-0.418) = 1.72x`,
+or -41.8% -- **and the fp16 O tile alone gives back +22.4%, while the fp32 tile gives back +114.9%,
+which is more than the entire win.** So the shared-O design cannot pay for itself. **It is dead, and
+recorded as dead before anyone implements it.**
+
+**It also corrects this session's earlier claim that occupancy does not matter.** That claim came from
+`__launch_bounds__(256,4)` and `-maxrregcount` giving ~1% -- both of which were *raising* occupancy
+from an already-sufficient 3. **Going the other way is not symmetric: at 3 blocks this kernel is
+SMEM-bound, and the attention kernel is strongly occupancy-sensitive downward.** The earlier
+generalisation ("occupancy was never the problem") was too broad; the correct statement is
+**"raising occupancy above 3 buys nothing, and lowering it below 3 is very expensive."**
+
+### What survives
+
+**Only the shuffle route.** Each warp owns 32 output columns (thread `tid` owns column `tid`, so warp
+`w` owns columns `w*32..w*32+31`), so the PV for those columns can be computed by that warp and
+redistributed **within the warp with `__shfl_sync` -- needing no extra shared memory at all.** The
+D-fragment mapping is already proven (`probe_pv_mapping.cu`, `EXACT: 256/256`), and `Vs` needs no
+transposed copy (`ldmatrix.x2.trans`, stride `PS = 264`).
+
+**Cost estimate: 8 mma + ~128 shuffles per warp per key tile, against the current 384 smem loads +
+384 FMA per thread.** That is the only remaining route to the 41.8%, and it is now the only one
+consistent with the occupancy measurements above.

@@ -1812,9 +1812,17 @@ impl Ops {
         // 16-byte aligned so ldmatrix can read whole fragments in one instruction,
         // which retires the old +4 gap that only existed for the scalar kernel's
         // bank behaviour.
-        let smem = (BQ * (head_dim + 8) + BK * (head_dim + 8)) * 2
+        let smem_base = (BQ * (head_dim + 8) + BK * (head_dim + 8)) * 2
             + (BQ * BK + 3 * BQ) * 4
             + BK * (head_dim + 8) * 2;   // the staged V tile
+        // OCCUPANCY EXPERIMENT: request extra dynamic smem the kernel never touches.
+        // Dynamic smem is a launch parameter, so this lowers occupancy without
+        // changing a single instruction -- the zero-risk way to price the
+        // shared-O PV design before writing it.
+        let smem = match std::env::var("GB10_ATTN_PAD_SMEM").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(pad) => smem_base + pad,
+            None => smem_base,
+        };
 
         // Occupancy probe. The computed request (43,104 B here) is what lets two
         // blocks co-reside per SM; `GB10_ATTN_SMEM_PROBE=<bytes>` raises the
