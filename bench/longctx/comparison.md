@@ -13781,3 +13781,36 @@ build flags.
 Operand shape, for the implementation: 4 fp32 accumulators (`+f`), 4 int A registers, 2 int B registers,
 and 2 int scale registers (a_scale, b_scale) -- `m16n8k64`, so one instruction covers 64 K elements.
 `scale_vec::4X` means 4 elements per scale group (the 16-element sub-block is covered by 4 scale groups).
+
+## STEP 1 VERIFIED (twice, independently): the sm_121a arch change is correctness-neutral
+
+`crates/gb10-cuda/build.rs` now sets `CUDA_ARCH = "sm_121a"`, and the change has been confirmed by **two
+independent runs**:
+
+| check | result |
+|---|---|
+| nvcc 13.0.88 accepts `-arch=sm_121a` | yes |
+| `cargo build --release --workspace` | succeeded; all three emitted PTX files (`elementwise.ptx`, `gemm.ptx`, `gemv.ptx`) now read `.target sm_121a` |
+| `generate` (implementation agent's run) | **exact match, 16/16**, TTFT 959.1 ms, model load 57.4 s |
+| `generate` (independent run by the session owner) | **exact match, 16/16**, same ids, TTFT 980.6 ms, model load 57.5 s |
+
+Ids both times: `[1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]`.
+
+**So `sm_121a` is additive as expected: every pre-existing kernel compiles and produces bit-identical
+results, and the FP4 block-scaled mma is now assemblable.** This was the one assertion that had been
+recorded as unverified; it is now verified, and by two separate runs rather than one self-report.
+
+### Provenance warning on the FP4 performance numbers
+
+The FP4 payoff estimates are **derived, not measured**, and must be treated as such:
+
+* the **11.7 ms** compute floor assumes ~500 dense FP4 TFLOP/s, a spec-sheet figure never measured on this
+  GB10;
+* the **25.7 GB / ~103-113 ms** tile-reread figure comes from tile-count arithmetic;
+* the **~45 TFLOP/s** figure quoted earlier in this session was an aggregate over llama.cpp's *mixed*
+  FP4-OMMA / IMMA / FMA kernel set, not an NVFP4-GEMM measurement.
+
+What is actually measured: llama.cpp's 32K cold TTFT is **43.25-44.56 s** against our **53.08 s**, and our
+MLP component at 32K is **21,456 ms** (45% of the 115 TFLOP/s `mma.sync` ceiling). That bounds the entire
+non-attention difference at 32K to about 10 s but does not isolate the MLP. **The in-session A/B against
+our own bf16 path is therefore the measure that matters, and it is the one the objective requires anyway.**
