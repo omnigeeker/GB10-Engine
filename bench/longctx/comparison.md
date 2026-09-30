@@ -13751,3 +13751,33 @@ consistent with the GEMM being memory/L2-bound rather than FP4-compute-bound.
   of weights + 360 KB of activations each, and the 48-SM working set is 34.6 MB so L2 cannot hold it --
   **25.7 GB of traffic, ~103-113 ms with no L2 reuse.** That is the real target to beat, and it says the
   win comes from **tile scheduling / L2 reuse**, not from the mma alone.
+
+## VERIFIED: the FP4 block-scaled mma assembles on sm_121a and is REJECTED on sm_121
+
+A minimal standalone test settled the FP4 question directly, without needing the engine or the GPU. The
+exact PTX from llama.cpp's `mma.cuh:1145` was compiled with `nvcc -ptx` for both targets:
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+    {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0,0}, %11, {0,0};
+```
+
+**`-arch=sm_121` (what `crates/gb10-cuda/build.rs:11` uses today) FAILS:**
+
+```
+ptxas fp4asm_121.ptx, line 50; error   : Instruction 'mma with block scale' not supported on .target 'sm_121'
+ptxas fp4asm_121.ptx, line 50; error   : Feature '.kind::mxf4nvf4' not supported on .target 'sm_121'
+ptxas fp4asm_121.ptx, line 50; error   : Feature '.block_scale' not supported on .target 'sm_121'
+ptxas fp4asm_121.ptx, line 50; error   : Feature '.scale_vec::4X' not supported on .target 'sm_121'
+```
+
+**`-arch=sm_121a` ACCEPTS it**, and `grep -c mxf4nvf4` on the emitted PTX returns 1.
+
+**Conclusion: the `sm_121a` target is both NECESSARY and SUFFICIENT for the FP4 tensor-core path.** The
+instruction exists and works on this exact GB10; nothing else blocks it. The FP4 plan is de-risked, and the
+single required build change is confirmed by direct measurement rather than inference from llama.cpp's
+build flags.
+
+Operand shape, for the implementation: 4 fp32 accumulators (`+f`), 4 int A registers, 2 int B registers,
+and 2 int scale registers (a_scale, b_scale) -- `m16n8k64`, so one instruction covers 64 K elements.
+`scale_vec::4X` means 4 elements per scale group (the 16-element sub-block is covered by 4 scale groups).

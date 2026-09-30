@@ -3,12 +3,19 @@
 //
 // PTX (not cubin) is used so the driver JITs for the exact device it finds;
 // sm_121 is the measured compute capability of the DGX Spark GB10.
+//
+// `sm_121a` (not `sm_121`) is required for the architecture-specific
+// `kind::mxf4nvf4.block_scale` tensor-core mma used by the NVFP4 MLP GEMM
+// (`kernels/nvfp4_gemm.cu`). The plain `sm_121` target cannot assemble that
+// instruction at all. `sm_121a` is a strict superset of `sm_121`, so every
+// pre-existing kernel compiles and runs identically -- verified by an exact
+// `generate` match before the FP4 kernel was written.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CUDA_ARCH: &str = "sm_121";
+const CUDA_ARCH: &str = "sm_121a";
 
 fn find_nvcc() -> PathBuf {
     if let Ok(p) = env::var("NVCC") {
