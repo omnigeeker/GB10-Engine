@@ -14530,3 +14530,34 @@ The FP4 reference measurement (llama.cpp's own NVFP4 `MUL_MAT` rate) is still th
 **Caveat, unchanged and important:** these are `prefill-shape` totals, not cold TTFT, and the 128K/256K figures
 are an extrapolation applying the prefill-shape ratio to the TTFT component accounting. The TTFT proof still
 has to come from `ab_all.py`, which is the only instrument that measures both engines the same way.
+
+### Addendum: design rationale, the rejected alternative, and the shipping-tree confirmation
+
+**The design: two slots, no double buffering.** K and V each prefetch their own next tile into their **own
+existing 16 KB buffer**, so the footprint stays 32 KB and 3 CTAs/SM survives:
+
+* `K(s0)` is in flight during iteration `s0-32`'s P*V
+* `V(s0)` is issued at the top of iteration `s0` and hides under QK^T(s0) + softmax(s0)
+* `K(s0+32)` is issued after the softmax and hides under P*V(s0)
+
+Two `cp.async.wait_group 0` + `__syncthreads()` per tile -- the **same two barriers** the synchronous version
+had; the change is only that each copy now overlaps a compute phase instead of serialising. Out-of-range keys
+are zero-filled with the `cp.async` `src-size` operand rather than branching, so the whole tile is one
+unconditional pass. The **top-of-loop** barrier is what lets `V(s0)` overwrite `tile_V` (it proves every warp
+finished the previous iteration's P*V read); the **mid-loop** barrier is what lets `K(s0+32)` overwrite
+`tile_K` (it proves every warp finished this iteration's QK^T read). Both are load-bearing.
+
+**Rejected: double-buffering K+V.** It needs 64 KB, which takes the kernel from 3 CTAs/SM to 1, and the old
+kernel's own measurement prices 3->1 at **+114.9%**. The same-buffer form is the whole point.
+
+**Confirmed on the shipping tree.** The pair was re-run on a binary built from the then-current HEAD
+(`ad5fe78`, which by then included the MLP agent's committed dequantise work) plus this kernel change, in a
+private `CARGO_TARGET_DIR` so the shared `target/` was never touched: 32K attention 22,092/22,122 ->
+**6,972/6,973 ms = 3.17x / 3.17x**, total 65.42/66.55 -> 50.22/50.57 s, `generate` exact 16/16, `perplexity`
+6.5213, occupancy regs 168 / 32,768 B -> 3 CTAs/SM, and `attn-tile` byte-identical to the isolated pipeline
+binary. So the win is **not** an artifact of the isolated baseline tree.
+
+**Not attempted.** The mid-loop barrier only needs QK^T finished (softmax is register-only), so the
+`K(s0+32)` issue could move one phase earlier and hide under softmax + P*V instead of P*V alone, at the same
+barrier count. That is a second change on top of an unmeasured one; the measured pipeline was committed
+first. It is the obvious next micro-optimisation if more attention speedup is needed at 128K/256K.

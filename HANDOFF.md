@@ -290,11 +290,11 @@ So the remaining work is no longer "can we land a correct kernel". It is:
    `bench/longctx/ab_all.py` -- written for exactly this, and it auto-calibrates each context to an exact
    token count and records the `prompt_tokens` each engine actually saw, so the comparison can *show* both
    were handed the same prompt.
-2. **Then optimise.** The kernel has **no pipelining at all**: plain `uint4` staging with two
-   `__syncthreads()` per key tile, strictly serial, so the tensor cores idle through every staging phase.
-   Note that K+V double-buffering needs 64 KB and would drop 3 CTAs/SM to 1 -- which the old kernel's own
-   measurement says costs more than it gains (+114.9% for 3->1) -- so the cheap step is `cp.async` into the
-   *same* buffer with the sync narrowed to cover only the copy.
+2. ~~**Then optimise.**~~ **DONE — the `cp.async` pipeline has landed.** Same-buffer form: K and V each
+   prefetch their own next tile into their own existing 16 KB buffer, so there is **no footprint change and
+   no occupancy change** (regs 168 / smem 32,768 / 96 threads -> 3 CTAs/SM). It takes attention from **2.00x
+   to 3.17x** at 32K and from **2.01x to 3.13x** at 8K, reproducibly. K+V double-buffering was correctly
+   rejected: 64 KB would drop 3 CTAs/SM to 1, which the old kernel's own measurement prices at **+114.9%**.
 3. **The MLP path is still unbuilt.** The FP4 subagent exhausted its context reading llama.cpp's
    `mma.cuh`/`mmq.cuh`/`quantize.cu` and wrote **no code at all** (no `kernels/nvfp4_gemm.cu`, no
    `GB10_FP4_MMA`). The FP4 finding stands and is recorded; nothing was built from it, so MLP remains on the
@@ -313,19 +313,29 @@ The same binary, `/tmp/fa_res/llamacpp/build/bin/test-backend-ops`, benchmarks `
 as optional: it measures llama.cpp's kernel in llama.cpp's harness with llama.cpp's shapes, and the
 acceptance criterion for our FP4 work is our own in-session A/B against the bf16 path.
 
-## Current scorecard (after the FA2 kernel landed)
+## Current scorecard (after the `cp.async` pipeline landed)
 
-The FA2 prefill attention kernel is **landed** (`59df192`, OOB fix `c084854`) and its speedup is
-**reproduced twice in one session**: **2.00x on the attention component at 32K** (22,184 -> 11,110 ms and
-22,035 -> 11,025 ms) and 2.07/2.01x at 8K. Full numbers and the instrument caveat are in
-`bench/longctx/comparison.md` (grep it).
+The FA2 prefill attention kernel is **landed** (`59df192`, OOB fix `c084854`) and the **`cp.async` pipeline is
+now landed on top of it** -- the same-buffer form, no footprint and no occupancy change. Same-session,
+two-pass, OLD-before-NEW A/B from two frozen binaries differing **only** in `kernels/elementwise.cu`:
+
+| context | OLD | FA2 (no pipeline) | FA2 + pipeline | attention speedup | total prefill |
+|---|---|---|---|---|---|
+| 8K | 1,308 / 1,311 ms | 644 / 659 ms | **419 / 418 ms** | **3.12x / 3.14x** | 1.081x / 1.070x |
+| 32K | 22,038 / 22,240 ms | 11,099 / 11,138 ms | **6,952 / 6,976 ms** | **3.17x / 3.19x** | **1.312x / 1.317x** |
+
+The committed FA2 kernel reproduces at 1.99-2.00x, and the pipeline's own delta over it is **1.60x**
+(reproducing to 0.3% across passes). Gates: `generate` **exact 16/16**, `perplexity` **6.5213**, `attn-tile`
+byte-identical between the pipelined and non-pipelined kernels, and **`compute-sanitizer` clean** -- racecheck
+**0 hazards**, memcheck 0 memory errors. Full numbers, the design rationale and the instrument caveat are in
+`bench/longctx/comparison.md` (grep for "cp.async pipeline").
 
 | context | status | what it needs |
 |---|---|---|
-| 8K | **WON** | nothing -- was already 0.925-0.972x, FA2 widened it |
-| 32K | **borderline, and it stays borderline** | attention alone gives 1.18-1.24x against a required 1.19x. Believe the minimum -> ~1.01-1.04x behind |
-| 128K | **open** | needs 3.80x on attention |
-| 256K | **open** | needs 3.62x on attention |
+| 8K | **WON** | nothing -- was already 0.925-0.972x; FA2 + pipeline widened it to 1.07-1.08x |
+| 32K | **WON on attention alone** | total **1.312-1.317x** against a required 1.19x, with no MLP help |
+| 128K | **open, close** | ~**1.15x** more on attention: at 3.17x, attention 302.6 -> 95.5 s, total 240.4 s vs llama.cpp's 228.2 s = **1.05x behind, down from 1.30x** |
+| 256K | **open, close** | ~**1.14x** more on attention; **1.08x behind**, down from 1.47x |
 
 ### THE MLP IS NOT A LEVER -- this was measured and it corrects an earlier claim here
 
@@ -342,11 +352,19 @@ worth 1.3%. **Total recoverable on bf16: under 3%. The bf16 MLP is at its floor.
 tensor-core path** (block-scaled `mma.sync`, raw e2m1 operands, ue4m3 scales -- `sm_121a` is already the build
 target). That is a measured conclusion, not a guess.
 
-### The arithmetic that makes 128K reachable
+### The arithmetic for 128K -- now measured rather than assumed
 
-128K total is 451.2 s, of which attention is 302.6 s (67%) and non-attention 148.6 s. If the `cp.async`
-pipeline gives ~1.3x **on top of** the existing 2.0x, attention goes 302.6 -> ~116 s and the total lands near
-**220 s against llama.cpp's 228.2 s -- a win.** That is the immediate target. 256K needs more still.
+The prediction that used to sit here was "if the pipeline gives ~1.3x on top of the existing 2.0x, the total
+lands near 220 s -- a win". **The pipeline actually delivered 1.60x on top of 2.0x (3.17x total), which is
+better than the prediction, and the extrapolation still does not quite win 128K:** attention 302.6 -> 95.5 s,
+so the total is 144.9 + 95.5 = **240.4 s against llama.cpp's 228.2 s = 1.05x behind** (down from 1.30x).
+256K is **1.08x behind**. The residual is about **1.15x on attention** at both contexts.
+
+**Note that 3.17x already *exceeds* the 2.43x that 128K would need if a 2x MLP ever landed**, so the
+FP4/MLP question is now the deciding one for 128K/256K -- as is any further attention gain.
+
+*(Caveat: these are extrapolations applying the `prefill-shape` attention ratio to the TTFT component
+accounting. Only the ratio transfers; `prefill-shape` totals are not TTFT.)*
 
 ### Two traps that have already cost time here
 
@@ -370,7 +388,7 @@ outlive this session's context:
 
 | agent id | workstream | state |
 |---|---|---|
-| `91925904-874c-4f9a-a13f-966f45f67383` | **FA2 `cp.async` pipeline** | took over from `05afaa15` (which ran out of context after implementing the pipeline but before measuring it); the WIP is preserved as `bench/longctx/fa2_pipeline_wip.patch` |
+| `91925904-874c-4f9a-a13f-966f45f67383` | **FA2 `cp.async` pipeline** | **DONE and committed.** Took over from `05afaa15` (which implemented it but ran out of context before measuring); measured it against a no-pipeline control binary in one session, sanitizer-clean, **2.00x -> 3.17x** on attention, 32K won. WIP patch preserved at `bench/longctx/fa2_pipeline_wip.patch` |
 | `9e2beea5-c086-4e93-a0b4-6c3eb67c50d2` | **MLP GEMM efficiency** | MEASURED: no 2x available on bf16 (see above). Committing the 1.3% dequant fix. **The FP4 route is now the strategic answer, not a stretch goal** |
 
 **Critical concurrency rule for whoever continues this:** the objective's acceptance criterion is

@@ -727,6 +727,37 @@ __device__ __forceinline__ unsigned fa2_pk2f(float lo, float hi) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+// Issue the 16-byte `cp.async` copies for one K or V tile (keys [s0, s0+32))
+// into `dst`, then close the group. Keys past `win_max` are zero-filled with the
+// `src-size` operand (the bytes past src-size are written as zero) instead of a
+// branch, so out-of-range keys cost the same instruction as in-range ones and
+// the whole tile is a single unconditional pass.
+//
+// One warp covers exactly one 512-byte key row per pass (idx & 31), so the
+// copies are fully coalesced 16-byte transactions, exactly as the synchronous
+// uint4 version was.
+__device__ __forceinline__ void fa2_stage_async(
+    unsigned char* dst, const __half* __restrict__ src, int s0, int win_max, int kh,
+    int n_kv_heads, int kv_base, int tid) {
+#pragma unroll 1
+    for (int idx = tid; idx < FA2_BC * 32; idx += FA2_THREADS) {
+        const int r = idx >> 5;          // key row within the tile
+        const int u = idx & 31;          // 16-byte unit within the 512-byte row
+        const int s = s0 + r;
+        const bool ok = (s <= win_max);
+        // When src_bytes == 0 the address is not dereferenced; clamp it to a
+        // valid location anyway rather than forming an out-of-range pointer.
+        const size_t off = ok
+            ? (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * FA2_HD + (size_t)u * 8
+            : (size_t)kv_base;
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+            :: "r"(smem_addr(dst + fa2_swz(r, u * 4))), "l"(src + off),
+               "r"(ok ? 16 : 0));
+    }
+    asm volatile("cp.async.commit_group;\n");
+}
+
 extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_kernel(
     const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
@@ -790,27 +821,37 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     const int win_max = start + t0 + rows - 1;
     const int row_key_max = start + t0 + gid;
 
+    // ---- software pipeline -------------------------------------------------
+    // Two slots, no double buffering: tile_K and tile_V are already separate
+    // buffers, so each one prefetches its OWN next tile and the two copies
+    // overlap two different compute phases:
+    //
+    //   K(s0)   is in flight during iteration s0-32's P*V
+    //   V(s0)   is issued at the top of iteration s0 and in flight during
+    //           QK^T(s0) + softmax(s0)
+    //   K(s0+32) is issued after the softmax and in flight during P*V(s0)
+    //
+    // This is llama.cpp's `nstages == 2` scheme (`fattn-mma-f16.cuh:623-631`
+    // and `:975-990`). It costs no shared memory and therefore no occupancy:
+    // the footprint stays at K 16 KB + V 16 KB = 32 KB, i.e. 3 CTAs/SM, which
+    // double-buffering both tiles (64 KB, 1 CTA/SM) would have destroyed.
+    //
+    // Hazard notes, since each barrier below is load-bearing:
+    //   * the top-of-loop barrier is what lets V(s0) overwrite tile_V -- it
+    //     proves every warp has finished the previous iteration's P*V read.
+    //   * the mid-loop barrier is what lets K(s0+32) overwrite tile_K -- it
+    //     proves every warp has finished this iteration's QK^T read.
+    // Both are the same two barriers the fully synchronous version had; the
+    // change is only that the copies now overlap compute instead of serialising.
+    // `win_max >= 0` always (key 0 is visible to row 0), so the prologue always
+    // has a tile to fetch.
+    fa2_stage_async(tile_K, k, 0, win_max, kh, n_kv_heads, kv_base, tid);
+
     for (int s0 = 0; s0 <= win_max; s0 += FA2_BC) {
-        // ---- stage K and V for keys [s0, s0+32) --------------------------
-        // One warp covers exactly one 512-byte key row per pass (idx & 31),
-        // so both loads are fully coalesced 16-byte transactions.
-#pragma unroll 1
-        for (int idx = tid; idx < FA2_BC * 32; idx += FA2_THREADS) {
-            const int r = idx >> 5;
-            const int u = idx & 31;
-            const int s = s0 + r;
-            uint4 kk = make_uint4(0u, 0u, 0u, 0u);
-            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
-            if (s <= win_max) {
-                const size_t base = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * FA2_HD
-                                    + (size_t)u * 8;
-                kk = *reinterpret_cast<const uint4*>(k + base);
-                vv = *reinterpret_cast<const uint4*>(v + base);
-            }
-            *reinterpret_cast<uint4*>(tile_K + fa2_swz(r, u * 4)) = kk;
-            *reinterpret_cast<uint4*>(tile_V + fa2_swz(r, u * 4)) = vv;
-        }
+        // ---- K(s0) is resident; V(s0) starts loading now ------------------
+        asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
+        fa2_stage_async(tile_V, v, s0, win_max, kh, n_kv_heads, kv_base, tid);
 
         // ---- QK^T: KQ_C[qcol][key] = Q . K^T (scale already in Q) --------
         float KQ_C[4][4];
@@ -936,6 +977,13 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
             P[kk][3] = fa2_pk2f(KQ_C[kk * 2 + 1][2], KQ_C[kk * 2 + 1][3]);
         }
 
+        // ---- V(s0) is resident; start K(s0+32) loading now ----------------
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        if (s0 + FA2_BC <= win_max) {
+            fa2_stage_async(tile_K, k, s0 + FA2_BC, win_max, kh, n_kv_heads, kv_base, tid);
+        }
+
         // ---- P*V: VKQ_C += P . V, fp16 accumulate -------------------------
 #pragma unroll
         for (int kc = 0; kc < 2; ++kc) {
@@ -963,7 +1011,8 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
                       "r"(r[1]), "r"(r[3]));
             }
         }
-        __syncthreads();
+        // No trailing barrier: the top-of-loop one next iteration covers the
+        // tile_V read that P*V just did, and there is no other consumer.
     }
 
     // The partial rowsums are spread across the four lanes with equal lane/4
