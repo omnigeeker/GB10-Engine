@@ -14287,3 +14287,62 @@ consequences, both of which change the plan:
 **Note the general form of the lesson**, because it is the same mistake as the withdrawn "provably
 unreachable" proof: a number that was *measured* somewhere is not automatically a *constraint* somewhere else.
 The measurement is real; the transfer is the assumption.
+
+## CRITICAL: the bf16 MLP has NO 2x available -- this refutes the premise the 32K plan rested on
+
+The MLP agent measured cuBLAS at **the shapes the model actually runs**, and the answer is not what the
+earlier analysis assumed.
+
+**The error.** The "MLP runs at 43-45% of peak, so ~2x is available" claim was priced against the **115
+TFLOP/s `mma.sync` microbenchmark**, and the "76.7 / 78-87 TFLOP/s, essentially peak" figure in this document
+was measured at **t=2048**. At the real shapes:
+
+| shape | t | cuBLAS bf16->f32 | bf16->bf16 | staging share |
+|---|---|---|---|---|
+| gate/up | 8192 | **67.9** | 72.1 | 11.3% |
+| down | 8192 | **65.6** | 65.5 | 21.1% |
+| gate/up | 32768 | **67.2** | 73.6 | 7.3% |
+| down | 32768 | **55.7** | 60.7 | 18.1% |
+
+**Against what cuBLAS actually retires at these shapes, the MLP GEMM is at 48-58%, not 43-45%.** The
+microbenchmark ceiling is not the achievable rate for a real GEMM.
+
+**The arithmetic that kills the 2x:** 2x on the MLP means **104 TFLOP/s**. cuBLAS retires 55.7-67.9 here. So
+2x is 1.5-1.9x away from cuBLAS's own best, and **above the 115 TFLOP/s microbenchmark ceiling at 90% issue
+efficiency sustained across a real GEMM.** The bf16 path is at its floor for this hardware.
+
+**Levers measured and rejected:**
+
+* **Algorithm sweep: flat.** 13 algorithms at each shape; best-vs-DEFAULT is 1.04x / 1.03x / 1.06x / 1.06x.
+  cuBLAS's heuristic is already at the best available. **No cheap algorithmic win is hiding there.**
+* **In-model vs standalone: within 8-16%.** tc-mlp at t=8192 gives gate/up 24.2 ms and down 28.2 ms; in-model
+  MLP events at 32K give gate 25.9 ms, up 26.2 ms, down 32.7 ms. The model captures nearly all of it.
+* **The `down` activation cast** is the biggest staging item -- 22.0 ms/call x 256 calls = **5.6 s = 8.5% of
+  32K prefill** -- but it moves 3.42 GB at ~155 GB/s, which is already the achievable mixed read/write rate
+  (2/3 read at 228 GB/s + 1/3 write). **Not obviously improvable.**
+* **The dequant fix is real but small: 66.28 -> 65.41 s = 1.3%**, per-kernel 1.10 ms vs 1.30-1.64 ms. The
+  weight stage in-model is 2113 ms of 65.79 s = 3.2% across *all* GEMMs, so 1.3% is this fix's ceiling and it
+  was measured rather than estimated.
+* **The gate/up activation cast IS duplicated** (shared `x`), so hoisting it is worth ~0.7 s = 1.1%.
+
+**Total recoverable on bf16: ~1.3% (dequant, done) + ~1.1% (cast hoist) + the fp32-output cost (6-9% of the
+GEMM, but required for the documented accuracy fix) = under 3%.** **That cannot convert 32K from marginal to
+won.**
+
+### What this does to the plan
+
+**The 32K plan recorded above was wrong and is withdrawn.** It said a 2x MLP "drops the requirement to 0.95x
+and wins 32K". **There is no 2x on bf16**, so:
+
+* **32K on attention alone is 1.18-1.24x against a required 1.19x -- i.e. genuinely borderline, and it stays
+  borderline.** It is not rescued by the MLP.
+* **128K/256K cannot reach their reduced bars either.** They need 3.80x/3.62x on attention, or 2.43x/2.86x
+  *with* a 2x MLP. Without the 2x MLP, **the full 3.80x/3.62x is required on attention alone**, and the
+  `cp.async` pipeline is not going to deliver that by itself.
+
+**So the only remaining lever that can produce a 2x is the FP4 tensor-core path** -- which is exactly what
+llama.cpp does (real block-scaled `mma.sync` with raw e2m1 operands and ue4m3 block scales, needing
+`sm_121a`, already the build target). **The bf16 tuning route is closed, and that is a measured conclusion, not
+a guess.** This is the same lesson as the withdrawn "provably unreachable" proof, in the opposite direction: a
+ceiling measured in one regime (t=2048, or a microbenchmark) is not the ceiling in the regime that matters
+(t=8192/32768, a real GEMM).
