@@ -13010,3 +13010,48 @@ Together with the two end-to-end gates used throughout this session:
 | `gb10-verify attn-tile` | **attn-tile: OK** |
 | `gb10-verify generate` | **16/16 exact token ids** vs an independent `Qwen3_5ForCausalLM` oracle dequantised from NVFP4 to bf16 |
 | `gb10-verify perplexity` | **PPL 6.5212** (15,300 predictions, `bench/ppl/wiki.test.raw`, ctx 512) |
+
+## The mma PV register accounting -- and the mitigation that makes it fit
+
+The 5-register headroom looked fatal, because the mma layout needs more accumulator registers than the
+scalar one. The exact accounting:
+
+```
+output tile                 24 x 256 = 6144 floats over 256 threads -> 24 per thread
+current acc[PREFILL_BQ]     24 registers
+
+mma layout, 8 warps, 4 n-tiles and 2 m-tiles per warp:
+  2 m-tiles x 4 n-tiles = 8 tiles x 4 registers = 32 registers per lane
+
+the 2 m-tiles cover rows 0-15 and 8-23, so rows 8-15 are computed twice:
+  32 rows computed for 24 useful ones -> 33% extra work and +8 registers
+```
+
+**So the mma layout needs 32 accumulator registers against the current 24 -- about 88 total against a
+budget of 85, which would drop the kernel to 2 blocks and pay the measured +22.4%.** But the fix is
+known to work in this very kernel:
+
+**`__launch_bounds__(256, 3)` (or `-maxrregcount=85`) caps registers at the 3-block limit.** This
+session already measured `__launch_bounds__(256,4)` taking the kernel from 80 to **64** registers --
+**so the mechanism is proven here, and capping at 85 is a weaker demand than the 64 that already
+worked.** A spill of ~3 registers is a far smaller cost than a 22.4% occupancy penalty, and it is
+measurable before the mma is written.
+
+### The complete plan, with every constraint now priced
+
+| step | action | how it is verified |
+|---|---|---|
+| 1 | stage `P` as fp16 (`24 x 16 x 2 = 768 B`, fits the 2,741 B smem headroom) | `GB10_ATTN_OCCUPANCY=1` -- registers must stay <= 85 |
+| 2 | add `__launch_bounds__(256, 3)` and confirm the occupancy report still says 3 blocks | occupancy probe |
+| 3 | add the mma PV: `A = P` via `ldmatrix.x4`, `B = V` via `ldmatrix.x2.trans` (stride `PS = 264`) | `probe_pv_mapping.cu` already proves the mapping, `EXACT: 256/256` |
+| 4 | redistribute the D fragments to the owning columns with `__shfl_sync` (no extra smem) | `generate` 16/16 exact, PPL ~6.52 |
+| 5 | price it | `GB10_ATTN_EVENTS=1 prefill-shape --limit 32768` against 18,548 ms |
+
+**Every one of these five steps now has a known answer or a known trap:** the smem fits, the register
+cap is proven to work in this kernel, the fragment mapping is proven exact, the B operand needs no
+transposed copy, and the acceptance gates are `generate` and perplexity (`attn-tile` will fail and must
+not veto).
+
+**Expected outcome, bounded honestly:** the PV is 41.8% of the attention kernel. If it becomes nearly
+free, 32K goes to ~1.05x (parity, inside noise) and 128K to ~1.41x. **It cannot reach 128K/256K
+parity** -- that is the proof recorded earlier, and it does not change however well this is implemented.
