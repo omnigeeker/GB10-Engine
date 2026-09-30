@@ -636,6 +636,376 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// FA2-style prefill attention: `attn_prefill_fa2_kernel`.
+//
+// Selected by `GB10_FA2=1` inside `Ops::attn_prefill_tiled`; it falls back to
+// `attn_prefill_tiled_kernel` above whenever head_dim != 256 or the GQA ratio
+// is not exactly 6. The old kernel is untouched.
+//
+// The two structural changes against the old kernel, both from
+// fa_brief/llamacpp_fa_prefill_brief.md:
+//
+//   1. P never touches shared memory and is never consumed by FFMA. The QK^T
+//      accumulator is converted to fp16 fragments IN REGISTERS (plain
+//      `make_half2` pairing -- no `movmatrix`, because the QK^T below is laid
+//      out with M = qcols so the fp32 KQ accumulator already comes out in the
+//      `[qcols][keys]` order that the P*V A-operand wants) and fed straight
+//      into the second `mma`.
+//   2. One block covers all 6 query heads that share a KV head, so the 32 KB
+//      K/V tile is reused 6x instead of once. Arithmetic intensity per byte of
+//      K/V goes from 24 to 48 FLOP/B.
+//
+// Geometry (the addendum in fa_brief/FA2_IMPLEMENTATION_SPEC.md):
+//
+//   ncols1 = 8 query rows, ncols2 = 6 query heads (exact GQA, no padding),
+//   ncols = 48 qcols = 3 warps x 16, 96 threads, key tile 32, head dim 256 in
+//   one tile. Q is held in registers (64 regs) so there is no Q smem tile and
+//   no epilogue combine buffer; smem is K 16 KB + V 16 KB = 32 KB, which is
+//   3 CTAs/SM against the 101,376 B opt-in ceiling.
+//
+// Qcol index c in [0,48) is `head*8 + row`: warp w owns qcols [16w,16w+16),
+// i.e. heads {2w, 2w+1} x query rows 0..7. A fragment rows 0..7 are head 2w
+// and rows 8..15 are head 2w+1, so a lane's two KQ rows (`gid` and `gid+8`)
+// are the SAME query row under two different heads. The causal boundary
+// `s <= start + t0 + i` therefore depends only on `gid`, which is what makes
+// one mask test serve both rows.
+//
+// Fragment layouts, verified against a CPU/probe reference on this part
+// (sm_121, nvcc 13.0) rather than assumed:
+//
+//   QK^T: mma.m16n8k16.row.col.f32.f16.f16.f32, M = qcols(16), N = keys(8),
+//         K = head_dim(16 per step, 16 steps). A = Q row-major (16x16), B = K
+//         column-major, and since a key's head_dim is contiguous the plain
+//         `ldmatrix.m8n8.x4` on the `[key][head_dim]` tile lands b0/b1 exactly.
+//         The probe confirms one x4 (lanes 0-7 -> keys +0..7 @hd+0, 8-15 ->
+//         keys +0..7 @hd+8, 16-23 -> keys +8..15 @hd+0, 24-31 -> keys +8..15
+//         @hd+8) yields {b0(nt), b1(nt), b0(nt+1), b1(nt+1)} in r0..r3.
+//   P*V:  mma.m16n8k16.row.col.f16.f16.f16.f16, M = qcols(16), N = dv(8),
+//         K = keys(16 per step, 2 steps). B = V^T, loaded with
+//         `ldmatrix.m8n8.x4.trans` straight off the `[key][dv]` tile so V is
+//         NOT stored transposed. The probe confirms that with lanes 0-7 ->
+//         keys +0..7 @dv+0, 8-15 -> keys +0..7 @dv+8, 16-23 -> keys +8..15
+//         @dv+0, 24-31 -> keys +8..15 @dv+8, the transposed outputs are
+//         {b0(dv0), b0(dv1), b1(dv0), b1(dv1)} in r0..r3 (the 1<->2 swap that
+//         `mma.cuh:884-894` bakes into its asm output list).
+//
+// Softmax is llama.cpp's, because the fp16 P*V accumulator needs it:
+// FATTN_KQ_MAX_OFFSET = 3*ln2, the -20.0f FTZ bit-trick on the rescale factor,
+// an in-place half2 rescale of the fp16 VKQ fragments, the rowsum reduction
+// over __shfl_xor_sync offsets 2 and 1 only (the qcol row is held by lanes
+// with equal lane/4), masking by writing -INFINITY into the score, KQ_max
+// initialised to -FLT_MAX/2 so an all-masked row cannot produce NaN, and the
+// divide by rowsum deferred to the very end. P*V accumulating in fp16 is
+// deliberate -- it is what keeps the register budget at 3 CTAs/SM.
+// ---------------------------------------------------------------------------
+
+#define FA2_HD         256
+#define FA2_BC         32      // key rows per tile (nbatch_fa)
+#define FA2_NROWS      8       // ncols1: query rows per block
+#define FA2_GQA        6       // ncols2: query heads per KV head
+#define FA2_NCOLS      48      // qcols = 8 * 6
+#define FA2_THREADS    96      // 3 warps
+#define FA2_STRIDE_H2  128     // K/V smem row stride in half2 (256 halves, no pad)
+#define FA2_KQ_OFFSET  2.0794415f          // 3 * ln2
+#define FA2_FTZ_THRESH (-20.0f)
+// -FLT_MAX/2 (llama.cpp's KQ_max seed): an all-masked row must not go to NaN.
+#define FA2_NEG_HUGE    (-1.7014117e38f)
+
+// XOR swizzle from fattn-swizzle.cuh:6-47 with `stride = 128` half2, which is
+// a multiple of 32 so no row padding is needed. The XOR touches bits 4-6 of
+// the byte address, i.e. it permutes the 16-byte units inside each 128-byte
+// group, so every ldmatrix row (one 16-byte unit) stays intact.
+__device__ __forceinline__ unsigned fa2_swz(int row, int col_h2) {
+    return (unsigned)((row * FA2_STRIDE_H2 + col_h2) * 4) ^ (unsigned)((row & 7) << 4);
+}
+
+// Pack two fp32 into one .b32 fp16 pair, low half = first argument. Same
+// convention as `pk2` above and as the mma fragment docs: element k in the low
+// half, element k+1 in the high half.
+__device__ __forceinline__ unsigned fa2_pk2f(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+
+extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_kernel(
+    const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
+    float scale, int start, int kv_base) {
+    // 32 KB dynamic: K then V, both FA2_BC * FA2_STRIDE_H2 half2.
+    extern __shared__ __align__(16) unsigned char fa2_raw[];
+    unsigned char* tile_K = fa2_raw;
+    unsigned char* tile_V = fa2_raw + (size_t)FA2_BC * FA2_STRIDE_H2 * 4;
+
+    const int kh = blockIdx.x;                    // KV head this block serves
+    const int t0 = blockIdx.y * FA2_NROWS;        // local query-row offset
+    const int rows = min(FA2_NROWS, n_tokens - t0);
+    if (rows <= 0) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int gid = lane >> 2;                    // 0..7: query row of this lane
+    const int t4 = lane & 3;                      // 0..3: column pair in a fragment
+
+    const int h0 = kh * FA2_GQA + 2 * warp;       // the two query heads of this warp
+    const bool row_ok = (gid < rows);
+
+    // ---- Q fragments, registers only (64 regs) ---------------------------
+    // A = Q is row-major 16x16 per k-step: a0 = rows gid @ kt+t4*2..+1,
+    // a1 = rows gid+8 (the other head, same query row), a2/a3 = the same at
+    // +8. So a lane needs four head-dim elements per k-step per head, which is
+    // two 8-byte loads -- the head dim is contiguous and 16-byte aligned.
+    unsigned Q_B[16][4];
+#pragma unroll
+    for (int kt = 0; kt < 16; ++kt) {
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            float2 lo = make_float2(0.0f, 0.0f);
+            float2 hi = make_float2(0.0f, 0.0f);
+            if (row_ok) {
+                const size_t base = ((size_t)(t0 + gid) * n_q_heads + (h0 + jj)) * FA2_HD
+                                    + (size_t)kt * 16 + t4 * 2;
+                lo = *reinterpret_cast<const float2*>(q + base);
+                hi = *reinterpret_cast<const float2*>(q + base + 8);
+            }
+            // `scale` is 1/sqrt(256) == 2^-4 here, so folding it into Q before
+            // the fp16 round is exact and identical to scaling S afterwards.
+            Q_B[kt][jj]     = fa2_pk2f(lo.x * scale, lo.y * scale);
+            Q_B[kt][2 + jj] = fa2_pk2f(hi.x * scale, hi.y * scale);
+        }
+    }
+
+    float KQ_max[2] = {FA2_NEG_HUGE, FA2_NEG_HUGE};
+    float KQ_rowsum[2] = {0.0f, 0.0f};
+    // fp16 P*V accumulator: 32 dv n-tiles x {row gid, row gid+8}.
+    unsigned VKQ_C[32][2];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        VKQ_C[i][0] = 0u;
+        VKQ_C[i][1] = 0u;
+    }
+
+    // Highest key any row in this block may attend to, and this lane's own
+    // causal boundary (identical for both of its heads).
+    const int win_max = start + t0 + rows - 1;
+    const int row_key_max = start + t0 + gid;
+
+    for (int s0 = 0; s0 <= win_max; s0 += FA2_BC) {
+        // ---- stage K and V for keys [s0, s0+32) --------------------------
+        // One warp covers exactly one 512-byte key row per pass (idx & 31),
+        // so both loads are fully coalesced 16-byte transactions.
+#pragma unroll 1
+        for (int idx = tid; idx < FA2_BC * 32; idx += FA2_THREADS) {
+            const int r = idx >> 5;
+            const int u = idx & 31;
+            const int s = s0 + r;
+            uint4 kk = make_uint4(0u, 0u, 0u, 0u);
+            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+            if (s <= win_max) {
+                const size_t base = (size_t)kv_base + ((size_t)s * n_kv_heads + kh) * FA2_HD
+                                    + (size_t)u * 8;
+                kk = *reinterpret_cast<const uint4*>(k + base);
+                vv = *reinterpret_cast<const uint4*>(v + base);
+            }
+            *reinterpret_cast<uint4*>(tile_K + fa2_swz(r, u * 4)) = kk;
+            *reinterpret_cast<uint4*>(tile_V + fa2_swz(r, u * 4)) = vv;
+        }
+        __syncthreads();
+
+        // ---- QK^T: KQ_C[qcol][key] = Q . K^T (scale already in Q) --------
+        float KQ_C[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) KQ_C[nt][l] = 0.0f;
+        }
+#pragma unroll
+        for (int kt = 0; kt < 16; ++kt) {
+#pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                // One x4 covers two 8-key n-tiles: r0/r1 = b0/b1 of n-tile
+                // 2*np, r2/r3 = b0/b1 of n-tile 2*np+1.
+                const int krow = np * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);
+                const int kcol = kt * 8 + ((lane & 8) ? 4 : 0);
+                unsigned b[4];
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+                    : "r"(smem_addr(tile_K + fa2_swz(krow, kcol))));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(KQ_C[np * 2][0]), "+f"(KQ_C[np * 2][1]),
+                      "+f"(KQ_C[np * 2][2]), "+f"(KQ_C[np * 2][3])
+                    : "r"(Q_B[kt][0]), "r"(Q_B[kt][1]), "r"(Q_B[kt][2]), "r"(Q_B[kt][3]),
+                      "r"(b[0]), "r"(b[1]));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(KQ_C[np * 2 + 1][0]), "+f"(KQ_C[np * 2 + 1][1]),
+                      "+f"(KQ_C[np * 2 + 1][2]), "+f"(KQ_C[np * 2 + 1][3])
+                    : "r"(Q_B[kt][0]), "r"(Q_B[kt][1]), "r"(Q_B[kt][2]), "r"(Q_B[kt][3]),
+                      "r"(b[2]), "r"(b[3]));
+            }
+        }
+
+        // ---- causal mask: write -INFINITY into masked scores -------------
+        // x[0]/x[1] are row `gid`, x[2]/x[3] are row `gid+8`; both are the
+        // same query row, so one boundary (`row_key_max`) serves all four.
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int key0 = s0 + nt * 8 + t4 * 2;
+            if (!row_ok || key0 > row_key_max) {
+                KQ_C[nt][0] = -INFINITY;
+                KQ_C[nt][2] = -INFINITY;
+            }
+            if (!row_ok || key0 + 1 > row_key_max) {
+                KQ_C[nt][1] = -INFINITY;
+                KQ_C[nt][3] = -INFINITY;
+            }
+        }
+
+        // ---- online softmax ----------------------------------------------
+        float KQ_max_new[2] = {KQ_max[0], KQ_max[1]};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            KQ_max_new[0] = fmaxf(KQ_max_new[0], KQ_C[nt][0] + FA2_KQ_OFFSET);
+            KQ_max_new[0] = fmaxf(KQ_max_new[0], KQ_C[nt][1] + FA2_KQ_OFFSET);
+            KQ_max_new[1] = fmaxf(KQ_max_new[1], KQ_C[nt][2] + FA2_KQ_OFFSET);
+            KQ_max_new[1] = fmaxf(KQ_max_new[1], KQ_C[nt][3] + FA2_KQ_OFFSET);
+        }
+        // A KQ row is spread over the four lanes with equal lane/4 (they hold
+        // different key columns), so only offsets 2 and 1 are needed.
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            KQ_max_new[c] = fmaxf(KQ_max_new[c],
+                                  __shfl_xor_sync(0xffffffffu, KQ_max_new[c], 2));
+            KQ_max_new[c] = fmaxf(KQ_max_new[c],
+                                  __shfl_xor_sync(0xffffffffu, KQ_max_new[c], 1));
+        }
+
+        float KQ_rowsum_add[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const float p = __expf(KQ_C[nt][l] - KQ_max_new[l >> 1]);
+                KQ_C[nt][l] = p;
+                KQ_rowsum_add[l >> 1] += p;
+            }
+        }
+
+        // Rescale factor for the previous VKQ, with llama.cpp's FTZ bit-trick:
+        // multiplying the float's bit pattern by 0 or 1 zeroes a denormal
+        // exp() without a branch. KQ_max_diff <= 0 always.
+        float KQ_max_scale[2];
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const float diff = KQ_max[c] - KQ_max_new[c];
+            float sc = __expf(diff);
+            unsigned bits = *reinterpret_cast<unsigned*>(&sc);
+            bits *= (diff >= FA2_FTZ_THRESH) ? 1u : 0u;
+            KQ_max_scale[c] = *reinterpret_cast<const float*>(&bits);
+            KQ_max[c] = KQ_max_new[c];
+            KQ_rowsum[c] = KQ_max_scale[c] * KQ_rowsum[c] + KQ_rowsum_add[c];
+        }
+
+        // In-place half2 rescale of the fp16 P*V accumulator.
+        {
+            const __half2 sc0 = __float2half2_rn(KQ_max_scale[0]);
+            const __half2 sc1 = __float2half2_rn(KQ_max_scale[1]);
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                __half2 v0 = *reinterpret_cast<const __half2*>(&VKQ_C[i][0]);
+                __half2 v1 = *reinterpret_cast<const __half2*>(&VKQ_C[i][1]);
+                v0 = __hmul2(v0, sc0);
+                v1 = __hmul2(v1, sc1);
+                VKQ_C[i][0] = *reinterpret_cast<const unsigned*>(&v0);
+                VKQ_C[i][1] = *reinterpret_cast<const unsigned*>(&v1);
+            }
+        }
+
+        // ---- P fragments: plain make_half2 pairing, no transpose ----------
+        // A_PV = get_half2(KQ_C): k-step kk uses KQ n-tiles 2kk and 2kk+1.
+        unsigned P[2][4];
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            P[kk][0] = fa2_pk2f(KQ_C[kk * 2][0], KQ_C[kk * 2][1]);
+            P[kk][1] = fa2_pk2f(KQ_C[kk * 2][2], KQ_C[kk * 2][3]);
+            P[kk][2] = fa2_pk2f(KQ_C[kk * 2 + 1][0], KQ_C[kk * 2 + 1][1]);
+            P[kk][3] = fa2_pk2f(KQ_C[kk * 2 + 1][2], KQ_C[kk * 2 + 1][3]);
+        }
+
+        // ---- P*V: VKQ_C += P . V, fp16 accumulate -------------------------
+#pragma unroll
+        for (int kc = 0; kc < 2; ++kc) {
+#pragma unroll
+            for (int dc = 0; dc < 16; ++dc) {
+                const int vrow = kc * 16 + (lane & 7) + ((lane & 16) ? 8 : 0);
+                const int vcol = dc * 8 + ((lane & 8) ? 4 : 0);
+                unsigned r[4];
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                    : "r"(smem_addr(tile_V + fa2_swz(vrow, vcol))));
+                // r0/r2 = b0/b1 of dv n-tile 2*dc, r1/r3 = those of 2*dc+1.
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                    "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                    : "+r"(VKQ_C[dc * 2][0]), "+r"(VKQ_C[dc * 2][1])
+                    : "r"(P[kc][0]), "r"(P[kc][1]), "r"(P[kc][2]), "r"(P[kc][3]),
+                      "r"(r[0]), "r"(r[2]));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                    "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                    : "+r"(VKQ_C[dc * 2 + 1][0]), "+r"(VKQ_C[dc * 2 + 1][1])
+                    : "r"(P[kc][0]), "r"(P[kc][1]), "r"(P[kc][2]), "r"(P[kc][3]),
+                      "r"(r[1]), "r"(r[3]));
+            }
+        }
+        __syncthreads();
+    }
+
+    // The partial rowsums are spread across the four lanes with equal lane/4
+    // (each holds a quarter of the key columns), so they must be reduced -- but
+    // only ONCE, here, not per key tile: the per-tile rescale factor is the
+    // same for all four lanes (KQ_max is already reduced), so each lane's
+    // running partial stays a consistent fraction of the whole. This is what
+    // llama.cpp does at `fattn-mma-f16.cuh:1370-1392` (offset_first = 2,
+    // offset_last = 1 for cols_per_warp != 8), and it costs 2 shuffles for the
+    // whole kernel rather than 2 per key tile.
+    //
+    // Omitting it is not a subtle error: the output comes out exactly 4x too
+    // large for multi-key rows, and +-inf for a single-key row (three of the
+    // four lanes divide by a zero partial).
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        KQ_rowsum[c] += __shfl_xor_sync(0xffffffffu, KQ_rowsum[c], 2);
+        KQ_rowsum[c] += __shfl_xor_sync(0xffffffffu, KQ_rowsum[c], 1);
+    }
+
+    // ---- epilogue: divide by rowsum, write fp32 ---------------------------
+    // Rows past `rows` must be zeros, not whatever the accumulator held.
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const size_t o0 = ((size_t)(t0 + gid) * n_q_heads + h0) * FA2_HD
+                          + (size_t)i * 8 + t4 * 2;
+        const size_t o1 = o0 + FA2_HD;   // the second head of this warp
+        float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][0]));
+        float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][1]));
+        if (!row_ok) {
+            f0 = make_float2(0.0f, 0.0f);
+            f1 = make_float2(0.0f, 0.0f);
+        } else {
+            f0 = make_float2(f0.x / KQ_rowsum[0], f0.y / KQ_rowsum[0]);
+            f1 = make_float2(f1.x / KQ_rowsum[1], f1.y / KQ_rowsum[1]);
+        }
+        *reinterpret_cast<float2*>(out + o0) = f0;
+        *reinterpret_cast<float2*>(out + o1) = f1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gated DeltaNet per-head gating, from Qwen3_5GatedDeltaNet.forward:
 //
 //   beta  = sigmoid(b)

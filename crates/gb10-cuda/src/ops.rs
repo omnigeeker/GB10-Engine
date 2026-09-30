@@ -27,6 +27,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "deinterleave_heads_kernel",
     "attn_prefill_kernel",
     "attn_prefill_tiled_kernel",
+    "attn_prefill_fa2_kernel",
     "attn_decode_kernel",
     "kv_cache_append_kernel",
     "embed_gather_kernel",
@@ -89,6 +90,7 @@ pub struct Ops {
     deinterleave_heads: CudaFunction,
     attn_prefill: CudaFunction,
     attn_prefill_tiled: CudaFunction,
+    attn_prefill_fa2: CudaFunction,
     attn_decode: CudaFunction,
     kv_cache_append: CudaFunction,
     embed_gather: CudaFunction,
@@ -161,6 +163,7 @@ impl Ops {
             deinterleave_heads: take(map, "deinterleave_heads_kernel")?,
             attn_prefill: take(map, "attn_prefill_kernel")?,
             attn_prefill_tiled: take(map, "attn_prefill_tiled_kernel")?,
+            attn_prefill_fa2: take(map, "attn_prefill_fa2_kernel")?,
             attn_decode: take(map, "attn_decode_kernel")?,
             kv_cache_append: take(map, "kv_cache_append_kernel")?,
             embed_gather: take(map, "embed_gather_kernel")?,
@@ -1801,6 +1804,25 @@ impl Ops {
                 "attn_prefill_tiled needs BQ * BK == 3 * (head_dim / 2), got {BQ} * {BK} against head_dim {head_dim}"
             )));
         }
+        // FA2 dispatch. `GB10_FA2=1` selects `attn_prefill_fa2_kernel`, the
+        // mma.sync / P-in-registers / exact-GQA design from fa_brief. It only
+        // exists for head_dim == 256 with GQA ratio exactly 6 (3 warps x 16
+        // qcols == 8 query rows x 6 heads); anything else falls back to the
+        // kernel above, so the flag can never produce a wrong answer for an
+        // unsupported shape. The dispatch lives here rather than in
+        // `attn_prefill` so the `attn-tile` differential test exercises the new
+        // kernel too.
+        let fa2 = std::env::var("GB10_FA2")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+            && head_dim == 256
+            && n_kv_heads > 0
+            && n_q_heads == 6 * n_kv_heads;
+        if fa2 {
+            return self.attn_prefill_fa2(
+                dev, q, k, v, out, n_tokens, n_q_heads, n_kv_heads, head_dim, scale, start, kv_base,
+            );
+        }
         // Q and K rows are padded in the kernel to break the shared bank
         // conflicts the natural stride causes: the row stride is head_dim + 2
         // with the two halves separated by one extra float.
@@ -1901,6 +1923,83 @@ impl Ops {
                 .launch(LaunchConfig {
                     grid_dim: (n_q_heads as u32, tiles, 1),
                     block_dim: (head_dim as u32, 1, 1),
+                    shared_mem_bytes: smem as u32,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `GB10_FA2=1` path: `attn_prefill_fa2_kernel`, the mma.sync tensor-core
+    /// prefill from `fa_brief`. Both matmuls are `mma.m16n8k16`, P stays in
+    /// registers as fp16 fragments, and one block serves all 6 query heads of a
+    /// KV head.
+    ///
+    /// Geometry (must match the `FA2_*` defines in kernels/elementwise.cu):
+    /// 8 query rows x 6 query heads = 48 qcols, 3 warps / 96 threads, key tile
+    /// 32, head_dim 256 in one tile. Shared memory is K 16 KB + V 16 KB, no
+    /// padding (XOR swizzle), and Q lives in registers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_fa2(
+        &self,
+        dev: &Device,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        start: usize,
+        kv_base: usize,
+    ) -> Result<()> {
+        const NROWS: usize = 8;
+        const BC: usize = 32;
+        const STRIDE_H2: usize = 128;
+        const THREADS: u32 = 96;
+        debug_assert_eq!(head_dim, 256);
+        // K tile + V tile, both BC * STRIDE_H2 half2, swizzled with no padding.
+        let smem = 2 * BC * STRIDE_H2 * 4;
+        if std::env::var("GB10_ATTN_OCCUPANCY").is_ok() {
+            use cudarc::driver::sys::CUfunction_attribute_enum as A;
+            let f = &self.attn_prefill_fa2;
+            let regs = f.get_attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS).unwrap_or(-1);
+            let ssb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(-1);
+            let mtb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK).unwrap_or(-1);
+            let by_regs = if regs > 0 { 65536 / (regs * THREADS as i32) } else { -1 };
+            let by_smem = if ssb >= 0 { 102400 / (ssb + smem as i32) } else { -1 };
+            let by_thr = 1536 / THREADS as i32;
+            println!(
+                "[occ] attn_prefill_fa2: regs {regs}  static_smem {ssb} B  \
+                 dynamic_smem {smem} B  maxThreads {mtb}  -> by_regs {by_regs}  \
+                 by_smem {by_smem}  by_threads {by_thr}  binding {}",
+                if by_regs < by_smem { "REGS" } else { "SMEM" }
+            );
+        }
+        let (t, nq, nk, hd) =
+            (n_tokens as i32, n_q_heads as i32, n_kv_heads as i32, head_dim as i32);
+        let (st, kb) = (start as i32, kv_base as i32);
+        // blockIdx.x is the KV head (not the query head): the block covers all
+        // `n_q_heads / n_kv_heads` query heads that read that KV head.
+        let tiles = n_tokens.div_ceil(NROWS) as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.attn_prefill_fa2)
+                .arg(q)
+                .arg(k)
+                .arg(v)
+                .arg(out)
+                .arg(&t)
+                .arg(&nq)
+                .arg(&nk)
+                .arg(&hd)
+                .arg(&scale)
+                .arg(&st)
+                .arg(&kb)
+                .launch(LaunchConfig {
+                    grid_dim: (n_kv_heads as u32, tiles, 1),
+                    block_dim: (THREADS, 1, 1),
                     shared_mem_bytes: smem as u32,
                 })?;
         }
