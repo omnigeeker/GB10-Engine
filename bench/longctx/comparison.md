@@ -14561,3 +14561,53 @@ binary. So the win is **not** an artifact of the isolated baseline tree.
 `K(s0+32)` issue could move one phase earlier and hide under softmax + P*V instead of P*V alone, at the same
 barrier count. That is a second change on top of an unmeasured one; the measured pipeline was committed
 first. It is the obvious next micro-optimisation if more attention speedup is needed at 128K/256K.
+
+## The FP4 reference measurement does NOT support the pivot -- and it explains why
+
+`/tmp/fa_res/llamacpp/build/bin/test-backend-ops perf -o MUL_MAT -p nvfp4` on this box (`/tmp/nvfp4_ref.log`),
+raw rows, `type_a=nvfp4, type_b=f32, m=4096, k=14336`:
+
+| n | us/run | GFLOP/run | **TFLOPS** |
+|---|---|---|---|
+| 1 | 190.35 | 0.117 | **0.62** |
+| 2 | 187.54 | 0.235 | 1.25 |
+| 3 | 184.57 | 0.352 | 1.91 |
+| 4 | 185.03 | 0.470 | 2.54 |
+| 5 | 194.30 | 0.587 | 3.02 |
+| 8 | 197.76 | 0.940 | 4.75 |
+| **512** | **1518.79** | **60.13** | **39.59** |
+
+**Backend CUDA0: OK** -- so these are real, uncontended numbers, not a failure.
+
+### What it says
+
+**The largest shape llama.cpp's NVFP4 benchmark reaches is `n=512`, and there it delivers 39.59 TFLOPS. The
+bf16 GEMMs on this box deliver 55.7-67.9 TFLOPS at the model's real prefill shapes. So NVFP4 is SLOWER than
+bf16 at the largest shape measured -- it is not a free 2x, and this measurement does not support the premise
+that FP4 buys 2x for prefill.**
+
+**And the shape sweep explains why, which is the more useful part.** From `n=1` to `n=512` the rate rises
+monotonically by ~64x while `us/run` stays roughly flat (184-198 us for n<=8). That is the signature of a
+**memory-bound** kernel: the time is dominated by streaming the weights, and the FLOP count is nearly free
+until `n` is large enough to amortise it. **NVFP4's real advantage is memory traffic (4.5 bpw vs 16 bpw for
+bf16), not tensor-core throughput** -- which is exactly why llama.cpp uses it, and exactly why it pays off in
+**decode** (where the weight stream dominates) and not necessarily in **prefill** (where the work is
+compute-bound and bf16 tensor cores are already well utilised).
+
+### The honest conclusion, and the one thing that would overturn it
+
+**This is a negative result for the FP4 pivot as a route to winning prefill, but it is not yet decisive**,
+because of one specific gap: **the benchmark stops at `n=512`, while the model's prefill runs at `n=8192` and
+`n=32768`.** The rate is still climbing steeply at the largest measured point, so it has not saturated, and it
+is possible that at `n=8192` the kernel becomes compute-bound and the FP4 tensor cores pull ahead of bf16.
+
+**So the measurement does not close the FP4 route -- it fails to open it.** Before any large FP4 kernel effort
+is justified, the one thing to measure is **the same NVFP4 `MUL_MAT` at `n=8192` and `n=32768`** (i.e. at the
+prefill shapes, hidden 5120). If it is still below ~68 TFLOPS there, the pivot is dead and the long contexts
+have to be won another way. **This is now the highest-value open measurement in the effort** -- it is cheap,
+and it is the difference between a large speculative kernel effort and not doing one.
+
+**A methodological note worth keeping:** the earlier plan rested on "FP4 is what llama.cpp uses, so FP4 must be
+the answer". This measurement is the first check of that inference against a number, and the number says the
+reason llama.cpp uses FP4 is memory traffic -- which is a decode argument, not a prefill one. **The inference
+"our competitor uses X, therefore X is our answer" was never evidence.**
