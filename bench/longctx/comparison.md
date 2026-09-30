@@ -13644,3 +13644,32 @@ MLP is 40% and attention is 34.8%, so 32K needs both.** And 32K is the row with 
 41.8% ceiling and the MLP's bf16 floor -- came from comparing against a peak that was too low, or from
 accepting the kernel's own structure as the frame of reference. **The lesson is the same both times: price
 against what the hardware can actually retire, measured, and never against a structure you have assumed.**
+
+## Staged plan: GQA head-sharing first, FA2 second
+
+Given the roofline above -- the kernel is ~7.7x above a bandwidth bound it should be near, and **55.9% of
+it is K/V staging** -- there is a much smaller change than a full FA2 rewrite that captures the biggest
+lever:
+
+**STEP 1. GQA head-sharing on the EXISTING kernel.** Make one block process all
+`group = n_q_heads/n_kv_heads = 6` query heads that share a KV head, so the K/V tile staged in shared
+memory is reused **6x instead of once**. The scalar PV and the existing score mma can both stay.
+
+* Register budget: the old kernel holds `float acc[BQ]` per thread for one head; for 6 heads `BQ` must
+  shrink. `BQ = 8` with 6 heads gives 48 accumulator registers, comparable to the current 24.
+* The 6 heads sharing KV head `kh` are `h = kh*group + j` for `j = 0..5` (the old kernel computes
+  `kh = h / group`), each with its own Q rows and its own output location
+  `out[((t0+i)*n_q_heads + h)*HD + d]`.
+* **The causal boundary is identical for all 6** -- it depends only on `t0 + i`, not on the head -- so one
+  mask serves the whole tile.
+* Expected: staging falls from 55.9% toward ~9%, i.e. roughly a **1.9x kernel speedup** -- close to the
+  2.13x needed at 32K on its own.
+
+**STEP 2.** Then move P into registers and use `mma` for the P*V (the 41.8%).
+
+**STEP 3.** Only then cp.async / swizzle / stream-k.
+
+**Why this ordering matters:** the full FA2 rewrite is a large, high-risk change that has already defeated
+two previous attempts in this session. **A correct, measured Step 1 banks most of the 32K win for a
+fraction of the risk.** The plan is to take the cheap win first and let the expensive one follow only if it
+is actually working.
