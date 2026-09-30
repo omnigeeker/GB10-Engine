@@ -12987,3 +12987,26 @@ after staging `P` as fp16 but before adding the mma.
 **Recommended first step, in order:** (1) stage `P` as fp16 and re-check occupancy -- if registers
 exceed 85 the route is closed and no further work is warranted; (2) only then add the mma and the
 shuffle redistribution.
+
+## Final verification of the shipped state
+
+`gb10-verify all`, run against the committed tree:
+
+```
+layer 0 (LinearAttention)  fixture 8 tokens x 5120 hidden    (14 stage checks)  all OK
+layer 3 (FullAttention)    fixture 8 tokens x 5120 hidden    (10 stage checks)  all OK
+all gates: OK
+```
+
+Per-stage errors on the linear-attention path are ~1e-7 to 1.8e-6 relative; on the full-attention path
+the largest is `attn_gated` at 1.9e-3 max_rel, which is the attention stage and is the expected
+magnitude for the tiled kernel. **Every stage passes, on both layer types.**
+
+Together with the two end-to-end gates used throughout this session:
+
+| gate | result |
+|---|---|
+| `gb10-verify all` | **all gates: OK** (24 stage checks, both layer types) |
+| `gb10-verify attn-tile` | **attn-tile: OK** |
+| `gb10-verify generate` | **16/16 exact token ids** vs an independent `Qwen3_5ForCausalLM` oracle dequantised from NVFP4 to bf16 |
+| `gb10-verify perplexity` | **PPL 6.5212** (15,300 predictions, `bench/ppl/wiki.test.raw`, ctx 512) |
