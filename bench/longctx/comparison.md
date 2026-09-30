@@ -13055,3 +13055,60 @@ not veto).
 **Expected outcome, bounded honestly:** the PV is 41.8% of the attention kernel. If it becomes nearly
 free, 32K goes to ~1.05x (parity, inside noise) and 128K to ~1.41x. **It cannot reach 128K/256K
 parity** -- that is the proof recorded earlier, and it does not change however well this is implemented.
+
+## Step 4 in full: the shuffle redistribution, with the index math written out
+
+The last unspecified piece is how the D fragments get to the threads that own the columns. It is
+purely index arithmetic, so it can be written down exactly and checked by hand before any code is
+written.
+
+**Setup.** Thread `tid` owns output column `tid`, so warp `w` owns columns `n0 .. n0+31` where
+`n0 = w*32`. Within the warp, lane `L` owns column `n0 + L`.
+
+**What the mma leaves in each lane.** For m-tile `mt` and n-tile `nt`, with `gid = lane >> 2` and
+`t4 = lane & 3`:
+
+```
+d0 = O[mt*8 + gid][nt*8 + 2*t4]        d1 = O[mt*8 + gid][nt*8 + 2*t4 + 1]
+d2 = O[mt*8 + gid + 8][nt*8 + 2*t4]    d3 = O[mt*8 + gid + 8][nt*8 + 2*t4 + 1]
+```
+
+**What lane `L` needs.** Column `n0 + L`, i.e. n-tile `nt = L / 8` at offset `c = L % 8`. Only the
+n-tile `L/8` matters to lane `L`. The rows come from two m-tiles, using only the fragments that avoid
+the rows-8-15 overlap:
+
+| rows | m-tile | fragment | source `gid` |
+|---|---|---|---|
+| 0-7 | 0 | `d0`/`d1` | `gid = r` |
+| 8-15 | 0 | `d2`/`d3` | `gid = r - 8` |
+| 16-23 | 1 | `d2`/`d3` | `gid = r - 16` |
+
+**The shuffle.** For each row, the source lane is `src = gid*4 + c/2`. Since `c`'s parity decides
+between the two fragments of a pair, and `src` varies per lane while the *register* must be uniform
+across the warp, each row costs **two shuffles** and a select:
+
+```cuda
+const int src = gid * 4 + (c >> 1);
+const float v0 = __shfl_sync(0xffffffffu, dA, src);   // dA uniform across the warp
+const float v1 = __shfl_sync(0xffffffffu, dB, src);
+acc[r] = (c & 1) ? v1 : v0;
+```
+
+**Cost per warp per key tile: 8 mma, ~16 `ldmatrix`, and 24 rows x 2 = 48 shuffles per n-tile x 4
+n-tiles = 192 shuffles.** Against the current **768 warp-instructions per thread** (384 smem loads +
+384 FMA), that is a **~3.6x reduction in the PV's instruction count** -- which is the honest estimate,
+not the "free PV" bound:
+
+```
+PV drops from 41.8% of the kernel to ~41.8/3.6 = 11.6%
+kernel speedup       1 / (1 - 0.418 + 0.116) = 1.43x
+32K   18,495 -> 12,934 ms, saves 5,561 ms (10.5% of 53.08 s) -> 47.5 s = 1.098x
+128K  302,607 -> 211,614 ms, saves 90,993 ms (20.3% of 447.5 s) -> 356.5 s = 1.562x
+```
+
+**Both figures agree with the earlier bounded projections**, which is a useful cross-check: the
+"free PV" bound gave 1.049x/1.407x, and the realistic 3.6x implementation gives 1.098x/1.562x.
+
+**One check worth doing first, cheaply:** the row-16-23 group needs m-tile 1's `d2`/`d3`, i.e. rows
+16-23 of a tile whose rows are 8-23. **Rows 8-15 are therefore computed twice (once per m-tile) and
+discarded from m-tile 1** -- 33% wasted mma work, which is already included in the 8-mma count above.
