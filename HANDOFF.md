@@ -139,14 +139,71 @@ Baseline `attn kernel` ≈ 18,400–21,700 ms at 32K. **Measure the old kernel i
 
 **Occupancy matters**: on the OLD kernel, 3 blocks/SM → 2 costs **+22.4%**, → 1 costs **+114.9%**. Keep 3.
 
-## Open leads not yet resolved
+## THE SECOND GAP IS NOW SOLVED TOO — llama.cpp uses real FP4 tensor cores for the MLP
 
-* The two research agents' reports: **quantized GEMM / MMQ / NVFP4 handling** (llama.cpp's MLP path), and
-  **llama.cpp `test-backend-ops` measured head_dim=256 FA throughput on this exact GB10** — the latter
-  would give a real number to target rather than a derived one.
-* **The MLP side (43–45% of ceiling)** is untouched. At 32K it is 40% of the total. Improving it relaxes
-  the attention requirement proportionally: halving non-attention at 128K would drop the needed attention
-  speedup from 3.63x to about 1.9x.
+**This is a concrete, high-value, independent task. Read it before touching the MLP path.**
+
+Verified from the shipped binary with `cuobjdump -sass -arch sm_121a`:
+
+```
+1792  OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X     <- NVFP4
+1792  OMMA.SF.16864.F32.E2M1.E2M1.E8          <- MXFP4
+```
+
+PTX source `ggml/src/ggml-cuda/mma.cuh:1145`:
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+```
+
+**Weights AND activations are raw e2m1, block-scaled by ue4m3, f32 accumulate. No fp16/bf16 conversion
+anywhere in that path.**
+
+**Our engine does the opposite.** `crates/gb10-model/src/weights.rs::forward_prefill_tensor_core`
+(~132-225) runs `dequant_nvfp4_to_bf16` → activation cast → `cublas_gemm_bf16_f32`. Wrong on both axes:
+we dequantize to bf16, write it and re-read it, and the compute floor is **23.4 ms vs 11.7 ms** for the
+5120x17408x32768 GEMM — **2x worse**.
+
+**THE BLOCKER: `crates/gb10-cuda/build.rs:11` sets `CUDA_ARCH = "sm_121"`, and the build emits PTX with
+`-arch sm_121`. The `kind::mxf4nvf4` block-scaled mma requires `sm_121a`.** llama.cpp's own build used
+`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]`. **Step 1 is changing the arch target to
+`sm_121a`; without it we cannot emit the instruction at all.**
+
+Key implementation facts:
+* **Format**: `QK_NVFP4=64`, `QK_NVFP4_SUB=16`, `block_nvfp4 { uint8_t d[4]; uint8_t qs[32]; }` = 36 B/64
+  elems = 4.5 bpw. The E2M1 LUT is **doubled** (`ggml-common.h:1124-1129`) and `ggml_cuda_ue4m3_to_fp32`
+  returns `xf/2` (`common.cuh:856-867`) to compensate.
+* **The per-tensor f32 scale is NOT in the mma** — this GGUF carries it as a separate 1-element F32 tensor
+  and the stored `d` values are in `W/s` units (median 26, max 448 = ue4m3 saturation), so it is
+  **mandatory**. llama.cpp applies it as a **separate elementwise multiply on the GEMM output** during
+  prefill (~4.6 GB of extra traffic per GEMM, because `ggml_cuda_mul_mat_q` takes no fusion argument) —
+  **fusing it into our epilogue is an advantage we hold.**
+* **`input_scale` is loaded by llama.cpp and never consumed**; the activation global scale is computed
+  dynamically per row as `amax/(6.0f*448.0f)` (`quantize.cu:182`), applied in the MMQ epilogue
+  (`mmq.cuh:514-521`).
+* **The real limiter is tile re-read, not FP4 compute.** At I=J=128 there are 34,816 tiles with 360 KB of
+  weights + 360 KB of activations each; the 48-SM working set is 34.6 MB so **L2 cannot hold it** → 25.7 GB
+  of traffic, ~103-113 ms with no reuse. **The win comes from tile scheduling / L2 reuse, not the mma
+  alone.**
+* llama.cpp's Blackwell NVFP4 config: 8 warps / 256 threads, occupancy 1, I=128, J ∈ 8..128 step 8,
+  K_vram=512, stream_k=true, 57,856 B smem at J=128.
+* `ggml_cuda_should_use_mmq` has `if (turing_mma_available(cc)) return true;` (`mmq.cu:319-321`) — **MMQ
+  at all batch sizes on sm_75+; cuBLAS is essentially never used for quantized weights.**
+
+**Estimated payoff:** the MLP is 21.5 s at 32K and 89.8 s at 128K. A 2x MLP improvement takes 32K from
+53.1 s to ~42.6 s, which is **already a win against llama.cpp's 43.2 s** — before the attention fix lands.
+At 128K it takes 447.5 s to ~402.5 s, so attention is still required there.
+
+**Sequencing note:** changing `CUDA_ARCH` to `sm_121a` recompiles every kernel and would disturb any
+in-flight attention measurement. Do the FP4 work **after** the attention kernel is committed and measured,
+or coordinate the two.
+
+## Other open leads
+
+* **llama.cpp `test-backend-ops` measured head_dim=256 FA throughput on this exact GB10** — would give a
+  real number to target rather than a derived one.
+* **Improving the non-attention side relaxes the attention requirement proportionally**: halving
+  non-attention at 128K drops the needed attention speedup from 3.63x to about 1.9x.
 * Not done: hoisting the duplicated activation cast (four `proj in` calls share `sc.hidden`; ~3,377 ms at
   128K ≈ 0.75%).
 * Stream-K over the KV dimension (llama.cpp enables it unconditionally for cc ≥ Ada; relevant on 48 SMs)
