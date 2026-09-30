@@ -13376,3 +13376,62 @@ GEMV-shaped kernel as the frame of reference and then optimised inside it.**
 
 **Order of magnitude available:** at 30% of bf16 peak the 128K attention kernel would take ~12.5 s instead
 of 302.6 s, putting 128K at ~157 s against llama.cpp's 228 s -- **a 1.45x win, not a 1.96x loss.**
+
+## Two decisive measurements: the kernel is INSTRUCTION-bound, and sm_121 has only mma.sync
+
+### 1. Instruction-bound, not memory-bound (local measurement)
+
+Attention-kernel time and derived efficiency across an 8x range of sequence length:
+
+| n | FLOP (QK^T+PV) | attn kernel | achieved | vs n=8K | KV per head (K+V) |
+|---|---|---|---|---|---|
+| 8192 | 1.10 TFLOP | 1,288 ms | **0.854 TFLOP/s** | 1.000 | 8.4 MB |
+| 16384 | 4.40 TFLOP | 5,357 ms | **0.821 TFLOP/s** | 0.962 | 16.8 MB |
+| 32768 | 17.59 TFLOP | 21,734 ms | **0.809 TFLOP/s** | 0.948 | 33.6 MB |
+
+**Efficiency is flat to within 5% across an 8x increase in n, while the KV working set grows 8x and
+goes from comfortably L2-resident to not.** Time scales as n^2 (x4.16 and x4.06 for x4.00 FLOPs).
+
+**That rules out the memory-bound explanation and establishes the kernel as instruction/issue-bound at a
+constant cost per FLOP.** It also explains why the two staging fixes (K vectorized, V via uint4) helped
+proportionally at every length rather than only where the cache broke down.
+
+**The size of the instruction gap:** `mma.sync.aligned.m16n8k16` retires **4096 FLOP per instruction**.
+The scalar PV does **2 FLOP per FFMA**. That is a **2048x instruction-count gap on the PV alone**, and
+the staging loops are similarly instruction-heavy per FLOP. A kernel whose arithmetic never reaches a
+tensor core cannot be rescued by tuning the arithmetic it does in FFMA.
+
+### 2. sm_121's tensor-core instruction set -- Ampere-style `mma.sync` only (verified externally)
+
+Per PTX ISA 9.4 and corroborating sources:
+
+* **`tcgen05.mma` is NOT available on sm_120a/sm_121a** -- it is listed for sm_100a/sm_101a/sm_110a and
+  the `f`-suffix family variants, and TMEM is described only for the 10x family. **No 5th-gen tensor
+  cores, no TMEM on GB10.**
+* **`wgmma` requires sm_90a** and does not forward-compile; `ptxas` rejects it on sm_120.
+* **What sm_121 DOES have:** `mma.sync.aligned.m16n8k16` (bf16/f16, sm_80+),
+  `mma.sync.aligned.m16n8k32` (FP8, sm_89+), and **FP4 via `mma.sync...kind::mxf4nvf4` /
+  `kind::mxf4 .block_scale`, explicitly listed as supported on sm_120a/sm_121a.** `cp.async` (sm_80+) and
+  TMA `cp.async.bulk.tensor` (sm_90+) are both available.
+* **CUTLASS has no attention example for sm_120/sm_121 at all**, and its Blackwell FMHA example (77) is
+  sm_100a-only, tcgen05-based, and **supports head dims 32/64/128 only -- there is no head_dim=256
+  config.** So there is no drop-in CUTLASS attention kernel for this part at this head dim.
+
+**Consequences for the design:** an **FA2-style `mma.sync` kernel is the right target** -- do not design
+around tcgen05/TMEM warp-specialised ping-pong (that is FA3/FA4/sm_100a territory), and do not port
+FA3's `wgmma` path.
+
+**And the shared-memory ceiling is real and already measured on this box:** `sharedMemPerBlockOptin =
+101,376 B` (~99 KB) and `sharedMemPerMultiprocessor = 102,400 B`. For head_dim=256 bf16 a 64x256 Q tile is
+32 KB and each 64x256 K/V tile is 32 KB, so a Q+K+V triple is 96 KB -- **one CTA per SM, with no room for
+double buffering.** That is the tightest constraint on the rewrite and it is a property of sm_121, not of
+this kernel.
+
+### An open lead that could change the plan
+
+llama.cpp's own head_dim=256 FA MMA kernel (`ggml_cuda_flash_attn_ext_mma_f16_case<256,256,8,8>`)
+**fails on DGX Spark** at `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize)`
+(ollama issue #17596, deterministic, workaround `OLLAMA_FLASH_ATTENTION=0`) -- **a shared-memory-limit
+symptom in the 256 path on exactly this hardware.** If llama.cpp is also falling back for head_dim=256 on
+GB10, then its 2x end-to-end advantage at 128K is **not** coming from a superior FA kernel, and the
+question "where does llama.cpp's advantage actually come from" is reopened. **This is being chased now.**
