@@ -2,7 +2,54 @@
 
 ---
 
-## EXECUTIVE SUMMARY
+## CORRECTION (the earlier "provably unreachable" proof was WRONG)
+
+**The proof recorded above is invalid and is withdrawn.** It assumed the attention kernel's structure was
+fixed and that only its PV component (41.8%) could be improved. **That premise is false, and one number
+that should have been computed at the very start shows it:**
+
+| len | n | FLOP (QK^T + PV, 16 full-attn layers) | attn kernel | achieved | **% of bf16 peak** | attn share of prefill |
+|---|---|---|---|---|---|---|
+| **32K** | 32768 | 17.6 TFLOP | 18,495 ms | **0.95 TFLOP/s** | **1.27%** | 34.8% |
+| **128K** | 131072 | 281.5 TFLOP | 302,607 ms | **0.93 TFLOP/s** | **1.24%** | 67.6% |
+
+**The attention kernel is running at about 1.25% of this GPU's bf16 tensor-core peak.** A kernel at 1% of
+peak is not "at its floor with one expensive component left" -- **it is structurally wrong.** Every
+conclusion drawn from "the PV is 41.8%, so the ceiling is 14.6%/28.3% of the prefill" inherits that
+error, because it treats the *other 58.2%* of the kernel (K/V staging, softmax, and the score-product
+mma's own overhead) as irreducible when it is in fact the same 1%-of-peak problem.
+
+**What the same arithmetic says about what is actually available:**
+
+```
+if the attention kernel reached 30% of bf16 peak (still conservative for a well-tiled FA2 kernel):
+  128K attention  302,607 ms -> 12,510 ms
+  128K total      447.5 s     -> ~157 s      vs llama.cpp 228.2 s   ->  gb10 WINS by 1.45x
+```
+
+**So 128K and 256K are not out of reach -- they are reachable if the attention kernel is written
+properly, and the gap is entirely explained by it not being written properly.** The user was right to
+reject the 8K-only conclusion.
+
+### The likely structural cause, to be confirmed against llama.cpp's source
+
+The current kernel uses **`PREFILL_BQ = 24` and `PREFILL_BK = 16`** -- a 24x16 query/key tile -- with a
+**scalar fp32 PV loop** (384 shared-memory loads + 384 FFMA per thread per key tile) and a self-imposed
+constraint `BQ * BK == 3 * (head_dim/2) == 384` that exists only because of an ad-hoc warp mapping
+(`mt = warp >> 1`, `ntile = warp & 1`), not because of anything in the hardware.
+
+At 128K there are 131072/16 = **8192 key tiles** per query tile, each carrying full softmax, staging and
+synchronisation overhead against only 24x16x256 of real work. **The tile is far too small to amortise
+anything, and the PV never touches the tensor cores at all.** llama.cpp's `fattn-mma-f16` instead uses
+large query/key tiles with `mma.sync` on *both* matmuls and the P matrix kept in fp16 register
+fragments -- which is the design that needs to be ported here.
+
+**This section supersedes the "reachable set" and "EXECUTIVE SUMMARY" claims below, which are retained
+only as a record of the error.**
+
+---
+
+## EXECUTIVE SUMMARY (partially superseded -- see the correction above)
 
 **Two problems were opened. One is closed and certified; the other is half-won and provably cannot be
 finished on this hardware. Both conclusions rest on same-session measurements committed in this file.**
