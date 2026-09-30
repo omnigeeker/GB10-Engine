@@ -985,23 +985,29 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     }
 
     // ---- epilogue: divide by rowsum, write fp32 ---------------------------
-    // Rows past `rows` must be zeros, not whatever the accumulator held.
+    // Guarded on `row_ok` rather than zero-filling the invalid rows. `rows` is
+    // `min(8, n_tokens - t0)`, so `gid >= rows` implies `t0 + gid >= n_tokens`:
+    // those query rows do not exist in `out` at all and writing them would be an
+    // out-of-bounds store past the end of the buffer on any prefill whose token
+    // count is not a multiple of 8 (the last block of a 59-token prompt, say).
+    // The old kernel skips them for the same reason. Rows inside the block that
+    // are past `rows` still never contribute: their Q is zeroed and every key
+    // is masked to -INFINITY, so they cannot leak into a valid row either.
+    if (row_ok) {
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        const size_t o0 = ((size_t)(t0 + gid) * n_q_heads + h0) * FA2_HD
-                          + (size_t)i * 8 + t4 * 2;
-        const size_t o1 = o0 + FA2_HD;   // the second head of this warp
-        float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][0]));
-        float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][1]));
-        if (!row_ok) {
-            f0 = make_float2(0.0f, 0.0f);
-            f1 = make_float2(0.0f, 0.0f);
-        } else {
-            f0 = make_float2(f0.x / KQ_rowsum[0], f0.y / KQ_rowsum[0]);
-            f1 = make_float2(f1.x / KQ_rowsum[1], f1.y / KQ_rowsum[1]);
+        for (int i = 0; i < 32; ++i) {
+            const size_t o0 = ((size_t)(t0 + gid) * n_q_heads + h0) * FA2_HD
+                              + (size_t)i * 8 + t4 * 2;
+            const size_t o1 = o0 + FA2_HD;   // the second head of this warp
+            const float2 f0 =
+                __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][0]));
+            const float2 f1 =
+                __half22float2(*reinterpret_cast<const __half2*>(&VKQ_C[i][1]));
+            *reinterpret_cast<float2*>(out + o0) =
+                make_float2(f0.x / KQ_rowsum[0], f0.y / KQ_rowsum[0]);
+            *reinterpret_cast<float2*>(out + o1) =
+                make_float2(f1.x / KQ_rowsum[1], f1.y / KQ_rowsum[1]);
         }
-        *reinterpret_cast<float2*>(out + o0) = f0;
-        *reinterpret_cast<float2*>(out + o1) = f1;
     }
 }
 
