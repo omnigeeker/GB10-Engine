@@ -13926,3 +13926,39 @@ earlier in this session.
 
 One block per KV head, 48 qcols, K/V tile reused 6x -- so the dominant measured lever (worth 2.87x per the
 `test-backend-ops` numbers) is in the design, and the agent is not falling back to the scalar-PV variant.
+
+## Independent review of the FA2 kernel: the arithmetic checks out; the pipelining is missing
+
+I read `kernels/elementwise.cu:639-1003` (the FA2 kernel) line by line against the fragment specs, looking
+for bugs beyond the `KQ_rowsum` one the implementation agent already found. **I found no further correctness
+bug.** What I checked, and what makes each piece right:
+
+| piece | why it is right |
+|---|---|
+| **M = 2 heads x 8 rows** | A rows 0-7 are head `h0` and rows 8-15 are head `h0+1`, with the **same** query row `gid` in both. So a lane's two KQ rows are one query row under two heads, which is why a single causal boundary (`row_key_max = start + t0 + gid`) correctly serves all four KQ_C elements. |
+| **Q fragment packing** | `Q_B[kt][0..1]` are the two heads at head-dim 0-7 and `[2..3]` the same at +8, matching the m16n8k16 A fragment `{a0,a1,a2,a3}` exactly. `scale` is folded into Q before the fp16 round, which is exact here because `1/sqrt(256) == 2^-4`. |
+| **B (K) lane addresses** | `kcol = kt*8 + ((lane&8)?4:0)` is in **half2** units, so `+4` is `+8` halves -- exactly the `+8` head-dim offset the `b1` block needs. Easy to misread as `+4` halves. |
+| **swizzle consistency** | `fa2_swz(row, col_h2)` = `(row*128 + col_h2)*4 ^ ((row&7)<<4)`. The XOR is at 16-byte granularity, so each ldmatrix row (one 16-byte unit) stays intact. The write side uses `u*4` half2 (8 halves = 16 B per uint4) and the read side `kt*8` half2 (16 halves = 32 B per k-step), and both use the same `row`, so both apply the same XOR. |
+| **masking** | `KQ_C[nt][0]/[2]` are key `t4*2` and `[1]/[3]` are key `t4*2+1`, so the two tests cover all four elements. Keys past `win_max` are zero-filled in smem *and* masked, so they cannot leak in as a score of 0. |
+| **P fragments, no transpose** | `P[kk][0] = pack(KQ_C[2kk][0], KQ_C[2kk][1])` is `A[gid][16kk + t4*2, +1]` = `a0`; `[1]` = `a1` (row gid+8); `[2]` = `a2` (keys +8, n-tile `2kk+1`); `[3]` = `a3`. **Exactly the PV A-fragment with no `movmatrix` and no smem round-trip** -- the central claim of the design, and it holds. |
+| **P*V transposed load** | `vcol = dc*8 + ((lane&8)?4:0)` again in half2; `r[0],r[2]` feed the `dc*2` mma and `r[1],r[3]` the `dc*2+1` mma, matching the probe's `{b0(dv0), b0(dv1), b1(dv0), b1(dv1)}` order. |
+| **epilogue indexing** | `VKQ_C[dc*2]` covers dv `16dc + t4*2`, and the write offset is `i*8 + t4*2` with `i = dc*2`, so `i*8 == 16dc`. `o1 = o0 + FA2_HD` is the second head. Rows past `rows` are explicitly zeroed rather than divided. |
+
+**The causal work is also not wasted.** For a block at `t0` the loop runs `s0` from 0 to
+`start + t0 + rows - 1`. It looks like the leading keys are wasted, but row 0 of the block genuinely needs
+keys `0..start+t0`, so every tile in the loop is needed by at least one row. For `start = 0` this sums to the
+usual causal `N^2/2`; for a chunked prefill with `start > 0` the prefix tiles are all needed by row 0.
+
+### The real remaining gap: there is no pipelining at all
+
+**The objective called for `cp.async` and a software pipeline, and the kernel has neither.** Staging uses
+plain `uint4` loads, and there are exactly two `__syncthreads()` per key tile -- one after the staging writes
+(813) and one at the end of the tile (966) to protect the smem before the next tile's writes. That is
+**correct but strictly serial**: the global loads for tile *n+1* cannot begin until every warp has finished
+its mma work on tile *n*, and the mma units idle during the staging.
+
+This is the natural next lever once the correctness gates pass -- double-buffered K/V in the 32 KB budget
+would need 64 KB and drop occupancy from 3 to 1, so the cheaper first step is `cp.async` into the *same*
+buffer with the sync moved to cover only the copy, letting the copy for the next tile overlap the tail of
+the current mma. **But do not touch it before `generate` is exact and `perplexity` is 6.5212.** A correct
+kernel at 3 CTAs/SM is the deliverable; the pipeline is the next commit.
