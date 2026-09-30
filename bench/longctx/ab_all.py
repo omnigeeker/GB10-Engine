@@ -318,7 +318,7 @@ def binary_freshness():
 
 
 def occupancy_preflight():
-    """Assert the FA2 kernel really gets 4 CTAs/SM on this binary.
+    """Assert the FA2 kernel really gets 12 warps/SM on this binary.
 
     mtimes can lie -- a build that does not recompile the kernel still refreshes
     the binary. This runs the kernel once at 8K and reads the driver's REAL
@@ -326,6 +326,16 @@ def occupancy_preflight():
     EXPLICIT bad reading; a missing marker returns a warning instead of a
     failure, because a false failure in an abort-by-default harness is its own
     trap here (the `<defunct>` zombie and the `--report-api-errors` episode).
+
+    The invariant asserted is **12 warps/SM with `binding REGS`**, NOT a fixed
+    `by_regs`. Both shipped configurations reach 12 warps/SM by different routes
+    and BOTH report `binding REGS`, so only the thread count and register count
+    distinguish them:
+
+        BQ=8  : 96 threads,  by_regs 4  -> 4 CTAs x 3 warps = 12 warps/SM
+        BQ=16 : 192 threads, by_regs 2  -> 2 CTAs x 6 warps = 12 warps/SM
+
+    Hardcoding `by_regs >= 4` here would wrongly abort every BQ=16 run.
 
     Returns (occ_line_or_None, problem_or_None).
     """
@@ -339,12 +349,25 @@ def occupancy_preflight():
     if not m:
         return None, "no [occ] line in the 8K preflight (not treated as fatal)"
     line = m.group(0).strip()
+    bq = int(os.environ.get("GB10_FA2_BQ", "8") or "8")
+    want_threads = (bq // 8) * 3 * 32
     bad = []
     if "binding REGS" not in line:
         bad.append("binding is not REGS")
+    mt = re.search(r"maxThreads (\d+)", line)
+    if not mt or int(mt.group(1)) != want_threads:
+        bad.append(f"maxThreads != {want_threads} (GB10_FA2_BQ={bq} does not match "
+                   f"the compiled kernel)")
+    mr = re.search(r"regs (\d+)", line)
+    if mr and int(mr.group(1)) > 170:
+        bad.append(f"regs {mr.group(1)} > 170 (would spill / lose the CTA)")
     mb = re.search(r"by_regs (\d+)", line)
-    if not mb or int(mb.group(1)) < 4:
-        bad.append("by_regs < 4")
+    if mb:
+        warps = int(mb.group(1)) * (want_threads // 32)
+        if warps < 12:
+            bad.append(f"only {warps} warps/SM, expected 12")
+    else:
+        bad.append("no by_regs in the [occ] line")
     md = re.search(r"dynamic_smem (\d+)", line)
     if not md or int(md.group(1)) != 16384:
         bad.append("dynamic_smem != 16384 (host request does not match the 16 KB tile)")

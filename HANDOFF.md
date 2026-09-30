@@ -678,3 +678,48 @@ here). Verified good reading:
 [occ] attn_prefill_fa2: regs 168  static_smem 0 B  dynamic_smem 16384 B  maxThreads 96
       -> by_regs 4  by_smem 6  by_threads 16  binding REGS
 ```
+
+### TRAP: a PTX hash is NOT a no-op control — use SASS
+
+The build compiles with **`-lineinfo`** (`crates/gb10-cuda/build.rs`), which embeds line numbers in
+the PTX. **Adding a single comment line therefore changes the PTX bytes while the compiled program
+is unchanged.** The earlier no-op proofs in this project compared PTX hashes; they passed, so
+nothing is retroactively wrong — but they passed by luck of not having shifted a line, and the next
+agent would hit a **false alarm** and might abandon a correct change.
+
+**PTX hash proves identity of *source*; SASS proves identity of *program*.** Use the latter:
+
+```bash
+NVCC=/usr/local/cuda/bin/nvcc
+$NVCC -arch sm_121a -cubin -O3 --use_fast_math -I kernels -o /tmp/a.cubin kernels/elementwise.cu
+# then strip addresses and line-info comments from cuobjdump -sass and diff the instruction streams
+```
+
+This was hit for real on `BQ 8 -> 16`: the `#if FA2_NROWS == 8` path is verbatim the shipped code,
+and it produced PTX `47868e0e7aa4` instead of `e00754e5f1c1` — but **10535 instructions in both, SASS
+identical**. The PTX difference was purely line numbers.
+
+It is the same lesson as `occupancy_preflight()` over `binary_freshness()`: **the cheap proxy is not
+the measurement.**
+
+### The two shipped FA2 configurations
+
+`GB10_FA2_BQ` selects query rows per block and **must match the compiled kernel** (`FA2_NROWS`,
+`-DFA2_NROWS=16 -DFA2_MINBLOCKS=2` for the wide one), exactly like `GB10_FA2_BC`. Both reach **12
+warps/SM** and both report `binding REGS`, so **only `maxThreads` and `regs` distinguish them**:
+
+| config | threads | regs | by_regs | CTAs/SM | warps/SM | smem | K/V request traffic |
+|---|---|---|---|---|---|---|---|
+| BQ=8 (shipped) | 96 | 168 | 4 | 4 | 12 | 16384 | 1.0x |
+| BQ=16 | 192 | **166** | 2 | 2 | 12 | 16384 | **0.5x** |
+
+BQ=16 is **numerically free** — `generate` exact 16/16, `attn-tile` byte-identical, `ppl512` mean nll
+**bit-identical** at 1.875132 — because the extra key tiles it scans are fully masked and a masked
+key contributes `exp(-inf) = 0` to the rowsum with a rescale factor of `exp(0) = 1`. **That is a
+different epistemic situation from BC=16**, which costs +6.5e-5 mean NLL and is accepted only because
+the sign was predicted before measurement. "Provably free" and "accepted with a characterised cost"
+are not the same claim and must not be filed together.
+
+To run the TTFT proof on BQ=16, export `GB10_FA2_BQ=16` before `ab_all.py`: it propagates to the
+`gb10` engines through `ENGINES`, and the occupancy preflight reads it to know which thread count to
+expect.
