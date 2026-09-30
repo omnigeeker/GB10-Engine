@@ -13962,3 +13962,58 @@ would need 64 KB and drop occupancy from 3 to 1, so the cheaper first step is `c
 buffer with the sync moved to cover only the copy, letting the copy for the next tile overlap the tail of
 the current mma. **But do not touch it before `generate` is exact and `perplexity` is 6.5212.** A correct
 kernel at 3 CTAs/SM is the deliverable; the pipeline is the next commit.
+
+## LANDED: the FA2 prefill attention kernel is correct, committed, and independently verified
+
+`59df192 feat(attn): FA2 mma prefill kernel -- P in registers, exact GQA batching`. **This is the first time
+in this session that a prefill-attention rewrite has landed and passed both acceptance gates.** The old
+kernel is untouched and `GB10_FA2` selects between them.
+
+### Both gates, and the second one was reproduced independently
+
+| gate | result |
+|---|---|
+| `GB10_FA2=1 generate --n 24` | **exact match, 16/16**, ids `[1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]` |
+| `GB10_FA2=1 perplexity --ctx 512 --chunks 60` (agent) | **PPL = 6.5213**, mean nll 1.875067, 15300 predictions, 126.4 s |
+| `GB10_FA2=1 perplexity --ctx 512 --chunks 60` (**reproduced by the session owner**) | **PPL = 6.5213**, mean nll 1.875067, 15300 predictions, 183.5 s |
+
+Target 6.5212; both runs land at 6.5213 -- the same to four decimal places, from two separate processes. **So
+the fp16 P*V accumulator does not perturb the model's output distribution at this precision.**
+
+`attn-tile` is dirty, as expected and as designed: **2.6e-8 rel at 1 key rising to ~1.7e-3 rms rel at 2111
+keys**. That is the deliberate fp16 P*V accumulation, not a layout bug -- it is a differential test, and
+`generate`/`perplexity` are the acceptance gates. **It must not be treated as a veto.**
+
+### Runtime occupancy (the JIT'd value that actually runs, not `ptxas -v`)
+
+| | |
+|---|---|
+| registers | **168** |
+| static smem | 0 B |
+| dynamic smem | **32,768 B** |
+| threads | 96 |
+| by_regs / by_smem / by_threads | 4 / **3** / 16 |
+| **binding** | **SMEM -> 3 CTAs/SM** |
+
+0 `.local` in the PTX. The 3-CTA/SM target held.
+
+### The method that made it work
+
+Two things, and both were departures from how the earlier failed attempts went:
+
+1. **The fragment layouts were settled by a probe, not by reasoning.** `bench/longctx/ldmatrix_probe.cu` is
+   committed with a header explaining what it prints and why, including the `x4.trans` register-order
+   gotcha. The agent reports that this is exactly what caught its first-draft bug: it had the row offset and
+   the column offset swapped relative to the `b0`/`b1` pair (`((lane&16)?8:0)` in the wrong place), which is
+   the half2-units subtlety I flagged independently. **The probe is now the durable guard against that line
+   being "fixed" into a bug again.**
+2. **The old kernel was left in place behind a flag**, so every step had a same-session A/B baseline and the
+   change could never regress the default path.
+
+### Also noted
+
+The FP4 MLP agent (a separate subagent) exhausted its context **without writing any code** -- no
+`kernels/nvfp4_gemm.cu`, no `GB10_FP4_MMA` references, clean tree. It spent its entire budget reading
+llama.cpp's `mma.cuh`/`mmq.cuh`/`quantize.cu`. The FP4 finding itself (llama.cpp uses real block-scaled
+`mma.sync` FP4 with raw e2m1 operands, not a bf16 dequant) stands and is recorded, but **nothing was built
+from it**, so the MLP path is still on the bf16 dequant route.
