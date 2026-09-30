@@ -14669,3 +14669,51 @@ the property that makes FP4 good there (half the weight traffic) is worth nothin
 where the tensor-core rate is what matters -- and that rate is *worse* than bf16's here. **"Our competitor uses
 X, therefore X is our answer" was never evidence**, and this is the second time this session that a plausible
 attribution collapsed when measured (the first being the 2x-MLP premise).
+
+## THE SAME-SESSION TTFT PROOF: 8K and 32K WON, 128K lost by 2.9%, 256K lost by 18.2%
+
+`bench/longctx/ab_all.py --contexts 8192,32768,131072,262144`, three engines in ONE session, two trials each,
+minimum reported, server started once per engine. Raw stdout: `/tmp/ab_all_proof.log`. Prompt tokens verified
+per trial (8193 / 32746 / 131017 / 261992).
+
+| context | gb10 OLD kernel | **gb10 FA2+pipeline** | **llama.cpp** | verdict |
+|---|---|---|---|---|
+| **8K** | 12.57 / 12.57 s | **9.46 / 9.29 s** | 10.46 / 10.78 s | **gb10 WINS 1.13x / 1.14x** |
+| **32K** | 65.96 / 66.30 s | **40.41 / 40.72 s** | 43.57 / 43.82 s | **gb10 WINS 1.076x / 1.078x** |
+| **128K** | 543.67 / 522.49 s | **234.11 / 233.46 s** | 226.93 / 227.46 s | **gb10 loses 1.029x** |
+| **256K** | 1515.88 / 1507.08 s | **709.52 / 712.57 s** | 600.03 s (trial 0) | **gb10 loses 1.182x** |
+
+**Objective deficits vs. the new same-session ratios:** 32K 1.19x -> **0.93x (win)**; 128K 1.96x -> **1.029x**;
+256K 2.51x -> **1.18x**. 8K was 0.925-0.972x and is now **1.13x**.
+
+**The pipelined kernel's own speedup, same session, cold TTFT:** 1.33-1.35x (8K), 1.63x (32K), 2.23-2.32x
+(128K), 2.14x (256K). **It scales with context, exactly as the mechanism predicts** -- the per-key-tile stall
+is paid once per tile, and there are more tiles at longer context. That is why 128K moved from 1.96x behind to
+1.029x while 256K, starting from a deeper 2.51x hole, only reached 1.18x behind.
+
+**Trial-to-trial agreement:** pipelined kernel 0.3-0.4% at every context; OLD kernel 4% at 128K; llama.cpp
+0.2-3%. The pipelined kernel is the most reproducible of the three.
+
+### Two methodological findings from this run
+
+1. **This instrument reads ~15% slower than the older scorecard for BOTH engines** -- the OLD kernel shows
+   12.57 s at 8K here versus 8.69-8.75 s recorded, and llama shows 10.46 s versus 8.98-9.40 s. **The offset is
+   common-mode, so the ratio survives while the absolute seconds do not.** This was flagged as a worry
+   mid-run ("8K looks behind!") and the worry was wrong: against llama's same-session 10.46 s, gb10 wins 8K by
+   1.13x. **This is the first time "ratios transfer, absolute seconds do not" was confirmed on a real pair
+   rather than asserted** -- and the wrong reading was only available because the older llama number was
+   remembered instead of measured.
+2. **A stale comparison is worse than no comparison.** Every verdict above required llama measured in the same
+   session. The 128K verdict in particular flips on 6 s out of 227 (2.9%), which no cross-session comparison
+   could resolve.
+
+### Where this leaves the objective
+
+**2 of 4 contexts won (8K, 32K); 128K lost by 2.9%; 256K lost by 18.2%.** The objective required all four, so
+**the objective is NOT complete.** The honest statement of the remaining gap: **attention is no longer the
+bottleneck at 128K -- it is within 3% -- and 256K is 18% behind with no identified lever.**
+
+The small unclaimed levers that could plausibly matter at 128K but have NOT been measured and are NOT claimed to
+suffice: the deferred FA2 micro-opt (issue `K(s0+32)` one phase earlier so it hides under softmax + P*V at the
+same barrier count), and hoisting the duplicated gate/up activation cast (~1.1% at 32K). Both are refinements;
+neither is a route to 256K's 18%.
