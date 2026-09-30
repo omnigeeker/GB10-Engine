@@ -15177,3 +15177,47 @@ The recorded 256K attention rate (30.50 TFLOP/s) is well below 128K's (36.58), w
 signature of growing KV-bandwidth pressure. **If 256K is bandwidth-bound rather than
 occupancy-bound, the 1.41x will not hold there**, and that would not contradict this result.
 The 256K ratio must be measured, not extrapolated from 128K.
+
+---
+
+## 2026-10-01 — SESSION RESULT: 4 of 4. GB10 beats llama.cpp on cold TTFT at every context.
+
+Same-session, three engines, warm page cache, contention guard before and after every trial, two
+trials per arm, minimum reported. The artifact is **`bench/longctx/TTFT_PROOF_BQ16.md`**.
+
+| ctx | gb10 fa2off | **gb10 fa2on (BQ=16)** | llama.cpp | llama/gb10 | verdict |
+|---|---|---|---|---|---|
+| 8,192 | 9.61 | **8.98** | 10.50 | **1.169** | WON |
+| 32,768 | 52.03 | **37.22** | 43.81 | **1.177** | WON |
+| 131,072 | 441.10 | **197.26** | 225.49 | **1.143** | WON |
+| 262,144 | 1,514.80 | **547.67** | 601.76 | **1.099** | WON |
+
+The prediction at the end of this file — "if 256K is bandwidth-bound rather than occupancy-bound, the
+1.41x will not hold there" — was **half right, and the useful half was the measurement**. 256K did
+NOT flip on `BC = 16` alone (it lost by 2.8%), and it was **not** bandwidth-bound either: the handoff's
+near-1.0 test came back negative. The residual was an **L2-service dependency on 274.9 TB of K/V
+requests over a 17.18 GB footprint**, and the lever that attacked it directly was **`BQ = 16`**,
+halving query-row blocks so each fetched K/V tile is reused across 16 query rows instead of 8 —
+274.9 TB → ~137 TB at 256K, at unchanged mma work and unchanged occupancy (12 warps/SM either way).
+
+**Withdrawal chain — do not quote the superseded numbers.** `TTFT_PROOF.md`'s `fa2off` column was
+invalidated by the cold-page-cache error and **remains withdrawn**; the run killed at 01:00 on
+2026-10-01 ran a **stale `gb10-server`** (built before the `GB10_FA2_BC` default changed 32 → 16, so
+it requested 32 KB for a 16 KB tile, silently dropped to 3 CTAs/SM and lost 26% at 128K with every
+gate passing) and **zero `fa2on` numbers from it are usable at any context**.
+
+**Two kernels, two records, both kept:** `TTFT_PROOF_FINAL.md` is the **`BC = 16`** kernel
+(`GB10_FA2_BQ=8`, PTX `e00754e5f1c1`) — 8K/32K/128K won, 256K lost by 2.8%. `TTFT_PROOF_BQ16.md` is
+the **`BQ = 16`** kernel (PTX `a5ab008e2037`) and supersedes it as the objective's artifact.
+
+**Two traps and one standard that made this trustworthy rather than merely favourable — see
+`HANDOFF.md` for the full text, deliberately not duplicated here:**
+1. **Stale-binary trap** — the host's dynamic smem request and the compiled tile width are two halves
+   of ONE knob; a mismatch **cannot fail loudly**. Hence `occupancy_preflight()` over
+   `binary_freshness()`: mtimes can lie, the driver's real occupancy cannot.
+2. **PTX-hash vs SASS trap** — the build uses `-lineinfo`, so adding a comment line changes the PTX
+   bytes while the program is unchanged. **PTX hash proves identity of *source*; SASS proves identity
+   of *program*.** The earlier no-op proofs used PTX hashes and passed by luck.
+3. **Gate standard** — **provably free** (`BQ = 16`: masked keys contribute `exp(-inf) = 0` with
+   rescale `exp(0) = 1`, so `ppl512` is bit-identical at 1.875132) is a **different claim** from
+   **accepted characterised cost** (`BC = 16`: +6.5e-5 mean NLL, justified by a pre-registered sign).
