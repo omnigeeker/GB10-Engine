@@ -12812,3 +12812,52 @@ smaller task than the earlier section implied, and it is the last lever that has
 **It also means the 41.8% is reachable without any new research**, and the acceptance criteria are
 unchanged: `generate` 16/16 exact and PPL ~6.52 (`attn-tile` will fail; it is a differential test and
 must not veto the change).
+
+## A smaller route to the same 41.8%: mma into shared memory, keep the epilogue
+
+The earlier plan said the PV rewrite forces the epilogue to be rewritten, because `acc[i]` is owned
+per-thread by column while the mma D layout scatters `(row, col)` across lanes. **There is a way to
+avoid that entirely, and it is worth recording before anyone starts the rewrite.**
+
+**Route: have the mma write its result to a small shared-memory tile, then let each thread read back
+the one column it already owns.** The existing epilogue -- the `* c` rescale, the `/ red[...]`
+normalisation, and the store -- then stays **exactly as it is**.
+
+```
+per key tile, instead of:
+    384 smem loads + 384 FMA  per thread          (98,304 + 98,304 ops per block)
+
+do:
+    mma the 24x256 P.V into a shared O tile       (48 m16n8k16 mma per block, ~6 per warp)
+    __syncthreads()
+    each thread reads O[i][tid] for i in 0..23    (24 loads per thread = 6,144 per block)
+```
+
+**That is ~12,288 shared-memory operations per block instead of ~196,608** -- a 16x reduction in the
+PV's instruction count, which is what the 41.8% actually consists of. The mma itself is 48 instructions
+per block per key tile and is not the cost.
+
+**Costs and traps, stated up front:**
+
+* **Shared memory for the O tile**: 24 x 256 fp32 = **24,576 B**, taking the kernel from 31,392 B to
+  55,968 B. That exceeds `sharedMemPerBlock` (49,152) and needs
+  `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`; at 55,968 B the
+  occupancy is `102400 / 55968 = 1` block/SM, down from 3. **This is the main risk and it is the
+  occupancy question again** -- which this session measured to be worth only ~1% between 3 and 4
+  blocks, but 3 -> 1 was never measured cleanly.
+* **The smem formula in `crates/gb10-cuda/src/ops.rs` (~line 1816) must be updated in step** or the
+  kernel faults.
+* **The D-fragment mapping is already proven** -- `bench/longctx/probe_pv_mapping.cu`, `EXACT: 256/256`
+  -- and `Vs` needs no transposed copy, since `ldmatrix.x2.trans` reads its natural `[key][dim]`
+  layout with `PS = 264` (a multiple of 8).
+* **A `__syncthreads()` is required between the mma stores and the read-back.**
+* `P` must be staged as fp16 (stride 16) for the `ldmatrix.x4` A-operand. **fp16 `P` is already
+  accepted**: `generate` 16/16 exact, PPL 6.5217 vs 6.5212.
+
+**A way to dodge the occupancy cost**: stage the O tile in **fp16** (12,288 B, total 43,680 B,
+`102400 / 43680 = 2` blocks/SM) and accept fp16 rounding on the PV *result* rather than only on `P`.
+That is a second precision step and would need its own `generate` + perplexity check before it could
+be trusted -- **the session's rule is that the gate is `generate` and perplexity, not `attn-tile`.**
+
+**Recorded so the next attempt can start from a design that keeps the epilogue, instead of one that
+rewrites it.**
