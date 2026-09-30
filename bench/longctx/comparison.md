@@ -14183,3 +14183,40 @@ this same clean invocation lands.
 
 **The 32K NEW half was still running when this was recorded.** Expected, if FA2 behaves as at 8K: attn kernel
 near 11,000 ms and total near 56.7 s.
+
+## CLEAN 8K AND 32K A/B PAIRS: FA2 is 2.00-2.07x on attention, 1.07-1.24x on total prefill
+
+Both pairs from ONE invocation of `prefill-shape`, OLD then NEW, post-fix (`c084854`), same session:
+
+| context | kernel | total prefill | attn kernel | attn share |
+|---|---|---|---|---|
+| **8K** | OLD | 12.27 s | 1,311 ms | 10.7% |
+| **8K** | NEW | 11.47 s | **634 ms** | 5.5% |
+| **32K** | OLD | 67.91 s | 22,184 ms | 32.7% |
+| **32K** | NEW | **54.86 s** | **11,110 ms** | 20.3% |
+
+| context | **attention speedup** | **total prefill speedup** |
+|---|---|---|
+| 8K | **2.07x** | 1.07x |
+| 32K | **2.00x** | **1.238x** |
+
+**The FA2 kernel gives 2.0-2.07x on the attention component at both contexts -- a consistent, structural
+result, not a context-specific one.** This is the first clean same-session A/B evidence for the FA2 kernel.
+
+**The 32K total speedup of 1.238x is the number that matters for the objective.** The measured 32K deficit was
+1.19x (gb10 52.87-54.08 s vs llama.cpp 43.25-44.56 s on cold TTFT). A 1.238x prefill speedup closes it:
+52.87/1.238 = 42.7 s and 54.08/1.238 = 43.7 s, against llama.cpp's 43.25-44.56 s -- **at or slightly past the
+line at 32K, before any MLP improvement.**
+
+**Caveat, and it is a real one:** these are `prefill-shape` totals, not cold TTFT. `prefill-shape` at 32K
+reports 67.91 s where the TTFT component accounting recorded 53.08 s for the same context, so the two
+instruments do not measure the same thing (different chunking and warmup structure). **The speedup RATIO
+should transfer; the absolute seconds must not be substituted into a TTFT ratio.** The TTFT proof still has to
+come from `ab_all.py`, which is the only instrument that measures both engines the same way.
+
+**8K note:** attention is only 10.7% of prefill there, so 2.07x on it moves the total by 1.07x. 8K was
+already a win (0.925-0.972x on TTFT), so this widens it.
+
+**Remaining work:** 128K needs 3.80x and 256K 3.62x on attention (2.43x / 2.86x with a 2x MLP). At 2.0x the
+kernel is not sufficient there. 128K: attention 302.6 s -> 151.3 s, total 451.2 -> 299.9 s vs llama.cpp's
+228.2 s = still **1.31x behind**. So 128K/256K need either the missing `cp.async` pipeline or the MLP path.
