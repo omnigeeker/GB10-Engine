@@ -14471,3 +14471,62 @@ which exercises the long path end to end including `lm_head`.
 refuses loudly otherwise rather than silently truncating the row dimension. `lm_head` is
 `[248320, 5120]`, so the single shared call site in `weights.rs` branches: 2D when `n <= 65535`,
 the grid-stride kernel otherwise. `lm_head` therefore stays on the kernel that always worked.
+
+## MAJOR: the `cp.async` pipeline lands at 3.17x on attention -- 32K IS NOW WON
+
+Two frozen binaries differing **only** in `kernels/elementwise.cu`, one contiguous session, OLD before NEW, two
+passes, all runs interleaved:
+
+| 32K | OLD kernel | FA2 no pipeline | FA2 + pipeline |
+|---|---|---|---|
+| attn pass 1 | 22,038 ms | 11,099 ms | **6,952 ms** |
+| attn pass 2 | 22,240 ms | 11,138 ms | **6,976 ms** |
+| speedup vs OLD | -- | **1.99x / 2.00x** | **3.17x / 3.19x** |
+
+* The committed FA2 kernel **reproduces at 1.99x/2.00x**, matching the recorded 2.00x -- an independent
+  confirmation of the earlier result in a different session and a different binary.
+* **The pipeline's own delta over non-pipelined FA2 is 1.60x, reproducing to 0.3%** across passes.
+* **Total prefill 66.07/66.12 s -> 50.35/50.22 s = 1.312x / 1.317x**, against a required **1.19x**.
+  **So 32K is now WON on attention alone**, without any MLP help -- which matters, because the MLP was
+  measured to have no 2x available.
+* **8K: attention 1,308/1,311 -> 419/418 ms = 3.12x/3.14x** (was 2.01x); total 1.081x/1.070x.
+* **Cross-binary control:** the OLD kernel in the no-pipeline binary gives 22,140/22,195 ms, so the patch
+  provably leaves the old kernel untouched.
+* **Occupancy unchanged: regs 168 / smem 32,768 / 96 threads -> by_smem 3, binding SMEM = 3 CTAs/SM.** The
+  same-buffer form cost **zero** registers, exactly as the corrected 96-thread budget predicted. `generate`
+  **EXACT 16/16**; `perplexity` **6.5213**.
+
+### The sanitizer result is the strongest verification in this effort
+
+**`compute-sanitizer` clean:**
+* **racecheck: 0 hazards (0 errors, 0 warnings).** This directly validates the two-barrier `cp.async` hazard
+  design -- precisely the thing a hand argument gets wrong, and the failure mode that would be intermittent
+  and therefore invisible to any single A/B run.
+* **memcheck: 0 invalid global/shared accesses, 0 out-of-bounds, 0 misaligned.** The "112 errors" are all
+  benign `CUDA_ERROR_NOT_FOUND` module-probe artifacts; the **non-pipelined control binary reports the same
+  112**, so none were introduced.
+* **`attn-tile` output is byte-for-byte identical** between pipelined and non-pipelined FA2, including the
+  whole error table. So the pipeline is a **pure scheduling change -- same bytes, same arithmetic.** A race
+  would have perturbed those numbers.
+
+**Why this matters beyond this kernel:** the out-of-bounds store that both `generate` and `perplexity` passed
+taught us that the correctness gates do **not** certify memory safety. This is the first time in the effort
+that memory safety was checked **directly** rather than inferred, and it is a stronger form of evidence than
+another gate would have been.
+
+### Where the objective now stands
+
+| context | status | evidence |
+|---|---|---|
+| **8K** | **WON** | attention 3.12x/3.14x; total 1.07-1.08x on top of an already-winning 0.925-0.972x |
+| **32K** | **WON** | total 1.312x/1.317x against a required 1.19x, **on attention alone** |
+| 128K | **open, close** | 3.17x takes attention 302.6 -> 95.5 s, total 240.4 s vs llama.cpp's 228.2 s = **1.05x behind, down from 1.30x** |
+| 256K | **open, close** | **1.08x behind** |
+
+**The residual is now ~1.15x on attention at the long contexts** -- and note 3.17x already *exceeds* the 2.43x
+that 128K would need if a 2x MLP ever lands, so **the MLP/FP4 question is now the deciding one for 128K/256K**.
+The FP4 reference measurement (llama.cpp's own NVFP4 `MUL_MAT` rate) is still the right thing to chase.
+
+**Caveat, unchanged and important:** these are `prefill-shape` totals, not cold TTFT, and the 128K/256K figures
+are an extrapolation applying the prefill-shape ratio to the TTFT component accounting. The TTFT proof still
+has to come from `ab_all.py`, which is the only instrument that measures both engines the same way.
