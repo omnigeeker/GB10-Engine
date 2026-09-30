@@ -13867,3 +13867,62 @@ The 2.13x/3.63x targets in this document were computed from *total TTFT* ratios,
 acceptance criteria. **This benchmark says the headroom is far larger than those targets require** -- which
 is good news, but it also means the risk is no longer "can we find the speedup" but "can we land a correct
 kernel at all". The two implementation attempts so far have produced designs but no landed kernel.
+
+## The FA2 kernel: built, running, occupancy met, and one real bug found and fixed
+
+Status from the implementation agent. This is the first time in this session a prefill-attention rewrite has
+reached a successful build and a running kernel.
+
+**Built and wired.** `attn_prefill_fa2_kernel` is in `kernels/elementwise.cu` (old kernel untouched) with the
+`GB10_FA2=1` dispatch in `ops.rs::attn_prefill_tiled`, falling back to the old kernel whenever
+`head_dim != 256` or `n_q_heads != 6*n_kv_heads`. Workspace builds clean.
+
+**Occupancy target met, from the runtime probe** (`GB10_ATTN_OCCUPANCY=1`, the value that actually runs):
+
+| | |
+|---|---|
+| registers | **168** |
+| static smem | 0 B |
+| dynamic smem | **32,768 B** |
+| threads | 96 |
+| by_regs | 4 |
+| by_smem | **3** |
+| **binding** | **SMEM -> 3 CTAs/SM** |
+
+**No spills** -- 0 `.local` in the emitted PTX. The design's 32 KB footprint and 3-CTA/SM target are
+achieved.
+
+### The bug, and why its signature was diagnostic rather than mysterious
+
+`GB10_FA2=1 attn-tile` failed with `rms rel` of exactly **3.000e0** on every `start > 0` shape and `+-inf` on
+`start = 0`. **rel = 3.000 = sqrt(9) means the tiled output was exactly 4x the reference**, and `inf` on a
+single-key row means 3 of 4 lanes divided by a zero partial.
+
+**Root cause: `KQ_max` was reduced across the 4 lanes with `__shfl_xor_sync` (offsets 2,1) but `KQ_rowsum`
+was not.** Each lane holds 1/4 of the key columns, so the rowsum was 1/4 of the true value -- hence a clean
+4x. Confirmed against llama.cpp `fattn-mma-f16.cuh:1370-1392`: **`KQ_rowsum` is reduced ONCE after the KV
+loop** (offsets 2 then 1), not per tile. That is correct and cheaper: each lane accumulates its own partial
+across all tiles (inside the rescale step), and a single cross-lane reduction at the end yields the full
+rowsum. All 4 lanes share the same reduced `KQ_max`, so the per-lane partials are scaled consistently.
+**Total cost: 2 shuffles, once.**
+
+### The fragment layouts were VERIFIED EMPIRICALLY, not assumed
+
+A standalone sm_121 probe was written that dumps the `ldmatrix.x4` / `x4.trans` lane-to-element maps. It
+confirmed both crux claims of the design:
+
+* plain row-major `ldmatrix.x4` on the `[key][head_dim]` tile yields `{b0(nt), b1(nt), b0(nt+1), b1(nt+1)}`
+  for QK^T -- which is what makes `A_PV = get_half2(KQ_C)` work with **no transpose and no `movmatrix`**;
+* `ldmatrix.x4.trans` on the `[key][dv]` tile yields `V^T` with **no transposed V copy**. Note the trans
+  output order is `{b0(dv0), b0(dv1), b1(dv0), b1(dv1)}` -- the 1<->2 register swap that `mma.cuh:884-894`
+  bakes into its asm output list.
+
+**This is the right method and it is worth naming**: the layout question is the one that cannot be reasoned
+about reliably, and it was settled by a probe that prints the lane->element map rather than by reading the
+PTX ISA. That is the same discipline whose absence produced the two wrong "we are at the floor" conclusions
+earlier in this session.
+
+### The GQA term is already in
+
+One block per KV head, 48 qcols, K/V tile reused 6x -- so the dominant measured lever (worth 2.87x per the
+`test-backend-ops` numbers) is in the design, and the agent is not falling back to the scalar-PV variant.
