@@ -52,6 +52,10 @@ per-launch overhead added at short sequences regresses it. **Check 8K after ever
 * **The MLP is at 43–45% of the corrected ceiling, not at a "bf16 floor."** 128K: 89,781 ms for 4,486
   TFLOP = 50 TFLOP/s. 32K: 21,456 ms for 1,121.5 TFLOP = 52.3 TFLOP/s. **At 32K the MLP is 40% of the
   total and attention only 34.8%** — so 32K needs both sides.
+  **SUPERSEDED — see "THE MLP IS NOT A LEVER" below.** That 43–45% is a fraction of the ~115 TFLOP/s
+  `mma.sync` *microbenchmark* ceiling. Measured against what cuBLAS actually retires at the model's real
+  shapes (55.7–67.9 TFLOP/s), the MLP GEMM is at 48–58% and **there is no 2x on bf16.** The number to
+  quote for "how much is left in the bf16 MLP" is **~3%, not 2x.**
 
 ## What is being built
 
@@ -194,6 +198,12 @@ Key implementation facts:
 53.1 s to ~42.6 s, which is **already a win against llama.cpp's 43.2 s** — before the attention fix lands.
 At 128K it takes 447.5 s to ~402.5 s, so attention is still required there.
 
+> **WITHDRAWN — this paragraph is wrong and was measured wrong.** A 2x MLP improvement is not available on
+> the bf16 path: it would require 104 TFLOP/s, and cuBLAS retires **55.7–67.9 TFLOP/s** at the model's real
+> shapes. Total recoverable on bf16 is **under 3%**, not 2x. See "THE MLP IS NOT A LEVER" near the end of
+> this document. The FP4 tensor-core path is the only route to a 2x, and it is the strategic answer rather
+> than a stretch goal.
+
 **Sequencing note:** changing `CUDA_ARCH` to `sm_121a` recompiles every kernel and would disturb any
 in-flight attention measurement. Do the FP4 work **after** the attention kernel is committed and measured,
 or coordinate the two.
@@ -289,6 +299,12 @@ So the remaining work is no longer "can we land a correct kernel". It is:
    `mma.cuh`/`mmq.cuh`/`quantize.cu` and wrote **no code at all** (no `kernels/nvfp4_gemm.cu`, no
    `GB10_FP4_MMA`). The FP4 finding stands and is recorded; nothing was built from it, so MLP remains on the
    bf16 dequant route.
+   **Update: the bf16 side has now been measured to its floor and the one real bf16 win has landed.** The
+   NVFP4 dequantise is division-free (`dequant_nvfp4_to_bf16_2d_kernel`, bit-identical, 1.4-1.5x on the
+   kernel, worth 0.4-0.9 s at 32K), and `gb10-bench tc-mlp` + `dequant-parity` exist to measure this path.
+   Everything else on bf16 is closed: the algorithm sweep is flat, the in-model call is within 8-16% of
+   standalone, and the remaining staging is at the achievable memory rate. **The FP4 tensor-core path is
+   therefore the only remaining route to a 2x on the MLP** — see "THE MLP IS NOT A LEVER" below.
 
 ### Also available: a llama.cpp MUL_MAT benchmark
 

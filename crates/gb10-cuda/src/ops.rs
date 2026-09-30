@@ -51,6 +51,7 @@ pub const OP_KERNEL_NAMES: &[&str] = &[
     "concat2_kernel",
     "nvfp4_gemm_kernel",
     "dequant_nvfp4_to_bf16_kernel",
+    "dequant_nvfp4_to_bf16_2d_kernel",
     "dequant_nvfp4_to_f16_kernel",
     "dequant_fp8_to_f16_kernel",
     "u16_to_f16_kernel",
@@ -114,6 +115,7 @@ pub struct Ops {
     concat2: CudaFunction,
     nvfp4_gemm: CudaFunction,
     dequant_nvfp4_to_bf16: CudaFunction,
+    dequant_nvfp4_to_bf16_2d: CudaFunction,
     dequant_nvfp4_to_f16: CudaFunction,
     dequant_fp8_to_f16: CudaFunction,
     u16_to_f16: CudaFunction,
@@ -187,6 +189,7 @@ impl Ops {
             concat2: take(map, "concat2_kernel")?,
             nvfp4_gemm: take(map, "nvfp4_gemm_kernel")?,
             dequant_nvfp4_to_bf16: take(map, "dequant_nvfp4_to_bf16_kernel")?,
+            dequant_nvfp4_to_bf16_2d: take(map, "dequant_nvfp4_to_bf16_2d_kernel")?,
             dequant_nvfp4_to_f16: take(map, "dequant_nvfp4_to_f16_kernel")?,
             dequant_fp8_to_f16: take(map, "dequant_fp8_to_f16_kernel")?,
             u16_to_f16: take(map, "u16_to_f16_kernel")?,
@@ -771,6 +774,55 @@ impl Ops {
         Ok(())
     }
 
+    /// Dequantize a whole NVFP4 matrix `[N, K]` to row-major bf16 `[N, K]`,
+    /// with no per-element integer division.
+    ///
+    /// `blockIdx.y` is the row and one thread produces two adjacent `k` values
+    /// from one packed byte, so the address arithmetic is a shift instead of the
+    /// `idx / K` and `idx % K` the grid-stride form needs. Bit-identical output.
+    /// `k` must be even (it always is: NVFP4 stores two values per byte).
+    pub fn dequant_nvfp4_to_bf16_2d(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<u8>,
+        sc: &CudaSlice<u8>,
+        out: &mut CudaSlice<half::bf16>,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        need(
+            out.len() >= n * k && k % 2 == 0 && k >= 16,
+            "dequant_nvfp4_to_bf16_2d",
+        )?;
+        // The rows are NOT grid-strided -- `blockIdx.y` selects one row -- so the
+        // y dimension must cover `N` exactly. Truncating it would leave the tail
+        // of the matrix uninitialised, which is the kind of bug that passes a
+        // short-prompt `generate` and corrupts long contexts. Refuse instead.
+        need(n <= 65535, "dequant_nvfp4_to_bf16_2d: N must fit in gridDim.y")?;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let half_k = k / 2;
+        // One thread per packed byte. The `j` loop is grid-strided, so a capped
+        // `gx` still covers every byte; `gy` is exact.
+        let gx = cdiv(half_k, 256).min(65535) as u32;
+        let gy = n as u32;
+        unsafe {
+            dev.stream()
+                .launch_builder(&self.dequant_nvfp4_to_bf16_2d)
+                .arg(w)
+                .arg(sc)
+                .arg(out)
+                .arg(&n_i)
+                .arg(&k_i)
+                .launch(LaunchConfig {
+                    grid_dim: (gx, gy, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     /// Dequantize a whole FP8 (E4M3) matrix `[N, K]` to row-major bf16 `[N, K]`.
     /// `s1` is the per-tensor scale, applied here exactly as staging does.
     pub fn dequant_fp8_to_bf16(
@@ -1291,9 +1343,44 @@ impl Ops {
         beta_in: f32,
         alpha_in: f32,
     ) -> Result<()> {
+        self.cublas_gemm_bf16_f32_algo(
+            dev,
+            w,
+            x,
+            y,
+            n,
+            k,
+            t,
+            beta_in,
+            alpha_in,
+            cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    }
+
+    /// `cublas_gemm_bf16_f32` with an explicitly chosen `cublasGemmAlgo_t`.
+    ///
+    /// `cublasGemmEx`'s algorithm argument is a heuristic *input*, not a request
+    /// the library must honour: `CUBLAS_GEMM_DEFAULT` lets cuBLAS pick, and on a
+    /// brand-new architecture that pick is worth questioning. This entry point
+    /// exists so the choice can be measured rather than assumed; an algorithm
+    /// cuBLAS does not support for the shape returns an error, which the caller
+    /// is expected to treat as "not available" rather than a failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublas_gemm_bf16_f32_algo(
+        &self,
+        dev: &Device,
+        w: &CudaSlice<half::bf16>,
+        x: &CudaSlice<half::bf16>,
+        y: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        t: usize,
+        beta_in: f32,
+        alpha_in: f32,
+        algo: cudarc::cublas::sys::cublasGemmAlgo_t,
+    ) -> Result<()> {
         use cudarc::cublas::sys::{
-            cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cudaDataType,
-            cublasComputeType_t,
+            cublasGemmEx, cublasOperation_t, cudaDataType, cublasComputeType_t,
         };
         need(
             w.len() >= n * k && x.len() >= t * k && y.len() >= t * n,
@@ -1326,7 +1413,7 @@ impl Ops {
                 cudaDataType::CUDA_R_32F,
                 n as i32,
                 cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                algo,
             )
         };
         need(

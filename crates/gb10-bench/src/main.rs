@@ -48,6 +48,7 @@ fn main() -> Result<()> {
         "cublas-parity" => cublas_parity(),
         "tc-parity" => tc_parity(&model),
         "tc-phase" => tc_phase(),
+        "tc-mlp" => tc_mlp(),
         _ => {
             eprintln!(
                 "usage: gb10-bench <hw|gemv-parity|stream|launch-overhead> \
@@ -895,6 +896,34 @@ fn dequant_parity() -> Result<()> {
     dev.ops().dequant_nvfp4_to_bf16(&dev, &w_dev, &sc_dev, &mut out_dev, n, k)?;
     let gpu_raw = dev.stream().memcpy_dtov(&out_dev)?;
 
+    // ---- grid-stride vs 2D, BIT FOR BIT ----------------------------------
+    // The 2D form is the one the MLP now uses, and its whole claim is that it is
+    // arithmetically identical to the grid-stride form -- it only removes the
+    // per-element `idx / K` and `idx % K`. Comparing the two kernels against
+    // each other (rather than each against the CPU reference) is the direct test
+    // of that claim: any difference at all, including a different rounding, is a
+    // failure here. A sample this small (n=256, k=512) covers every E2M1 code and
+    // every 16-element scale boundary several times over.
+    let mut out2_dev = dev.stream().alloc_zeros::<bf16>(n * k)?;
+    dev.ops().dequant_nvfp4_to_bf16_2d(&dev, &w_dev, &sc_dev, &mut out2_dev, n, k)?;
+    let gpu2 = dev.stream().memcpy_dtov(&out2_dev)?;
+    let mut diff2d = 0usize;
+    let mut first2d = None;
+    for i in 0..n * k {
+        if gpu_raw[i].to_bits() != gpu2[i].to_bits() {
+            diff2d += 1;
+            if first2d.is_none() {
+                first2d = Some((i, i / k, i % k, bf16::to_f32(gpu_raw[i]), bf16::to_f32(gpu2[i])));
+            }
+        }
+    }
+    if diff2d == 0 {
+        println!("  nvfp4 2d vs grid-stride: {n}x{k} = {} elements, ALL BIT-IDENTICAL", n * k);
+    } else {
+        println!("  nvfp4 2d vs grid-stride: {diff2d} of {} elements DIFFER; first at {first2d:?}",
+                 n * k);
+    }
+
     let mut bad = 0usize;
     let mut worst = 0.0f32;
     let mut first_bad = None;
@@ -1320,5 +1349,170 @@ fn tc_phase() -> Result<()> {
     );
     println!();
     println!("  For reference, the whole prefill measured 4.44 s per 2048-token chunk.");
+    Ok(())
+}
+
+/// Per-phase timing of the MLP prefill pipeline at the token counts the model
+/// actually runs, plus the two questions the phase split cannot answer.
+///
+/// `tc-phase` times the pipeline at `t = 2048`, which is neither of the token
+/// counts the model uses: at 32K the prefill is chunked into 8192-token pieces,
+/// and a whole-prompt (uncached) prefill is 32768. It also times only the bf16
+/// cuBLAS variant, while the model asks for an **fp32** output. This entry point
+/// answers:
+///
+///  1. Does the fp32 output cost anything relative to bf16? (The model writes
+///     `t * n` fp32, i.e. 2x the bytes of the bf16 the benchmark writes.)
+///  2. Does cuBLAS's throughput hold up from `t = 2048` to `t = 8192`/`32768`?
+///     Standalone cuBLAS measures 76-79 TFLOP/s at `t = 2048`; the in-model MLP
+///     is well below that, and if it is below it *here too* then the gap is the
+///     GEMM call itself rather than the staging around it.
+///  3. Is `CUBLAS_GEMM_DEFAULT` the right algorithm? On a brand-new
+///     architecture the heuristic is worth checking rather than trusting.
+///  4. Is the grid-stride NVFP4 dequant ALU-bound on its per-element integer
+///     division? The 2D form is timed next to it.
+///
+/// Every phase is timed best-of-two rounds so a clock excursion cannot set the
+/// number, and `GB10_TCM_T` / `GB10_TCM_REPS` override the sweep.
+fn tc_mlp() -> Result<()> {
+    use half::bf16;
+
+    let dev = Device::new(0)?;
+    let kern = dev.ops();
+    let reps: usize = std::env::var("GB10_TCM_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let tsv: Vec<usize> = match std::env::var("GB10_TCM_T") {
+        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+        Err(_) => vec![8192, 32768],
+    };
+    let do_algos = std::env::var("GB10_TCM_ALGOS").map(|v| v != "0").unwrap_or(true);
+
+    println!("tc-mlp: MLP prefill phases, best of 2 rounds x {reps} reps");
+
+    for &t in &tsv {
+        for &(label, n, k) in &[
+            ("gate/up", 17408usize, 5120usize),
+            ("down", 5120usize, 17408usize),
+        ] {
+            // The buffers are never read, only written and streamed, so zeros
+            // are enough and cost nothing to produce. The tensor-core rate does
+            // not depend on the values.
+            let wq = dev.stream().alloc_zeros::<u8>(n * k / 2)?;
+            let ws = dev.stream().alloc_zeros::<u8>(n * k / 16)?;
+            let xf = dev.stream().alloc_zeros::<f32>(t * k)?;
+            let mut wb = dev.stream().alloc_zeros::<bf16>(n * k)?;
+            let mut xb = dev.stream().alloc_zeros::<bf16>(t * k)?;
+            let mut yf = dev.stream().alloc_zeros::<f32>(t * n)?;
+            let mut yb = dev.stream().alloc_zeros::<bf16>(t * n)?;
+
+            let flop = 2.0 * n as f64 * k as f64 * t as f64;
+            let wbytes = (n * k / 2 + n * k / 16) as f64;
+            println!(
+                "\n  {label}  n={n} k={k} t={t}   {:.3} TFLOP/GEMM   nvfp4 weights {:.1} MB",
+                flop / 1e12,
+                wbytes / 1e6
+            );
+
+            let mut time = |lbl: &str, f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+                f()?;
+                dev.synchronize()?;
+                let mut best = f64::MAX;
+                for _ in 0..2 {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        f()?;
+                    }
+                    dev.synchronize()?;
+                    best = best.min(t0.elapsed().as_secs_f64() / reps as f64);
+                }
+                println!("    {:<38} {:>9.3} ms", lbl, best * 1e3);
+                Ok(best)
+            };
+
+            let d_old = time("dequant nvfp4->bf16 (grid-stride)", &mut || {
+                kern.dequant_nvfp4_to_bf16(&dev, &wq, &ws, &mut wb, n, k)?;
+                Ok(())
+            })?;
+            let d_new = time("dequant nvfp4->bf16 (2d, no div)", &mut || {
+                kern.dequant_nvfp4_to_bf16_2d(&dev, &wq, &ws, &mut wb, n, k)?;
+                Ok(())
+            })?;
+            let c = time("f32_to_bf16 (activation)", &mut || {
+                kern.f32_to_bf16(&dev, &xf, &mut xb, t * k)?;
+                Ok(())
+            })?;
+            let g32 = time("cublas bf16->f32  (model path)", &mut || {
+                kern.cublas_gemm_bf16_f32(&dev, &wb, &xb, &mut yf, n, k, t, 0.0, 1.0)?;
+                Ok(())
+            })?;
+            let g16 = time("cublas bf16->bf16 (bench path)", &mut || {
+                kern.cublas_gemm_bf16(&dev, &wb, &xb, &mut yb, n, k, t)?;
+                Ok(())
+            })?;
+
+            println!(
+                "    -> dequant {:.2}x faster | gemm {:.1} TFLOP/s (f32 out) vs {:.1} (bf16 out) = {:.2}x",
+                d_old / d_new,
+                flop / g32 / 1e12,
+                flop / g16 / 1e12,
+                g16 / g32,
+            );
+            println!(
+                "    -> full linear (dequant2d + cast + gemm f32) {:.3} ms = {:.1} TFLOP/s; \
+                 staging is {:.1}% of it",
+                (d_new + c + g32) * 1e3,
+                flop / (d_new + c + g32) / 1e12,
+                100.0 * (d_new + c) / (d_new + c + g32),
+            );
+
+            if !do_algos {
+                continue;
+            }
+            // An algorithm cuBLAS does not support for this shape returns an
+            // error; that is "not available" here, not a failure.
+            use cudarc::cublas::sys::cublasGemmAlgo_t as Algo;
+            let algos: [(Algo, &str); 13] = [
+                (Algo::CUBLAS_GEMM_DEFAULT, "DEFAULT"),
+                (Algo::CUBLAS_GEMM_ALGO0, "ALGO0"),
+                (Algo::CUBLAS_GEMM_ALGO1, "ALGO1"),
+                (Algo::CUBLAS_GEMM_ALGO2, "ALGO2"),
+                (Algo::CUBLAS_GEMM_ALGO3, "ALGO3"),
+                (Algo::CUBLAS_GEMM_ALGO4, "ALGO4"),
+                (Algo::CUBLAS_GEMM_ALGO5, "ALGO5"),
+                (Algo::CUBLAS_GEMM_ALGO6, "ALGO6"),
+                (Algo::CUBLAS_GEMM_ALGO7, "ALGO7"),
+                (Algo::CUBLAS_GEMM_ALGO8, "ALGO8"),
+                (Algo::CUBLAS_GEMM_ALGO10, "ALGO10"),
+                (Algo::CUBLAS_GEMM_ALGO13, "ALGO13"),
+                (Algo::CUBLAS_GEMM_ALGO15, "ALGO15"),
+            ];
+            let mut best = (f64::MAX, "none");
+            for (a, nm) in algos {
+                let r = time(&format!("  algo {nm}"), &mut || {
+                    kern.cublas_gemm_bf16_f32_algo(
+                        &dev, &wb, &xb, &mut yf, n, k, t, 0.0, 1.0, a,
+                    )?;
+                    Ok(())
+                });
+                match r {
+                    Ok(s) => {
+                        if s < best.0 {
+                            best = (s, nm);
+                        }
+                    }
+                    Err(_) => println!("    {:<38} unsupported", format!("  algo {nm}")),
+                }
+            }
+            println!(
+                "    -> best algo {:<8} {:.3} ms = {:.1} TFLOP/s (default was {:.3} ms)",
+                best.1,
+                best.0 * 1e3,
+                flop / best.0 / 1e12,
+                g32 * 1e3,
+            );
+        }
+    }
     Ok(())
 }

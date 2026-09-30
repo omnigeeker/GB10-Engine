@@ -205,7 +205,25 @@ impl Linear {
         mark!(0);
         match &self.data {
             LinearData::NvFp4 { w: qw, wscale, .. } => {
-                kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
+                // The 2D kernel removes a per-element 32-bit integer division
+                // from the dequantise, which is what makes it ALU-bound rather
+                // than bandwidth-bound. It indexes rows with `blockIdx.y`, so it
+                // needs `N <= 65535`; `lm_head` is [248320, 5120] and must stay
+                // on the grid-stride kernel. This is the one call site that
+                // serves both, so the branch belongs here rather than in a
+                // widened guard -- a loud error on `lm_head` would surface as
+                // garbage output on long contexts while a short `generate`
+                // still looked perfect.
+                // `GB10_DEQ_2D=0` forces the original grid-stride kernel, so the
+                // two forms can be compared in one session with one binary.
+                // (This box has drifted 23% between sessions; only same-session
+                // pairs are comparable.)
+                let use_2d = std::env::var("GB10_DEQ_2D").map(|v| v != "0").unwrap_or(true);
+                if use_2d && n <= 65535 {
+                    kern.dequant_nvfp4_to_bf16_2d(dev, qw, wscale, wb, n, k)?;
+                } else {
+                    kern.dequant_nvfp4_to_bf16(dev, qw, wscale, wb, n, k)?;
+                }
             }
             LinearData::Fp8 { w: qw, .. } => {
                 // Deliberately dequantise with a 1.0 scale and apply the real

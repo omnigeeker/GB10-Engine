@@ -14346,3 +14346,128 @@ llama.cpp does (real block-scaled `mma.sync` with raw e2m1 operands and ue4m3 bl
 a guess.** This is the same lesson as the withdrawn "provably unreachable" proof, in the opposite direction: a
 ceiling measured in one regime (t=2048, or a microbenchmark) is not the ceiling in the regime that matters
 (t=8192/32768, a real GEMM).
+
+## MEASURED: the MLP bf16 GEMM is at its floor, and the "2x on bf16" premise is refuted
+
+The MLP is the largest non-attention component (40.4% of 32K). It was recorded as running at
+"43-45% of the measured `mma.sync` bf16 ceiling of ~115 TFLOP/s", with "roughly 2x available
+without changing precision". **That was priced against a microbenchmark ceiling, not against what
+any GEMM actually retires on this part.** Measured in one exclusive GPU window, same binary,
+same session (`gb10-bench tc-mlp`):
+
+| shape | t | cublas bf16->f32 (the model's call) | bf16->bf16 | staging share |
+|---|---|---|---|---|
+| gate/up | 8192 | **67.9 TFLOP/s** | 72.1 | 11.3% |
+| down | 8192 | **65.6** | 65.5 | 21.1% |
+| gate/up | 32768 | **67.2** | 73.6 | 7.3% |
+| down | 32768 | **55.7** | 60.7 | 18.1% |
+
+**cuBLAS reaches 55.7-67.9 TFLOP/s at the shapes the model actually runs.** The 76.7-87 TFLOP/s
+figure quoted in this document at rounds 22-27 ("essentially peak") was measured at **t = 2048**,
+which is neither of the token counts the model uses: 32K prefill is chunked into 8192-token pieces.
+At the real shapes cuBLAS is 12-27% slower.
+
+### The algorithm sweep is flat, so the default heuristic is already right
+
+13 `cublasGemmAlgo_t` values were timed at each shape. Best-vs-`CUBLAS_GEMM_DEFAULT`:
+
+| shape | t | DEFAULT | best | ratio |
+|---|---|---|---|---|
+| gate/up | 8192 | 21.37 ms | ALGO6 20.74 ms | 1.03x |
+| down | 8192 | 22.15 ms | ALGO6 21.51 ms | 1.03x |
+| gate/up | 32768 | 86.35 ms | ALGO7 81.70 ms | 1.06x |
+| down | 32768 | 104.25 ms | ALGO1 99.06 ms | 1.05x |
+
+**1.03-1.06x, and it does not reproduce across shapes** (a different algorithm wins at each).
+That is noise, not a lever. `cublas_gemm_bf16_f32_algo` is committed so the check is repeatable,
+but the conclusion is that cuBLAS's own choice is not the problem. **Rejected as a lever.**
+
+### The model already captures what the standalone call achieves
+
+In-model MLP phase events at 32K (256 MLP calls = 64 layers x 4 chunks), against the standalone
+`tc-mlp` numbers at the same t = 8192:
+
+| phase | in-model per call | standalone linear | ratio |
+|---|---|---|---|
+| gate | 25.9 ms | 24.2 ms | 1.07x |
+| up | 26.2 ms | 24.2 ms | 1.08x |
+| down | 32.7 ms | 28.2 ms | 1.16x |
+
+So there is no large in-model overhead hiding: the model runs the GEMM within 7-16% of what the
+same call achieves in isolation. **The remaining 1.5-1.9x to cuBLAS's own best is the GEMM itself,
+and it is not reachable through the call site.**
+
+### The arithmetic that kills the 2x
+
+2x on the MLP means 104 TFLOP/s at 32K. cuBLAS retires 55.7-67.9 here. That is **1.5-1.9x away
+from cuBLAS's own measured best**, and it is 90% of the 115 TFLOP/s `mma.sync` microbenchmark
+ceiling sustained across a real GEMM with staging. A bf16 GEMM does not do that. **So the earlier
+hope of 2x within bf16 is retired by measurement, not by argument** -- and this document had already
+reached the same conclusion analytically (round "the bf16-ceiling question, answered analytically",
+which priced the GEMM at 72% of a 75 TFLOP/s ceiling); the 115 TFLOP/s microbenchmark number
+introduced later is what reopened it.
+
+**What is recoverable on bf16 at 32K, measured:**
+
+| item | measured | share of 32K prefill |
+|---|---|---|
+| NVFP4 dequantise, division-free 2D kernel | 1.30-1.64 -> 1.09-1.11 ms/call | **0.4-0.9 s = 0.7-1.3%** |
+| gate/up activation cast, hoisted (shared `x`) | not done | ~0.7 s = ~1.1% |
+| fp32 GEMM output (required by the accuracy fix) | 0.91-0.94x of bf16 out | 6-9% of the GEMM |
+| `down` activation cast | 22.0 ms/call x 256 = 5.6 s | 8.5%, already at mixed R/W bandwidth |
+
+**Under 3% total.** That cannot convert 32K from marginal to won. **If 32K is to be won outright
+the 2x has to come from FP4 tensor cores, not from bf16 tuning.**
+
+## The NVFP4 dequantise: grid-stride -> 2D, bit-identical, 1.3% at 32K
+
+`dequant_nvfp4_to_bf16_kernel` computed `idx / K` and `idx % K` **per element** with a runtime `K`,
+which nvcc cannot strength-reduce: the full 32-bit divide sequence (multiply-by-reciprocal plus
+fixups) once per element, 89.1M elements for `mlp.gate_proj`. The kernel is weight-proportional, so
+its cost is roughly constant in `t` -- which is why it shows up as a *fixed* few percent rather than
+scaling with context.
+
+`dequant_nvfp4_to_bf16_2d_kernel` removes the division: `blockIdx.y` is the row, the loop index is
+already `k`, and one thread consumes one packed byte to produce two adjacent `k` values. That is
+exact rather than approximate, because for any even `2j`, `(2j) >> 4 == (2j+1) >> 4` -- the two
+nibbles of a byte always share one 16-element sub-block scale. It also halves the scale loads and
+makes the two bf16 results one aligned 4-byte store.
+
+**Same-session A/B, one binary, `GB10_DEQ_2D=0` vs `=1`** (the flag exists precisely so the pair is
+comparable; this box has drifted 23% between sessions, so a cross-session pair would be worthless):
+
+| measurement | OLD | NEW | delta |
+|---|---|---|---|
+| dequant per call (gate/up, t=32768) | 1.641 ms | 1.107 ms | **1.48x** |
+| dequant per call (down, t=32768) | 1.544 ms | 1.108 ms | **1.39x** |
+| dequant per call (down, t=8192) | 1.596 ms | 1.091 ms | **1.46x** |
+| in-model weight stage, all GEMMs | 2113 ms | 1955 ms | -158 ms (-7.5%) |
+| **MLP component at 32K** | **24.24 s (36.8%)** | **23.91 s (36.6%)** | **-0.33 s (-1.4%)** |
+| 32K prefill total, events on | 65.79 s | 65.36 s | -0.43 s (-0.65%) |
+| 32K prefill total, no events | 66.28 s | 65.41 s | -0.87 s (-1.3%) |
+
+The two totals bracket the win at **0.4-0.9 s of 32K prefill (0.65-1.3%)**; the single no-event runs
+are not repeated, so the event-instrumented pair is the better controlled number. The per-call
+kernel speedup (1.4-1.5x) is consistent and larger than the end-to-end share, because the dequant is
+only ~4% of the MLP to begin with.
+
+### Correctness (all gates, same session)
+
+| gate | result |
+|---|---|
+| `dequant-parity`, 2D vs grid-stride, bitwise | **131072 / 131072 elements bit-identical** |
+| `dequant-parity`, each vs the CPU reference | 131072 / 131072, `dequant-parity: OK` |
+| `generate` | **exact 16/16**, ids as documented |
+| `perplexity --ctx 512 --chunks 60` | **6.5212** (target 6.5212) |
+| `perplexity --ctx 4096 --chunks 8`, `GB10_DEQ_2D=0` | 6.3362, mean nll 1.846282 |
+| `perplexity --ctx 4096 --chunks 8`, `GB10_DEQ_2D=1` | **6.3362, mean nll 1.846282** |
+
+The ctx-4096 pair was run **baseline first, in the same session**, because ctx 512 is exactly the
+regime where a long-context bug does not appear -- the OOB store that both gates passed was a
+long-context bug for the same reason. Both 32K `prefill-shape` runs completed with no CUDA error,
+which exercises the long path end to end including `lm_head`.
+
+**`lm_head` routing.** The 2D kernel indexes rows with `blockIdx.y`, so it requires `N <= 65535` and
+refuses loudly otherwise rather than silently truncating the row dimension. `lm_head` is
+`[248320, 5120]`, so the single shared call site in `weights.rs` branches: 2D when `n <= 65535`,
+the grid-stride kernel otherwise. `lm_head` therefore stays on the kernel that always worked.

@@ -536,6 +536,45 @@ extern "C" __global__ void dequant_nvfp4_to_bf16_kernel(const uint8_t* __restric
     }
 }
 
+// ---- NVFP4 -> bf16 dequantise, 2D grid: no per-element integer division ----
+//
+// The grid-stride form above computes `idx / K` and `idx % K` for EVERY element,
+// with `K` a runtime value. nvcc cannot strength-reduce that, so it emits the
+// full 32-bit divide sequence (multiply-by-reciprocal plus fixups, ~20-30
+// cycles) once per element -- 89.1M elements for `mlp.gate_proj`. That makes the
+// kernel ALU-bound rather than bandwidth-bound: the same 223 MB of traffic is
+// moved either way, but the address arithmetic is not free.
+//
+// This form removes the division entirely: `blockIdx.y` is the row and the loop
+// index is already `k`. One thread handles one PACKED BYTE, i.e. two adjacent
+// `k` values, which is exact rather than an approximation: for any even `2j`,
+// `(2j) >> 4 == (2j+1) >> 4`, so the two nibbles of a byte always share one
+// 16-element sub-block scale. That also halves the scale loads and lets the two
+// bf16 results be stored as one aligned 4-byte pair.
+//
+// The arithmetic is bit-identical to the grid-stride form: same nibble order,
+// same e4m3 scale decode, same e2m1 LUT, same `__float2bfloat16_rn`. `K` must be
+// even, which it always is for NVFP4 (two values per packed byte).
+extern "C" __global__ void dequant_nvfp4_to_bf16_2d_kernel(const uint8_t* __restrict__ w,
+                                                           const uint8_t* __restrict__ sc,
+                                                           __nv_bfloat16* __restrict__ out,
+                                                           int N, int K) {
+    const int n = blockIdx.y;
+    if (n >= N) return;
+    const int half_k = K >> 1;
+    const uint8_t* __restrict__ wrow = w + (size_t)n * (size_t)half_k;
+    const uint8_t* __restrict__ srow = sc + (size_t)n * (size_t)(K >> 4);
+    __nv_bfloat16* __restrict__ orow = out + (size_t)n * (size_t)K;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < half_k;
+         j += gridDim.x * blockDim.x) {
+        const uint8_t byte = __ldg(wrow + j);
+        // (j >> 3) == ((2*j) >> 4) == ((2*j + 1) >> 4) for every j.
+        const float s = e4m3_to_float(__ldg(srow + (j >> 3)));
+        orow[2 * j] = __float2bfloat16_rn(e2m1_to_float(byte & 0xF) * s);
+        orow[2 * j + 1] = __float2bfloat16_rn(e2m1_to_float((uint8_t)(byte >> 4)) * s);
+    }
+}
+
 // ---- FP8 (E4M3) -> bf16 whole-matrix dequantise --------------------------
 //
 // Unlike the NVFP4 path there is no per-tensor post-scale to defer: fp8 carries
