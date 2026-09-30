@@ -14085,3 +14085,48 @@ terms are extrapolated from them (`attn ~ N^2`, `mlp ~ N`) and are labelled as d
 describe the requirement as it stood before the FA2 kernel landed. Once the FA2 A/B lands, the attention term
 drops and these bars move -- in the favourable direction. They should be recomputed from the post-FA2
 components rather than reused.
+
+## The OOB fix is landed (`c084854`), and a PROVISIONAL signal on the FA2 speedup
+
+### The fix
+
+`c084854 fix(attn): FA2 epilogue wrote out of bounds for query rows past 'rows'`. The repo no longer contains
+the buggy kernel. Two things in it are worth keeping:
+
+* **The fix was verified by a bit-for-bit `attn-tile` comparison.** Every shape reports *exactly* the same
+  `max|abs|` and `rms rel` as before the fix (2.6e-8 at 1 key through 1.7e-3 at 2111 keys). That is the
+  correct signature -- the fix changes *which rows are stored*, not any arithmetic -- **so a changed number
+  would have meant the fix broke something.** This is stronger evidence than the "output-preserving by
+  construction" argument, because it is measured rather than reasoned.
+* `GB10_FA2` defaults to off, so the default `attn_prefill_tiled_kernel` was never at risk.
+
+`generate` is still an exact 16/16 match post-fix. Occupancy unchanged: regs 168, 32,768 B smem, 3 CTAs/SM,
+0 spills.
+
+### PROVISIONAL -- these numbers are NOT evidence, and must not be quoted as such
+
+A contaminated A/B was taken while another agent's `generate` overlapped it. The agent correctly **discarded
+it**. Recording it anyway, clearly marked, because it is informative for planning:
+
+| pass | OLD kernel | NEW kernel |
+|---|---|---|
+| 1 | 41,643 ms | 11,251 ms |
+| 2 | 22,224 ms | 11,283 ms |
+
+**The OLD pair disagreeing by 1.87x is the tell that the run is contaminated** -- and it means the baseline is
+untrustworthy, not that the new kernel is 3.7x faster. The known clean baseline for the attention kernel at
+32K is 18,400-21,700 ms, so **pass 2's OLD (22,224 ms) is consistent with reality and pass 1's (41,643 ms) is
+the contaminated one.**
+
+**What this provisionally suggests:** if OLD is ~22.2 s and NEW is ~11.27 s, the FA2 kernel is about **1.97x**
+faster on the attention component at 32K. Note that the NEW pair agrees to **0.3%** across two passes while
+the OLD pair does not, which is itself a hint that the interference landed on the OLD passes.
+
+**Why it matters for planning, if it holds:** the 32K requirement is 2.13x on attention (or **0.95x -- an
+automatic win -- once the MLP is 2x faster**), so ~1.97x would put 32K essentially at the line on attention
+alone and comfortably past it with any MLP gain. **But at 128K the requirement is 3.80x (2.43x with a 2x MLP),
+so a ~2x attention kernel is not sufficient there** -- 128K and 256K still need either more attention work
+(the missing `cp.async` pipeline is the obvious next lever) or the MLP path.
+
+**Do not treat any of this as a result.** The re-measurement, in a window where `pgrep -x gb10-verify` shows
+only the measuring process, is the evidence.
