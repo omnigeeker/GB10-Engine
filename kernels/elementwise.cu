@@ -826,10 +826,11 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     // buffers, so each one prefetches its OWN next tile and the two copies
     // overlap two different compute phases:
     //
-    //   K(s0)   is in flight during iteration s0-32's P*V
+    //   K(s0)   is in flight during iteration s0-32's mask/softmax/P/P*V
     //   V(s0)   is issued at the top of iteration s0 and in flight during
-    //           QK^T(s0) + softmax(s0)
-    //   K(s0+32) is issued after the softmax and in flight during P*V(s0)
+    //           QK^T(s0)
+    //   K(s0+32) is issued immediately after QK^T(s0) and in flight during
+    //           mask(s0) + softmax(s0) + P packing + P*V(s0)
     //
     // This is llama.cpp's `nstages == 2` scheme (`fattn-mma-f16.cuh:623-631`
     // and `:975-990`). It costs no shared memory and therefore no occupancy:
@@ -839,8 +840,9 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     // Hazard notes, since each barrier below is load-bearing:
     //   * the top-of-loop barrier is what lets V(s0) overwrite tile_V -- it
     //     proves every warp has finished the previous iteration's P*V read.
-    //   * the mid-loop barrier is what lets K(s0+32) overwrite tile_K -- it
-    //     proves every warp has finished this iteration's QK^T read.
+    //   * the mid-loop barrier (placed just after QK^T) is what lets K(s0+32)
+    //     overwrite tile_K -- it proves every warp has finished this
+    //     iteration's QK^T read.
     // Both are the same two barriers the fully synchronous version had; the
     // change is only that the copies now overlap compute instead of serialising.
     // `win_max >= 0` always (key 0 is visible to row 0), so the prologue always
@@ -888,6 +890,26 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
                     : "r"(Q_B[kt][0]), "r"(Q_B[kt][1]), "r"(Q_B[kt][2]), "r"(Q_B[kt][3]),
                       "r"(b[2]), "r"(b[3]));
             }
+        }
+
+        // ---- K(s0) has now been fully consumed; start K(s0+32) loading ----
+        // The barrier is the same mid-loop barrier the synchronous version had,
+        // moved one phase earlier: QK^T is the only reader of tile_K, and the
+        // mask/softmax below touch registers only, so waiting for V(s0) here
+        // (rather than after the softmax) both frees tile_K for the next K
+        // fetch AND keeps the barrier count at two. The K(s0+32) copies are
+        // then in flight across the mask, the softmax, the P packing and P*V,
+        // instead of across P*V alone.
+        //
+        // Measured against the alternative of a third barrier that lets V(s0)
+        // and K(s0+32) overlap (`wait_group 1`): that form is NOT better. 32K
+        // attention 5,601 ms (this form) vs 5,773 ms (overlapped) vs 5,763 ms
+        // (two-barrier baseline); 8K 343 vs 347 vs 350. The two fetches are
+        // better serialised than overlapped, so the extra barrier is not paid.
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        if (s0 + FA2_BC <= win_max) {
+            fa2_stage_async(tile_K, k, s0 + FA2_BC, win_max, kh, n_kv_heads, kv_base, tid);
         }
 
         // ---- causal mask: write -INFINITY into masked scores -------------
@@ -975,13 +997,6 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
             P[kk][1] = fa2_pk2f(KQ_C[kk * 2][2], KQ_C[kk * 2][3]);
             P[kk][2] = fa2_pk2f(KQ_C[kk * 2 + 1][0], KQ_C[kk * 2 + 1][1]);
             P[kk][3] = fa2_pk2f(KQ_C[kk * 2 + 1][2], KQ_C[kk * 2 + 1][3]);
-        }
-
-        // ---- V(s0) is resident; start K(s0+32) loading now ----------------
-        asm volatile("cp.async.wait_group 0;\n");
-        __syncthreads();
-        if (s0 + FA2_BC <= win_max) {
-            fa2_stage_async(tile_K, k, s0 + FA2_BC, win_max, kh, n_kv_heads, kv_base, tid);
         }
 
         // ---- P*V: VKQ_C += P . V, fp16 accumulate -------------------------
