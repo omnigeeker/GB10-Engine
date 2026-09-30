@@ -409,3 +409,67 @@ worse than no number: it looks like evidence and is not.**
 `4d0bb3f5` and `a769397d` (earlier FA2 attempts) and `45535ecf` (FP4 MLP). The FP4 agent in particular spent
 its whole budget reading llama.cpp's `mma.cuh`/`mmq.cuh`/`quantize.cu` and wrote nothing; that is why the
 MLP brief now says **code first, read later**.
+
+## CLOSED: the FA2 staging-loop address arithmetic is not the bottleneck (it is a regression)
+
+**Read this before spending any more time on instruction counts in the attention kernel.**
+Full evidence in `bench/longctx/comparison.md`, section "The staging-loop address arithmetic is
+NOT the bottleneck", and in `bench/longctx/FA2_STAGE_AB.md`.
+
+The lead was well-motivated and priced correctly: `fa2_stage_async` computes a 64-bit global
+address per 16-byte `cp.async` copy, and the SASS shows **35 instructions per copy, 31 of them
+address/control** -- including a 64-bit `IMAD.WIDE.U32` on a runtime operand and a
+**loop-invariant** sign-extension re-derived every iteration, under `#pragma unroll 1`. The
+staging loops are roughly **half the kernel's issued instructions**. nvcc genuinely did not
+strength-reduce it (`u = idx & 31` is invariant and `r = idx >> 5` advances by exactly 3, so
+both addresses are affine).
+
+**It was implemented, measured, and rejected.** Same-binary, same-session, PTX-swap A/B,
+interleaved, min of 2 passes:
+
+| context | control (HEAD) | strength-reduced | SR + `unroll 2` |
+|---|---|---|---|
+| 8192 attn | **344 ms** | 349 ms | 344 ms |
+| 32768 attn | **5500 ms** | 5801 ms (**0.948x**) | 5638 ms (0.976x) |
+
+Issued instructions per main-loop iteration: **1403 -> 1077 (-23%) -> 1049 (-25%)**. The
+instruction ranks (`C < B < A`) are **anti-correlated** with the performance ranks
+(`A < C < B`): fewer instructions made it slower.
+
+**The transformation is provably semantics-preserving, so this is not a correctness artefact:**
+`attn-tile` output is byte-for-byte identical between the arms, `generate` is an exact 16/16
+match, and both perplexity gates reproduce the baselines exactly (1.875067 / 1.877331).
+Occupancy is unchanged (REG:168, LOCAL:0, 3 CTAs/SM for all arms), and an instruction-by-
+instruction comparison confirms **34 of 35 kernels are identical** -- only the FA2 kernel changed.
+The revert is byte-perfect: the rebuilt `elementwise.ptx` hashes to the control's `bdbff89850cb`.
+
+**What this closes:** the FA2 kernel's 36.58 TFLOP/s at 128K is **not issue-bound**. The residual
+~9% of headroom to the ~40 TFLOP/s practical ceiling is **not** reachable by cutting instruction
+count, and the flat 38.8 / 38.2 / 36.6 TFLOP/s across 8K / 32K / 128K is not issue saturation.
+Together with the earlier result that *more* `cp.async` overlap made the kernel worse
+(5601 vs 5773 vs 5763 ms), the evidence points at **`cp.async` issue timing / latency hiding**
+as the constraint. The mechanism -- that the strength-reduced form turns each copy's address
+from a pure function of `idx` into a loop-carried recurrence, shortening the prefetch distance
+-- is a **hypothesis**: there are no hardware counters on this box. It is consistent with
+unrolling recovering most of the loss, but it is not proven.
+
+**Do not re-open this by removing only the 64-bit multiply.** That variant keeps addresses
+independent and saves ~4 of 31 instructions (~11%), which is below this instrument's ~1.5%
+pass-to-pass resolution; it cannot distinguish no-effect from small-effect.
+
+### Harness fixes landed with this work (they protect every future measurement)
+
+* `ab_all.py`: **page-cache warm-up is now ON by default** (`--no-warm` to skip). This is the
+  fix for the mistake that invalidated the `fa2off` column.
+* `ab_all.py`: **contention guard that aborts rather than records**, checked before *and after*
+  every trial (not just at startup), using `ps` never `pgrep -f`. It caught a false positive on
+  its first real run -- `[gb10-server] <defunct>`, a zombie of the server it had just killed --
+  fixed at the cause (`proc.wait()`) and at the check (`ps -o stat`, skip `Z`).
+* `ab_all.py`: **repeats accumulate**, so an arm can be named twice (`A,B,A,B`) to interleave it
+  with its control. Ordering bias is how a sub-1% effect gets recorded as a finding.
+* `bench/longctx/fa2_stage_ab.py` (new): the PTX-swap A/B driver. `lib.rs:36` bakes the PTX
+  *path* in at compile time but the file is read at process start, so one binary can run
+  different kernels -- a stronger control than an env var, because it does not perturb register
+  allocation.
+* `bench/longctx/fa2_gates.sh` (new): gates + `compute-sanitizer` for an installed
+  `elementwise.ptx`, keyed by tag.

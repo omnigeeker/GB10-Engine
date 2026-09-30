@@ -64,8 +64,49 @@ CTX = 262144
 ENGINES = {
     "gb10-fa2off": {"kind": "gb10", "env": {"GB10_FA2": "0"}},
     "gb10-fa2on": {"kind": "gb10", "env": {"GB10_FA2": "1"}},
+    # Same-binary A/B arms for the shared-activation-cast hoist in
+    # `weights.rs`. Both run the FA2 kernel; only the hoist differs, so a pair
+    # taken in one session is a controlled comparison of that one change.
+    "gb10-hoist0": {"kind": "gb10", "env": {"GB10_FA2": "1", "GB10_CAST_HOIST": "0"}},
+    "gb10-hoist1": {"kind": "gb10", "env": {"GB10_FA2": "1", "GB10_CAST_HOIST": "1"}},
+    # Same-binary A/B arms for the FA2 staging-loop address arithmetic.
+    # NOTE: that A/B is done by swapping `elementwise.ptx` between runs of the
+    # SAME binary (the PTX path is baked in at compile time, but the file itself
+    # is read at process start), so it is not an `ENGINES` entry -- see
+    # bench/longctx/fa2_stage_ab.sh.
     "llama": {"kind": "llama", "env": {}},
 }
+
+
+def warm_page_cache():
+    """Read both model files so no engine pays first-touch cost on them.
+
+    This is not optional. A previous proof's baseline arm was invalidated
+    because it was the *first* engine started and read the 21.9 GB weight file
+    cold: 12.57 s at 8K where warm it is 9.67 s, a 15-23% error, while the
+    other two arms reproduced to ~1%. The ~48 GB of model files fit in this
+    box's page cache (121 GB RAM), so reading them once makes every arm warm.
+    """
+    paths = []
+    d = os.path.join(ROOT, GB10_MODEL)
+    if os.path.isdir(d):
+        for root, _, files in os.walk(d):
+            paths.extend(os.path.join(root, f) for f in sorted(files))
+    else:
+        paths.append(d)
+    paths.append(os.path.join(ROOT, LLAMA_MODEL))
+    for p in paths:
+        if not os.path.isfile(p):
+            log(f"warm: {p} not found, skipped")
+            continue
+        n = 0
+        with open(p, "rb") as fh:
+            while True:
+                b = fh.read(64 << 20)
+                if not b:
+                    break
+                n += len(b)
+        log(f"warmed {os.path.relpath(p, ROOT)} ({n / 2**30:.2f} GiB)")
 
 
 def log(msg):
@@ -150,12 +191,70 @@ def reps_for(target, per_rep, overhead):
     return max(1, int(round((target - overhead) / per_rep)))
 
 
-def measure(url, label, target, per_rep, overhead, trials, max_tokens, timeout):
+# Processes that mean someone else owns the GPU. `ps`, never `pgrep -f`: a
+# pattern in the searching command line self-matches and has produced phantom
+# readings on this box.
+BUSY = ("gb10-verify", "gb10-server", "llama-server", "test-backend-ops")
+
+
+def foreign_gpu_procs(allow=()):
+    """Processes that mean someone else owns the GPU.
+
+    Zombies must be excluded. A killed server that its parent has not reaped
+    shows up as `[gb10-server] <defunct>` -- the name matches, but a zombie
+    holds no GPU resources and is not contention. This guard produced exactly
+    that false positive on its first real run (it aborted the 128K hoist A/B
+    after the hoist0 arm, on the defunct husk of hoist0's own server). `ps -o
+    stat` gives `Z` for a zombie; the `<defunct>` marker in `args` is the
+    belt-and-braces check.
+    """
+    out = subprocess.run(["ps", "-eo", "pid,stat,args", "--no-headers"],
+                         capture_output=True, text=True).stdout
+    me = os.getpid()
+    hits = []
+    for ln in out.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        pid, _, rest = ln.partition(" ")
+        stat, _, rest = rest.strip().partition(" ")
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        if stat.startswith("Z") or "<defunct>" in rest or "grep" in rest:
+            continue
+        if any(a in rest for a in allow):
+            continue
+        if any(b in rest for b in BUSY):
+            hits.append(f"{pid} [{stat}] {rest}")
+    return hits
+
+
+def require_exclusive_gpu(where, allow=()):
+    """Abort rather than record a contended number.
+
+    A number produced under contention is worse than no number: it looks like
+    evidence and is not. This box has already had one A/B pair invalidated that
+    way. Note that `kill_servers()` between engines is not sufficient -- a
+    *foreign* process (another agent's benchmark) can appear at any time, so the
+    check has to run around every measurement, not just at startup.
+
+    `allow` names the server this run started, which is of course expected to be
+    present.
+    """
+    hits = foreign_gpu_procs(allow)
+    if hits:
+        sys.exit(f"GPU CONTENDED {where}: refusing to measure. Foreign processes:\n  "
+                 + "\n  ".join(hits))
+
+
+def measure(url, label, target, per_rep, overhead, trials, max_tokens, timeout,
+            allow=()):
     """Return (min_cold_ttft, prompt_tokens_seen, n_trials)."""
     reps = reps_for(target, per_rep, overhead)
     best = None
     seen = None
     for i in range(trials):
+        require_exclusive_gpu(f"before {label} ctx={target} trial={i}", allow)
         marker = f"{label}-t{target}-{i}-{int(time.time())}"
         prompt = ttft.build_prompt(marker, reps)
         cold, _, _, pt, _ = ttft.stream_once(url, prompt, max_tokens, timeout)
@@ -163,6 +262,7 @@ def measure(url, label, target, per_rep, overhead, trials, max_tokens, timeout):
         best = cold if best is None else min(best, cold)
         log(f"  {label} target={target} reps={reps} trial={i} "
             f"prompt_tokens={pt} cold_ttft={cold:.2f}s")
+        require_exclusive_gpu(f"after {label} ctx={target} trial={i}", allow)
     return best, seen, reps
 
 
@@ -175,6 +275,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--timeout", type=float, default=172800)
     ap.add_argument("--out", default=None, help="markdown output path")
+    ap.add_argument("--no-warm", action="store_true",
+                    help="skip the page-cache warm-up (only if you know the model "
+                         "files are already resident)")
     args = ap.parse_args()
 
     contexts = [int(c) for c in args.contexts.split(",") if c.strip()]
@@ -199,9 +302,17 @@ def main():
     emit(f"- host {os.uname().nodename}")
     emit()
 
+    if not args.no_warm:
+        log("warming page cache for both model files")
+        warm_page_cache()
+
     for engine in engines:
         kill_servers()
+        require_exclusive_gpu(f"before starting {engine}")
         proc, port = start_server(engine)
+        # Our own server is expected to be present during the measurements.
+        allow = ("llama-server",) if ENGINES[engine]["kind"] == "llama" \
+            else ("./target/release/gb10-server",)
         url = f"http://127.0.0.1:{port}/v1/chat/completions"
         try:
             if not wait_healthy(engine, port):
@@ -214,56 +325,97 @@ def main():
             log(f"{engine}: {per_rep:.3f} tokens/rep, overhead {overhead:.1f}")
             for ctx in contexts:
                 best, seen, reps = measure(url, engine, ctx, per_rep, overhead,
-                                           args.trials, args.max_tokens, args.timeout)
-                results[(engine, ctx)] = (best, seen, reps)
+                                           args.trials, args.max_tokens, args.timeout,
+                                           allow)
+                # Accumulate rather than overwrite: naming the same engine twice
+                # on the command line is how an arm gets interleaved with its
+                # control (A,B,A,B) so monotonic within-session drift cancels
+                # instead of loading onto whichever arm ran second. The reported
+                # figure is the minimum over every repeat and trial.
+                results.setdefault((engine, ctx), []).append((best, seen, reps))
         finally:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            # Reap it, or it lingers as `[gb10-server] <defunct>` -- which the
+            # contention guard then sees by name on the next engine.
+            try:
+                proc.wait(timeout=30)
             except Exception:
                 pass
             kill_servers()
             time.sleep(5)
 
     # ---- report -------------------------------------------------------------
+    # `engines` may name the same arm twice (interleaved A,B,A,B); report each
+    # distinct arm once, taking the minimum over every repeat and trial.
+    names = []
+    for e in engines:
+        if e not in names:
+            names.append(e)
+
+    def best_of(v):
+        return min(x[0] for x in v) if v else None
+
+    def seen_of(v):
+        for x in v:
+            if x[1] is not None:
+                return x[1]
+        return None
+
     emit()
-    emit("## Cold TTFT (s)")
+    emit("## Cold TTFT (s, minimum over every repeat and trial)")
     emit()
-    hdr = "| context | " + " | ".join(engines) + " |"
-    emit(hdr)
-    emit("|---|" + "---|" * len(engines))
+    emit("| context | " + " | ".join(names) + " |")
+    emit("|---|" + "---|" * len(names))
     for ctx in contexts:
         cells = []
-        for e in engines:
-            v = results.get((e, ctx))
-            cells.append(f"{v[0]:.2f}" if v else "n/a")
+        for e in names:
+            b = best_of(results.get((e, ctx)))
+            cells.append(f"{b:.2f}" if b is not None else "n/a")
         emit(f"| {ctx} | " + " | ".join(cells) + " |")
 
     emit()
-    emit("## Ratio vs llama.cpp (< 1.00 means gb10 is faster)")
+    emit("## Ratio vs the first arm (> 1.00 means the first arm is faster)")
     emit()
-    base = "llama" if "llama" in engines else engines[-1]
-    emit(f"| context | " + " | ".join(e for e in engines if e != base) + " |")
-    emit("|---|" + "---|" * (len(engines) - 1))
+    # With llama.cpp present the ratio is gb10/llama; without it the first named
+    # arm is the control, so the ratio is control/treatment, i.e. the speedup.
+    base = "llama" if "llama" in engines else names[0]
+    emit(f"| context | " + " | ".join(e for e in names if e != base) + " |")
+    emit("|---|" + "---|" * (len(names) - 1))
     for ctx in contexts:
-        b = results.get((base, ctx))
+        b = best_of(results.get((base, ctx)))
         cells = []
-        for e in engines:
+        for e in names:
             if e == base:
                 continue
-            v = results.get((e, ctx))
-            cells.append(f"{v[0] / b[0]:.3f}" if (v and b) else "n/a")
+            v = best_of(results.get((e, ctx)))
+            cells.append(f"{b / v:.4f}" if (v and b) else "n/a")
         emit(f"| {ctx} | " + " | ".join(cells) + " |")
+
+    emit()
+    emit("## Every measurement (raw, in run order)")
+    emit()
+    emit("| # | context | arm | min cold TTFT s | prompt tokens | reps |")
+    emit("|---|---|---|---|---|---|")
+    n = 0
+    for ctx in contexts:
+        for e in engines:
+            for (best, seen, reps) in results.get((e, ctx), []):
+                n += 1
+                emit(f"| {n} | {ctx} | {e} | {best:.2f} | {seen} | {reps} |")
 
     emit()
     emit("## Prompt tokens actually seen (proof both engines got the same prompt)")
     emit()
-    emit("| context | " + " | ".join(engines) + " |")
-    emit("|---|" + "---|" * len(engines))
+    emit("| context | " + " | ".join(names) + " |")
+    emit("|---|" + "---|" * len(names))
     for ctx in contexts:
         cells = []
-        for e in engines:
-            v = results.get((e, ctx))
-            cells.append(str(v[1]) if v and v[1] is not None else "n/a")
+        for e in names:
+            s = seen_of(results.get((e, ctx)))
+            cells.append(str(s) if s is not None else "n/a")
         emit(f"| {ctx} | " + " | ".join(cells) + " |")
 
     emit()

@@ -14907,3 +14907,161 @@ Both changes are bit-identical by construction (the hoist feeds the same bf16
 bytes to the same GEMMs; the FA2 change reorders no arithmetic), and ctx512 and
 ctx4096 perplexity confirm that. **This does not certify memory safety** -- an
 out-of-bounds store has passed these exact gates in this project before.
+
+## The staging-loop address arithmetic is NOT the bottleneck -- measured, and it is a REGRESSION
+
+**This closes the instruction-count line of attack on the FA2 kernel.** The idea was
+specific and, on the evidence available before measuring, well-motivated: `fa2_stage_async`
+computes a 64-bit global address for every 16-byte `cp.async` copy, and if the kernel were
+issue-bound then removing that arithmetic would buy several percent. It does not. Cutting
+23-25% of the kernel's issued instructions makes attention **slower**, and the transformation
+is provably semantics-preserving, so the result is not a correctness artefact.
+
+### The pricing, before any code was written
+
+Disassembled the emitted SASS (`nvcc -arch sm_121a -cubin -O3`, then `cuobjdump -sass`).
+The staging loop body is **35 instructions for one 16-byte copy, 31 of them address/control**:
+
+```
+SHF.R.U32.HI R126, RZ, 0x5, R3          r = idx >> 5
+BSSY.RECONVERGENT B1, 0x3410            \
+MOV R124, RZ                             |  the `ok ? off : kv_base` select
+ISETP.GE.AND P0, PT, R127, R0, PT        |  compiles to a BRANCH, not a SEL
+@P0 BRA 0x3400                          /
+USHF.R.S32.HI UR13, URZ, 0x1f, UR12     sign-extend n_kv_heads -- LOOP-INVARIANT,
+IMAD.WIDE.U32 R124, R127, UR12, R124    re-derived every iteration
+IMAD R127, R127, UR13, R125             64-bit multiply by a RUNTIME value
+LEA / LEA.HI.X                          form the 64-bit pointer
+LOP3 / SHF / IADD3                      the shared-memory swizzle
+@!PT LDS RZ, [RZ]  (x3)                 never-executed placeholders, still issue slots
+LDGSTS.E.BYPASS.128.ZFILL               the actual copy
+```
+
+`#pragma unroll 1` gives no amortisation. **nvcc did not strength-reduce it.** The affine
+structure is real and easy to miss: `idx` advances by `FA2_THREADS == 96 == 3*32`, so
+`u = idx & 31` is **invariant** across the loop and `r = idx >> 5` advances by **exactly 3**.
+Both the global offset and the shared offset are therefore affine in the iteration count,
+the shared one modulo a 3-periodic XOR term.
+
+Static instruction mix of the main loop body: **794 instructions, 128 HMMA, 64 LDSM**, and
+dynamically the two in-loop staging calls are `2 x ~10.67 iterations x ~31` instructions --
+i.e. the staging loops are roughly **half of the kernel's issued instructions**. If the kernel
+were issue-bound, this was worth far more than the 5.3% of attention needed. That "if" is
+what the experiment settles.
+
+### The measurement
+
+Three kernels, one binary, one session. The A/B is a **PTX swap**: `lib.rs:36` bakes the PTX
+*path* in at compile time via `env!("GB10_KERNEL_PTX")`, but the file itself is read by
+`ctx.load_module(Ptx::from_file(path))` at process start, so the same binary runs a different
+kernel depending on what is installed as `elementwise.ptx`. That is a stronger control than an
+env-var switch: no extra kernel parameter, no branch, and **no perturbation of register
+allocation** -- which is the thing that decides occupancy here.
+
+Interleaved A,B,C,A,B,C at each context, minimum of 2 passes, `prefill-shape`,
+`GB10_PREFILL_NSEQ=1`, chunk 8192. Driver: `bench/longctx/fa2_stage_ab.py`.
+
+| arm | what it is | SASS per copy (prologue K / in-loop V / in-loop K) |
+|---|---|---|
+| **A_control** | HEAD, unmodified (`bdbff89850cb`) | 30 / 28 / 35 |
+| **B_sr** | strength-reduced, 32-bit offset, carried addresses | 17 / 17 / 18 |
+| **C_sr_unroll2** | B + `#pragma unroll 2` | 13.5 / 14.0 / 14.5 |
+
+Issued instructions per main-loop iteration (static main-loop body minus the staging loops
+counted once, plus their dynamic cost): **A 1403, B 1077 (-23%), C 1049 (-25%)**.
+
+| context | A_control | B_sr | C_sr_unroll2 |
+|---|---|---|---|
+| 8192 | **344 ms** | 349 ms | 344 ms |
+| 32768 | **5500 ms** | 5801 ms | 5638 ms |
+
+Speedup vs control (1.00 = equal, < 1.00 = control is faster):
+
+| context | B_sr | C_sr_unroll2 |
+|---|---|---|
+| 8192 | 0.986 | 1.000 |
+| 32768 | **0.948** | **0.976** |
+
+At 32K the separation is clean, not noise: A's two passes were 5500/5586, B's 5857/5801,
+C's 5706/5638. **B's best (5801) is worse than A's worst (5586).**
+
+### Controls
+
+* **Only the intended kernel changed.** Instruction-by-instruction comparison of all 35
+  kernels in the two `elementwise.ptx` files: **34 are identical, only
+  `attn_prefill_fa2_kernel` differs** (1728 -> 1664 instructions). The comparison is over the
+  instruction text only, because `-lineinfo` shifts every debug line number when the source
+  changes length and a naive diff then reports all 35 as different.
+* **Occupancy unchanged.** `cuobjdump -res-usage` gives **REG:168, LOCAL:0** for all three
+  arms, so all three keep 3 CTAs/SM. The kernel is SMEM-bound (32,768 B of a 34,133 B budget),
+  and this change does not touch SMEM. So the regression is not an occupancy effect.
+* **The transformation is semantics-preserving, measured not assumed.**
+  * `attn-tile` output is **byte-for-byte identical** between armA and armB, across every shape
+    it tests including non-zero `start`.
+  * `generate` is an **exact 16/16** match to the documented ids for both arms
+    `[1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]`.
+  * `perplexity --ctx 512 --chunks 60` -> **1.875067** (baseline 1.875067).
+  * `perplexity --ctx 4096 --chunks 60` -> **1.877331** (baseline 1.877331).
+  * Both are bit-identical to the committed baselines.
+* **The revert is byte-perfect.** After `git checkout -- kernels/elementwise.cu` and a rebuild,
+  the regenerated `elementwise.ptx` hashes to **`bdbff89850cb`**, identical to the control arm's
+  PTX. That also proves the control arm *was* exactly HEAD's kernel.
+
+### The finding, and what it rules out
+
+**The ALU instruction count in the `cp.async` staging loop is not the binding constraint.**
+A 23-25% cut in issued instructions cost **5.2%** of attention at 32K. The instruction-count
+ranks are `C (14/copy) < B (17.3) < A (31)`, while the performance ranks are
+`A (5500 ms) < C (5638) < B (5801)` -- **anti-correlated**. Fewer instructions made it slower.
+
+This is a stronger statement than "it did not help". If issue slots were the bottleneck,
+removing 23% of them could not cost 5.2%, because the memory traffic, the addresses written,
+the `mma` count and the occupancy are all unchanged. So:
+
+* **The FA2 kernel's 36.58 TFLOP/s at 128K is not issue-bound.** The residual ~9% of headroom
+  to the ~40 TFLOP/s practical ceiling cannot be recovered by reducing instruction count, and
+  the flat 38.8 / 38.2 / 36.6 TFLOP/s across 8K / 32K / 128K is now explained by something
+  other than issue saturation. The instruction-count line of attack on attention is closed.
+* Combined with the earlier measurements (more `cp.async` overlap made it *worse*: 5601 vs
+  5773 vs 5763 ms), the kernel appears bound by `cp.async` **issue timing / latency hiding**,
+  not by ALU throughput and not by the amount of overlap.
+
+**Mechanism -- offered as a hypothesis, NOT measured.** The original computes each copy's
+address as a **pure function of the loop counter** `idx`, so `ptxas` can compute addresses well
+ahead of use and issue `LDGSTS` early. The strength-reduced form makes the address a
+**loop-carried recurrence**, so every `LDGSTS` depends on the previous iteration's `IADD3`.
+That shortens the effective prefetch distance, and the latency-hiding loss exceeds the ALU
+saving. Two observations are consistent with it: (i) unrolling by 2 (armC) halves the
+recurrence depth per copy and recovers most of the loss (5801 -> 5638 ms); (ii) the ordering is
+anti-correlated with instruction count. **It is a hypothesis because there are no hardware
+counters on this box** (`ncu` is blocked by `RmProfilingAdminOnly: 1`, no passwordless sudo),
+so the mechanism cannot be confirmed directly -- only its predictions tested.
+
+**A cheaper variant that keeps independent addresses was considered and deliberately not run.**
+Removing only the 64-bit `IMAD.WIDE` and the redundant sign-extension while keeping the
+address a pure function of `idx` saves ~4 of 31 instructions (~11%). Given that a 51% cut in
+the loop body was 5.2% *worse* and the observed pass-to-pass spread is ~1.5%, an 11% cut is
+below the resolution of this instrument -- it could not distinguish "no effect" from "small
+effect" either way, so it would not have changed the conclusion.
+
+### Harness changes that came out of this (kept)
+
+* `ab_all.py`: **page-cache warm-up, ON by default** (`--no-warm` to skip). This is the fix for
+  the error that invalidated the `fa2off` column -- an arm reading 12.57 s cold where warm it is
+  9.67 s. Both model files are read before the first server starts, so no arm pays first-touch.
+* `ab_all.py`: **a contention guard that aborts rather than records.**
+  `require_exclusive_gpu()` runs before AND after every trial, not just at startup, because
+  `kill_servers()` between engines cannot catch a *foreign* process appearing mid-run -- which
+  is how this project's one invalidated A/B pair was produced. It uses `ps`, never `pgrep -f`.
+  **It caught a false positive on its first real run**: the guard aborted the 128K hoist A/B on
+  `[gb10-server] <defunct>`, a zombie of the server it had just killed, which holds no GPU
+  resources. Fixed at the cause (`proc.wait()` at teardown) and at the check (`ps -o stat`,
+  skip `Z`/`<defunct>`). A false positive in an abort-by-default guard is not harmless: it
+  silently kills valid runs, and the tempting fix is to weaken the guard.
+* `ab_all.py`: **repeats accumulate instead of overwriting**, so an arm can be named twice on
+  the command line (`A,B,A,B`) to interleave it with its control. A sub-1% effect measured in
+  blocks of A-then-B is exactly how ordering bias gets recorded as a finding.
+* `bench/longctx/fa2_stage_ab.py` (new): the PTX-swap A/B driver, with the contention guard and
+  a recorded PTX sha256 per measurement so the report proves which kernel ran.
+* `bench/longctx/fa2_gates.sh` (new): the acceptance gates + `compute-sanitizer` for a given
+  installed `elementwise.ptx`, keyed by tag so arms can be diffed.
