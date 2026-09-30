@@ -37,9 +37,11 @@ and the run should not be interrupted and resumed piecemeal -- if it is, the
 numbers stop being comparable and the whole point is lost.
 """
 import argparse
+import glob
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -266,6 +268,89 @@ def measure(url, label, target, per_rep, overhead, trials, max_tokens, timeout,
     return best, seen, reps
 
 
+def ptx_path():
+    hits = glob.glob(os.path.join(ROOT,
+                    "target/release/build/gb10-cuda-*/out/elementwise.ptx"))
+    return hits[0] if len(hits) == 1 else None
+
+
+def binary_freshness():
+    """The stale-binary guard -- the trap that silently cost 27% of a proof.
+
+    The host's dynamic shared-memory request (`GB10_FA2_BC` in ops.rs) and the
+    compiled key-tile width (`FA2_BC` in kernels/elementwise.cu) are two halves
+    of ONE knob. A `gb10-server` built before that default changed 32 -> 16
+    requests 32 KB for a 16 KB tile, which silently drops occupancy from
+    4 CTAs/SM to 3 and loses the entire BC=16 win -- while every correctness
+    gate still passes. Nothing fails loudly, so the driver has to check it.
+
+    Returns (evidence_lines, stale_problems).
+    """
+    import hashlib
+    lines, stale = [], []
+    srcs = [p for p in (os.path.join(ROOT, "crates/gb10-cuda/src/ops.rs"),
+                        os.path.join(ROOT, "kernels/elementwise.cu"))
+            if os.path.exists(p)]
+    src_mt = max(os.path.getmtime(p) for p in srcs) if srcs else 0
+    for name, rel in (("gb10-server", "target/release/gb10-server"),
+                      ("gb10-verify", "target/release/gb10-verify")):
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            stale.append(f"{name} is missing at {rel}")
+            continue
+        mt = os.path.getmtime(path)
+        lines.append(
+            f"- `{name}` built {time.strftime('%H:%M:%S', time.localtime(mt))}, "
+            f"newest kernel source {time.strftime('%H:%M:%S', time.localtime(src_mt))}")
+        if mt < src_mt:
+            stale.append(
+                f"{name} is OLDER than the newest kernel source "
+                f"({os.path.basename(max(srcs, key=os.path.getmtime))}) -- "
+                f"run `cargo build --release` (the WHOLE workspace, not just "
+                f"gb10-verify: that is how this trap was sprung)")
+    ptx = ptx_path()
+    if ptx:
+        lines.append("- elementwise.ptx sha256[:12] `" +
+                     hashlib.sha256(open(ptx, "rb").read()).hexdigest()[:12] + "`")
+    else:
+        stale.append("could not locate exactly one elementwise.ptx under target/")
+    return lines, stale
+
+
+def occupancy_preflight():
+    """Assert the FA2 kernel really gets 4 CTAs/SM on this binary.
+
+    mtimes can lie -- a build that does not recompile the kernel still refreshes
+    the binary. This runs the kernel once at 8K and reads the driver's REAL
+    occupancy, which is the check that cannot be faked. It aborts only on an
+    EXPLICIT bad reading; a missing marker returns a warning instead of a
+    failure, because a false failure in an abort-by-default harness is its own
+    trap here (the `<defunct>` zombie and the `--report-api-errors` episode).
+
+    Returns (occ_line_or_None, problem_or_None).
+    """
+    env = dict(os.environ)
+    env.update({"GB10_FA2": "1", "GB10_ATTN_OCCUPANCY": "1"})
+    cmd = ["./target/release/gb10-verify", "prefill-shape", "--model", GB10_MODEL,
+           "--limit", "8192", "--max-seq", "8192"]
+    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True,
+                       timeout=1800)
+    m = re.search(r"\[occ\] attn_prefill_fa2:.*", r.stdout + r.stderr)
+    if not m:
+        return None, "no [occ] line in the 8K preflight (not treated as fatal)"
+    line = m.group(0).strip()
+    bad = []
+    if "binding REGS" not in line:
+        bad.append("binding is not REGS")
+    mb = re.search(r"by_regs (\d+)", line)
+    if not mb or int(mb.group(1)) < 4:
+        bad.append("by_regs < 4")
+    md = re.search(r"dynamic_smem (\d+)", line)
+    if not md or int(md.group(1)) != 16384:
+        bad.append("dynamic_smem != 16384 (host request does not match the 16 KB tile)")
+    return line, ("; ".join(bad) if bad else None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--contexts", default="8192,32768,131072,262144",
@@ -301,6 +386,39 @@ def main():
     emit(f"- trials {args.trials} (minimum reported), max_tokens {args.max_tokens}")
     emit(f"- host {os.uname().nodename}")
     emit()
+
+    # Guard the stale-binary trap BEFORE spending hours on the GPU: a
+    # `gb10-server` older than the kernel source silently loses the BC=16
+    # occupancy win with every gate still green.
+    fresh_lines, stale = binary_freshness()
+    emit("## binaries under test")
+    emit()
+    for l in fresh_lines:
+        emit(l)
+    emit()
+    for l in fresh_lines:
+        log(l.lstrip("- "))
+    if stale:
+        for l in stale:
+            log("STALE: " + l)
+        sys.exit("STALE BINARY -- refusing to measure (this trap costs 27% and "
+                 "cannot fail loudly):\n  " + "\n  ".join(stale))
+
+    # The real check: mtimes can lie, the driver's occupancy cannot.
+    if any(ENGINES[e]["kind"] == "gb10" for e in engines):
+        log("preflight: asserting the FA2 occupancy on the 8K shape")
+        occ_line, occ_bad = occupancy_preflight()
+        if occ_line:
+            log("  " + occ_line)
+            emit(f"- occupancy preflight (8K): `{occ_line}`")
+            emit()
+        if occ_bad and occ_line:
+            log("OCCUPANCY PREFLIGHT FAILED: " + occ_bad)
+            sys.exit("OCCUPANCY PREFLIGHT FAILED -- this binary is not the "
+                     "4-CTA/SM BC=16 configuration, so every gb10 number would be "
+                     f"wrong: {occ_bad}\n  {occ_line}")
+        elif occ_bad:
+            log("  WARNING: " + occ_bad)
 
     if not args.no_warm:
         log("warming page cache for both model files")
