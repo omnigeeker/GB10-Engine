@@ -12950,3 +12950,40 @@ remaining time, and the exclusion does not depend on how well the PV is implemen
 
 **The honest summary: one length won, one within reach, two provably out of reach, and the reason is
 now arithmetic rather than effort.**
+
+## The implementation budget for the PV: 5 registers and 2,741 bytes
+
+Any remaining PV route has to fit inside the occupancy cliff measured above. At 32K the kernel sits at
+**3 blocks/SM bound equally by registers and shared memory**, so both budgets matter:
+
+| resource | current | limit to keep 3 blocks | **headroom** |
+|---|---|---|---|
+| registers | **80** | `65536 / (3 * 256) = 85` | **5 registers** |
+| dynamic smem | **31,392 B** | `102400 / 3 = 34,133 B` | **2,741 B** |
+
+**And the economics of blowing it:**
+
+```
+3 -> 2 blocks costs  +22.4% of the attention kernel =  4,143 ms at 32K
+PV maximum benefit  = 41.8% of the attention kernel =  7,731 ms at 32K
+net if occupancy drops to 2 blocks                  = +3,588 ms  (6.8% of the 53.08 s prefill)
+```
+
+**So a PV that costs an occupancy level is still net positive, but it gives back half its value.**
+The design targets are therefore concrete:
+
+* **Stage `P` as fp16 at 24 x 16 x 2 = 768 B** -- fits the 2,741 B smem headroom with room to spare,
+  and it is required anyway for the `ldmatrix.x4` A-operand. **This is affordable.**
+* **Keep the `acc` fragments within 5 registers of the current 80.** That is the hard constraint: the
+  mma route replaces `float acc[24]` (24 registers) with `d[4]` fragments per (m-tile, n-tile) pair,
+  and if the warp's fragment count exceeds the current accumulator footprint the kernel falls to 2
+  blocks and the 4,143 ms penalty applies.
+
+**This is why the warp-shuffle route is the right one:** it needs **no shared memory at all** beyond
+the fp16 `P` tile, so the smem budget is comfortable, and the only risk is the 5-register register
+budget -- which is measurable before committing to the full change, by checking `GB10_ATTN_OCCUPANCY`
+after staging `P` as fp16 but before adding the mma.
+
+**Recommended first step, in order:** (1) stage `P` as fp16 and re-check occupancy -- if registers
+exceed 85 the route is closed and no further work is warranted; (2) only then add the mma and the
+shuffle redistribution.
