@@ -12743,3 +12743,34 @@ same shape and leading dimensions as the FP4 leg, so the difference is the data 
 
 **Left undone and recorded as such.** The probe source is committed (`bench/longctx/fp4_probe.cu`);
 the bf16-only variant and the crash were not.
+
+### The bf16-ceiling question, answered analytically instead
+
+The crashed probe was trying to measure whether the MLP's ~52 TFLOP/s is a weight-format problem or
+just where a bf16 GEMM lands on this part. **That can be answered from the measured phase total and
+the dequant's traffic, with no probe at all.**
+
+```
+MLP params/layer          267.4 M      (gate 17408x5120, up 17408x5120, down 5120x17408)
+MLP FLOPs at 32K        1,121.5 TFLOP  (2 * params * 32768 tokens * 64 layers)
+MLP measured               21.46 s   ->   52.3 TFLOP/s
+
+dequant traffic           171.1 GB      (read FP4 at 0.5 B/param, write bf16 at 2 B/param,
+                                        64 layers x 4 chunks)
+  at 228 GB/s            ->  751 ms    =   3.5% of the MLP phase
+
+GEMM alone                 20.71 s   ->   54.2 TFLOP/s
+  = 72.2% of a 75 TFLOP/s bf16 ceiling
+  = 67.7% of an 80 TFLOP/s bf16 ceiling
+```
+
+**So the MLP's GEMM is already running at roughly 70% of the bf16 ceiling, and the NVFP4->bf16
+dequant costs only 3.5% of the phase.**
+
+**This settles what the FP4 closure cost.** The MLP is not slow because of a fixable inefficiency --
+it is at its floor for a bf16 GEMM on this part. **The only way past that floor was FP4 tensor cores,
+and cuBLASLt does not provide them for sm_121.** So lever 2's closure removes a genuine ~4x on 40.4%
+of the 32K prefill, and there is no cheaper substitute hiding inside the phase.
+
+**It also retires the earlier hope that the MLP might be improvable by 2x within bf16** -- at 70% of
+ceiling there is no 2x to find.
