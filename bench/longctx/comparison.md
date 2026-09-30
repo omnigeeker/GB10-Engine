@@ -14611,3 +14611,61 @@ and it is the difference between a large speculative kernel effort and not doing
 the answer". This measurement is the first check of that inference against a number, and the number says the
 reason llama.cpp uses FP4 is memory traffic -- which is a decode argument, not a prefill one. **The inference
 "our competitor uses X, therefore X is our answer" was never evidence.**
+
+## FP4 SETTLED: the pivot is unsupported -- NVFP4 is a decode win, not a prefill win
+
+The n=512 measurement left the FP4 question "unopened rather than closed", because the benchmark stops there
+while prefill runs at n=8192/32768. **It is now closed by analysis of the same data**, because the curve is
+already at its asymptote.
+
+**`test-backend-ops` cannot reach n>=8192 -- definitively.** The nvfp4 shapes come from one hardcoded loop
+(`tests/test-backend-ops.cpp:11472-11478`) over `bs = {1,2,3,4,5,8,512}`, where `bs` is the `n` dimension. The
+whole CLI is `test|perf|grad|support`, `-o`, `-b`, `-p`, `--output`, `--list-ops`, `--show-coverage`,
+`--test-file`, `-j`, and **none of them changes a shape**; `-p` is a regex *filter* (`std::regex_search` on
+`vars()`, `:11931-11939`), so it can only select shapes that already exist. The one theoretical route,
+`--test-file`, needs `test-export-graph-ops`, which is **not built**. So the seven rows in `/tmp/nvfp4_ref.log`
+are the complete nvfp4 `MUL_MAT` set.
+
+**But the asymptote is reached, so the extrapolation is not speculative.** A fixed+linear fit on the two
+largest points:
+
+```
+t(n) = 176.8 us + 2.621 us * n        predicts n=512 as 1519.0 vs measured 1518.79  (0.01%)
+marginal FLOPs per column = 2*m*k = 2*4096*14336 = 117.44 MFLOP
+=> asymptotic rate = 117.44 MFLOP / 2.621 us = 44.8 TFLOPS
+   n=8192  -> 21.65 ms for 962.1 GFLOP = 44.4 TFLOPS
+   n=32768 ->                            44.7 TFLOPS
+```
+
+The same line fits n=3, n=4 and n=8 essentially exactly (n=8 predicted 197.8 vs measured 197.76), so the
+per-column cost is at steady state from n~8 onward. **Against bf16's measured 55.7-67.9 TFLOPS at the real
+prefill shapes, NVFP4 is 1.25-1.5x SLOWER on throughput**, and 2x would need 111-136 TFLOPS. **The pivot is
+unsupported as a throughput play.**
+
+**The mechanism is in the intercept, and it is the useful part.** `t0 = 176.8 us` is the cost of streaming
+A = 4096x14336 at 4.5 bpw = **33.0 MB** -> **187 GB/s**, i.e. ~**82% of this box's measured 228 GB/s** read
+bandwidth. So small-n is weight-streaming-bound (hence flat `us/run` and the 64x TFLOPS rise to n=8), and the
+slope is the tensor-core rate -- which is *below* bf16's.
+
+**So NVFP4's advantage is memory traffic, and it is a DECODE win.** At n=1, NVFP4 streams 33.0 MB in 190 us;
+bf16's 117.4 MB at 228 GB/s would take ~515 us, so **NVFP4 is ~2.7x faster at n=1**. That is the real payoff,
+and **it does not transfer to compute-bound prefill** -- which is exactly why llama.cpp uses NVFP4 (its decode
+is memory-bound) and why copying that choice would not have helped us here.
+
+**Caveat, stated plainly:** this is a 2-point extrapolation, not a measurement at n=8192. The fit is tight and
+the asymptote is reached, so treat it as decisive -- but it is not a measurement.
+
+**A cheap head-to-head that needs no build, if it is ever wanted:** `all_types` contains both `GGML_TYPE_BF16`
+and `GGML_TYPE_NVFP4`, so the same loop generates **bf16 at identical m=4096, k=14336, n in
+{1,2,3,4,5,8,512}**. `perf -o MUL_MAT -p 'type_a=(nvfp4|bf16).*k=14336'` is a ~1-2 min run giving both at
+**identical shapes** -- stronger than comparing against our bf16 numbers, which come from a different
+instrument at different shapes.
+
+### The general lesson, which is the real result here
+
+The plan to pivot to FP4 rested on the inference **"llama.cpp uses FP4, so FP4 is the answer."** Checked
+against a number, the inference was backwards: llama.cpp uses FP4 because **its decode** is memory-bound, and
+the property that makes FP4 good there (half the weight traffic) is worth nothing in compute-bound prefill,
+where the tensor-core rate is what matters -- and that rate is *worse* than bf16's here. **"Our competitor uses
+X, therefore X is our answer" was never evidence**, and this is the second time this session that a plausible
+attribution collapsed when measured (the first being the 2x-MLP premise).
