@@ -13553,3 +13553,69 @@ move at once:**
 per-launch overhead at short sequences (a stream-k combine pass, or a fixed setup cost), 8K is the row
 most at risk. **Check 8K explicitly after any kernel change** -- it is the cheapest length to regress and
 the only one currently won.
+
+## Corrections from deeper source analysis: the real performance model, and three myths killed
+
+### The mma.sync ceiling on this box is ~115 TFLOP/s, not 75
+
+Measured with `ptxas`/microbenchmarks on this exact GB10 by the research pass. **So our kernel's 0.85
+TFLOP/s is 0.74% of the reachable `mma.sync` ceiling**, not 1.25% of a nominal 75. The gap is even larger
+than the first estimate, and the reference peak to quote is 115.
+
+### Attention here is K/V-BANDWIDTH-bound, not tensor-core-bound
+
+The roofline at 32K, causal, 24 heads, D=256:
+
+| component | value |
+|---|---|
+| attention FLOPs | ~13.2 TFLOP |
+| at the ~115 TFLOP/s mma.sync ceiling | **~115 ms of pure compute** |
+| naive per-output-tile full-K/V reads | ~549 GB |
+| at the measured 228 GB/s | **~2.4 s** |
+
+**The bandwidth term is 20x the compute term.** So the binding constraint is K/V movement, and the lever
+is **reuse**: GQA head-sharing (one staged K/V tile serving 6 query heads) plus L2 reuse across a
+persistent grid. Our kernel takes 18.5 s at 32K against that 2.4 s bound, so **there is ~7.7x of headroom
+before the bandwidth wall is even reached** -- and the required win is only 2.13x.
+
+### Myth 1 killed: the ollama head_dim=256 crash is NOT a capacity overflow
+
+The exact shared memory for llama.cpp's config, recomputed from `fattn-mma-f16.cuh:2017-2100`:
+
+```
+KV 2-stage : 32 * (128+128) * 4 B = 32768 B
+Q          : 64 * (256/2+4) * 4 B = 33792 B   (only used if Q_in_reg were false)
+mask       :  8 * (32/2+4)  * 4 B =   640 B
+combine    :  4 * 16 * (128+4) * 4 B = 33792 B
+Q_in_reg=true -> total = max(combine, max(Q, KV+mask)) = 33792 B
+```
+
+**33,792 x 3 = 101,376 exactly** -- llama.cpp's config is deliberately sized for **3 CTAs/SM** against
+our measured 101,376 B opt-in limit. The reported failure is a *sticky* CUDA error surfacing at
+`cudaFuncSetAttribute` from an earlier kernel, in a different (MoE, q8_0 KV) model. **Not head-dim-256
+specific, and not something to design around.** (We verified `sharedMemPerBlockOptin` reads a sane
+101,376 on this box.)
+
+### Myth 2 killed: there is no fallback path to target instead
+
+`fattn.cu:758` -- `ggml_cuda_get_best_fattn_kernel()` picks the kernel *before* launch, and
+`case BEST_FATTN_KERNEL_NONE: GGML_ABORT("fatal error")`; the `cudaFuncSetAttribute` is inside
+`CUDA_CHECK`. **There is no try-mma-then-fall-back-to-tile logic anywhere.** For head_dim=256 prefill on
+cc=121 the selection is unconditionally `BEST_FATTN_KERNEL_MMA_F16`, i.e. the Ampere-style `mma.sync`
+kernel `..._case<256,256,8,8>`. The cuBLAS-based non-FA path is a *graph-level* alternative (separate
+MUL_MAT / SOFT_MAX / MUL_MAT nodes) that materialises the score matrix -- **at 32K that is ~51 GB and at
+128K impossible**, so it is not a viable target for either engine.
+
+### Confirmed: no CUTLASS attention kernel exists for sm_120/sm_121
+
+The example list has only `77_blackwell_fmha` (SM100, `CUTLASS_ARCH_MMA_SM100_SUPPORTED`-guarded,
+tcgen05-based, README: head dims **32/64/128 only -- no 256**) and `88_hopper_fmha`; the sm120/sm121
+examples (79, 80, 87) are GEMM-only. CUTLASS maintainer: *"SM120 ... and SM121 (Spark) only support
+99 KiB smem."* **So the mma.sync port is the only route, and it has to be written by hand.**
+
+### The one exploitable advantage we hold
+
+llama.cpp computes `ncols2` from `gqa_ratio` and can only use powers of two, so with `gqa_ratio = 6` it
+picks **`ncols2 = 8` and throws away 2 of 8 GQA slots -- ~25% of its KQ and P*V FLOPs.**
+**A kernel that groups exactly 6 query heads per KV head beats llama.cpp's arithmetic on this shape**, and
+we own the kernel so we can do it.
