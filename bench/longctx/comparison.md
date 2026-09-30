@@ -14017,3 +14017,41 @@ The FP4 MLP agent (a separate subagent) exhausted its context **without writing 
 llama.cpp's `mma.cuh`/`mmq.cuh`/`quantize.cu`. The FP4 finding itself (llama.cpp uses real block-scaled
 `mma.sync` FP4 with raw e2m1 operands, not a bf16 dequant) stands and is recorded, but **nothing was built
 from it**, so the MLP path is still on the bf16 dequant route.
+
+## A latent out-of-bounds store in the COMMITTED kernel, which both gates passed anyway
+
+The implementation agent found a second bug in `attn_prefill_fa2_kernel` after it was committed as `59df192`.
+The epilogue wrote **zeros** for rows `gid >= rows` rather than skipping them:
+
+```cuda
+if (!row_ok) { f0 = make_float2(0,0); f1 = make_float2(0,0); }
+else { ... divide ... }
+*reinterpret_cast<float2*>(out + o0) = f0;   // <- executed unconditionally
+```
+
+`rows = min(8, n_tokens - t0)`, so `gid >= rows` means `t0 + gid >= n_tokens` -- those query rows **do not
+exist in `out`**. The store address is `o0 = ((t0 + gid) * n_q_heads + h0) * HD + i*8 + t4*2`, so writing
+them is an **out-of-bounds store past the end of the output buffer** on any prefill whose token count is not
+a multiple of 8. For a 59-token prompt the last block has `t0 = 56`, `rows = 3`, so `gid = 3..7` write rows
+59..63 of a 59-row buffer -- about 400 KB past the end at `n_q_heads = 24`, `HD = 256`.
+
+### This is the most important measurement lesson in the whole document
+
+**Both acceptance gates passed with this bug present.** `generate` was an exact 16/16 match and `perplexity`
+was 6.5213 (reproduced independently) -- with an out-of-bounds write happening on every single forward pass
+of a 59-token prompt. The write lands in memory the allocator happened to have mapped, and it writes zeros,
+so it corrupts nothing observable.
+
+**So `generate` + `perplexity` do not certify memory safety, and passing them is not the same as the kernel
+being correct.** They certify numerical agreement on the paths they exercise. A wrong-address store that
+writes benign values is invisible to both. This is worth stating plainly because the previous rounds in this
+session repeatedly treated "the gates pass" as equivalent to "the change is correct".
+
+### An honest note on the independent audit
+
+I read this epilogue line by line in the audit recorded above and **did not catch it.** I saw the `!row_ok`
+branch and the comment *"Rows past `rows` must be zeros, not whatever the accumulator held"*, and I accepted
+the zero-fill as correct behaviour without checking whether the store that follows it was in bounds. The
+comment described the *intent* accurately, and I audited the intent rather than the address arithmetic. That
+is the same failure mode named repeatedly in this session -- accepting a stated cause in place of the
+measured one -- and it happened in the audit that was specifically written to avoid it.
