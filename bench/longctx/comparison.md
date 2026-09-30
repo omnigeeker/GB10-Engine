@@ -12569,3 +12569,42 @@ burned by changes whose share was assumed rather than measured.**
 two landed load optimisations, a 4.7% softmax, an already-tensor-core score product, and a 41.8% PV
 whose removal requires rewriting the kernel's output path.** There is no cheap remaining win in this
 kernel -- the cheap ones were taken, and the expensive one is genuinely expensive.
+
+## Repeat pairs at 8K and 32K -- the 8K win is 4/4 trials, and 32K is stable
+
+Same session, same scripts, two trials each, servers restarted between legs.
+
+**8K** (`reps=229`, ~7,171 tokens):
+
+```
+gb10-8K   trial 0  cold 8.73  trial 1  cold 8.75
+llama-8K  trial 0  cold 8.98  trial 1  cold 9.22
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| trial 0 | **8.73 s** | 8.98 s | **0.972x** |
+| trial 1 | **8.75 s** | 9.22 s | **0.949x** |
+| earlier pair | 8.69-8.72 s | 9.06-9.40 s | 0.925-0.963x |
+
+**8K wins on all four trials measured this session -- 0.925x, 0.949x, 0.963x, 0.972x.** gb10's own
+8K spread is 0.06 s (0.7%); llama.cpp's is 0.42 s (4.7%). **The win is real and the reference is the
+noisier side.**
+
+**32K** (`reps=1049`, ~32,592 tokens):
+
+```
+gb10-32K   trial 0  cold 52.87  trial 1  cold 52.95
+llama-32K  trial 0  cold 43.34  trial 1  cold 44.48
+```
+
+| | gb10 | llama.cpp | ratio |
+|---|---|---|---|
+| trial 0 | **52.87 s** | 43.34 s | 1.220x |
+| trial 1 | **52.95 s** | 44.48 s | 1.190x |
+| earlier pair | 53.99-54.08 s | 43.25-44.56 s | 1.214-1.248x |
+
+**32K is stable at 1.19-1.25x, and gb10's own 32K improved again: 53.99-54.08 s -> 52.87-52.95 s.**
+
+**The two lengths the objective can actually reach are now measured four times each, and the
+conclusion does not move.**
