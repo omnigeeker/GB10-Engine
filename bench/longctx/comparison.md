@@ -13673,3 +13673,81 @@ memory is reused **6x instead of once**. The scalar PV and the existing score mm
 two previous attempts in this session. **A correct, measured Step 1 banks most of the 32K win for a
 fraction of the risk.** The plan is to take the cheap win first and let the expensive one follow only if it
 is actually working.
+
+## THE MLP GAP, ROOT CAUSE FOUND: llama.cpp uses real FP4 tensor cores; we dequantize to bf16
+
+Verified from the shipped binary `tools/llama.cpp/build/bin/libggml-cuda.so.0.24.0`
+(`cuobjdump -sass -arch sm_121a`):
+
+```
+1792  OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X     <- NVFP4 (ue4m3 block scales)
+1792  OMMA.SF.16864.F32.E2M1.E2M1.E8          <- MXFP4 (e8m0 block scales)
+```
+
+Those live in `mul_mat_q<NVFP4, J=128>`, and the PTX source is `ggml/src/ggml-cuda/mma.cuh:1145`:
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+```
+
+**Both weights AND activations are raw e2m1, block-scaled by ue4m3, accumulated in f32. There is no
+fp16/bf16 conversion anywhere in that path.**
+
+**Our engine does the opposite.** `crates/gb10-model/src/weights.rs:forward_prefill_tensor_core` (~line
+132-225) runs three kernels: `dequant_nvfp4_to_bf16` -> activation cast -> `cublas_gemm_bf16_f32`. **That
+is the wrong approach on both axes:**
+
+| | llama.cpp | us |
+|---|---|---|
+| weights | raw FP4 in the mma | dequantized to bf16, written and re-read |
+| activations | quantized to FP4 | cast to bf16 |
+| instruction | `mma...m16n8k64.e2m1.e2m1` | bf16 HMMA |
+| compute floor for the 5120x17408x32768 GEMM | **11.7 ms** @ ~500 dense FP4 TFLOPS | **23.4 ms** (2x worse) |
+
+**And the `a` suffix is the blocker.** `crates/gb10-cuda/build.rs:11` sets `const CUDA_ARCH: &str =
+"sm_121"`, and the build emits PTX with `-arch sm_121`. **The `kind::mxf4nvf4` block-scaled mma is an
+architecture-specific instruction that requires `sm_121a`** -- llama.cpp's own build used
+`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]`. **So we literally cannot emit that
+instruction today; the first step is changing the arch target to `sm_121a`.**
+
+### Details worth keeping
+
+* **Format**: `QK_NVFP4=64`, `QK_NVFP4_SUB=16`, `block_nvfp4 { uint8_t d[4]; uint8_t qs[32]; }` = 36 B/64
+  elems = **4.5 bpw**. The E2M1 LUT is **doubled** (`ggml-common.h:1124-1129`) and
+  `ggml_cuda_ue4m3_to_fp32` returns `xf/2` (`common.cuh:856-867`) to compensate.
+* **The per-tensor f32 scale is NOT in the mma.** GGML's NVFP4 type has no per-tensor scale (only
+  `amax/6.0f` per 16-element sub-block, `ggml-quants.c:384-417`). This GGUF carries it as a separate
+  1-element F32 tensor (`blk.0.ffn_gate.scale = 1.5695e-04`), and the stored `d` values are in `W/s` units
+  (median 26, max 448 = ue4m3 saturation), so it is mandatory.
+* **llama.cpp applies that scale as a SEPARATE elementwise `ggml_mul` on the GEMM output**
+  (`src/llama-graph.cpp:1514-1522`); it is fused into the kernel epilogue **only for MMVQ/decode**
+  (`ggml-cuda.cu:3758-3772`), because `ggml_cuda_mul_mat_q` takes no fusion argument. **So during prefill
+  llama.cpp pays a separate full-tensor fp32 pass over the [17408,32768] output -- ~4.6 GB of extra
+  traffic per GEMM.** That is an inefficiency we can beat by fusing it.
+* **`input_scale` is loaded and never consumed.** The activation global scale is computed dynamically per
+  row as `amax/(6.0f*448.0f)` (`quantize.cu:182`) and applied in the MMQ epilogue (`mmq.cuh:514-521`).
+* **Dispatch**: `ggml_cuda_should_use_mmq` has `if (turing_mma_available(cc)) return true;`
+  (`mmq.cu:319-321`) -- **on any sm_75+ GPU, MMQ is used at all batch sizes**; the `ne11 < 64` thresholds
+  are pre-Turing only. MMVQ is gated at `MMVQ_MAX_BATCH_SIZE = 8`. **cuBLAS is essentially never used for
+  quantized weights in llama.cpp.**
+* **Tile config (Blackwell NVFP4)**: 8 warps / 256 threads, occupancy 1, **I=128**, J in 8..128 step 8,
+  K_vram=512, stream_k=true. Shared mem at J=128 = **57,856 B**.
+* **`mmf.cu` (the F16/BF16 weight path) contains ZERO tensor-core instructions** -- it is half2/bfloat162
+  FMA. bf16 HMMA appears only in attention.
+
+### A correction to this document's own earlier claim
+
+`comparison.md` previously asserted that "llama.cpp runs the prefill GEMMs on bf16 tensor cores at ~45
+TFLOPS". **The source contradicts that**: the NVFP4 FFN GEMMs use FP4 OMMA, the BF16 tensors use `mmf.cu`
+with no tensor-core instruction at all, and the other quant types use int8 IMMA. The ~45 TFLOPS is an
+aggregate over a mixed FP4-OMMA / IMMA / FMA kernel set -- and it is only ~9% of the dense FP4 peak,
+consistent with the GEMM being memory/L2-bound rather than FP4-compute-bound.
+
+### The roofline for the big MLP GEMM (5120x17408, 32768 rows)
+
+* FLOPs **5.841e12**; weights 50.1 MB; output **2.28 GB f32**; ideal traffic **3.19 GB**.
+* Floors: FP4 compute **11.7 ms**, memory 11.7-14.0 ms -- it sits on the roofline knee.
+* **The practical limiter is tile re-read, not FP4 compute**: at I=J=128 there are 34,816 tiles with 360 KB
+  of weights + 360 KB of activations each, and the 48-SM working set is 34.6 MB so L2 cannot hold it --
+  **25.7 GB of traffic, ~103-113 ms with no L2 reuse.** That is the real target to beat, and it says the
+  win comes from **tile scheduling / L2 reuse**, not from the mma alone.
