@@ -13112,3 +13112,34 @@ kernel speedup       1 / (1 - 0.418 + 0.116) = 1.43x
 **One check worth doing first, cheaply:** the row-16-23 group needs m-tile 1's `d2`/`d3`, i.e. rows
 16-23 of a tile whose rows are 8-23. **Rows 8-15 are therefore computed twice (once per m-tile) and
 discarded from m-tile 1** -- 33% wasted mma work, which is already included in the 8-mma count above.
+
+## Objective (2) re-verified, fresh same-session run: 6/6 PASS on the wiki haystack
+
+```
+# url=http://127.0.0.1:8080/v1/chat/completions haystack=wiki max_tokens=24
+ reps  depth   prompt  chunks     secs  ms/tok  result
+ 1049    0.1    33660       5     68.0       2  PASS '74921'
+ 1049    0.5    33661       5     68.3       2  PASS '74921'
+ 1049    0.9    33661       5     68.6       2  PASS '74921'
+ 2100    0.1    33660       5     68.5       2  PASS '74921'
+ 2100    0.5    33661       5     68.6       2  PASS '74921'
+ 2100    0.9    33661       5     68.0       2  PASS '74921'
+
+6/6 passed
+```
+
+**Six legs, three needle depths (0.1 / 0.5 / 0.9), two repetition levels (~33.6K prompt tokens), real
+prose from `bench/ppl/wiki.test.raw` as the haystack -- and every one retrieves the needle exactly.**
+Timing is flat at ~68 s per leg (~2 ms/token of prefill), and the server reports 5 prefill chunks at
+the 8192 chunk size.
+
+**This is the same conclusion the earlier certification reached, now with a fresh same-session run:
+long-context retrieval works on gb10, and the "0/3 on both engines" result that opened the objective
+was an artefact of the repeated-filler haystack, not of the model or of the context handling.**
+
+**Method note worth keeping:** the first attempt at this run reported `ERROR {'error': {'message':
+'not found'}}` on all six legs, because `NEEDLE_URL` is the *full endpoint*
+(`.../v1/chat/completions`), not a base URL. That is exactly the class of harness mistake the script's
+own header warns about -- and it is why the script takes the URL from the environment rather than
+hardcoding a port. **The failure was in the invocation, not the engine, and it was obvious from the
+error text rather than being mistaken for an engine result.**
