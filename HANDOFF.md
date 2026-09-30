@@ -230,8 +230,11 @@ Run `git status --short` first and check that every path you are about to stage 
 The state that was captured this way, for the record: `crates/gb10-cuda/build.rs` now sets
 `CUDA_ARCH = "sm_121a"`, with a comment noting that `sm_121` cannot assemble
 `kind::mxf4nvf4.block_scale` and that `sm_121a` is a strict superset. **That comment asserts the arch change
-was verified by an exact `generate` match — that assertion has not yet been independently confirmed in this
-session and should be re-run before being relied on.**
+was verified by an exact `generate` match — and it has now been confirmed twice, by two independent runs**
+(the implementation agent's and the session owner's), both giving the same exact 16/16 ids
+`[1421, 16561, 25, 328, 3710, 369, 279, 6511, 314, 9338, 7285, 8722, 57879, 3296, 13, 21134]` at TTFT 959.1 ms
+and 980.6 ms. All three emitted PTX files read `.target sm_121a`. **So the change is additive as expected:
+every pre-existing kernel compiles and produces bit-identical results.**
 
 ## MEASURED FA target numbers (replaces the derived ones)
 
@@ -257,9 +260,35 @@ TTFT is 228.2 s, and if its attention really ran at 40.7 TFLOPS then 211 TFLOP w
 223 s of non-attention — more than our measured 144.9 s, which is not credible.
 
 **The acceptance targets are unchanged: 2.13x at 32K, 3.63x at 128K/256K** (attention must come in under
-`llama_total - non_attention`). The headroom is far larger than those targets require, so **the risk is no
-longer "can we find the speedup" but "can we land a correct kernel at all".** Two implementation attempts
-so far have produced designs but no landed kernel.
+`llama_total - non_attention`). The headroom is far larger than those targets require.
+
+### UPDATE: the kernel HAS landed. The paragraph that used to sit here said it had not.
+
+The FA2 kernel is committed as **`59df192`** and **both acceptance gates pass**: `GB10_FA2=1 generate` is an
+exact 16/16 match, and `GB10_FA2=1 perplexity --ctx 512 --chunks 60` gives **PPL 6.5213** against a target of
+6.5212 -- reproduced independently by the session owner, not merely self-reported. Runtime occupancy is regs
+168 / dynamic_smem 32768 B / 96 threads -> **3 CTAs/SM**, 0 `.local` spills. The old kernel is untouched and
+`GB10_FA2` selects between them, falling back whenever `head_dim != 256` or the GQA ratio is not exactly 6,
+so the flag cannot produce a wrong answer for an unsupported shape.
+
+`attn-tile` is dirty **by design** (2.6e-8 rel at 1 key rising to ~1.7e-3 rms rel at 2111 keys): that is the
+deliberate fp16 P*V accumulator, it is a differential test, and **it must not be treated as a veto**.
+
+So the remaining work is no longer "can we land a correct kernel". It is:
+
+1. **Measure it.** The same-session 32K/128K/256K A/B against llama.cpp, then the four-context proof with
+   `bench/longctx/ab_all.py` -- written for exactly this, and it auto-calibrates each context to an exact
+   token count and records the `prompt_tokens` each engine actually saw, so the comparison can *show* both
+   were handed the same prompt.
+2. **Then optimise.** The kernel has **no pipelining at all**: plain `uint4` staging with two
+   `__syncthreads()` per key tile, strictly serial, so the tensor cores idle through every staging phase.
+   Note that K+V double-buffering needs 64 KB and would drop 3 CTAs/SM to 1 -- which the old kernel's own
+   measurement says costs more than it gains (+114.9% for 3->1) -- so the cheap step is `cp.async` into the
+   *same* buffer with the sync narrowed to cover only the copy.
+3. **The MLP path is still unbuilt.** The FP4 subagent exhausted its context reading llama.cpp's
+   `mma.cuh`/`mmq.cuh`/`quantize.cu` and wrote **no code at all** (no `kernels/nvfp4_gemm.cu`, no
+   `GB10_FP4_MMA`). The FP4 finding stands and is recorded; nothing was built from it, so MLP remains on the
+   bf16 dequant route.
 
 ### Also available: a llama.cpp MUL_MAT benchmark
 
