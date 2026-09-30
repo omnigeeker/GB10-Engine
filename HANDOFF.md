@@ -296,3 +296,25 @@ The same binary, `/tmp/fa_res/llamacpp/build/bin/test-backend-ops`, benchmarks `
 `perf -o MUL_MAT -p nvfp4` — so a real reference number for llama.cpp's NVFP4 GEMM is obtainable. Treat it
 as optional: it measures llama.cpp's kernel in llama.cpp's harness with llama.cpp's shapes, and the
 acceptance criterion for our FP4 work is our own in-session A/B against the bf16 path.
+
+## Live workstreams (so they can be continued via send_message)
+
+Two subagents were running when this note was written. Both have their own context budgets, so they can
+outlive this session's context:
+
+| agent id | workstream | state |
+|---|---|---|
+| `05afaa15-786f-424c-bc49-b80c9930db72` | **FA2 prefill attention kernel** | landed as `59df192`; both gates pass; found and is fixing a latent OOB store; running the same-session 8K/32K A/B |
+| `9e2beea5-c086-4e93-a0b4-6c3eb67c50d2` | **MLP GEMM efficiency** | briefed to improve the bf16 path from 43-45% of the 115 TFLOP/s ceiling; FP4 is a stretch goal only |
+
+**Critical concurrency rule for whoever continues this:** the objective's acceptance criterion is
+*same-session* comparison data, so **only one agent may use the GPU at a time**. Both agents were told to run
+`pgrep -x gb10-verify` and `pgrep -x gb10-server` before **every** GPU command and to do code work instead if
+either is non-zero. A collision already happened once (an MLP `generate` overlapped an attention
+`prefill-shape` A/B) and the affected pair has to be re-measured. **A number produced under contention is
+worse than no number: it looks like evidence and is not.**
+
+**Dead workstreams, for the record** — three subagents exhausted their context without landing code:
+`4d0bb3f5` and `a769397d` (earlier FA2 attempts) and `45535ecf` (FP4 MLP). The FP4 agent in particular spent
+its whole budget reading llama.cpp's `mma.cuh`/`mmq.cuh`/`quantize.cu` and wrote nothing; that is why the
+MLP brief now says **code first, read later**.
