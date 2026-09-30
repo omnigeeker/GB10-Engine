@@ -14055,3 +14055,33 @@ the zero-fill as correct behaviour without checking whether the store that follo
 comment described the *intent* accurately, and I audited the intent rather than the address arithmetic. That
 is the same failure mode named repeatedly in this session -- accepting a stated cause in place of the
 measured one -- and it happened in the audit that was specifically written to avoid it.
+
+## How much the MLP path lowers the attention bar (derived from measured components)
+
+The objective is a *total-TTFT* comparison, so attention and MLP are substitutes: every second the MLP saves
+is a second attention does not have to. This is worth quantifying, because it decides whether the MLP
+workstream is optional. It is not.
+
+Components are measured (32K and 128K from the session's event instrumentation); the 256K attention and MLP
+terms are extrapolated from them (`attn ~ N^2`, `mlp ~ N`) and are labelled as derived. The requirement is
+`attn / (llama_total - non_attention)`, i.e. how much faster the attention kernel must be for gb10 to win.
+
+| context | attention required, no MLP fix | non-attn | **attention required, 2x MLP** | non-attn |
+|---|---|---|---|---|
+| 32K | 2.13x | 34.6 s | **0.95x -- ALREADY A WIN** | 23.9 s |
+| 128K | 3.80x | 148.6 s | **2.43x** | 103.7 s |
+| 256K | 3.62x | 245.7 s | **2.86x** | 156.0 s |
+
+**Two conclusions.**
+
+1. **At 32K, a 2x MLP improvement alone wins the context outright** -- `0.95x` means no attention speedup is
+   required at all. 32K is the context with the largest component overlap, and it is the cheapest win.
+2. **At 128K the MLP path cuts the attention requirement from 3.80x to 2.43x**, and at 256K from 3.62x to
+   2.86x. Those are very different engineering problems. **So the MLP workstream is not a nice-to-have; it is
+   what makes 128K/256K reachable**, and it is currently dead -- the FP4 subagent exhausted its context
+   without writing code, so the MLP is still on the bf16 dequant route.
+
+**Caveat on these numbers:** they are derived from the *old* attention kernel's measured share, so they
+describe the requirement as it stood before the FA2 kernel landed. Once the FA2 A/B lands, the attention term
+drops and these bars move -- in the favourable direction. They should be recomputed from the post-FA2
+components rather than reused.
