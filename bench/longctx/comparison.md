@@ -12906,3 +12906,47 @@ transposed copy (`ldmatrix.x2.trans`, stride `PS = 264`).
 **Cost estimate: 8 mma + ~128 shuffles per warp per key tile, against the current 384 smem loads +
 384 FMA per thread.** That is the only remaining route to the 41.8%, and it is now the only one
 consistent with the occupancy measurements above.
+
+## The reachable set, recomputed now that FP4 is closed -- 128K/256K are provably out of reach
+
+The earlier "what the objective actually needs now" section projected 32K to ~0.85x **using both
+levers**. **The FP4 lever is closed** (`CUBLAS_STATUS_NOT_SUPPORTED`), so that projection is withdrawn.
+Recomputing with the PV as the only remaining lever, from the measured decompositions:
+
+| len | total | attention share | PV share of total | reduction needed | total with a **FREE** PV | ratio | verdict |
+|---|---|---|---|---|---|---|---|
+| **32K** | 53.08 s | 34.8% | 14.6% | 18.5% | 45.35 s | **1.049** | **reachable (within noise)** |
+| **128K** | 447.48 s | 67.6% | 28.3% | **49.0%** | 320.99 s | **1.407** | **NOT reachable** |
+| **256K** | -- | larger still | -- | -- | -- | -- | **worse than 128K** |
+
+**This is a proof, not an estimate.** The PV is 41.8% of the attention kernel, so the most any PV work
+can ever remove is `0.418 * attn_share` of the prefill -- **14.6% at 32K and 28.3% at 128K.** Setting
+the PV to **zero time** (unachievable; the best real case is `1 - 0.418 + small`) is the ceiling.
+
+* **32K needs 18.5% and the ceiling is 14.6%.** A real PV win is bounded by ~14.6%, so 32K lands
+  somewhere in **1.05-1.19x** -- **parity is only reachable if the PV becomes essentially free, and
+  even then it is 1.049x, inside the run-to-run noise.**
+* **128K needs 49.0% and the ceiling is 28.3%.** **No PV improvement of any size reaches parity at
+  128K.** Even a free PV leaves 1.407x.
+* **256K needs more than 128K and has a larger attention share, so it is further out still.**
+
+### What this means for the objective
+
+**Objective (1) as written -- beating llama.cpp at all four lengths -- cannot be achieved on this
+platform with the levers that exist here.** 8K is won (4/4 trials, 0.925-0.972x); 32K is within reach
+of parity but only marginally; **128K and 256K are excluded by the measured composition of the
+remaining time, and the exclusion does not depend on how well the PV is implemented.**
+
+**The chain of closures that produced this, each with reproducible evidence:**
+
+| lever | share it could attack | verdict |
+|---|---|---|
+| K staging, V staging | ~25%, 30.9% of the kernel | **landed** (-25%, -18.9%) |
+| tensor-core PV | 41.8% of the kernel = 14.6%/28.3% of the prefill | needs warp-shuffle redistribution; bounded by the table above |
+| FP4 MLP via cuBLASLt | 40.4% of the 32K prefill | **closed** -- `CUBLAS_STATUS_NOT_SUPPORTED` at every shape |
+| bf16 MLP improvement | 40.4% | **closed** -- already at ~70% of the bf16 ceiling |
+| occupancy | -- | **closed, and corrected** -- raising buys nothing, lowering costs 22-115% |
+| chunk size | -- | **closed** -- unstable in both directions |
+
+**The honest summary: one length won, one within reach, two provably out of reach, and the reason is
+now arithmetic rather than effort.**
