@@ -12694,3 +12694,29 @@ the measured one -- **8K won 4/4 trials, and the other three lengths remain behi
 recorded above.**
 
 The probe is committed so the negative is reproducible rather than asserted.
+
+### Follow-up: the other scale modes, and the one open thread
+
+`cublasLt.h` exposes six scale modes; only one matches this engine's weights, but all were tried:
+
+| mode | name | result |
+|---|---|---|
+| 1 | `VEC16_UE4M3` (16-element blocks, UE4M3) -- **matches NVFP4, i.e. the actual weights** | **status 15 `NOT_SUPPORTED`, 0 results** |
+| 2 | `VEC32_UE8M0` (32-element blocks, UE8M0 -- MXFP4) | status 7 `INVALID_VALUE` |
+| 0 | `SCALAR_32F` (per-tensor) | status 7 `INVALID_VALUE` |
+| 3 | `OUTER_VEC_32F` | status 7 `INVALID_VALUE` |
+
+**Mode 2 was retried with the correct scale-tensor type `CUDA_R_8F_UE8M0` (= 30, found in
+`library_types.h`) and 32-element blocks, and still returns `INVALID_VALUE`** -- so its configuration
+is still not right, and the layout could not be resolved here.
+
+**The decisive row is mode 1.** It is the mode that exactly describes the engine's NVFP4 weights --
+16-element blocks with UE4M3 scales -- it is configured correctly (proved by the status-7 vs status-15
+split: the API demands these attributes and accepts them), and it is refused at every shape.
+
+**Open thread, stated so it is not lost:** `VEC32_UE8M0` returning `INVALID_VALUE` rather than
+`NOT_SUPPORTED` is a *different* signal, and it leaves open the possibility that this library does
+have an FP4 GEMM on sm_121 under MXFP4 (32-element blocks) rather than NVFP4. **Testing that would
+require repacking the weights' 16-element UE4M3 scales into 32-element UE8M0 scales** -- a load-time
+conversion, and only worth doing if the mode-2 configuration can first be made to return a heuristic.
+**It is recorded as an unresolved possibility, not as a closed door.**
