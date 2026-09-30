@@ -313,73 +313,80 @@ The same binary, `/tmp/fa_res/llamacpp/build/bin/test-backend-ops`, benchmarks `
 as optional: it measures llama.cpp's kernel in llama.cpp's harness with llama.cpp's shapes, and the
 acceptance criterion for our FP4 work is our own in-session A/B against the bf16 path.
 
-## Current scorecard (after the `cp.async` pipeline landed)
+## Current scorecard -- 8K and 32K WON, 128K/256K nearly closed
 
-The FA2 prefill attention kernel is **landed** (`59df192`, OOB fix `c084854`) and the **`cp.async` pipeline is
-now landed on top of it** -- the same-buffer form, no footprint and no occupancy change. Same-session,
-two-pass, OLD-before-NEW A/B from two frozen binaries differing **only** in `kernels/elementwise.cu`:
+Two kernels landed this session, both with same-session reproducible A/B evidence:
 
-| context | OLD | FA2 (no pipeline) | FA2 + pipeline | attention speedup | total prefill |
-|---|---|---|---|---|---|
-| 8K | 1,308 / 1,311 ms | 644 / 659 ms | **419 / 418 ms** | **3.12x / 3.14x** | 1.081x / 1.070x |
-| 32K | 22,038 / 22,240 ms | 11,099 / 11,138 ms | **6,952 / 6,976 ms** | **3.17x / 3.19x** | **1.312x / 1.317x** |
+* **FA2 prefill attention** (`59df192`, OOB fix `c084854`) -- **2.00x** on the attention component.
+* **`cp.async` pipeline** (`9527eec`) -- attention **2.00x -> 3.17x**, verified by a bit-for-bit `attn-tile`
+  equality and a clean `compute-sanitizer` run (`racecheck` 0 hazards, `memcheck` 0 memory errors).
 
-The committed FA2 kernel reproduces at 1.99-2.00x, and the pipeline's own delta over it is **1.60x**
-(reproducing to 0.3% across passes). Gates: `generate` **exact 16/16**, `perplexity` **6.5213**, `attn-tile`
-byte-identical between the pipelined and non-pipelined kernels, and **`compute-sanitizer` clean** -- racecheck
-**0 hazards**, memcheck 0 memory errors. Full numbers, the design rationale and the instrument caveat are in
-`bench/longctx/comparison.md` (grep for "cp.async pipeline").
+| 32K attention | pass 1 | pass 2 | speedup |
+|---|---|---|---|
+| OLD kernel | 22,038 ms | 22,240 ms | -- |
+| FA2 | 11,099 ms | 11,138 ms | 1.99x / 2.00x |
+| **FA2 + pipeline** | **6,952 ms** | **6,976 ms** | **3.17x / 3.19x** |
 
-| context | status | what it needs |
+| context | status | evidence |
 |---|---|---|
-| 8K | **WON** | nothing -- was already 0.925-0.972x; FA2 + pipeline widened it to 1.07-1.08x |
-| 32K | **WON on attention alone** | total **1.312-1.317x** against a required 1.19x, with no MLP help |
-| 128K | **open, close** | ~**1.15x** more on attention: at 3.17x, attention 302.6 -> 95.5 s, total 240.4 s vs llama.cpp's 228.2 s = **1.05x behind, down from 1.30x** |
-| 256K | **open, close** | ~**1.14x** more on attention; **1.08x behind**, down from 1.47x |
+| **8K** | **WON** | attention 3.12x/3.14x; total 1.07-1.08x on top of an already-winning 0.925-0.972x |
+| **32K** | **WON** | total prefill 1.312x/1.317x against a required 1.19x, **on attention alone** |
+| 128K | **nearly closed** | 1.05x behind (was 1.30x) |
+| 256K | **nearly closed** | 1.08x behind (was 1.47x) |
 
-### THE MLP IS NOT A LEVER -- this was measured and it corrects an earlier claim here
+Residual at the long contexts is ~**1.15x on attention**. Note 3.17x already *exceeds* the 2.43x that 128K
+would need if a 2x MLP ever landed.
 
-**An earlier version of this section said "a 2x MLP drops the 32K requirement to 0.95x and wins it". That was
-wrong and is withdrawn.** cuBLAS was measured at the shapes the model actually runs and retires
-**55.7-67.9 TFLOP/s** there (the "76.7, essentially peak" figure was at **t=2048**, and the "43-45% of peak"
-figure was priced against the 115 TFLOP/s `mma.sync` microbenchmark). Against what cuBLAS actually retires, the
-MLP GEMM is at 48-58% -- and **2x would mean 104 TFLOP/s, above the microbenchmark ceiling at 90% issue
-efficiency sustained across a real GEMM.** The algorithm sweep is flat (1.03-1.06x), in-model is within 8-16%
-of standalone, the `down` activation cast is already at the achievable memory rate, and the dequant fix is
-worth 1.3%. **Total recoverable on bf16: under 3%. The bf16 MLP is at its floor.**
+### The MLP is NOT a lever, and neither is FP4
 
-**So attention is the only lever for the long contexts, and the only route to a 2x anywhere is the FP4
-tensor-core path** (block-scaled `mma.sync`, raw e2m1 operands, ue4m3 scales -- `sm_121a` is already the build
-target). That is a measured conclusion, not a guess.
+**bf16 MLP: no 2x available (measured).** cuBLAS retires only **55.7-67.9 TFLOP/s** at the shapes the model
+actually runs (gate/up 67.9 @8192 and 67.2 @32768; down 65.6 @8192 and 55.7 @32768). The "76.7, essentially
+peak" figure was measured at **t=2048**, and "43-45% of peak" was priced against the 115 TFLOP/s `mma.sync`
+microbenchmark. 2x would mean 104 TFLOP/s -- above that microbenchmark ceiling at 90% issue efficiency
+sustained across a real GEMM. The algorithm sweep is flat (1.03-1.06x), in-model is within 8-16% of standalone,
+and the dequant fix landed at **1.3%** (`752fa8d`). **Total recoverable on bf16: under 3%.**
 
-### The arithmetic for 128K -- now measured rather than assumed
+**FP4: measured, and it does not support the pivot.** llama.cpp's own NVFP4 `MUL_MAT` (`/tmp/nvfp4_ref.log`,
+clean uncontended run) reaches only **39.59 TFLOPS** at the largest shape its benchmark tests
+(`m=4096, n=512, k=14336`) -- **below** bf16's 55.7-67.9. The sweep is the explanation: from `n=1` to `n=512`
+the rate rises ~64x while `us/run` stays flat (184-198 us), the signature of a **memory-bound** kernel.
+**NVFP4's advantage is memory traffic (4.5 bpw vs 16 bpw), not tensor-core throughput** -- which is why
+llama.cpp uses it, and why it pays off in *decode*, not in compute-bound *prefill*.
 
-The prediction that used to sit here was "if the pipeline gives ~1.3x on top of the existing 2.0x, the total
-lands near 220 s -- a win". **The pipeline actually delivered 1.60x on top of 2.0x (3.17x total), which is
-better than the prediction, and the extrapolation still does not quite win 128K:** attention 302.6 -> 95.5 s,
-so the total is 144.9 + 95.5 = **240.4 s against llama.cpp's 228.2 s = 1.05x behind** (down from 1.30x).
-256K is **1.08x behind**. The residual is about **1.15x on attention** at both contexts.
+**Caveat that keeps this from being decisive:** the benchmark stops at `n=512` while prefill runs at
+`n=8192`/`32768`, and the rate is still climbing at the last measured point, so the FP4 route is **unopened
+rather than closed**. But **do not start a large FP4 kernel effort without a measurement at `n>=8192`** -- and
+`test-backend-ops` appears unable to reach it.
 
-**Note that 3.17x already *exceeds* the 2.43x that 128K would need if a 2x MLP ever landed**, so the
-FP4/MLP question is now the deciding one for 128K/256K -- as is any further attention gain.
+### The TTFT proof
 
-*(Caveat: these are extrapolations applying the `prefill-shape` attention ratio to the TTFT component
-accounting. Only the ratio transfers; `prefill-shape` totals are not TTFT.)*
+**It is RUNNING as of this note**, detached: `nohup python3 bench/longctx/ab_all.py --contexts
+8192,32768,131072,262144 --out bench/longctx/TTFT_PROOF.md > /tmp/ab_all_proof.log`. It is multi-hour and needs
+the GPU exclusively -- **do not start anything else on the GPU while it runs.**
 
-### Two traps that have already cost time here
+**Every number above except the final proof is `prefill-shape`, not cold TTFT** -- and the two instruments
+disagree in absolute terms (67.91 s vs 53.08 s for the same 32K context). Ratios transfer; absolute seconds do
+not. `ab_all.py` is the only instrument that measures gb10 and llama.cpp the same way.
 
-1. **Do not double-buffer K+V** in the pipeline: 64 KB, which takes 3 CTAs/SM down to 1, and the old kernel's
-   own measurement says 3->1 costs **+114.9%**. Use `cp.async` into the same buffer with
-   `cp.async.wait_group` and a narrowed `__syncthreads()`.
-2. **The FA2 kernel is 96 threads, not 256.** Its budget is `regs <= 65536/(96*3) = 227` and
-   `smem <= 34,133 B`; it sits at regs 168 / smem 32,768, so **SMEM binds at exactly 3 CTAs/SM with 59
-   registers of headroom**. A "regs <= 85" note derived from the old 256-thread kernel does **not** apply.
-   Use `GB10_ATTN_OCCUPANCY=1`, never a hand calculation from an unchecked block size.
+### Traps that have already cost time here
 
-**The final four-context proof has NOT been run.** It is `python3 bench/longctx/ab_all.py --contexts
-8192,32768,131072,262144 --out <md>` -- multi-hour, needs the GPU exclusively, and is the only instrument that
-measures gb10 and llama.cpp the same way. `prefill-shape` totals are NOT TTFT and must not be substituted into
-a TTFT ratio.
+1. **Do not double-buffer K+V**: 64 KB takes 3 CTAs/SM to 1, measured at **+114.9%**. The same-buffer
+   `cp.async` form costs **zero** registers and no occupancy.
+2. **The FA2 kernel is 96 threads, not 256.** Budget: `regs <= 65536/(96*3) = 227`, `smem <= 34,133 B`. It sits
+   at regs 168 / smem 32,768, so **SMEM binds at exactly 3 CTAs/SM**. A "regs <= 85" note from the old
+   256-thread kernel does **not** apply. Use `GB10_ATTN_OCCUPANCY=1`, never a hand calculation from an
+   unchecked block size.
+3. **`pgrep -f <pattern>` self-matches** when the searching command line contains the pattern -- it produced
+   two phantom process readings this session. Use `pgrep -x` (names <=15 chars only; longer names can never
+   match) or `ps -eo ... | grep -v grep`.
+4. **"pgrep is empty" is necessary but not sufficient** to claim the GPU. A sequence of invocations has gaps
+   that look identical to "finished". This cost one contaminated A/B pair.
+
+### Verification standard established here
+
+The correctness gates (`generate`, `perplexity`) **do not certify memory safety** -- an out-of-bounds store
+passed both. The checks that actually caught things were a **differential layout probe** (`ldmatrix_probe.cu`),
+a **bit-for-bit `attn-tile` comparison**, and **`compute-sanitizer`**. Prefer those.
 
 ## Live workstreams (so they can be continued via send_message)
 
