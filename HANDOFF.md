@@ -301,23 +301,46 @@ acceptance criterion for our FP4 work is our own in-session A/B against the bf16
 
 The FA2 prefill attention kernel is **landed** (`59df192`, OOB fix `c084854`) and its speedup is
 **reproduced twice in one session**: **2.00x on the attention component at 32K** (22,184 -> 11,110 ms and
-22,035 -> 11,025 ms) and 2.07/2.01x at 8K. 32K total prefill improves 1.18-1.24x. Full numbers and the
-instrument caveat are in `bench/longctx/comparison.md` (grep it).
+22,035 -> 11,025 ms) and 2.07/2.01x at 8K. Full numbers and the instrument caveat are in
+`bench/longctx/comparison.md` (grep it).
 
 | context | status | what it needs |
 |---|---|---|
 | 8K | **WON** | nothing -- was already 0.925-0.972x, FA2 widened it |
-| 32K | **borderline on attention alone** | required 1.19x total, got 1.18-1.24x; believe the minimum, so still ~1.01-1.04x behind. **A 2x MLP drops the requirement to 0.95x and wins it** |
-| 128K | **open** | needs 3.80x on attention (2.43x with a 2x MLP); at 2.0x it is still 1.31x behind |
-| 256K | **open** | needs 3.62x (2.86x with a 2x MLP) |
+| 32K | **borderline, and it stays borderline** | attention alone gives 1.18-1.24x against a required 1.19x. Believe the minimum -> ~1.01-1.04x behind |
+| 128K | **open** | needs 3.80x on attention |
+| 256K | **open** | needs 3.62x on attention |
 
-**The two remaining levers are (a) the `cp.async` pipeline in the FA2 kernel** -- the one structural item from
-the original brief that has not landed, and attention is 67% of 128K -- **and (b) the MLP path**, where the
-three GEMMs are 22.8 s of the 25.6 s MLP, so the dequantise is worth only a few percent.
+### THE MLP IS NOT A LEVER -- this was measured and it corrects an earlier claim here
 
-**Do not double-buffer K+V in the pipeline:** it needs 64 KB and takes 3 CTAs/SM down to 1, and the old
-kernel's own measurement says 3->1 costs +114.9%. Use `cp.async` into the same buffer with
-`cp.async.wait_group` and a narrowed `__syncthreads()`.
+**An earlier version of this section said "a 2x MLP drops the 32K requirement to 0.95x and wins it". That was
+wrong and is withdrawn.** cuBLAS was measured at the shapes the model actually runs and retires
+**55.7-67.9 TFLOP/s** there (the "76.7, essentially peak" figure was at **t=2048**, and the "43-45% of peak"
+figure was priced against the 115 TFLOP/s `mma.sync` microbenchmark). Against what cuBLAS actually retires, the
+MLP GEMM is at 48-58% -- and **2x would mean 104 TFLOP/s, above the microbenchmark ceiling at 90% issue
+efficiency sustained across a real GEMM.** The algorithm sweep is flat (1.03-1.06x), in-model is within 8-16%
+of standalone, the `down` activation cast is already at the achievable memory rate, and the dequant fix is
+worth 1.3%. **Total recoverable on bf16: under 3%. The bf16 MLP is at its floor.**
+
+**So attention is the only lever for the long contexts, and the only route to a 2x anywhere is the FP4
+tensor-core path** (block-scaled `mma.sync`, raw e2m1 operands, ue4m3 scales -- `sm_121a` is already the build
+target). That is a measured conclusion, not a guess.
+
+### The arithmetic that makes 128K reachable
+
+128K total is 451.2 s, of which attention is 302.6 s (67%) and non-attention 148.6 s. If the `cp.async`
+pipeline gives ~1.3x **on top of** the existing 2.0x, attention goes 302.6 -> ~116 s and the total lands near
+**220 s against llama.cpp's 228.2 s -- a win.** That is the immediate target. 256K needs more still.
+
+### Two traps that have already cost time here
+
+1. **Do not double-buffer K+V** in the pipeline: 64 KB, which takes 3 CTAs/SM down to 1, and the old kernel's
+   own measurement says 3->1 costs **+114.9%**. Use `cp.async` into the same buffer with
+   `cp.async.wait_group` and a narrowed `__syncthreads()`.
+2. **The FA2 kernel is 96 threads, not 256.** Its budget is `regs <= 65536/(96*3) = 227` and
+   `smem <= 34,133 B`; it sits at regs 168 / smem 32,768, so **SMEM binds at exactly 3 CTAs/SM with 59
+   registers of headroom**. A "regs <= 85" note derived from the old 256-thread kernel does **not** apply.
+   Use `GB10_ATTN_OCCUPANCY=1`, never a hand calculation from an unchecked block size.
 
 **The final four-context proof has NOT been run.** It is `python3 bench/longctx/ab_all.py --contexts
 8192,32768,131072,262144 --out <md>` -- multi-hour, needs the GPU exclusively, and is the only instrument that
@@ -331,8 +354,8 @@ outlive this session's context:
 
 | agent id | workstream | state |
 |---|---|---|
-| `05afaa15-786f-424c-bc49-b80c9930db72` | **FA2 prefill attention kernel** | landed as `59df192`; both gates pass; found and is fixing a latent OOB store; running the same-session 8K/32K A/B |
-| `9e2beea5-c086-4e93-a0b4-6c3eb67c50d2` | **MLP GEMM efficiency** | briefed to improve the bf16 path from 43-45% of the 115 TFLOP/s ceiling; FP4 is a stretch goal only |
+| `91925904-874c-4f9a-a13f-966f45f67383` | **FA2 `cp.async` pipeline** | took over from `05afaa15` (which ran out of context after implementing the pipeline but before measuring it); the WIP is preserved as `bench/longctx/fa2_pipeline_wip.patch` |
+| `9e2beea5-c086-4e93-a0b4-6c3eb67c50d2` | **MLP GEMM efficiency** | MEASURED: no 2x available on bf16 (see above). Committing the 1.3% dequant fix. **The FP4 route is now the strategic answer, not a stretch goal** |
 
 **Critical concurrency rule for whoever continues this:** the objective's acceptance criterion is
 *same-session* comparison data, so **only one agent may use the GPU at a time**. Both agents were told to run
