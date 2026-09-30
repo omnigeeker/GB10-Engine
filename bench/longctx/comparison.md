@@ -13523,3 +13523,33 @@ tcgen05. The actionable target is therefore **llama.cpp's mma.sync design**, not
 number. That also means beating llama.cpp is a fair goal: we would be porting the same instruction set,
 and we have one structural advantage available that it does not use -- **`ncols2 = 6` exactly**, since
 we own the kernel, versus its power-of-two `ncols2 = 8` that wastes 25% of QK^T work.
+
+## The actual target: a 2.1x-3.6x attention speedup, not 5.98x/8.40x/8.82x
+
+With the non-attention part held constant (the conservative assumption), the attention kernel must come in
+under `llama_total - non_attention` for each length. 256K's attention is extrapolated from 128K by n^2.
+
+| len | total | attention | non-attention | llama.cpp | attention must be < | **speedup needed** | verdict |
+|---|---|---|---|---|---|---|---|
+| **8K** | 8.7 s | 1.3 s | 7.4 s | 9.0 s | 1.6 s | **0.82x** | **ALREADY WINS** |
+| **32K** | 53.1 s | 18.5 s | 34.6 s | 43.2 s | 8.7 s | **2.13x** | need 2.13x |
+| **128K** | 447.5 s | 302.6 s | 144.9 s | 228.2 s | 83.3 s | **3.63x** | need 3.63x |
+| **256K** | 1456.2 s | 1210.4 s | 245.7 s | 579.9 s | 334.1 s | **3.62x** | need 3.62x |
+
+**This is a completely different picture from the original objective's premise.** That premise asked for
+"prefill attention acceleration of 1.29x/5.98x/8.40x/8.82x" and concluded the only path was an mma rewrite
+"designed for 9x". **The measured requirement is 2.13x at 32K and 3.63x at 128K/256K.**
+
+**And a proper FA2 kernel should exceed that comfortably, because both of the kernel's two cost centres
+move at once:**
+
+* **PV (41.8%)** -- moves from 384 smem loads + 384 FFMA per thread per key tile to register-resident fp16
+  fragments feeding `mma.m16n8k16`. `mma` retires 4096 FLOP/instruction against FFMA's 2.
+* **K/V staging (55.9%)** -- GQA batching makes one staged K/V tile serve 6 query heads instead of 1, and
+  a larger `BQ`/`ncols` raises the reuse ratio from 24 to ~64 FLOP per byte of K/V.
+
+**Caveat that must be carried with these numbers:** the 8K row shows the non-attention part already costs
+7.4 s against llama.cpp's 9.0 s total, so **8K is won with almost no margin**. If the new kernel adds
+per-launch overhead at short sequences (a stream-k combine pass, or a fixed setup cost), 8K is the row
+most at risk. **Check 8K explicitly after any kernel change** -- it is the cheapest length to regress and
+the only one currently won.
