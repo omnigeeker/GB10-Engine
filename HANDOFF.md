@@ -646,3 +646,35 @@ Recorded in `bench/longctx/FA2_BC16_GATES.md`, raw output in `bench/longctx/gate
 design, 12 MISMATCH / 13 shapes. **`compute-sanitizer` was re-run this session and is CLEAN** --
 `memcheck` **0 errors**, `racecheck` **0 hazards** (the earlier in-progress run left no result in
 `/tmp/gates_bc16/`). Use `--report-api-errors no`.
+
+### TRAP THAT COST A WHOLE TTFT PROOF: a stale `gb10-server` silently loses 27%
+
+**`GB10_FA2_BC` in `ops.rs` (the host's dynamic shared-memory request) and `FA2_BC` in
+`kernels/elementwise.cu` (the compiled tile width) are two halves of ONE knob.** A `gb10-server`
+built *before* that default changed 32 -> 16 requests **32 KB for a 16 KB tile**, which silently
+drops occupancy from **4 CTAs/SM to 3** and loses the entire BC=16 win — **with every correctness
+gate still passing.** It cannot fail loudly.
+
+**This happened.** `d599e28` rebuilt only `gb10-verify`, so the TTFT proof's `gb10-fa2on` arm ran
+BC=16 at 3 CTAs/SM and read **252.78 s at 128K** against the ~199 s the kernel actually delivers —
+*worse than plain BC=32* (231.71 s), because it paid the extra per-key instruction cost and the
+doubled P*V rescale without the fourth CTA. That run was killed and its `fa2on` numbers are void.
+
+**Two rules, and both are now enforced in `bench/longctx/ab_all.py`:**
+
+1. **Rebuild the WHOLE workspace** (`cargo build --release`), not just the binary you are testing.
+   `gb10-server` must be rebuilt in the same change as any kernel or host-launch knob.
+2. **Assert the real occupancy, not the mtime.** `GB10_ATTN_OCCUPANCY=1` must print
+   `binding REGS`, `by_regs 4`, `dynamic_smem 16384`. If it says `binding SMEM` / `by_smem 3`, the
+   binary is stale. mtimes can lie — a build that skips the kernel still refreshes the binary.
+
+`ab_all.py` now runs `binary_freshness()` (aborts if a binary is older than the newest kernel
+source, and records both mtimes plus the PTX sha **in the report**) and `occupancy_preflight()`
+(runs FA2 once at 8K and asserts the occupancy above, aborting only on an **explicit** bad reading —
+a missing marker warns, because a false failure in an abort-by-default harness is its own trap
+here). Verified good reading:
+
+```
+[occ] attn_prefill_fa2: regs 168  static_smem 0 B  dynamic_smem 16384 B  maxThreads 96
+      -> by_regs 4  by_smem 6  by_threads 16  binding REGS
+```
