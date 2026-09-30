@@ -704,10 +704,25 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
 // Key n-tiles of 8 keys each: 4 at BC=32, 2 at BC=16. Everything sized by the
 // tile width is expressed through this so the two configurations are one source.
 #define FA2_NT         (FA2_BC / 8)
+// Query rows per block: 8 (shipped, 3 warps) or 16 (6 warps). BQ=16 halves the
+// K/V request traffic -- the fetch is per query tile -- at the SAME warps/SM:
+// 2 CTAs x 192 threads = 4 CTAs x 96 threads = 12 warps/SM, because per-thread
+// Q/VKQ_C state is unchanged (each warp still owns 16 qcols = 8 rows x 2 heads).
+// See bench/longctx/FA2_BC16_256K_BOUND.md. The BQ=8 path below is written so it
+// compiles to the shipped kernel verbatim (verify by PTX hash).
+#ifndef FA2_NROWS
 #define FA2_NROWS      8       // ncols1: query rows per block
+#endif
 #define FA2_GQA        6       // ncols2: query heads per KV head
-#define FA2_NCOLS      48      // qcols = 8 * 6
-#define FA2_THREADS    96      // 3 warps
+#define FA2_RGRP       (FA2_NROWS / 8)        // 8-row groups per block
+#define FA2_WARPS      (FA2_RGRP * 3)         // 3 warps per 8-row group
+#define FA2_NCOLS      (FA2_NROWS * FA2_GQA)  // qcols
+#define FA2_THREADS    (FA2_WARPS * 32)
+// Occupancy hint: BQ=8 keeps the historical 3; BQ=16 must ask for 2, because
+// __launch_bounds__(192,3) would cap registers at 113 and spill.
+#ifndef FA2_MINBLOCKS
+#define FA2_MINBLOCKS  3
+#endif
 #define FA2_STRIDE_H2  128     // K/V smem row stride in half2 (256 halves, no pad)
 #define FA2_KQ_OFFSET  2.0794415f          // 3 * ln2
 #define FA2_FTZ_THRESH (-20.0f)
@@ -761,7 +776,7 @@ __device__ __forceinline__ void fa2_stage_async(
     asm volatile("cp.async.commit_group;\n");
 }
 
-extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_kernel(
+extern "C" __global__ void __launch_bounds__(FA2_THREADS, FA2_MINBLOCKS) attn_prefill_fa2_kernel(
     const float* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     float* __restrict__ out, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     float scale, int start, int kv_base) {
@@ -782,8 +797,19 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     const int gid = lane >> 2;                    // 0..7: query row of this lane
     const int t4 = lane & 3;                      // 0..3: column pair in a fragment
 
+#if FA2_NROWS == 8
     const int h0 = kh * FA2_GQA + 2 * warp;       // the two query heads of this warp
+    const int r0 = 0;                             // one 8-row group per block
     const bool row_ok = (gid < rows);
+#else
+    // Warp -> (8-row group, head pair): warps 0-2 cover rows 0-7 for all 6 heads,
+    // warps 3-5 cover rows 8-15. Each warp still owns 16 qcols = 8 rows x 2 heads.
+    const int hg = warp / 3;                      // 8-row group within the block
+    const int hp = warp % 3;                      // head pair within the KV head
+    const int h0 = kh * FA2_GQA + 2 * hp;         // the two query heads of this warp
+    const int r0 = hg * 8;                        // this warp's first query row
+    const bool row_ok = (r0 + gid < rows);
+#endif
 
     // ---- Q fragments, registers only (64 regs) ---------------------------
     // A = Q is row-major 16x16 per k-step: a0 = rows gid @ kt+t4*2..+1,
@@ -798,7 +824,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
             float2 lo = make_float2(0.0f, 0.0f);
             float2 hi = make_float2(0.0f, 0.0f);
             if (row_ok) {
-                const size_t base = ((size_t)(t0 + gid) * n_q_heads + (h0 + jj)) * FA2_HD
+                const size_t base = ((size_t)(t0 + r0 + gid) * n_q_heads + (h0 + jj)) * FA2_HD
                                     + (size_t)kt * 16 + t4 * 2;
                 lo = *reinterpret_cast<const float2*>(q + base);
                 hi = *reinterpret_cast<const float2*>(q + base + 8);
@@ -823,7 +849,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     // Highest key any row in this block may attend to, and this lane's own
     // causal boundary (identical for both of its heads).
     const int win_max = start + t0 + rows - 1;
-    const int row_key_max = start + t0 + gid;
+    const int row_key_max = start + t0 + r0 + gid;
 
     // ---- software pipeline -------------------------------------------------
     // Two slots, no double buffering: tile_K and tile_V are already separate
@@ -1064,7 +1090,7 @@ extern "C" __global__ void __launch_bounds__(FA2_THREADS, 3) attn_prefill_fa2_ke
     if (row_ok) {
 #pragma unroll
         for (int i = 0; i < 32; ++i) {
-            const size_t o0 = ((size_t)(t0 + gid) * n_q_heads + h0) * FA2_HD
+            const size_t o0 = ((size_t)(t0 + r0 + gid) * n_q_heads + h0) * FA2_HD
                               + (size_t)i * 8 + t4 * 2;
             const size_t o1 = o0 + FA2_HD;   // the second head of this warp
             const float2 f0 =

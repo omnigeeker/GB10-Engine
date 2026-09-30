@@ -2041,7 +2041,17 @@ impl Ops {
         start: usize,
         kv_base: usize,
     ) -> Result<()> {
-        const NROWS: usize = 8;
+        // Query rows per block. MUST match the kernel the PTX was built with
+        // (FA2_NROWS in kernels/elementwise.cu): BQ=8 -> 96 threads / 3 warps,
+        // BQ=16 -> 192 threads / 6 warps. BQ=16 halves the K/V request traffic
+        // at the SAME warps/SM -- see bench/longctx/FA2_BC16_256K_BOUND.md.
+        // The default 8 is the shipped configuration. The two are one knob, so a
+        // mismatch is loud rather than silently wrong (as with GB10_FA2_BC).
+        let nrows: usize = std::env::var("GB10_FA2_BQ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8);
+        assert!(nrows == 8 || nrows == 16, "GB10_FA2_BQ must be 8 or 16, got {nrows}");
         // Key rows per tile, mirroring FA2_BC in kernels/elementwise.cu. The
         // dynamic smem request must match the tile the kernel was built with:
         // too small overflows the tile, too large wastes a resident block. The
@@ -2060,7 +2070,7 @@ impl Ops {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(16);
         const STRIDE_H2: usize = 128;
-        const THREADS: u32 = 96;
+        let threads: u32 = ((nrows / 8) * 3 * 32) as u32;
         debug_assert_eq!(head_dim, 256);
         // K tile + V tile, both BC * STRIDE_H2 half2, swizzled with no padding.
         let mut smem = 2 * bc * STRIDE_H2 * 4;
@@ -2082,9 +2092,9 @@ impl Ops {
             let regs = f.get_attribute(A::CU_FUNC_ATTRIBUTE_NUM_REGS).unwrap_or(-1);
             let ssb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(-1);
             let mtb = f.get_attribute(A::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK).unwrap_or(-1);
-            let by_regs = if regs > 0 { 65536 / (regs * THREADS as i32) } else { -1 };
+            let by_regs = if regs > 0 { 65536 / (regs * threads as i32) } else { -1 };
             let by_smem = if ssb >= 0 { 102400 / (ssb + smem as i32) } else { -1 };
-            let by_thr = 1536 / THREADS as i32;
+            let by_thr = 1536 / threads as i32;
             println!(
                 "[occ] attn_prefill_fa2: regs {regs}  static_smem {ssb} B  \
                  dynamic_smem {smem} B  maxThreads {mtb}  -> by_regs {by_regs}  \
@@ -2097,7 +2107,7 @@ impl Ops {
         let (st, kb) = (start as i32, kv_base as i32);
         // blockIdx.x is the KV head (not the query head): the block covers all
         // `n_q_heads / n_kv_heads` query heads that read that KV head.
-        let tiles = n_tokens.div_ceil(NROWS) as u32;
+        let tiles = n_tokens.div_ceil(nrows) as u32;
         unsafe {
             dev.stream()
                 .launch_builder(&self.attn_prefill_fa2)
@@ -2114,7 +2124,7 @@ impl Ops {
                 .arg(&kb)
                 .launch(LaunchConfig {
                     grid_dim: (n_kv_heads as u32, tiles, 1),
-                    block_dim: (THREADS, 1, 1),
+                    block_dim: (threads, 1, 1),
                     shared_mem_bytes: smem as u32,
                 })?;
         }
