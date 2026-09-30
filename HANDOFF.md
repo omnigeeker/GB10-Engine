@@ -4,6 +4,24 @@
 `main`. The detailed evidence lives in `bench/longctx/comparison.md` (large — grep it, do not read it
 whole) and `fa_brief/`.
 
+> ### LATEST (read this before the rest of the document)
+> **256K was measured on the BC=16 kernel and it does NOT flip. 3 of 4 contexts are won
+> (8K, 32K, 128K).** Same-session bc32-vs-bc16 at 262144: **1.3273x** on attention (438,623 ->
+> 330,455 ms, min of 2); prefill total **610.18 s** against llama.cpp's recorded 600.03 s = **1.7%
+> behind**, down from 18.2%. See the section **"256K MEASURED ON BC=16"** near the end of this file,
+> and `bench/longctx/FA2_BC16_256K_AB.md` / `bench/longctx/FA2_BC16_256K_BOUND.md`.
+>
+> **Two things that are now settled and must not be re-derived wrongly:** (1) **256K is NOT
+> "bandwidth-bound" in the DRAM-byte sense** — the measured 1.327x contradicts the near-1.0 ratio
+> that test required; it is occupancy/latency-hiding limited *and* L2-service dependent, and the
+> second term grows with context. (2) **GQA sharing is already fully exploited in the FA2 kernel**
+> (`kh = blockIdx.x`, 6 heads per block); the "6 blocks re-read the same K/V" diagnosis describes
+> the OLD kernel only.
+>
+> **Next lever, priced and not yet built: BQ 8 -> 16**, which halves K/V request traffic at equal
+> warp occupancy. Only 1.032x more on attention flips 256K. Gate on `GB10_ATTN_OCCUPANCY=1`: the
+> register budget is 170.7 and the kernel sits at 168.
+
 ## The objective
 
 Close the long-context prefill gap against llama.cpp and beat it at 8K/32K/128K/256K.
@@ -564,3 +582,67 @@ compute-sanitizer --tool racecheck --report-api-errors no ... attn-tile
 Without it the gate is a false failure in an abort-by-default harness -- the same class of bug as
 the `<defunct>` zombie false positive in `ab_all.py`, and it would have been "fixed" by weakening
 the gate.
+
+## 256K MEASURED ON BC=16: it does NOT flip -- 3 of 4 contexts won
+
+**This is the measurement `d599e28` left open. Read this before re-deriving anything about 256K.**
+Full evidence: `bench/longctx/FA2_BC16_256K_AB.md` (the raw A/B) and
+`bench/longctx/FA2_BC16_256K_BOUND.md` (the analysis and priced levers).
+
+Same session, same binary, PTX swap, interleaved A,B,A,B, min of 2, at limit 262144 with
+`GB10_PREFILL_NSEQ=1`:
+
+| ctx | bc32 (3 CTAs/SM) | **bc16 (4 CTAs/SM)** | speedup |
+|---|---|---|---|
+| 262144 | 438,623 ms | **330,455 ms** | **1.3273** |
+
+* **bc32 reproduces the recorded 443,018 ms within 1.0%** (438,623), so instrument and baseline agree.
+* **Every bc16 pass beats every bc32 pass** (worst bc16 371,698 is 15.3% under best bc32 438,623).
+* 256K attention rate **30.80 -> 40.89 TFLOP/s**; prefill total **704.85 -> 610.18 s**.
+* Against llama.cpp's recorded 600.03 s that is **1.7% behind, down from 18.2%. 256K is still lost.**
+
+**The handoff's own test came back NEGATIVE for the bandwidth hypothesis.** It said: *"if the ratio
+comes in near 1.0, the honest reading is BC=16 is an occupancy win and 256K is bandwidth-bound."*
+1.327 is not near 1.0, so **256K is still predominantly occupancy/latency-hiding limited**. The
+occupancy gain does shrink with context (1.408 at 128K -> 1.327 at 256K, ~6%) but it is not a wall.
+**Do not write "256K is bandwidth-bound" as a finding -- it is contradicted by the measurement.**
+
+**Byte arithmetic (from the kernel, not assumed).** The block is `kh = blockIdx.x` -- one KV head
+serving all 6 GQA heads -- so **GQA sharing is already fully exploited**; the "6 blocks re-read the
+same K/V" diagnosis describes the OLD kernel and does not apply to FA2. The 256K pass issues
+**274.9 TB** of K/V requests (16 layers x 17.18 TB) against a **17.18 GB** unique footprint: 16,000x
+reuse required. Unique DRAM bytes are **75 ms** at 228 GB/s -- irrelevant. DRAM at 100% duty for the
+whole pass moves 75.3 TB = **27%** of the requests, so the kernel depends on **>=73% L2 service**.
+That is the defensible form of "KV bandwidth": an **L2 hit-rate / latency** dependency, not a
+DRAM-byte wall. Corroborated by the committed negative `2673c74`: cutting staging-loop instructions
+23% made the kernel **slower** because it shortened the prefetch distance -- an issue-bound kernel
+would have got faster.
+
+**Two caveats that must travel with the 1.7% figure.** (1) It is a **cross-session** comparison and
+this session's own noise floor on the total is **5.1%** (measured on non-attention work, which the
+kernel change cannot touch). (2) Pass-to-pass spread at 256K is 4.8% (bc32) / 12.5% (bc16), far
+worse than 32K's ~1.5%. **So 256K is a coin-flip that only the same-session three-engine run can
+decide** -- see `bench/longctx/TTFT_PROOF_FINAL.md`.
+
+### The lever that is priced and NOT built: BQ 8 -> 16
+
+Traffic is per *key fetch per query tile*, so covering 16 query rows per block **halves the K/V
+request traffic** and halves the block count at unchanged total `mma` work. It need not cost warp
+occupancy: 2 CTAs x 192 threads = 4 CTAs x 96 threads = **12 warps/SM either way**, because
+per-thread state is unchanged (each warp still owns 16 qcols = 8 rows x 2 heads, so Q stays 64 regs
+and `VKQ_C` stays 64 regs); smem is unchanged at 2 x BC x 512 B.
+
+**Only 1.032x more on attention flips 256K**, so this lever is priced well above the bar.
+**Gate it on `GB10_ATTN_OCCUPANCY=1` first:** the budget is `65536/(192*2) = 170.7` regs/thread and
+the kernel sits at **168** -- a 2-register margin, exactly the margin the BC=16 landing ran on. If
+6 warps change allocation and it spills, occupancy goes to 1 CTA/SM and the whole gain is lost.
+**Do not build it without that readout**, and measure it with `fa2_stage_ab.py` so the ratio stays
+same-session. `cp.async` double-buffering stays rejected (48 KB -> 2 CTAs/SM, priced at +22.4%).
+
+### Gates and memory safety on the BC=16 kernel
+
+Recorded in `bench/longctx/FA2_BC16_GATES.md`, raw output in `bench/longctx/gates_bc16/`.
+`generate` **exact 16/16**; `ppl512` **1.875132**; `ppl4096` **1.877423**; `attn-tile` rc=1 by
+design, 12 MISMATCH / 13 shapes. **`compute-sanitizer` was re-run this session and is CLEAN** --
+`memcheck` **0 errors**, `racecheck` **0 hazards** (the earlier in-progress run left no result in
+`/tmp/gates_bc16/`). Use `--report-api-errors no`.
