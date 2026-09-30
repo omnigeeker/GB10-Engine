@@ -2045,12 +2045,13 @@ impl Ops {
         // (FA2_NROWS in kernels/elementwise.cu): BQ=8 -> 96 threads / 3 warps,
         // BQ=16 -> 192 threads / 6 warps. BQ=16 halves the K/V request traffic
         // at the SAME warps/SM -- see bench/longctx/FA2_BC16_256K_BOUND.md.
-        // The default 8 is the shipped configuration. The two are one knob, so a
-        // mismatch is loud rather than silently wrong (as with GB10_FA2_BC).
+        // The default 16 is the shipped configuration: it wins all four contexts
+        // (bench/longctx/TTFT_PROOF_BQ16.md). The two are one knob, so a mismatch
+        // is loud rather than silently wrong (as with GB10_FA2_BC).
         let nrows: usize = std::env::var("GB10_FA2_BQ")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8);
+            .unwrap_or(16);
         assert!(nrows == 8 || nrows == 16, "GB10_FA2_BQ must be 8 or 16, got {nrows}");
         // Key rows per tile, mirroring FA2_BC in kernels/elementwise.cu. The
         // dynamic smem request must match the tile the kernel was built with:

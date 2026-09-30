@@ -708,10 +708,15 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
 // K/V request traffic -- the fetch is per query tile -- at the SAME warps/SM:
 // 2 CTAs x 192 threads = 4 CTAs x 96 threads = 12 warps/SM, because per-thread
 // Q/VKQ_C state is unchanged (each warp still owns 16 qcols = 8 rows x 2 heads).
-// See bench/longctx/FA2_BC16_256K_BOUND.md. The BQ=8 path below is written so it
-// compiles to the shipped kernel verbatim (verify by PTX hash).
+// See bench/longctx/FA2_BC16_256K_BOUND.md and bench/longctx/FA2_BQ16_256K_AB.md.
+// BQ=16 is the shipped default: it wins all four contexts against llama.cpp
+// (bench/longctx/TTFT_PROOF_BQ16.md). The BQ=8 path is still selectable by
+// building with -DFA2_NROWS=8, and it is `#if`-guarded so it compiles to the
+// earlier kernel verbatim -- verify that by SASS, NOT by PTX hash: the build
+// uses -lineinfo, so adding a comment shifts every embedded line number while
+// the program is unchanged.
 #ifndef FA2_NROWS
-#define FA2_NROWS      8       // ncols1: query rows per block
+#define FA2_NROWS      16      // ncols1: query rows per block
 #endif
 #define FA2_GQA        6       // ncols2: query heads per KV head
 #define FA2_RGRP       (FA2_NROWS / 8)        // 8-row groups per block
@@ -721,7 +726,7 @@ extern "C" __global__ void attn_prefill_tiled_kernel(
 // Occupancy hint: BQ=8 keeps the historical 3; BQ=16 must ask for 2, because
 // __launch_bounds__(192,3) would cap registers at 113 and spill.
 #ifndef FA2_MINBLOCKS
-#define FA2_MINBLOCKS  3
+#define FA2_MINBLOCKS  (FA2_NROWS == 16 ? 2 : 3)
 #endif
 #define FA2_STRIDE_H2  128     // K/V smem row stride in half2 (256 halves, no pad)
 #define FA2_KQ_OFFSET  2.0794415f          // 3 * ln2
