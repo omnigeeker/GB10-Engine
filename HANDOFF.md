@@ -5,26 +5,57 @@
 whole) and `fa_brief/`.
 
 > ### LATEST (read this before the rest of the document)
-> **256K was measured on the BC=16 kernel and it does NOT flip. 3 of 4 contexts are won
-> (8K, 32K, 128K).** Same-session bc32-vs-bc16 at 262144: **1.3273x** on attention (438,623 ->
-> 330,455 ms, min of 2); prefill total **610.18 s** against llama.cpp's recorded 600.03 s = **1.7%
-> behind**, down from 18.2%. See the section **"256K MEASURED ON BC=16"** near the end of this file,
-> and `bench/longctx/FA2_BC16_256K_AB.md` / `bench/longctx/FA2_BC16_256K_BOUND.md`.
+> **OBJECTIVE MET: 4 of 4. GB10 beats llama.cpp on same-session cold TTFT at every context.** The
+> artifact is **`bench/longctx/TTFT_PROOF_BQ16.md`** — one session, three engines, warm page cache,
+> contention guard before *and* after every trial, 2 trials per arm, minimum reported:
 >
-> **Two things that are now settled and must not be re-derived wrongly:** (1) **256K is NOT
-> "bandwidth-bound" in the DRAM-byte sense** — the measured 1.327x contradicts the near-1.0 ratio
-> that test required; it is occupancy/latency-hiding limited *and* L2-service dependent, and the
-> second term grows with context. (2) **GQA sharing is already fully exploited in the FA2 kernel**
-> (`kh = blockIdx.x`, 6 heads per block); the "6 blocks re-read the same K/V" diagnosis describes
-> the OLD kernel only.
+> | ctx | gb10 fa2off | **gb10 fa2on (BQ=16)** | llama.cpp | llama/gb10 | verdict |
+> |---|---|---|---|---|---|
+> | 8,192 | 9.61 | **8.98** | 10.50 | **1.169** | WON |
+> | 32,768 | 52.03 | **37.22** | 43.81 | **1.177** | WON |
+> | 131,072 | 441.10 | **197.26** | 225.49 | **1.143** | WON |
+> | 262,144 | 1,514.80 | **547.67** | 601.76 | **1.099** | WON |
 >
-> **Next lever, priced and not yet built: BQ 8 -> 16**, which halves K/V request traffic at equal
-> warp occupancy. Only 1.032x more on attention flips 256K. Gate on `GB10_ATTN_OCCUPANCY=1`: the
-> register budget is 170.7 and the kernel sits at 168.
+> **Two kernels, two records, both kept — know which you are reading.** `TTFT_PROOF_FINAL.md` is the
+> **`BC = 16`** kernel (`GB10_FA2_BQ=8`, PTX `e00754e5f1c1`): 8K/32K/128K won, **256K lost by 2.8%**.
+> `TTFT_PROOF_BQ16.md` is the **`BQ = 16`** kernel (PTX `a5ab008e2037`) and supersedes it. Both
+> supersede `TTFT_PROOF.md` (its `fa2off` column was invalidated by the cold-page-cache error and
+> **remains withdrawn**) and the 01:00 run killed for a **stale `gb10-server`** (**zero usable `fa2on`
+> numbers at any context**).
+>
+> **The chain, every step same-session measured and committed:** 1.3% of bf16 peak → FA2 rewrite
+> (MMA `QK^T`/`P*V`, online softmax, `cp.async`) → shared-cast hoist → **`BC = 16`** (halved smem per
+> tile, moving SMEM-bound 3 CTAs/SM → REGS-bound 4 CTAs/SM — occupancy was the dominant lever) →
+> **`BQ = 16`** (halves K/V *request* traffic, 274.9 TB → ~137 TB at 256K, by reusing each fetched
+> tile across 16 query rows instead of 8). **32K: 1.19x behind → 1.177x ahead. 128K: 1.96x behind →
+> 1.143x ahead. 256K: 2.51x behind → 1.099x ahead.**
+>
+> **256K is the noisy context; the verdict does not depend on pass selection.** `fa2on`
+> 553.43/547.67 s (1.05% spread), llama 601.76/603.58 s — llama's trial 1 came in *higher*, so
+> 601.76 is its minimum and **1.099x is the conservative floor**. The arms do not overlap at any
+> context. The earlier `BC = 16`-only 256K read *failed* this test (its deficit sat inside the spread
+> band), which is why it was correctly reported as "cannot call it".
+>
+> **Settled, do not re-derive wrongly:** (1) **256K is NOT "bandwidth-bound" in the DRAM-byte sense**
+> — the measured `BC=16` ratio of 1.327x contradicts the near-1.0 ratio that test required; it is
+> occupancy/latency-hiding limited *and* **L2-service dependent**, and the second term grows with
+> context. The residual was quantified as an **L2-service dependency on 274.9 TB of K/V requests over
+> a 17.18 GB footprint**, which is exactly what `BQ = 16` attacked. (2) **GQA sharing is already fully
+> exploited** in the FA2 kernel (`kh = blockIdx.x`, 6 heads per block); the "6 blocks re-read the same
+> K/V" diagnosis describes the OLD kernel only.
+>
+> **Three traps/standards that made this trustworthy — see the dedicated sections below:**
+> the **stale-binary trap** (host smem request and compiled tile width are two halves of ONE knob; a
+> mismatch **cannot fail loudly** — hence `occupancy_preflight()` over `binary_freshness()`); the
+> **PTX-hash-vs-SASS trap** (`-lineinfo` shifts embedded line numbers, so PTX identity is not program
+> identity); and the **gate standard** (**provably free**, e.g. `BQ = 16`'s bit-identical `ppl512`, is
+> a *different claim* from **accepted characterised cost**, e.g. `BC = 16`'s +6.5e-5 justified by a
+> pre-registered sign).
 
 ## The objective
 
 Close the long-context prefill gap against llama.cpp and beat it at 8K/32K/128K/256K.
+**MET 2026-10-01 — 4 of 4; see the LATEST block above.**
 
 ## The diagnosis (settled — do not re-derive)
 
