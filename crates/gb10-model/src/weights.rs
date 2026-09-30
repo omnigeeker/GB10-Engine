@@ -128,6 +128,10 @@ impl Linear {
     /// `alloc_zeros` is the only allocator cudarc exposes, so every buffer is
     /// zeroed before being fully overwritten. That is pure waste and is the
     /// first thing to remove if the profile says so.
+    /// `precast == true` means the caller has ALREADY run `cast_activation_bf16`
+    /// for this activation at this `t` immediately beforehand, so the
+    /// fp32 -> bf16 staging pass is skipped. Only valid with `GB10_TC_SPLIT=1`;
+    /// `forward_prefill_shared_input` is the only caller and it enforces that.
     #[allow(clippy::too_many_arguments)]
     fn forward_prefill_tensor_core(
         &self,
@@ -135,6 +139,7 @@ impl Linear {
         x: &CudaSlice<f32>,
         y: &mut CudaSlice<f32>,
         t: usize,
+        precast: bool,
     ) -> Result<()> {
         use half::bf16;
         let kern = dev.ops();
@@ -254,15 +259,17 @@ impl Linear {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
-        match split {
-            1 => {
-                kern.f32_to_bf16(dev, x, xhi, t * k)?;
-            }
-            2 => {
-                kern.f32_split_bf16(dev, x, xhi, xlo, t * k)?;
-            }
-            _ => {
-                kern.f32_split3_bf16(dev, x, xhi, xmid, xlo, t * k)?;
+        if !precast {
+            match split {
+                1 => {
+                    kern.f32_to_bf16(dev, x, xhi, t * k)?;
+                }
+                2 => {
+                    kern.f32_split_bf16(dev, x, xhi, xlo, t * k)?;
+                }
+                _ => {
+                    kern.f32_split3_bf16(dev, x, xhi, xmid, xlo, t * k)?;
+                }
             }
         }
         mark!(2);
@@ -301,6 +308,55 @@ impl Linear {
             GEMM_EVENTS.lock().unwrap().push(t);
         }
         Ok(())
+    }
+
+    /// Whether `forward_prefill` would take the tensor-core path at this `t`.
+    /// Mirrors the dispatch in `forward_prefill` exactly; used to decide
+    /// whether a group of Linears sharing one activation can share one cast.
+    fn uses_tensor_core_prefill(&self, t: usize) -> bool {
+        const SMALL_N_CUT: usize = 256;
+        if t <= 16 || (self.n < 256 && t < SMALL_N_CUT) {
+            return false;
+        }
+        std::env::var("GB10_TC_GEMM").map(|v| v != "0").unwrap_or(true)
+    }
+
+    /// Stage `x` (`t x k` fp32) as bf16 in the shared tensor-core scratch, so a
+    /// group of Linears that share this activation pays for the cast once.
+    ///
+    /// PAIRED with `forward_prefill_precast`: this must be immediately followed
+    /// by that, for the same `t`, with no other `Linear` call in between (which
+    /// would overwrite the scratch). Both are private to this module precisely
+    /// so that `forward_prefill_shared_input` is the only thing that can
+    /// establish or rely on that invariant.
+    fn cast_activation_bf16(&self, dev: &Device, x: &CudaSlice<f32>, t: usize) -> Result<()> {
+        use half::bf16;
+        let mut sc = dev.tc_scratch();
+        if sc.x.as_ref().map_or(true, |b| b.len() < t * self.k) {
+            sc.x = Some(dev.stream().alloc_zeros::<bf16>(t * self.k)?);
+        }
+        let xhi = sc.x.as_mut().unwrap();
+        dev.ops().f32_to_bf16(dev, x, xhi, t * self.k)?;
+        Ok(())
+    }
+
+    /// `forward_prefill_tensor_core` for an activation that
+    /// `cast_activation_bf16` has already staged. `x` is accepted (and unused)
+    /// only so no per-call allocation is needed to satisfy the signature.
+    ///
+    /// Private, and only correct immediately after `cast_activation_bf16`.
+    fn forward_prefill_precast(
+        &self,
+        dev: &Device,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<()> {
+        debug_assert!(
+            self.uses_tensor_core_prefill(t),
+            "forward_prefill_precast needs the tensor-core path"
+        );
+        self.forward_prefill_tensor_core(dev, x, y, t, true)
     }
 
     pub fn forward_prefill(
@@ -387,7 +443,7 @@ impl Linear {
         // is the gate: on real weights it shows the tensor-core path within
         // 1.3e-6 of the fp32 reference at t=1024, where it used to be 1.5e3.
         if std::env::var("GB10_TC_GEMM").map(|v| v != "0").unwrap_or(true) {
-            return self.forward_prefill_tensor_core(dev, x, y, t);
+            return self.forward_prefill_tensor_core(dev, x, y, t, false);
         }
         let kern = dev.ops();
         match &self.data {
@@ -410,6 +466,59 @@ impl Linear {
             LinearData::Bf16 { w } => w.len() * 2,
         }
     }
+}
+
+/// Run several `Linear`s that share one fp32 input activation, staging that
+/// activation to bf16 exactly once instead of once per `Linear`.
+///
+/// This is deliberately a *caller-scoped* fusion and NOT a cache: the cast is
+/// consumed by the GEMMs immediately below it, so there is no key to
+/// invalidate. A pointer-keyed cache would be unsafe here, because
+/// `sc.hidden` is rewritten between layers -- the same address holds different
+/// data at different points in the forward pass, so a cache keyed on it would
+/// silently return a stale activation.
+///
+/// Falls back to independent `forward_prefill` calls whenever any member would
+/// not take the tensor-core path, so the small-`t` GEMV heuristic and the
+/// `GB10_TC_SPLIT != 1` precision modes keep their existing behaviour exactly.
+///
+/// The four DeltaNet in-projections, the attention q/k/v projections and the
+/// MLP gate/up pair are the three call sites; between them this removes 3,840
+/// redundant `t x 5120` fp32 -> bf16 passes at 128K.
+pub fn forward_prefill_shared_input(
+    dev: &Device,
+    lins: &[&Linear],
+    x: &CudaSlice<f32>,
+    ys: &mut [&mut CudaSlice<f32>],
+    t: usize,
+) -> Result<()> {
+    assert_eq!(lins.len(), ys.len(), "one output per Linear");
+    if lins.is_empty() {
+        return Ok(());
+    }
+    let split: u32 = std::env::var("GB10_TC_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    // `GB10_CAST_HOIST=0` disables the fusion so the two forms can be compared
+    // in ONE session with ONE binary -- the same reason `GB10_DEQ_2D` exists.
+    let hoist_on = std::env::var("GB10_CAST_HOIST")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let shareable = split == 1
+        && hoist_on
+        && lins.iter().all(|l| l.uses_tensor_core_prefill(t) && l.k == lins[0].k);
+    if !shareable {
+        for (l, y) in lins.iter().zip(ys.iter_mut()) {
+            l.forward_prefill(dev, x, &mut **y, t)?;
+        }
+        return Ok(());
+    }
+    lins[0].cast_activation_bf16(dev, x, t)?;
+    for (l, y) in lins.iter().zip(ys.iter_mut()) {
+        l.forward_prefill_precast(dev, x, &mut **y, t)?;
+    }
+    Ok(())
 }
 
 /// Read-only view over the checkpoint's shards.

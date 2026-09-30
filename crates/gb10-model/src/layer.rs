@@ -175,9 +175,19 @@ impl Mlp {
             ($i:expr) => { if let Some(t) = &evs { let _ = t[$i].record(dev.stream()); } };
         }
         mmark!(0);
-        self.gate.forward_prefill(dev, x, a, t)?;
+        // gate and up read the SAME `x`, so they share one fp32 -> bf16 staging
+        // pass instead of two. Caller-scoped fusion, not a cache -- see
+        // `weights::forward_prefill_shared_input`. Consequence for the
+        // instrument: `MLP_PHASES[0]` ("gate gemm") now covers gate AND up, and
+        // `MLP_PHASES[1]` is zero. The phase SUM is what stays comparable.
+        crate::weights::forward_prefill_shared_input(
+            dev,
+            &[&self.gate, &self.up],
+            x,
+            &mut [&mut *a, &mut *b],
+            t,
+        )?;
         mmark!(1);
-        self.up.forward_prefill(dev, x, b, t)?;
         mmark!(2);
         dev.ops().swiglu_inplace(dev, a, b, self.gate.n * t)?;
         mmark!(3);
@@ -426,13 +436,26 @@ impl DeltaNetLayer {
         dmark!(0);
         let cpu_t0 = if pevs.is_some() { Some(std::time::Instant::now()) } else { None };
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
-        self.in_proj_qkv.forward_prefill(dev, &sc.hidden, &mut sc.qkv, t)?;
+        // All four in-projections read the SAME `sc.hidden`, so they share one
+        // fp32 -> bf16 staging pass instead of four. Caller-scoped fusion, not a
+        // cache -- see `weights::forward_prefill_shared_input`. Instrument
+        // consequence: `PROJ_PHASES[0]` now covers all four GEMMs and phases
+        // 1..3 are zero; the phase SUM is what stays comparable.
+        crate::weights::forward_prefill_shared_input(
+            dev,
+            &[
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &self.in_proj_a,
+                &self.in_proj_b,
+            ],
+            &sc.hidden,
+            &mut [&mut sc.qkv, &mut sc.z, &mut sc.a, &mut sc.b],
+            t,
+        )?;
         pmark!(1);
-        self.in_proj_z.forward_prefill(dev, &sc.hidden, &mut sc.z, t)?;
         pmark!(2);
-        self.in_proj_a.forward_prefill(dev, &sc.hidden, &mut sc.a, t)?;
         pmark!(3);
-        self.in_proj_b.forward_prefill(dev, &sc.hidden, &mut sc.b, t)?;
         pmark!(4);
         if let Some(t0) = cpu_t0 {
             PROJ_CPU_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -662,9 +685,14 @@ impl FullAttnLayer {
         }
         amark!(0);
         ops.rmsnorm_zero_centered(dev, x, &self.input_ln, &mut sc.hidden, t, hidden, eps)?;
-        self.q_proj.forward_prefill(dev, &sc.hidden, &mut sc.fused, t)?;
-        self.k_proj.forward_prefill(dev, &sc.hidden, &mut sc.kb, t)?;
-        self.v_proj.forward_prefill(dev, &sc.hidden, &mut sc.vb, t)?;
+        // q, k and v all read the SAME `sc.hidden` -- one staging pass, not three.
+        crate::weights::forward_prefill_shared_input(
+            dev,
+            &[&self.q_proj, &self.k_proj, &self.v_proj],
+            &sc.hidden,
+            &mut [&mut sc.fused, &mut sc.kb, &mut sc.vb],
+            t,
+        )?;
 
         ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.q, nh, hd, 0, t)?;
         ops.deinterleave_heads_batched(dev, &sc.fused, &mut sc.gate, nh, hd, hd, t)?;
